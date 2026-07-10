@@ -73,7 +73,16 @@ function dropTombstoned(sessions: SessionInfo[]): SessionInfo[] {
 // sees the persisted row), and sessions whose turn just settled (same race, but
 // for a chat the user has already navigated away from). Pass `scope` to only
 // keep the active row when it belongs to the profile being paged.
-function sessionsToKeep(scope?: string): Set<string> {
+//
+// `excludedSources`: the active row must NOT be kept if its source is one the
+// caller's aggregator query already excludes (e.g. 'cron'). Without this check,
+// opening a cron run from the Cron panel's run-history list (which navigates to
+// /session/<cron_id> and sets $selectedStoredSessionId) makes that cron session
+// "the active session" — and this function would then force it back into the
+// main recents list on every refresh, permanently bypassing the
+// SIDEBAR_EXCLUDED_SOURCES filter the aggregator query applies to freshly
+// fetched rows (#<issue-number-tbd>).
+function sessionsToKeep(scope?: string, excludedSources?: readonly string[]): Set<string> {
   const keep = new Set<string>([
     ...$workingSessionIds.get(),
     ...$pinnedSessionIds.get(),
@@ -83,9 +92,11 @@ function sessionsToKeep(scope?: string): Set<string> {
   const active = $selectedStoredSessionId.get()
 
   if (active) {
-    const session = scope ? $sessions.get().find(s => s.id === active) : null
+    const session = $sessions.get().find(s => s.id === active)
+    const sourceExcluded = excludedSources?.length ? excludedSources.includes(normalizeSessionSource(session?.source) ?? '') : false
+    const inScope = !scope || !session || normalizeProfileKey(session.profile) === scope
 
-    if (!scope || !session || normalizeProfileKey(session.profile) === scope) {
+    if (!sourceExcluded && inScope) {
       keep.add(active)
     }
   }
@@ -289,7 +300,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
           // identity, or every sidebar memo keyed on $sessions recomputes and the
           // whole list re-renders once per turn/broadcast for nothing.
           setSessions(prev => {
-            const next = mergeSessionPage(prev, incoming, sessionsToKeep())
+          const next = mergeSessionPage(prev, incoming, sessionsToKeep(undefined, SIDEBAR_EXCLUDED_SOURCES))
 
             return sameCronSignature(prev, next) ? prev : next
           })
