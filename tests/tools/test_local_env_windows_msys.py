@@ -293,6 +293,23 @@ class TestGitBashCoreutilsOnPath:
         # No Windows git dirs injected on POSIX.
         assert "mingw64" not in run_env["PATH"]
 
+    def test_make_run_env_merges_windows_path_case_variants(self, monkeypatch):
+        """Desktop/Python PATH overlays must not hide the inherited host PATH."""
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(local_mod, "_HERMES_BIN_DIR", None)
+        monkeypatch.setattr(local_mod, "_prepend_git_bash_dirs", lambda value: value)
+
+        host_path = r"C:\Host\GitHubCLI;C:\Windows\System32"
+        with patch.object(local_mod.os, "environ", {"Path": host_path}):
+            run_env = _make_run_env({"PATH": r"C:\Hermes\venv\Scripts"})
+
+        path_keys = [key for key in run_env if key.lower() == "path"]
+        assert path_keys == ["Path"]
+        merged_path = run_env["Path"]
+        assert merged_path.startswith(r"C:\Hermes\venv\Scripts;")
+        assert r"C:\Host\GitHubCLI" in merged_path
+        assert r"C:\Windows\System32" in merged_path
+
 
 # ---------------------------------------------------------------------------
 # Command wrapping — native Windows cwd must be Git Bash-friendly for cd
