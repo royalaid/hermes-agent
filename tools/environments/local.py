@@ -978,6 +978,10 @@ def _git_bash_bin_dirs() -> list[str]:
         os.path.join(root, "usr", "bin"),
         os.path.join(root, "bin"),
     ):
+        # These entries are exported to Git Bash, where forward slashes are
+        # the stable spelling even when Python discovered the native path with
+        # Windows separators.  os.path.isdir accepts either spelling.
+        candidate = candidate.replace("\\", "/")
         if os.path.isdir(candidate) and candidate not in dirs:
             dirs.append(candidate)
 
@@ -1265,6 +1269,59 @@ def _path_env_key(run_env: dict) -> str | None:
     return None
 
 
+def _merge_windows_path_env(base_env: dict, extra_env: dict) -> dict:
+    """Merge Windows PATH case-insensitively without losing either value.
+
+    ``os.environ`` and Electron's environment overlay can spell the same
+    Windows variable as ``Path`` and ``PATH``. Python dictionaries preserve
+    both spellings even though CreateProcess and Git Bash treat them as one
+    variable; leaving both entries makes the effective winner undefined and
+    can hide the inherited host PATH behind a Hermes-only overlay.
+
+    Explicit extra values lead so Hermes-managed directories retain their
+    intended precedence. The inherited value follows so host-installed tools
+    remain discoverable. All other environment keys keep normal overlay
+    semantics.
+    """
+    merged = dict(base_env)
+    if not _IS_WINDOWS:
+        merged.update(extra_env)
+        return merged
+
+    base_path_keys = [key for key in merged if key.lower() == "path"]
+    extra_path_keys = [key for key in extra_env if key.lower() == "path"]
+    path_keys = [*base_path_keys, *extra_path_keys]
+
+    merged.update(extra_env)
+    if not path_keys:
+        return merged
+
+    path_key = base_path_keys[0] if base_path_keys else extra_path_keys[0]
+    path_values = [
+        str(extra_env[key])
+        for key in extra_path_keys
+        if extra_env[key] is not None and str(extra_env[key])
+    ] + [
+        str(base_env[key])
+        for key in base_path_keys
+        if base_env[key] is not None and str(base_env[key])
+    ]
+
+    entries: list[str] = []
+    seen: set[str] = set()
+    for value in path_values:
+        for entry in value.split(";"):
+            comparison_key = entry.casefold()
+            if entry and comparison_key not in seen:
+                seen.add(comparison_key)
+                entries.append(entry)
+
+    for key in path_keys:
+        merged.pop(key, None)
+    merged[path_key] = ";".join(entries)
+    return merged
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -1276,7 +1333,7 @@ def _make_run_env(env: dict) -> dict:
         _is_passthrough = lambda _: False  # noqa: E731
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
-    merged = dict(os.environ | env)
+    merged = _merge_windows_path_env(os.environ, env)
     run_env = {}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
