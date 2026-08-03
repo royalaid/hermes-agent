@@ -174,6 +174,96 @@ class TestHTTP413Compression:
         assert result["completed"] is True
         assert result["final_response"] == "Success after compression"
 
+    def test_413_retries_after_request_only_native_compaction(self, agent):
+        err_413 = _make_413_error()
+        ok_resp = _mock_response(
+            content="Success after native compaction",
+            usage={
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+            },
+        )
+        agent.client.chat.completions.create.side_effect = [err_413, ok_resp]
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        def _native_success(messages, *_args, **_kwargs):
+            agent._last_native_compaction_succeeded = True
+            agent.context_compressor.awaiting_real_usage_after_compression = True
+            return messages, agent._cached_system_prompt
+
+        with (
+            patch.object(agent, "_compress_context", side_effect=_native_success),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["completed"] is True
+        assert result["final_response"] == "Success after native compaction"
+        assert agent.context_compressor.awaiting_real_usage_after_compression is False
+        assert agent.iteration_budget.used == 1
+
+    def test_failed_native_and_textual_noop_stops_413_retry_loop(self, agent):
+        agent._last_native_compaction_succeeded = True  # stale prior-turn state
+        agent.client.chat.completions.create.side_effect = [_make_413_error()]
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with (
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=lambda messages, *_args, **_kwargs: (
+                    messages,
+                    agent._cached_system_prompt,
+                ),
+            ) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        assert agent.client.chat.completions.create.call_count == 1
+        mock_compress.assert_called_once()
+        assert result["compression_exhausted"] is True
+
+    def test_context_overflow_retries_after_request_only_native_compaction(self, agent):
+        overflow = Exception("context window exceeded; reduce the prompt")
+        overflow.status_code = 400
+        agent.client.chat.completions.create.side_effect = [
+            overflow,
+            _mock_response(content="Recovered after native compaction"),
+        ]
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        def _native_success(messages, *_args, **_kwargs):
+            agent._last_native_compaction_succeeded = True
+            return messages, agent._cached_system_prompt
+
+        with (
+            patch.object(agent, "_compress_context", side_effect=_native_success),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after native compaction"
+
 
 
     def test_413_strips_vision_payloads_when_compression_cannot_reduce_messages(self, agent):
@@ -675,6 +765,42 @@ class TestPreflightCompression:
             ev == "lifecycle" and "Preflight compression" in msg
             for ev, msg in status_messages
         )
+
+    def test_preflight_native_success_continues_to_api_without_rewriting_messages(
+        self, agent
+    ):
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 100}
+            for i in range(40)
+        ]
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Provider received projected request"
+        )
+        estimates = iter([120_000, 120_000])
+
+        def _native_success(messages, *_args, **_kwargs):
+            agent._last_native_compaction_succeeded = True
+            return messages, agent._cached_system_prompt
+
+        with (
+            patch(
+                "agent.turn_context.estimate_request_tokens_rough",
+                side_effect=lambda *_args, **_kwargs: next(estimates),
+            ),
+            patch.object(agent, "_compress_context", side_effect=_native_success),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=history)
+
+        agent.client.chat.completions.create.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "Provider received projected request"
+        assert agent.iteration_budget.used == 1
 
     def test_preflight_suppresses_status_when_context_engine_opts_out(self, agent):
         """LCM-style engines can keep routine automatic preflight maintenance silent."""
