@@ -105,10 +105,16 @@ auxiliary:
 ### Native OpenAI Responses projection (local fork, opt-in)
 
 `compression.openai_native` defaults to `false`. When explicitly enabled, the
-built-in compressor first tries OpenAI's native Responses compaction only for a
-direct, first-party OpenAI API-key route using `api_mode: codex_responses`. It
-does not activate for OpenAI-compatible third-party endpoints, Codex OAuth, or
-Codex app-server sessions.
+built-in compressor first tries OpenAI's native Responses compaction on exactly
+these first-party routes using `api_mode: codex_responses`:
+
+- OpenAI API key: `provider: openai` with `https://api.openai.com/v1`;
+- ChatGPT Codex OAuth: `provider: openai-codex` with
+  `https://chatgpt.com/backend-api/codex`.
+
+It does not activate for OpenAI-compatible third-party endpoints or Codex
+app-server sessions. Other providers, hosts, and API modes fail closed to the
+existing text-compression path.
 
 Native compaction is a sidecar projection, not a transcript rewrite. Hermes
 keeps the complete readable conversation in `state.db` and stores the bounded
