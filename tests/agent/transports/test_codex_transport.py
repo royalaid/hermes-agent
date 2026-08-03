@@ -1,5 +1,6 @@
 """Tests for the ResponsesApiTransport (Codex)."""
 
+import copy
 import json
 import pytest
 from types import SimpleNamespace
@@ -38,6 +39,124 @@ class TestCodexTransportBasic:
 
 
 class TestCodexBuildKwargs:
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {},
+            {"instructions": "Explicit instructions", "is_codex_backend": True},
+            {"is_github_responses": True},
+            {"is_xai_responses": True, "replay_encrypted_reasoning": False},
+        ],
+    )
+    def test_build_input_items_matches_ordinary_request_input(self, transport, params):
+        messages = [
+            {"role": "system", "content": "System instructions"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ]
+
+        serialized = transport.build_input_items(messages, **params)
+        ordinary = transport.build_kwargs(
+            model="gpt-5.5", messages=messages, tools=[], **params
+        )
+
+        assert serialized == ordinary["input"]
+        assert isinstance(serialized, list)
+
+    def test_build_input_items_substitutes_sidecars_without_mutating_messages(
+        self, transport
+    ):
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "clean stored text"}],
+                "api_content": "exact wire text",
+                "metadata": {"nested": ["untouched"]},
+            },
+            {
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": {"command": "pwd"},
+                        },
+                    }
+                ],
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        serialized = transport.build_input_items(messages, is_codex_backend=True)
+
+        assert serialized[0] == {"role": "user", "content": "exact wire text"}
+        assert messages == original
+        assert "api_content" in messages[0]
+        assert messages[1]["tool_calls"][0]["function"]["arguments"] == {
+            "command": "pwd"
+        }
+
+    def test_build_input_items_preserves_supported_response_item_order(self, transport):
+        reasoning = {
+            "type": "reasoning",
+            "id": "reasoning-store-id",
+            "encrypted_content": "opaque-reasoning",
+            "summary": [{"type": "summary_text", "text": "summary"}],
+        }
+        assistant_message = {
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [{"type": "output_text", "text": "answer"}],
+            "id": "msg_1",
+            "phase": "final_answer",
+        }
+        messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "answer",
+                "codex_reasoning_items": [reasoning],
+                "codex_message_items": [assistant_message],
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "terminal", "arguments": "{\"command\":\"pwd\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+
+        serialized = transport.build_input_items(messages, is_codex_backend=True)
+
+        assert [item.get("type", item.get("role")) for item in serialized] == [
+            "user",
+            "reasoning",
+            "message",
+            "function_call",
+            "function_call_output",
+        ]
+        assert serialized[1] == {
+            "type": "reasoning",
+            "encrypted_content": "opaque-reasoning",
+            "summary": [{"type": "summary_text", "text": "summary"}],
+        }
+        assert serialized[2] == assistant_message
+        assert serialized[3] == {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "terminal",
+            "arguments": "{\"command\":\"pwd\"}",
+        }
+        assert serialized[4] == {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "result",
+        }
 
 
 

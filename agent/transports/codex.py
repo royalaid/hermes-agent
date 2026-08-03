@@ -5,6 +5,7 @@ This transport owns format conversion and normalization — NOT client lifecycle
 streaming, or the _run_codex_stream() call path.
 """
 
+import copy
 import hashlib
 import json
 import re
@@ -151,6 +152,38 @@ class ResponsesApiTransport(ProviderTransport):
         from agent.codex_responses_adapter import _responses_tools
         return _responses_tools(tools)
 
+    def build_input_items(
+        self, messages: List[Dict[str, Any]], **params
+    ) -> List[Dict[str, Any]]:
+        """Build only the finalized Responses ``input`` items for messages."""
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+        from agent.turn_context import substitute_api_content
+
+        payload_messages = copy.deepcopy(messages)
+        for message in payload_messages:
+            if isinstance(message, dict):
+                substitute_api_content(message)
+
+        instructions = params.get("instructions", "")
+        if (
+            not instructions
+            and payload_messages
+            and payload_messages[0].get("role") == "system"
+        ):
+            payload_messages = payload_messages[1:]
+
+        issuer_kind = self._resolve_issuer_kind(params)
+        self._last_issuer_kind = issuer_kind
+        return _chat_messages_to_responses_input(
+            payload_messages,
+            is_xai_responses=params.get("is_xai_responses") is True,
+            is_github_responses=params.get("is_github_responses") is True,
+            replay_encrypted_reasoning=bool(
+                params.get("replay_encrypted_reasoning", True)
+            ),
+            current_issuer_kind=issuer_kind,
+        )
+
     def build_kwargs(
         self,
         model: str,
@@ -180,19 +213,14 @@ class ResponsesApiTransport(ProviderTransport):
             is_xai_responses: bool — xAI/Grok backend
             github_reasoning_extra: dict | None — Copilot reasoning params
         """
-        from agent.codex_responses_adapter import (
-            _chat_messages_to_responses_input,
-            _responses_tools,
-        )
+        from agent.codex_responses_adapter import _responses_tools
 
         from run_agent import DEFAULT_AGENT_IDENTITY
 
         instructions = params.get("instructions", "")
-        payload_messages = messages
         if not instructions:
             if messages and messages[0].get("role") == "system":
                 instructions = str(messages[0].get("content") or "").strip()
-                payload_messages = messages[1:]
         if not instructions:
             instructions = DEFAULT_AGENT_IDENTITY
 
@@ -203,13 +231,6 @@ class ResponsesApiTransport(ProviderTransport):
             params.get("replay_encrypted_reasoning", True)
         )
 
-        # Resolve the issuing endpoint for this call. Stashed on the
-        # transport so normalize_response can stamp it onto reasoning
-        # items captured from the response, and passed to the input
-        # converter so foreign-issuer reasoning blocks in history are
-        # dropped before the API rejects them.
-        issuer_kind = self._resolve_issuer_kind(params)
-        self._last_issuer_kind = issuer_kind
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -301,13 +322,7 @@ class ResponsesApiTransport(ProviderTransport):
         kwargs = {
             "model": model,
             "instructions": instructions,
-            "input": _chat_messages_to_responses_input(
-                payload_messages,
-                is_xai_responses=is_xai_responses,
-                is_github_responses=is_github_responses,
-                replay_encrypted_reasoning=replay_encrypted_reasoning,
-                current_issuer_kind=issuer_kind,
-            ),
+            "input": self.build_input_items(messages, **params),
             "store": False,
         }
         if response_tools:
