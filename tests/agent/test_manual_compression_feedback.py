@@ -64,5 +64,27 @@ def test_fallback_compression_reports_dropped_message_count():
     assert "invalid response" in feedback["note"]
 
 
+def test_native_compaction_reports_committed_checkpoint_without_transcript_rewrite():
+    messages = _messages(12)
+
+    feedback = summarize_manual_compression(
+        messages,
+        list(messages),
+        120_000,
+        120_000,
+        native_succeeded=True,
+    )
+
+    assert feedback["noop"] is False
+    assert feedback["native_succeeded"] is True
+    assert feedback["headline"] == (
+        "OpenAI native compaction checkpoint committed: 12 messages preserved"
+    )
+    assert feedback["token_line"] == (
+        "Approx readable request size: ~120,000 tokens (transcript unchanged)"
+    )
+    assert "next matching OpenAI Responses request" in feedback["note"]
+
+
 
 

@@ -7,6 +7,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.conversation_compression import (
     CompressionCommitFence,
     capture_compression_attempt_outcome,
@@ -337,6 +339,31 @@ def test_ineligible_native_path_preserves_text_compressor_behavior():
 
     assert returned is messages
     assert agent.context_compressor.text_calls == 1
+    endpoint.assert_not_called()
+
+
+@pytest.mark.parametrize("middleware_kind", ["llm_request", "llm_execution"])
+def test_native_compaction_fails_closed_when_llm_middleware_can_rewrite_wire_input(
+    middleware_kind,
+):
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+    messages = _messages()
+
+    def _has_middleware(kind):
+        return kind == middleware_kind
+
+    with (
+        patch("hermes_cli.plugins.has_middleware", side_effect=_has_middleware),
+        patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate"
+        ) as endpoint,
+    ):
+        returned, _ = compress_context(agent, messages, "sys", force=True)
+
+    assert returned is messages
+    assert agent.context_compressor.text_calls == 1
+    assert agent._last_native_compaction_succeeded is False
     endpoint.assert_not_called()
 
 

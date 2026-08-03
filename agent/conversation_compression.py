@@ -2427,6 +2427,22 @@ def _try_native_openai_compaction(
     if not eligible:
         return "fallback"
 
+    # Native creation serializes candidate prefixes before request and execution
+    # middleware run, while replay sees the finalized post-middleware request.
+    # Unless those middleware stacks are empty, Hermes cannot prove that the
+    # compacted source prefix is the prefix that will reach the provider. Fail
+    # closed to same-attempt textual compression rather than commit an unusable
+    # checkpoint and report false progress.
+    try:
+        from hermes_cli.middleware import has_llm_request_or_execution_middleware
+
+        if has_llm_request_or_execution_middleware():
+            return "fallback"
+    except Exception:
+        return "abort" if _cancelled() or _observed_lease_lost() else "fallback"
+    if _cancelled() or _observed_lease_lost():
+        return "abort"
+
     if session_db is None or type(session_id) is not str or not session_id:
         return _fallback("session_state")
     if type(active_holder) is not str or not active_holder:

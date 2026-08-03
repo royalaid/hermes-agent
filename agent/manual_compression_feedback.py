@@ -44,11 +44,13 @@ def summarize_manual_compression(
     after_tokens: int,
     *,
     compression_state: Any = None,
+    native_succeeded: bool = False,
 ) -> dict[str, Any]:
     """Return consistent user-facing feedback for manual compression."""
     before_count = len(before_messages)
     after_count = len(after_messages)
-    noop = list(after_messages) == list(before_messages)
+    native_succeeded = native_succeeded is True
+    noop = list(after_messages) == list(before_messages) and not native_succeeded
     aborted = (
         compression_state is not None
         and getattr(compression_state, "_last_compress_aborted", False) is True
@@ -65,7 +67,12 @@ def summarize_manual_compression(
     if not isinstance(failure_reason, str) or not failure_reason.strip():
         failure_reason = None
 
-    if aborted:
+    if native_succeeded:
+        headline = (
+            "OpenAI native compaction checkpoint committed: "
+            f"{before_count} messages preserved"
+        )
+    elif aborted:
         headline = f"Compression aborted: {before_count} messages preserved"
     elif fallback_used:
         headline = (
@@ -76,7 +83,12 @@ def summarize_manual_compression(
     else:
         headline = f"Compressed: {before_count} → {after_count} messages"
 
-    if noop and after_tokens == before_tokens:
+    if native_succeeded:
+        token_line = (
+            f"Approx readable request size: ~{before_tokens:,} tokens "
+            "(transcript unchanged)"
+        )
+    elif noop and after_tokens == before_tokens:
         token_line = f"Approx request size: ~{before_tokens:,} tokens (unchanged)"
     else:
         token_line = (
@@ -85,7 +97,12 @@ def summarize_manual_compression(
         )
 
     note = None
-    if aborted:
+    if native_succeeded:
+        note = (
+            "The readable transcript is unchanged; the next matching OpenAI "
+            "Responses request will replay the compacted checkpoint."
+        )
+    elif aborted:
         note = "Summary generation failed; no messages were removed."
     elif fallback_used:
         dropped_count = getattr(
@@ -112,6 +129,7 @@ def summarize_manual_compression(
 
     return {
         "noop": noop,
+        "native_succeeded": native_succeeded,
         "aborted": aborted,
         "fallback_used": fallback_used,
         "headline": headline,
