@@ -75,7 +75,21 @@ def test_sibling_profile_native_scope_key_is_blocked_for_reads_and_writes(
     monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
 
     assert "credential store" in (fs.get_read_block_error(str(sibling_key)) or "")
-    assert fs.is_write_denied(str(sibling_key))
+    assert fs.is_write_denied(str(sibling_key)) is True
+
+
+def test_native_scope_key_windows_data_stream_alias_is_blocked(fake_home):
+    if os.name != "nt":
+        pytest.skip("NTFS stream aliases are Windows-only")
+
+    import agent.file_safety as fs
+
+    scope_key = _create(fake_home, Path("cache") / "native_openai_scope.key")
+    alias = f"{scope_key.parent}\\NaTiVe_OpEnAi_ScOpE.KeY::$DATA"
+
+    assert fs._is_native_openai_scope_key_basename(alias) is True
+    assert "credential store" in (fs.get_read_block_error(alias) or "")
+    assert fs.is_write_denied(alias) is True
 
 
 def test_arbitrary_hermes_home_file_not_blocked(fake_home):

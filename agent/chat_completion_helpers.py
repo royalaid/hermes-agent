@@ -170,22 +170,50 @@ def _load_or_create_native_scope_key():
     except OSError:
         return None
 
-    for _attempt in range(8):
+    missing = object()
+
+    def read_existing_key():
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            key_stat = key_path.lstat()
+            fd = os.open(key_path, flags)
         except FileNotFoundError:
-            key_stat = None
+            return missing
         except OSError:
             return None
-        if key_stat is not None and (
-            stat.S_ISLNK(key_stat.st_mode) or key_stat.st_nlink != 1
-        ):
-            # Never treat another file as credential-scope material through a
-            # symlink or hard link. Fall back to per-agent random scoping.
-            return None
+
         try:
-            existing = key_path.read_bytes()
-        except FileNotFoundError:
+            opened_stat = os.fstat(fd)
+            path_stat = key_path.lstat()
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or opened_stat.st_nlink != 1
+                or stat.S_ISLNK(path_stat.st_mode)
+                or not stat.S_ISREG(path_stat.st_mode)
+                or path_stat.st_nlink != 1
+                or (opened_stat.st_dev, opened_stat.st_ino)
+                != (path_stat.st_dev, path_stat.st_ino)
+            ):
+                return None
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                return handle.read(33)
+        except (FileNotFoundError, OSError):
+            return None
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    for _attempt in range(8):
+        existing = read_existing_key()
+        if existing is None:
+            # Never treat another file as credential-scope material through a
+            # symlink, hard link, or path swap. Fall back conservatively.
+            return None
+        if existing is missing:
             candidate = os.urandom(32)
             try:
                 fd = os.open(
@@ -211,8 +239,6 @@ def _load_or_create_native_scope_key():
                 return candidate
             except OSError:
                 return None
-        except OSError:
-            return None
         if len(existing) == 32:
             return existing
         if existing:

@@ -76,6 +76,27 @@ def test_media_delivery_denies_sibling_profile_native_scope_key(
     assert base.validate_media_delivery_path(str(sibling_key)) is None
 
 
+def test_media_delivery_denies_native_scope_key_windows_data_stream_alias(
+    tmp_path, monkeypatch
+):
+    if os.name != "nt":
+        pytest.skip("NTFS stream aliases are Windows-only")
+
+    import gateway.platforms.base as base
+
+    root = tmp_path / "hermes"
+    key = root / "cache" / "native_openai_scope.key"
+    key.parent.mkdir(parents=True)
+    key.write_bytes(b"x" * 32)
+    alias = f"{key.parent}\\NaTiVe_OpEnAi_ScOpE.KeY::$DATA"
+    monkeypatch.setattr(base, "_HERMES_HOME", root)
+    monkeypatch.setattr(base, "_HERMES_ROOT", root)
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(root))
+
+    assert base._is_native_openai_scope_key_basename(alias) is True
+    assert base.validate_media_delivery_path(alias) is None
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 
