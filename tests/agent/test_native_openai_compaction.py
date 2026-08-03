@@ -1111,3 +1111,182 @@ def test_cut_repr_and_invalid_payload_errors_never_expose_payloads():
     )
     assert sentinel not in rendered
     assert rendered == "None"
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        {"role": "developer", "content": "hidden developer instruction"},
+        {"role": "unknown", "content": "unknown role payload"},
+        {"content": "missing role payload"},
+        {"role": 7, "content": "non-string role payload"},
+    ],
+)
+def test_cut_refuses_raw_rows_with_unserializable_roles_before_serialization(bad_row):
+    from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        bad_row,
+        {"role": "user", "content": "new request"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    transport = ResponsesApiTransport()
+    calls = 0
+
+    def serialize(rows):
+        nonlocal calls
+        calls += 1
+        return transport.build_input_items(rows, is_codex_backend=True)
+
+    assert select_native_compaction_cut(messages, protect_last_n=1, serialize_input=serialize) is None
+    assert calls == 0
+
+
+def test_cut_refuses_non_plain_raw_row_and_role():
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    class Row(dict):
+        pass
+
+    class Role(str):
+        pass
+
+    for bad_row in (
+        Row(role="assistant", content="not a plain row"),
+        {"role": Role("assistant"), "content": "not a plain role"},
+    ):
+        messages = [
+            {"role": "user", "content": "old"},
+            bad_row,
+            {"role": "user", "content": "new"},
+        ]
+        assert select_native_compaction_cut(
+            messages, protect_last_n=1, serialize_input=_serialize_rows
+        ) is None
+
+
+@pytest.mark.parametrize("api_content", [{"private": "object"}, [], 7, False])
+def test_cut_refuses_raw_non_string_api_content(api_content):
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "answer", "api_content": api_content},
+        {"role": "user", "content": "new"},
+    ]
+    assert select_native_compaction_cut(
+        messages, protect_last_n=1, serialize_input=_serialize_rows
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("codex_reasoning_items", "not-a-list"),
+        ("codex_reasoning_items", {}),
+        ("codex_reasoning_items", ()),
+        ("codex_message_items", "not-a-list"),
+        ("codex_message_items", {}),
+        ("codex_message_items", ()),
+    ],
+)
+def test_cut_refuses_raw_non_list_wire_sidecar_containers(field, value):
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "new"},
+        {"role": "assistant", "content": "tail", field: value},
+    ]
+    assert select_native_compaction_cut(
+        messages, protect_last_n=1, serialize_input=_serialize_rows
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "graph",
+    [
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "tool", "arguments": {}},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ],
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "tool", "arguments": "{}", "extra": "x"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ],
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": {"private": "object"}},
+        ],
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok", "extra": "x"},
+        ],
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": {"private": "object"}}]},
+        ],
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_image", "image_url": ""}]},
+        ],
+        [{"type": "reasoning", "encrypted_content": {"private": "object"}, "summary": []}],
+        [{"type": "reasoning", "encrypted_content": "opaque", "summary": {}}],
+        [{"type": "reasoning", "encrypted_content": "opaque", "summary": [{"type": "summary_text", "text": "ok", "extra": "x"}]}],
+        [{"type": "reasoning", "encrypted_content": "opaque", "summary": [], "extra": "x"}],
+        [{"type": "message", "role": "assistant", "status": "completed", "content": {"private": "object"}}],
+        [{"type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "ok", "extra": "x"}]}],
+        [{"type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "ok"}], "extra": "x"}],
+        [{"role": "user", "content": {"private": "object"}}],
+        [{"role": "user", "content": [{"type": "output_text", "text": "wrong direction"}]}],
+        [{"role": "assistant", "content": [{"type": "input_text", "text": "wrong direction"}]}],
+        [{"role": "user", "content": [{"type": "input_image", "image_url": "", "detail": "auto"}]}],
+        [{"role": "user", "content": "ok", "extra": "x"}],
+    ],
+)
+def test_cut_refuses_malformed_exact_finalized_responses_schemas(graph):
+    assert _select_cut_for_serialized_tool_graph(graph) is None
+
+
+def test_cut_refuses_non_plain_finalized_item_and_nested_part():
+    class Item(dict):
+        pass
+
+    assert _select_cut_for_serialized_tool_graph(
+        [Item(role="user", content="not plain")]
+    ) is None
+    assert _select_cut_for_serialized_tool_graph(
+        [{"role": "user", "content": [Item(type="input_text", text="not plain")]}]
+    ) is None
+
+
+def test_cut_accepts_all_exact_finalized_responses_schemas():
+    graph = [
+        {"role": "user", "content": [
+            {"type": "input_text", "text": "question"},
+            {"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"},
+        ]},
+        {"type": "reasoning", "encrypted_content": "opaque", "summary": [
+            {"type": "summary_text", "text": "summary"}
+        ]},
+        {"type": "message", "role": "assistant", "status": "completed", "id": "msg_1", "phase": "final_answer", "content": [
+            {"type": "output_text", "text": "calling"}
+        ]},
+        {"type": "function_call", "call_id": "call_a", "name": "a", "arguments": "{}"},
+        {"type": "function_call", "call_id": "call_b", "name": "b", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_b", "output": [
+            {"type": "input_text", "text": "B"},
+            {"type": "input_image", "image_url": "https://example.test/b.png"},
+        ]},
+        {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+        {"role": "assistant", "content": [
+            {"type": "output_text", "text": "done"},
+            {"type": "input_image", "image_url": "https://example.test/result.png", "detail": "low"},
+        ]},
+    ]
+
+    assert _select_cut_for_serialized_tool_graph(graph) is not None
