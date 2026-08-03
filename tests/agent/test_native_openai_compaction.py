@@ -411,7 +411,7 @@ def test_redacted_metadata_contains_only_safe_operational_fields():
         "model": "gpt-5",
         "base_url_host": "api.openai.com",
         "issuer_kind": "api_key",
-        "credential_scope": "account-1",
+        "credential_scope_present": True,
         "replay_encrypted_reasoning": True,
         "source_input_item_count": 1,
         "source_input_sha256": checkpoint.source_input_sha256[:12],
@@ -427,6 +427,17 @@ def test_redacted_metadata_contains_only_safe_operational_fields():
     assert "opaque-A" not in rendered
     assert "retained" not in rendered
     assert "output_json" not in rendered
+
+
+def test_redacted_metadata_never_exposes_arbitrary_credential_scope_values():
+    credential_scope = "credential-scope-raw-secret-sentinel"
+    checkpoint = _checkpoint(identity=_identity(credential_scope=credential_scope))
+
+    metadata = checkpoint.redacted_metadata()
+
+    assert metadata["credential_scope_present"] is True
+    assert "credential_scope" not in metadata
+    assert credential_scope not in repr(metadata)
 
 
 def test_redacted_metadata_excludes_base_url_credentials_and_route_details():
