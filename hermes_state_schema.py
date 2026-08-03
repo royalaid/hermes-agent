@@ -664,6 +664,8 @@ class SessionSchemaMixin:
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by
             # _reconcile_columns() above and no longer need entries here.
+            # v25 adds the optional native OpenAI compaction checkpoint
+            # sidecar declaratively via SCHEMA_SQL and requires no backfill.
             if current_version < 10 and SCHEMA_VERSION == 10:
                 # v10: trigram FTS5 table for CJK/substring search. The
                 # virtual table + triggers are created unconditionally via
