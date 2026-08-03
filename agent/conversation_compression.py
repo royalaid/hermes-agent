@@ -3567,6 +3567,12 @@ def compress_context(
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
                     agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    # The readable history rewrite above is irreversible even if a
+                    # later metadata update fails. Invalidate at that exact boundary
+                    # so an old opaque projection can never replace the new summary.
+                    _invalidate_native_checkpoint_after_textual_compaction(
+                        agent, agent.session_id or ""
+                    )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3642,6 +3648,11 @@ def compress_context(
                         profile_name=_profile_for_child,
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
+                    )
+                    # Publication atomically commits the textual child. Delete the
+                    # parent's now-stale projection before any later bookkeeping.
+                    _invalidate_native_checkpoint_after_textual_compaction(
+                        agent, old_session_id
                     )
                     agent.session_id = new_session_id
                     from agent.chat_completion_helpers import (
@@ -3725,12 +3736,6 @@ def compress_context(
                     )
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
-
-        if _session_commit_succeeded:
-            _invalidate_native_checkpoint_after_textual_compaction(
-                agent,
-                locals().get("old_session_id") or agent.session_id or "",
-            )
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
