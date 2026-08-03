@@ -556,15 +556,42 @@ def test_commit_fence_cancellation_after_endpoint_denies_native_and_text_commit(
     assert agent.context_compressor.text_calls == 0
 
 
-def test_hard_cancel_during_native_dispatch_sets_event_without_waiting_for_request():
+def test_hard_cancel_during_native_dispatch_returns_without_waiting_and_defers_lease():
     fence = CompressionCommitFence()
     hard_cancel = threading.Event()
+    releases = []
+    fence.register_cancelled_lock_release(lambda: releases.append("released"))
 
     assert fence.begin_dispatch(hard_cancel) is True
+    assert fence.cancel_before_commit(hard_cancel) is True
+    assert hard_cancel.is_set()
+    assert fence.is_cancelled is True
+    fence.release_cancelled_compression_lock()
+    assert releases == []
+
+    fence.finish_dispatch()
+    assert releases == ["released"]
+
+
+def test_hard_cancel_rechecks_when_dispatch_wins_after_initial_phase_probe():
+    fence = CompressionCommitFence()
+    hard_cancel = threading.Event()
+    original_try_cancel = fence.try_cancel_before_commit
+    probes = 0
+
+    def race_dispatch_after_first_probe():
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            assert fence.begin_dispatch(hard_cancel) is True
+            return None
+        return original_try_cancel()
+
+    fence.try_cancel_before_commit = race_dispatch_after_first_probe
     try:
-        assert fence.cancel_before_commit(hard_cancel) is False
+        assert fence.cancel_before_commit() is True
         assert hard_cancel.is_set()
-        assert fence.is_cancelled is True
+        assert probes == 2
     finally:
         fence.finish_dispatch()
 

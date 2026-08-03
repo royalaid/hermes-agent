@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import math
@@ -163,11 +164,37 @@ def native_openai_identity_for_agent(agent, *, model=None):
     from agent.native_openai_compaction import NativeCompactionIdentity
 
     raw_credential_scope = getattr(agent, "_credential_pool_entry_id", None)
-    credential_scope = (
-        raw_credential_scope.strip()
-        if type(raw_credential_scope) is str and raw_credential_scope.strip()
-        else ""
-    )
+    if type(raw_credential_scope) is str and raw_credential_scope.strip():
+        credential_scope = "pool-entry-sha256:" + hashlib.sha256(
+            b"native-openai-pool-entry\0"
+            + raw_credential_scope.strip().encode("utf-8")
+        ).hexdigest()
+    else:
+        # No stable non-secret account identifier exists for a direct key.
+        # Retain only an in-memory key fingerprint to rotate a random,
+        # payload-safe checkpoint scope when the live credential changes.
+        # The fingerprint itself is never persisted in checkpoint identity.
+        raw_api_key = getattr(agent, "api_key", None)
+        credential_scope = ""
+        if type(raw_api_key) is str and raw_api_key:
+            fingerprint = hashlib.sha256(raw_api_key.encode("utf-8")).digest()
+            prior_fingerprint = getattr(
+                agent, "_native_compaction_direct_credential_fingerprint", None
+            )
+            prior_scope = getattr(
+                agent, "_native_compaction_direct_credential_scope", None
+            )
+            if prior_fingerprint != fingerprint or type(prior_scope) is not str:
+                prior_scope = f"direct-instance:{uuid.uuid4().hex}"
+                setattr(
+                    agent,
+                    "_native_compaction_direct_credential_fingerprint",
+                    fingerprint,
+                )
+                setattr(
+                    agent, "_native_compaction_direct_credential_scope", prior_scope
+                )
+            credential_scope = prior_scope
 
     return NativeCompactionIdentity(
         provider=getattr(agent, "provider", ""),
