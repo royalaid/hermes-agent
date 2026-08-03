@@ -292,7 +292,7 @@ class NativeCompactionCheckpoint:
             "model": self.identity.model,
             "base_url_host": _safe_base_url_host(self.identity.base_url),
             "issuer_kind": self.identity.issuer_kind,
-            "credential_scope": self.identity.credential_scope,
+            "credential_scope_present": bool(self.identity.credential_scope),
             "replay_encrypted_reasoning": self.identity.replay_encrypted_reasoning,
             "source_input_item_count": self.source_input_item_count,
             "source_input_sha256": self.source_input_sha256[:12],
