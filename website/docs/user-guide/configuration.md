@@ -817,11 +817,14 @@ Older configs with `compression.summary_model`, `compression.summary_provider`, 
 `progress_notices` (default `false`) controls whether **routine** compression progress statuses reach chat platforms (Telegram, Discord, Slack, etc.). By design, automatic compression is silent on chat surfaces — it runs in the background with server-side logging only. Set `progress_notices: true` to opt into seeing the routine lifecycle on chat platforms: the "Compacting context…" start notice, preflight/pre-API compression triggers, idle compaction, retry progress ("Compressed 30 → 12 messages, retrying…"), and the "Context compaction complete" notice. The gate is scoped to compression statuses only — unrelated operational noise (auxiliary model failures, provider rate-limit/retry chatter) stays suppressed either way. Compression **failure** notices and manual `/compress` feedback are always visible regardless of this setting. Editing this value on a running gateway takes effect on the next message.
 
 `openai_native` (default `false`) is a local-fork, opt-in first step for the
-built-in compressor. It is eligible only on the direct first-party OpenAI
-API-key route with `api_mode: codex_responses`; OpenAI-compatible third-party
-endpoints, Codex OAuth, and Codex app-server sessions continue to use their
-existing paths. Hermes keeps the readable transcript in `state.db` and stores
-the provider's bounded opaque compaction output in a separate checkpoint. A
+built-in compressor. With `api_mode: codex_responses`, it is eligible on exactly
+two first-party routes: `provider: openai` at `https://api.openai.com/v1` using
+an API key, and `provider: openai-codex` at
+`https://chatgpt.com/backend-api/codex` using ChatGPT Codex OAuth.
+OpenAI-compatible third-party endpoints and Codex app-server sessions continue
+to use their existing paths. Hermes keeps the readable transcript in `state.db`
+and stores the provider's bounded opaque compaction output in a separate
+checkpoint. A
 request replays that checkpoint only when both the finalized readable prefix and
 the full route identity still match. Rewinds, edits, provider/model changes, and
 fallback activation therefore use readable history instead of stale opaque
