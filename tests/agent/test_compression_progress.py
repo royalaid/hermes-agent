@@ -10,9 +10,14 @@ an otherwise healthy session.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import Context
 from types import SimpleNamespace
 
 from agent.conversation_compression import (
+    _begin_compression_attempt_outcome,
+    _mark_native_compression_attempt_succeeded,
+    capture_compression_attempt_outcome,
     compression_attempt_made_progress,
     conversation_history_after_compression,
 )
@@ -20,6 +25,7 @@ from agent.turn_context import (
     _compression_made_progress,
     _compression_warrants_another_preflight_pass,
 )
+from tools.thread_context import propagate_context_to_thread
 
 
 class TestCompressionMadeProgress:
@@ -84,6 +90,63 @@ class TestCompressionMadeProgress:
             old_context_length=-1,
             new_context_length=-2,
         )
+
+    def test_interleaved_attempts_use_context_local_native_outcome(self):
+        agent = SimpleNamespace(_last_native_compaction_succeeded=False)
+        native_context = Context()
+        noop_context = Context()
+
+        native_context.run(_begin_compression_attempt_outcome, agent)
+        native_context.run(_mark_native_compression_attempt_succeeded, agent)
+        native_outcome = native_context.run(
+            capture_compression_attempt_outcome, agent
+        )
+
+        # A later no-op attempt overwrites the legacy shared signal before the
+        # native caller evaluates progress, reproducing the reported race.
+        noop_context.run(_begin_compression_attempt_outcome, agent)
+        agent._last_native_compaction_succeeded = False
+        noop_outcome = noop_context.run(capture_compression_attempt_outcome, agent)
+
+        assert compression_attempt_made_progress(
+            agent,
+            before_count=4,
+            after_count=4,
+            before_tokens=1_000,
+            after_tokens=1_000,
+            attempt_outcome=native_outcome,
+        )
+        assert not compression_attempt_made_progress(
+            agent,
+            before_count=4,
+            after_count=4,
+            before_tokens=1_000,
+            after_tokens=1_000,
+            attempt_outcome=noop_outcome,
+        )
+
+    def test_native_outcome_crosses_progress_timeout_worker_boundary(self):
+        agent = SimpleNamespace(_last_native_compaction_succeeded=False)
+        _begin_compression_attempt_outcome(agent)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(
+                propagate_context_to_thread(
+                    lambda: _mark_native_compression_attempt_succeeded(agent)
+                )
+            ).result()
+
+        outcome = capture_compression_attempt_outcome(agent)
+        agent._last_native_compaction_succeeded = False
+        assert compression_attempt_made_progress(
+            agent,
+            before_count=4,
+            after_count=4,
+            before_tokens=1_000,
+            after_tokens=1_000,
+            attempt_outcome=outcome,
+        )
+        assert "_last_native_compaction_succeeded" not in repr(outcome)
 
 
 class TestCompressionWarrantsAnotherPreflightPass:
