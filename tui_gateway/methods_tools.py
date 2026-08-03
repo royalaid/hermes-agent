@@ -1032,6 +1032,9 @@ def _(rid, params: dict) -> dict:
                 before_tokens,
                 after_tokens,
                 compression_state=getattr(_agent, "context_compressor", None),
+                native_succeeded=(
+                    getattr(_agent, "_last_native_compaction_succeeded", False) is True
+                ),
             )
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             finalize_context_engine_compression_notification(
