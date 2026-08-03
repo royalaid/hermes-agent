@@ -140,7 +140,24 @@ def _is_openai_codex_backend(agent) -> bool:
     )
 
 
-def native_openai_identity_for_agent(agent):
+def bind_native_openai_checkpoint_cache(agent, session_id) -> None:
+    """Clear and load the one cached checkpoint for a persistent session binding."""
+    agent._native_openai_checkpoint = None
+    agent._native_openai_checkpoint_session_id = (
+        session_id if type(session_id) is str and session_id else None
+    )
+    session_db = getattr(agent, "_session_db", None)
+    if session_db is None or agent._native_openai_checkpoint_session_id is None:
+        return
+    try:
+        agent._native_openai_checkpoint = session_db.load_native_openai_checkpoint(
+            agent._native_openai_checkpoint_session_id
+        )
+    except Exception:
+        pass
+
+
+def native_openai_identity_for_agent(agent, *, model=None):
     """Build the single native-compaction identity used for create and replay."""
     from agent.codex_responses_adapter import _classify_responses_issuer
     from agent.native_openai_compaction import NativeCompactionIdentity
@@ -148,7 +165,7 @@ def native_openai_identity_for_agent(agent):
     return NativeCompactionIdentity(
         provider=getattr(agent, "provider", ""),
         api_mode=getattr(agent, "api_mode", ""),
-        model=getattr(agent, "model", ""),
+        model=getattr(agent, "model", "") if model is None else model,
         base_url=getattr(agent, "base_url", ""),
         issuer_kind=_classify_responses_issuer(
             is_codex_backend=_is_openai_codex_backend(agent),
@@ -174,7 +191,12 @@ def maybe_apply_native_openai_projection(agent, api_kwargs: dict) -> dict:
     if (
         getattr(agent, "api_mode", None) != "codex_responses"
         or type(checkpoint) is not NativeCompactionCheckpoint
-        or checkpoint.session_id != getattr(agent, "session_id", None)
+        or checkpoint.session_id
+        != getattr(
+            agent,
+            "_native_openai_checkpoint_session_id",
+            getattr(agent, "session_id", None),
+        )
         or type(ordinary_input) is not list
     ):
         return api_kwargs
@@ -190,7 +212,9 @@ def maybe_apply_native_openai_projection(agent, api_kwargs: dict) -> dict:
             )
         ):
             return api_kwargs
-        identity = native_openai_identity_for_agent(agent)
+        identity = native_openai_identity_for_agent(
+            agent, model=api_kwargs.get("model", "")
+        )
         if not checkpoint_matches(identity, checkpoint, ordinary_input):
             return api_kwargs
         projected = dict(api_kwargs)

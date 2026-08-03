@@ -164,6 +164,50 @@ def test_agent_init_caches_bound_session_native_checkpoint_once(monkeypatch, tmp
     assert loads == [agent.session_id]
 
 
+def test_native_checkpoint_cache_rebinds_once_to_new_session():
+    from types import SimpleNamespace
+
+    from agent.chat_completion_helpers import bind_native_openai_checkpoint_cache
+
+    loaded = object()
+    loads = []
+    agent = SimpleNamespace(
+        _session_db=SimpleNamespace(
+            load_native_openai_checkpoint=lambda session_id: (
+                loads.append(session_id) or loaded
+            )
+        ),
+        _native_openai_checkpoint=object(),
+        _native_openai_checkpoint_session_id="old-session",
+    )
+
+    bind_native_openai_checkpoint_cache(agent, "new-session")
+
+    assert agent._native_openai_checkpoint is loaded
+    assert agent._native_openai_checkpoint_session_id == "new-session"
+    assert loads == ["new-session"]
+
+
+def test_native_checkpoint_cache_rebind_clears_stale_state_on_load_failure():
+    from types import SimpleNamespace
+
+    from agent.chat_completion_helpers import bind_native_openai_checkpoint_cache
+
+    def _fail(_session_id):
+        raise RuntimeError("unavailable")
+
+    agent = SimpleNamespace(
+        _session_db=SimpleNamespace(load_native_openai_checkpoint=_fail),
+        _native_openai_checkpoint=object(),
+        _native_openai_checkpoint_session_id="old-session",
+    )
+
+    bind_native_openai_checkpoint_cache(agent, "new-session")
+
+    assert agent._native_openai_checkpoint is None
+    assert agent._native_openai_checkpoint_session_id == "new-session"
+
+
 def test_agent_init_marks_missing_session_state_ineligible(monkeypatch, tmp_path):
     agent = _make_agent(monkeypatch, tmp_path, openai_native=True, session_db=False)
 

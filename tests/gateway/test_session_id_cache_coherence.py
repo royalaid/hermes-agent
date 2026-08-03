@@ -27,6 +27,7 @@ REAL cache lock, mirroring the structure used by
 """
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +42,31 @@ def _make_runner():
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
     return runner
+
+
+def test_cached_agent_session_switch_rebinds_native_checkpoint_once():
+    from gateway.run import _sync_cached_agent_native_checkpoint
+
+    loaded = object()
+    loads = []
+    agent = SimpleNamespace(
+        session_id="session-a",
+        _session_db=SimpleNamespace(
+            load_native_openai_checkpoint=lambda session_id: (
+                loads.append(session_id) or loaded
+            )
+        ),
+        _native_openai_checkpoint=object(),
+        _native_openai_checkpoint_session_id="session-a",
+    )
+
+    _sync_cached_agent_native_checkpoint(agent, "session-b")
+    _sync_cached_agent_native_checkpoint(agent, "session-b")
+
+    assert agent.session_id == "session-a"
+    assert agent._native_openai_checkpoint_session_id == "session-b"
+    assert agent._native_openai_checkpoint is loaded
+    assert loads == ["session-b"]
 
 
 def _guard_would_reuse(runner, session_key, session_id):
