@@ -180,6 +180,9 @@ def select_native_compaction_cut(
         return None
 
     try:
+        if not _tool_atomic_prefix(messages):
+            return None
+
         from agent.conversation_compression import _is_real_user_message
 
         newest_real_user_index = next(
