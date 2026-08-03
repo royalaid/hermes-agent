@@ -186,6 +186,12 @@ class ResponsesApiTransport(ProviderTransport):
             ),
             current_issuer_kind=issuer_kind,
         )
+        request_overrides = params.get("request_overrides")
+        if request_overrides:
+            effective_overrides: Dict[str, Any] = {}
+            effective_overrides.update(request_overrides)
+            if "input" in effective_overrides:
+                input_items = copy.deepcopy(effective_overrides["input"])
         return _preflight_codex_input_items(
             input_items,
             is_github_responses=params.get("is_github_responses") is True,

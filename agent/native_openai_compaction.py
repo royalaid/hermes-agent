@@ -138,10 +138,16 @@ def _tool_atomic_prefix(messages: list[dict]) -> bool:
             for tool_call in tool_calls:
                 if not isinstance(tool_call, dict):
                     return False
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    return False
+                function_name = function.get("name")
+                if type(function_name) is not str or not function_name.strip():
+                    return False
                 call_id = tool_call.get("call_id")
-                if not isinstance(call_id, str) or not call_id.strip():
+                if type(call_id) is not str or not call_id.strip():
                     call_id = tool_call.get("id")
-                if not isinstance(call_id, str) or not call_id.strip():
+                if type(call_id) is not str or not call_id.strip():
                     return False
                 call_id = call_id.strip()
                 if call_id in pending:
@@ -156,6 +162,39 @@ def _tool_atomic_prefix(messages: list[dict]) -> bool:
             pending.remove(call_id.strip())
         elif pending:
             return False
+    return not pending
+
+
+def _finalized_tool_graph_is_valid(items: list[dict]) -> bool:
+    """Validate completed tool-call relationships in finalized Responses items."""
+    pending: set[str] = set()
+    seen_calls: set[str] = set()
+    for item in items:
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            if type(call_id) is not str or not call_id.strip():
+                return False
+            call_id = call_id.strip()
+            if call_id in seen_calls:
+                return False
+            seen_calls.add(call_id)
+            pending.add(call_id)
+            continue
+
+        if item_type == "function_call_output":
+            call_id = item.get("call_id")
+            if type(call_id) is not str or call_id.strip() not in pending:
+                return False
+            pending.remove(call_id.strip())
+            continue
+
+        if pending and (
+            item_type in {"reasoning", "message"}
+            or item.get("role") in {"user", "assistant"}
+        ):
+            return False
+
     return not pending
 
 
@@ -204,6 +243,8 @@ def select_native_compaction_cut(
         ):
             return None
         canonical_input_sha256(full_input)
+        if not _finalized_tool_graph_is_valid(full_input):
+            return None
 
         for message_count in range(max_cut, 0, -1):
             prefix_messages = messages[:message_count]
@@ -223,6 +264,8 @@ def select_native_compaction_cut(
             if source_input_item_count <= previous_source_input_item_count:
                 continue
             canonical_input_sha256(source_input)
+            if not _finalized_tool_graph_is_valid(source_input):
+                continue
             if (
                 source_input_item_count >= len(full_input)
                 or full_input[:source_input_item_count] != source_input
