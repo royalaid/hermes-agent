@@ -68,7 +68,9 @@ def test_sibling_profile_native_scope_key_is_blocked_for_reads_and_writes(
     )
     active.mkdir(parents=True)
     sibling_key.parent.mkdir(parents=True)
-    sibling_key.write_bytes(b"x" * 32)
+    target = sibling_key.parent / "replay-secret.bin"
+    target.write_bytes(b"x" * 32)
+    sibling_key.symlink_to(target)
     monkeypatch.setattr(fs, "_hermes_home_path", lambda: active)
     monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
 

@@ -1450,6 +1450,16 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
+_NATIVE_OPENAI_SCOPE_KEY_BASENAME = "native_openai_scope.key"
+
+
+def _is_native_openai_scope_key_basename(path: str | Path) -> bool:
+    basename = os.path.basename(os.path.normpath(os.path.expanduser(str(path))))
+    if os.name == "nt":
+        return basename.casefold() == _NATIVE_OPENAI_SCOPE_KEY_BASENAME.casefold()
+    return basename == _NATIVE_OPENAI_SCOPE_KEY_BASENAME
+
+
 def validate_media_delivery_path(path: str) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
@@ -1479,6 +1489,8 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     candidate = candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
     if not candidate:
         return None
+    if _is_native_openai_scope_key_basename(candidate):
+        return None
 
     try:
         expanded = Path(os.path.expanduser(candidate))
@@ -1499,7 +1511,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # Installation-private replay scope keys can exist beneath any profile.
     # Deny the unambiguous basename before cache/operator allowlists and before
     # default non-strict acceptance so one profile cannot deliver another's key.
-    if resolved.name == "native_openai_scope.key":
+    if _is_native_openai_scope_key_basename(resolved):
         return None
 
     # Cache / operator allowlist is always honored — these are unconditionally
