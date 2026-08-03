@@ -156,7 +156,10 @@ class ResponsesApiTransport(ProviderTransport):
         self, messages: List[Dict[str, Any]], **params
     ) -> List[Dict[str, Any]]:
         """Build only the finalized Responses ``input`` items for messages."""
-        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+        from agent.codex_responses_adapter import (
+            _chat_messages_to_responses_input,
+            _preflight_codex_input_items,
+        )
         from agent.turn_context import substitute_api_content
 
         payload_messages = copy.deepcopy(messages)
@@ -174,7 +177,7 @@ class ResponsesApiTransport(ProviderTransport):
 
         issuer_kind = self._resolve_issuer_kind(params)
         self._last_issuer_kind = issuer_kind
-        return _chat_messages_to_responses_input(
+        input_items = _chat_messages_to_responses_input(
             payload_messages,
             is_xai_responses=params.get("is_xai_responses") is True,
             is_github_responses=params.get("is_github_responses") is True,
@@ -182,6 +185,11 @@ class ResponsesApiTransport(ProviderTransport):
                 params.get("replay_encrypted_reasoning", True)
             ),
             current_issuer_kind=issuer_kind,
+        )
+        return _preflight_codex_input_items(
+            input_items,
+            is_github_responses=params.get("is_github_responses") is True,
+            sanitize_harmony_tokens=params.get("is_codex_backend") is True,
         )
 
     def build_kwargs(
