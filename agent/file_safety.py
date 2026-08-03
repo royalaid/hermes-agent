@@ -49,6 +49,9 @@ def build_write_denied_paths(home: str) -> set[str]:
             # Bitwarden Secrets Manager encrypted disk cache.
             str(hermes_home / "cache" / "bws_cache.enc.json"),
             str(hermes_root / "cache" / "bws_cache.enc.json"),
+            # Installation-private HMAC key for direct-credential replay scope.
+            str(hermes_home / "cache" / "native_openai_scope.key"),
+            str(hermes_root / "cache" / "native_openai_scope.key"),
             os.path.join(home, ".netrc"),
             os.path.join(home, ".pgpass"),
             os.path.join(home, ".npmrc"),
@@ -282,6 +285,7 @@ def get_read_block_error(path: str) -> Optional[str]:
         # to avoid re-fetching across back-to-back CLI invocations. The file
         # was introduced by #31968 but not added to this guard.
         os.path.join("cache", "bws_cache.json"),
+        os.path.join("cache", "native_openai_scope.key"),
     )
     for hd in hermes_dirs:
         for name in credential_file_names:

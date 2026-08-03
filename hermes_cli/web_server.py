@@ -1778,6 +1778,7 @@ _SENSITIVE_MANAGED_FILE_BASENAMES = frozenset({
     "webhook_subscriptions.json",
     "bws_cache.json",
     "bws_cache.enc.json",
+    "native_openai_scope.key",
     # git's credential-store helper cache (agent.file_safety blocks this too).
     ".git-credentials",
 })
