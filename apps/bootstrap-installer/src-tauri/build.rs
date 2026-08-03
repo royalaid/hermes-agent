@@ -33,6 +33,10 @@ fn main() {
 
     let commit = resolve_commit_pin();
     let branch = resolve_branch_pin();
+    let repository = resolve_repository_pin();
+
+    println!("cargo:rustc-env=BUILD_PIN_REPOSITORY={repository}");
+    println!("cargo:warning=hermes-bootstrap: repository {repository}");
 
     if let Some(c) = &commit {
         println!("cargo:rustc-env=BUILD_PIN_COMMIT={c}");
@@ -81,6 +85,7 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_COMMIT");
     println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_BRANCH");
+    println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_REPOSITORY");
 
     // -----------------------------------------------------------------
     // Tauri windows manifest. See hermes-setup.manifest for rationale —
@@ -135,6 +140,29 @@ fn resolve_commit_pin() -> Option<String> {
         "HERMES_BUILD_PIN_COMMIT={requested:?} could not be resolved to a commit \
          (git rev-parse failed and it is not a valid SHA)"
     );
+}
+
+fn resolve_repository_pin() -> String {
+    let repository = std::env::var("HERMES_BUILD_PIN_REPOSITORY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "NousResearch/hermes-agent".to_string());
+    let repository = repository.trim();
+    let mut parts = repository.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    let safe = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    };
+    if !safe(owner) || !safe(repo) || parts.next().is_some() {
+        panic!("HERMES_BUILD_PIN_REPOSITORY={repository:?} is invalid; expected owner/repo");
+    }
+    repository.to_string()
 }
 
 /// True if `s` looks like an abbreviated-or-full git SHA (7..=40 hex chars).

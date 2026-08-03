@@ -152,6 +152,47 @@ if ($repoParts[0] -in @('.', '..') -or $repoParts[1] -in @('.', '..')) {
 }
 $RepoUrlSsh = "git@github.com:$Repository.git"
 $RepoUrlHttps = "https://github.com/$Repository.git"
+
+function ConvertTo-RepositorySlug {
+    param([string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return "" }
+    $slug = $Url.Trim()
+    $slug = $slug -replace '^git@github\.com:', ''
+    $slug = $slug -replace '^https?://github\.com/', ''
+    $slug = $slug.TrimEnd('/')
+    $slug = $slug -replace '\.git$', ''
+    return $slug.ToLowerInvariant()
+}
+
+function Resolve-RepositoryRemote {
+    $wanted = ConvertTo-RepositorySlug $RepoUrlHttps
+    foreach ($remote in @(git -c windows.appendAtomically=false remote 2>$null)) {
+        foreach ($url in @(git -c windows.appendAtomically=false remote get-url --all $remote 2>$null)) {
+            if ((ConvertTo-RepositorySlug $url) -eq $wanted) {
+                return $remote.ToString().Trim()
+            }
+        }
+    }
+
+    $existing = @(git -c windows.appendAtomically=false remote 2>$null)
+    if (($wanted -eq "nousresearch/hermes-agent") -and ($existing -contains "origin")) {
+        return "origin"
+    }
+
+    # A custom requested repository is not configured yet. Keep origin untouched;
+    # add a dedicated managed remote so local forks/upstreams retain their roles.
+    $name = "hermes-source"
+    $suffix = 2
+    while ($existing -contains $name) {
+        $name = "hermes-source-$suffix"
+        $suffix++
+    }
+    Write-Info "Adding managed source remote '$name' for $Repository..."
+    git -c windows.appendAtomically=false remote add $name $RepoUrlHttps
+    if ($LASTEXITCODE -ne 0) { throw "git remote add $name failed (exit $LASTEXITCODE)" }
+    return $name
+}
+
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -1601,6 +1642,7 @@ function Install-Repository {
         if ($repoValid) {
             Write-Info "Existing installation found, updating..."
             Push-Location $InstallDir
+            $sourceRemote = ""
             # Wrap the entire fetch+checkout block in EAP=Continue so git's
             # routine stderr output (e.g. 'From <url>' info lines emitted by
             # `git fetch`) doesn't terminate the script under the global
@@ -1609,6 +1651,8 @@ function Install-Repository {
             $ErrorActionPreference = "Continue"
             $autostashRef = ""
             try {
+                $sourceRemote = Resolve-RepositoryRemote
+                Write-Info "Using '$sourceRemote' as source for $Repository."
                 # This is a MANAGED checkout, not a repo the user edits. Git for
                 # Windows defaults to core.autocrlf=true, which renormalizes the
                 # repo's LF-only text files to CRLF in the working tree -- so
@@ -1648,7 +1692,7 @@ function Install-Repository {
                     git -c windows.appendAtomically=false stash push --include-untracked -m "$stashName"
                     if ($LASTEXITCODE -eq 0) { $autostashRef = "stash@{0}" }
                 }
-                git -c windows.appendAtomically=false fetch origin $Branch
+                git -c windows.appendAtomically=false fetch $sourceRemote $Branch
                 if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
                 # Precedence: Commit > Tag > Branch.  Commit and Tag check
                 # out as detached HEAD intentionally -- they're meant to be
@@ -1656,7 +1700,7 @@ function Install-Repository {
                 if ($Commit) {
                     # Make sure we have the commit locally (a tag-less commit
                     # SHA isn't always reachable from any one branch fetch).
-                    git -c windows.appendAtomically=false fetch origin $Commit
+                    git -c windows.appendAtomically=false fetch $sourceRemote $Commit
                     # A commit pin must never move an existing install
                     # BACKWARDS. hermes-setup.exe bakes its build-time commit
                     # into the binary (BUILD_PIN_COMMIT) and passes it as
@@ -1684,7 +1728,7 @@ function Install-Repository {
                         if ($LASTEXITCODE -ne 0) { throw "git checkout $Commit failed (exit $LASTEXITCODE)" }
                     }
                 } elseif ($Tag) {
-                    git -c windows.appendAtomically=false fetch origin "refs/tags/${Tag}:refs/tags/${Tag}"
+                    git -c windows.appendAtomically=false fetch $sourceRemote "refs/tags/${Tag}:refs/tags/${Tag}"
                     git -c windows.appendAtomically=false checkout --detach "refs/tags/$Tag"
                     if ($LASTEXITCODE -ne 0) { throw "git checkout tag $Tag failed (exit $LASTEXITCODE)" }
                 } else {
@@ -1694,11 +1738,11 @@ function Install-Repository {
                     # the checkout has diverged (or has local-only commits),
                     # ff-only pull cannot succeed -- mirror ``hermes update`` and
                     # reset to the fetched remote so bootstrap/install can recover.
-                    git -c windows.appendAtomically=false pull --ff-only origin $Branch
+                    git -c windows.appendAtomically=false pull --ff-only $sourceRemote $Branch
                     if ($LASTEXITCODE -ne 0) {
-                        Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
-                        git -c windows.appendAtomically=false reset --hard "origin/$Branch"
-                        if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
+                        Write-Warn "Fast-forward not possible; resetting managed install to $sourceRemote/$Branch..."
+                        git -c windows.appendAtomically=false reset --hard "$sourceRemote/$Branch"
+                        if ($LASTEXITCODE -ne 0) { throw "git reset --hard $sourceRemote/$Branch failed (exit $LASTEXITCODE)" }
                     }
                 }
 

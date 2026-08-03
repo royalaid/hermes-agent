@@ -57,11 +57,11 @@ def test_install_sh_resets_when_ff_only_pull_fails() -> None:
 def test_install_ps1_resets_when_ff_only_pull_fails() -> None:
     block = _extract_install_ps1_branch_update_block()
 
-    assert "pull --ff-only origin $Branch" in block
-    assert 'reset --hard "origin/$Branch"' in block
+    assert "pull --ff-only $sourceRemote $Branch" in block
+    assert 'reset --hard "$sourceRemote/$Branch"' in block
     assert "Fast-forward not possible" in block
 
-    pull_idx = block.find("pull --ff-only origin $Branch")
-    reset_idx = block.find('reset --hard "origin/$Branch"')
+    pull_idx = block.find("pull --ff-only $sourceRemote $Branch")
+    reset_idx = block.find('reset --hard "$sourceRemote/$Branch"')
     assert pull_idx != -1 and reset_idx != -1
     assert pull_idx < reset_idx, "ff-only pull must be attempted before reset fallback"
