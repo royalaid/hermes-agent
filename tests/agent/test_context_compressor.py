@@ -2895,3 +2895,229 @@ class TestPreLlmFeasibilityCheck:
             feasibility_skip=compressor._last_feasibility_skip,
         )
         assert compressor._fallback_compression_streak == 1
+
+
+class TestRecordExternalCompaction:
+    def test_records_successful_boundary_and_parks_usage(self, compressor):
+        compressor.compression_count = 4
+        compressor.last_compression_rough_tokens = 91_000
+
+        compressor.record_external_compaction(
+            strategy="openai.compact-v1",
+            source_items=12,
+            output_items=3,
+        )
+
+        assert compressor.compression_count == 5
+        assert compressor._last_compression_made_progress is True
+        assert compressor.last_prompt_tokens == -1
+        assert compressor.last_completion_tokens == 0
+        assert compressor.last_compression_rough_tokens == 0
+        assert compressor.awaiting_real_usage_after_compression is True
+        assert compressor._verify_compaction_cleared_threshold is True
+
+    def test_telemetry_contains_only_content_free_external_metadata(self, compressor):
+        compressor._last_compression_telemetry = {"stale": "payload"}
+        compressor._active_compression_telemetry = {"stale": "payload"}
+
+        compressor.record_external_compaction(
+            strategy="openai.compact-v1",
+            source_items=12,
+            output_items=3,
+        )
+
+        assert compressor._last_compression_telemetry == {
+            "event": "compression_attempt",
+            "strategy": "openai.compact-v1",
+            "source_items": 12,
+            "output_items": 3,
+            "commit_status": "committed",
+            "failure_class": None,
+        }
+        assert compressor._active_compression_telemetry is None
+        assert not {
+            "messages", "summary", "routes", "credentials", "response", "output",
+        }.intersection(compressor._last_compression_telemetry)
+
+    @pytest.mark.parametrize(
+        ("prompt_tokens", "starting_count", "expected_count"),
+        [
+            (90_000, 1, 2),
+            (20_000, 1, 0),
+        ],
+    )
+    def test_next_real_usage_owns_effectiveness_verdict(
+        self, compressor, prompt_tokens, starting_count, expected_count,
+    ):
+        compressor.threshold_tokens = 85_000
+        compressor._ineffective_compression_count = starting_count
+        compressor.last_compression_rough_tokens = 77_777
+        compressor.record_external_compaction(
+            strategy="openai.compact-v1",
+            source_items=12,
+            output_items=3,
+        )
+
+        assert compressor._ineffective_compression_count == starting_count
+        assert compressor.last_compression_rough_tokens == 0
+        compressor.update_from_response({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": 11,
+            "total_tokens": prompt_tokens + 11,
+        })
+
+        assert compressor._ineffective_compression_count == expected_count
+        assert compressor.awaiting_real_usage_after_compression is False
+        assert compressor._verify_compaction_cleared_threshold is False
+        assert compressor.last_rough_tokens_when_real_prompt_fit == 0
+
+    def test_clears_failure_state_and_persists_cleared_fallback_streak(self, compressor):
+        session_db = MagicMock()
+        compressor.bind_session_state(session_db, "session-1")
+        compressor._fallback_compression_streak = 2
+        compressor._last_compress_aborted = True
+        compressor._last_summary_auth_failure = True
+        compressor._last_summary_network_failure = True
+        compressor._last_summary_error = "prior failure"
+        compressor._last_summary_dropped_count = 7
+        compressor._last_summary_fallback_used = True
+        compressor._last_feasibility_skip = True
+        compressor._last_aux_model_failure_error = "aux failure"
+        compressor._last_aux_model_failure_model = "aux-model"
+        compressor._summary_failure_cooldown_until = time.monotonic() + 60
+        compressor._consecutive_timeout_failures = 2
+        compressor._cooldown_persist_failed = True
+
+        compressor.record_external_compaction(
+            strategy="openai.compact-v1",
+            source_items=12,
+            output_items=3,
+        )
+
+        assert compressor._last_compress_aborted is False
+        assert compressor._last_summary_auth_failure is False
+        assert compressor._last_summary_network_failure is False
+        assert compressor._last_summary_error is None
+        assert compressor._last_summary_dropped_count == 0
+        assert compressor._last_summary_fallback_used is False
+        assert compressor._last_feasibility_skip is False
+        assert compressor._last_aux_model_failure_error is None
+        assert compressor._last_aux_model_failure_model is None
+        assert compressor._summary_failure_cooldown_until == 0.0
+        assert compressor._consecutive_timeout_failures == 0
+        assert compressor._cooldown_persist_failed is False
+        assert compressor._fallback_compression_streak == 0
+        session_db.set_compression_fallback_streak.assert_called_once_with("session-1", 0)
+        session_db.clear_compression_failure_cooldown.assert_called_once_with("session-1")
+
+    def test_cooldown_clear_still_honors_cancellation_fence(self, compressor):
+        session_db = MagicMock()
+        compressor.bind_session_state(session_db, "session-1")
+        compressor._summary_failure_cooldown_until = time.monotonic() + 60
+        compressor._last_summary_error = "host timeout"
+        compressor._compression_cancelled_check = lambda: True
+
+        compressor.record_external_compaction(
+            strategy="openai.compact-v1",
+            source_items=12,
+            output_items=3,
+        )
+
+        assert compressor._summary_failure_cooldown_until > time.monotonic()
+        assert compressor._last_summary_error == "host timeout"
+        session_db.clear_compression_failure_cooldown.assert_not_called()
+
+    def test_preserves_messages_and_textual_summary_state_without_side_effect_calls(
+        self, compressor,
+    ):
+        messages = [
+            {"role": "user", "content": "sentinel user payload"},
+            {"role": "assistant", "content": "sentinel response payload"},
+        ]
+        original_messages = [message.copy() for message in messages]
+        compressor._previous_summary = "existing textual summary"
+        compressor._summary_has_user_turn = True
+        compressor._micro_compact_passes = 4
+        session_db = MagicMock()
+        compressor.bind_session_state(session_db, "session-1")
+
+        with patch.object(compressor, "compress") as compress_call, patch.object(
+            compressor, "_generate_summary"
+        ) as summarize_call, patch.object(
+            compressor, "_begin_compression_telemetry"
+        ) as begin_telemetry_call:
+            compressor.record_external_compaction(
+                strategy="openai.compact-v1",
+                source_items=12,
+                output_items=3,
+            )
+
+        assert messages == original_messages
+        assert compressor._previous_summary == "existing textual summary"
+        assert compressor._summary_has_user_turn is True
+        assert compressor._micro_compact_passes == 4
+        compress_call.assert_not_called()
+        summarize_call.assert_not_called()
+        begin_telemetry_call.assert_not_called()
+        session_db.archive_and_compact.assert_not_called()
+        session_db.save_checkpoint.assert_not_called()
+
+    def test_session_boundaries_clear_external_compaction_state(self, compressor):
+        compressor.record_external_compaction(
+            strategy="openai.compact-v1",
+            source_items=12,
+            output_items=3,
+        )
+        compressor.on_session_reset()
+
+        assert compressor.compression_count == 0
+        assert compressor.last_prompt_tokens == 0
+        assert compressor.last_completion_tokens == 0
+        assert compressor.last_compression_rough_tokens == 0
+        assert compressor.awaiting_real_usage_after_compression is False
+        assert compressor._verify_compaction_cleared_threshold is False
+        assert compressor._last_compression_made_progress is False
+        assert compressor._last_compression_telemetry is None
+        assert compressor._active_compression_telemetry is None
+
+        compressor.record_external_compaction(
+            strategy="openai.compact-v1",
+            source_items=12,
+            output_items=3,
+        )
+        compressor.on_session_end("session-1", [])
+
+        assert compressor.last_compression_rough_tokens == 0
+        assert compressor.awaiting_real_usage_after_compression is False
+        assert compressor._verify_compaction_cleared_threshold is False
+        assert compressor._last_compression_made_progress is False
+        assert compressor._last_compression_telemetry is None
+        assert compressor._active_compression_telemetry is None
+
+    @pytest.mark.parametrize(
+        ("kwargs", "field_name"),
+        [
+            ({"strategy": "", "source_items": 2, "output_items": 1}, "strategy"),
+            ({"strategy": "SECRET SENTINEL", "source_items": 2, "output_items": 1}, "strategy"),
+            ({"strategy": "a" * 65, "source_items": 2, "output_items": 1}, "strategy"),
+            ({"strategy": 7, "source_items": 2, "output_items": 1}, "strategy"),
+            ({"strategy": "openai.compact", "source_items": True, "output_items": 1}, "source_items"),
+            ({"strategy": "openai.compact", "source_items": 0, "output_items": 1}, "source_items"),
+            ({"strategy": "openai.compact", "source_items": 2, "output_items": False}, "output_items"),
+            ({"strategy": "openai.compact", "source_items": 2, "output_items": -1}, "output_items"),
+        ],
+    )
+    def test_invalid_arguments_fail_before_any_state_mutation(
+        self, compressor, kwargs, field_name, caplog,
+    ):
+        compressor._last_compression_telemetry = {"existing": "telemetry"}
+        before = compressor.__dict__.copy()
+
+        with pytest.raises(ValueError) as exc_info:
+            compressor.record_external_compaction(**kwargs)
+
+        assert field_name in str(exc_info.value)
+        assert "SECRET SENTINEL" not in str(exc_info.value)
+        assert compressor.__dict__ == before
+        assert "SECRET SENTINEL" not in caplog.text
+        assert "SECRET SENTINEL" not in repr(compressor._last_compression_telemetry)

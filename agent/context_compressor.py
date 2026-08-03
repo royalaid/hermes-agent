@@ -1827,6 +1827,56 @@ class ContextCompressor(ContextEngine):
             self._fallback_compression_streak = 0
         self._persist_fallback_compression_streak()
 
+    def record_external_compaction(
+        self,
+        *,
+        strategy: str,
+        source_items: int,
+        output_items: int,
+    ) -> None:
+        """Record a provider-native compaction boundary without rewriting messages."""
+        if type(strategy) is not str or re.fullmatch(
+            r"[a-z0-9_.-]{1,64}", strategy,
+        ) is None:
+            raise ValueError(
+                "strategy must be a 1-64 character lowercase identifier"
+            )
+        if type(source_items) is not int or source_items <= 0:
+            raise ValueError("source_items must be a positive integer")
+        if type(output_items) is not int or output_items <= 0:
+            raise ValueError("output_items must be a positive integer")
+
+        self.compression_count += 1
+        self._last_compression_made_progress = True
+        self.last_prompt_tokens = -1
+        self.last_completion_tokens = 0
+        self.last_compression_rough_tokens = 0
+        self.awaiting_real_usage_after_compression = True
+
+        self._last_compress_aborted = False
+        self._last_summary_auth_failure = False
+        self._last_summary_network_failure = False
+        self._last_summary_dropped_count = 0
+        self._last_summary_fallback_used = False
+        self._last_feasibility_skip = False
+        self._last_aux_model_failure_error = None
+        self._last_aux_model_failure_model = None
+        self._clear_compression_failure_cooldown()
+        self.record_completed_compaction(
+            used_fallback=False,
+            feasibility_skip=False,
+        )
+
+        self._last_compression_telemetry = {
+            "event": "compression_attempt",
+            "strategy": strategy,
+            "source_items": source_items,
+            "output_items": output_items,
+            "commit_status": "committed",
+            "failure_class": None,
+        }
+        self._active_compression_telemetry = None
+
     def get_active_compression_failure_cooldown(
         self,
         *,
