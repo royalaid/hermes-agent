@@ -367,6 +367,31 @@ def test_native_compaction_fails_closed_when_llm_middleware_can_rewrite_wire_inp
     endpoint.assert_not_called()
 
 
+def test_native_compaction_aborts_if_cancelled_during_middleware_lookup():
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+    cancel_event = threading.Event()
+    agent._hard_interrupt_requested = cancel_event
+    messages = _messages()
+
+    def _has_middleware(_kind):
+        cancel_event.set()
+        return True
+
+    with (
+        patch("hermes_cli.plugins.has_middleware", side_effect=_has_middleware),
+        patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate"
+        ) as endpoint,
+    ):
+        returned, _ = compress_context(agent, messages, "sys", force=True)
+
+    assert returned is messages
+    assert agent.context_compressor.text_calls == 0
+    assert agent._last_native_compaction_succeeded is False
+    endpoint.assert_not_called()
+
+
 def test_lock_loser_never_calls_native_endpoint_or_text_compressor():
     agent = _Agent()
     agent._session_db.acquire = False
