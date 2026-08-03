@@ -215,6 +215,7 @@ def test_eligible_native_success_keeps_readable_transcript_and_skips_text_bounda
     assert agent._session_db.events == ["upsert", "record"]
     checkpoint = agent._session_db.checkpoint
     assert agent._native_openai_checkpoint is checkpoint
+    assert agent._native_openai_checkpoint_session_id == "session-native"
     assert checkpoint.session_id == "session-native"
     assert checkpoint.generation == 1
     assert checkpoint.identity.provider == "openai"

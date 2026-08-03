@@ -31,6 +31,8 @@ class _FakeAgent:
         self.session_start = session_start
         self.model = "anthropic/claude-opus-4.6"
         self._last_flushed_db_idx = 7
+        self._native_openai_checkpoint = object()
+        self._native_openai_checkpoint_session_id = session_id
         self._todo_store = TodoStore()
         self._todo_store.write(
             [{"id": "t1", "content": "unfinished task", "status": "in_progress"}]
@@ -168,6 +170,8 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli._session_db.append_message(cli.session_id, role="user", content="next turn")
 
     assert cli.agent.session_id == cli.session_id
+    assert cli.agent._native_openai_checkpoint is None
+    assert cli.agent._native_openai_checkpoint_session_id == cli.session_id
     assert cli.agent._last_flushed_db_idx == 0
     assert cli.agent._todo_store.read() == []
     assert cli.session_start > old_session_start

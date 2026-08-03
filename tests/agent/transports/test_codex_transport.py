@@ -92,7 +92,14 @@ def test_native_checkpoint_projection_replaces_only_preflighted_input():
 
 @pytest.mark.parametrize(
     "mismatch",
-    ["no_checkpoint", "disabled_policy", "session", "identity", "prefix"],
+    [
+        "no_checkpoint",
+        "disabled_policy",
+        "session",
+        "identity",
+        "effective_model",
+        "prefix",
+    ],
 )
 def test_native_checkpoint_projection_fails_open_without_mutation(mismatch):
     from agent.chat_completion_helpers import maybe_apply_native_openai_projection
@@ -107,7 +114,9 @@ def test_native_checkpoint_projection_fails_open_without_mutation(mismatch):
     elif mismatch == "session":
         agent.session_id = "other-session"
     elif mismatch == "identity":
-        agent.model = "gpt-5-different"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+    elif mismatch == "effective_model":
+        ordinary["model"] = "gpt-5-effective"
     elif mismatch == "prefix":
         ordinary["input"][0] = {"role": "user", "content": "rewound"}
     snapshot = copy.deepcopy(

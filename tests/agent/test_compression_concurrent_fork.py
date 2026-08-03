@@ -734,6 +734,8 @@ def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
     db.replace_messages(child_sid, compacted)
 
     agent = _build_agent_with_db(db, parent_sid)
+    agent._native_openai_checkpoint = object()
+    agent._native_openai_checkpoint_session_id = parent_sid
     stale_messages = [
         {"role": "user", "content": "stale"},
         {"role": "assistant", "content": "x" * 1000},
@@ -743,6 +745,8 @@ def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
     )
 
     assert agent.session_id == child_sid
+    assert agent._native_openai_checkpoint is None
+    assert agent._native_openai_checkpoint_session_id == child_sid
     assert [(m["role"], m["content"]) for m in recovered] == [
         ("user", "[CONTEXT COMPACTION] summary"),
         ("assistant", "compacted tail"),
