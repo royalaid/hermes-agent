@@ -966,43 +966,48 @@ def request_native_compaction_candidate(
     close_failed = False
     try:
         try:
-            if pre_dispatch_check is not None:
-                try:
-                    dispatch_allowed = pre_dispatch_check() is True
-                except Exception:
-                    dispatch_allowed = False
-            else:
-                dispatch_allowed = True
-            if not dispatch_allowed:
+            try:
+                compact = getattr(
+                    getattr(client, "responses", None), "compact", None
+                )
+            except Exception:
                 result: NativeCompactionCandidate | NativeCompactionFailure = (
-                    _native_compaction_failure("client")
+                    _native_compaction_failure("unsupported")
                 )
             else:
-                try:
-                    compact = getattr(
-                        getattr(client, "responses", None), "compact", None
-                    )
-                except Exception:
+                if not callable(compact):
                     result = _native_compaction_failure("unsupported")
                 else:
-                    if not callable(compact):
-                        result = _native_compaction_failure("unsupported")
+                    try:
+                        request_input = copy.deepcopy(effective_input)
+                    except Exception:
+                        result = _native_compaction_failure("invalid_response")
                     else:
-                        try:
-                            response = compact(
-                                model=model,
-                                input=copy.deepcopy(effective_input),
-                                instructions=compact_instructions,
-                                timeout=resolved_timeout,
-                            )
-                        except Exception as exc:
-                            result = _classify_native_compaction_exception(exc)
+                        if pre_dispatch_check is not None:
+                            try:
+                                dispatch_allowed = pre_dispatch_check() is True
+                            except Exception:
+                                dispatch_allowed = False
                         else:
-                            result = _candidate_from_compact_response(
-                                response,
-                                cut=cut,
-                                input_item_count=len(effective_input),
-                            )
+                            dispatch_allowed = True
+                        if not dispatch_allowed:
+                            result = _native_compaction_failure("client")
+                        else:
+                            try:
+                                response = compact(
+                                    model=model,
+                                    input=request_input,
+                                    instructions=compact_instructions,
+                                    timeout=resolved_timeout,
+                                )
+                            except Exception as exc:
+                                result = _classify_native_compaction_exception(exc)
+                            else:
+                                result = _candidate_from_compact_response(
+                                    response,
+                                    cut=cut,
+                                    input_item_count=len(effective_input),
+                                )
         except Exception:
             result = _native_compaction_failure("invalid_response")
     except BaseException:
