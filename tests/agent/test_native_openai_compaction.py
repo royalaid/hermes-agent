@@ -1443,6 +1443,44 @@ def test_invalid_compact_outputs_fail_safely_and_close_once(response):
     assert agent.close_calls == [(client, "native_openai_compaction")]
 
 
+def test_compact_output_over_item_limit_fails_safely_and_closes_once():
+    compact = _CompactRecorder(SimpleNamespace(output=[{"x": 1}] * 513))
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+
+    result = _request(agent, _cut_for([{"x": 1}]))
+
+    assert result == NativeCompactionFailure("invalid_response", False, True)
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+def test_compact_output_over_depth_limit_fails_safely_and_closes_once():
+    nested = "leaf"
+    for _ in range(65):
+        nested = {"nested": nested}
+    compact = _CompactRecorder(SimpleNamespace(output=[nested]))
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+
+    result = _request(agent, _cut_for([{"x": 1}]))
+
+    assert result == NativeCompactionFailure("invalid_response", False, True)
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+def test_compact_output_over_serialized_size_limit_fails_safely_and_closes_once():
+    compact = _CompactRecorder(
+        SimpleNamespace(output=[{"opaque": "x" * (4 * 1024 * 1024 + 1)}])
+    )
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+
+    result = _request(agent, _cut_for([{"x": 1}]))
+
+    assert result == NativeCompactionFailure("invalid_response", False, True)
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
 def test_cyclic_compact_output_fails_safely():
     cyclic = []
     cyclic.append(cyclic)
