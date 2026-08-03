@@ -107,6 +107,32 @@ NATIVE_OPENAI_COMPACTION_INSTRUCTIONS = (
 )
 
 
+def compression_attempt_made_progress(
+    agent: Any,
+    *,
+    before_count: int,
+    after_count: int,
+    before_tokens: int,
+    after_tokens: int,
+    old_context_length: Optional[int] = None,
+    new_context_length: Optional[int] = None,
+) -> bool:
+    """Return whether one compression attempt produced retryable progress."""
+    if getattr(agent, "_last_native_compaction_succeeded", False) is True:
+        return True
+    if after_count < before_count:
+        return True
+    if before_tokens > 0 and after_tokens > 0 and after_tokens < before_tokens * 0.95:
+        return True
+    return bool(
+        type(old_context_length) is int
+        and old_context_length > 0
+        and type(new_context_length) is int
+        and new_context_length > 0
+        and new_context_length < old_context_length
+    )
+
+
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction."""
     status_callback = getattr(agent, "status_callback", None)
@@ -4225,6 +4251,7 @@ __all__ = [
     "COMPACTION_DONE_STATUS",
     "COMPACTION_STATUS_MARKER",
     "check_compression_model_feasibility",
+    "compression_attempt_made_progress",
     "replay_compression_warning",
     "compress_context",
     "try_shrink_image_parts_in_messages",
