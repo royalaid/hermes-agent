@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -1399,6 +1400,38 @@ def test_predispatch_guard_runs_after_client_creation_and_before_compact():
     assert guard_calls == ["checked"]
     assert compact.calls == []
     assert len(agent.create_calls) == 1
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+def test_predispatch_guard_runs_after_request_payload_copy():
+    source = [{"role": "user", "content": "question"}]
+    compact = _CompactRecorder(
+        SimpleNamespace(output=[{"type": "compaction", "encrypted_content": "opaque"}])
+    )
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+    dispatch_allowed = True
+    real_deepcopy = copy.deepcopy
+
+    def _copy_then_cancel(value):
+        nonlocal dispatch_allowed
+        copied = real_deepcopy(value)
+        if value == source:
+            dispatch_allowed = False
+        return copied
+
+    with patch(
+        "agent.native_openai_compaction.copy.deepcopy",
+        side_effect=_copy_then_cancel,
+    ):
+        result = _request(
+            agent,
+            _cut_for(source),
+            pre_dispatch_check=lambda: dispatch_allowed,
+        )
+
+    assert result == NativeCompactionFailure("client", False, True)
+    assert compact.calls == []
     assert agent.close_calls == [(client, "native_openai_compaction")]
 
 
