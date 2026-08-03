@@ -223,6 +223,29 @@ def test_checkpoint_output_is_isolated_from_constructor_and_property_mutation():
     assert checkpoint.output == [{"nested": ["original"]}]
 
 
+def test_identity_and_checkpoint_reprs_exclude_route_and_credential_secrets():
+    sentinels = (
+        "repr-user-sentinel",
+        "repr-password-sentinel",
+        "repr-path-sentinel",
+        "repr-query-sentinel",
+        "repr-fragment-sentinel",
+        "repr-credential-scope-sentinel",
+    )
+    base_url = (
+        f"https://{sentinels[0]}:{sentinels[1]}@api.example.com/{sentinels[2]}"
+        f"?token={sentinels[3]}#{sentinels[4]}"
+    )
+    identity = _identity(base_url=base_url, credential_scope=sentinels[5])
+    checkpoint = _checkpoint(identity=identity)
+
+    for rendered in (repr(identity), repr(checkpoint)):
+        assert base_url not in rendered
+        assert all(sentinel not in rendered for sentinel in sentinels)
+        assert "provider='openai'" in rendered
+        assert "model='gpt-5'" in rendered
+
+
 def test_redacted_metadata_contains_only_safe_operational_fields():
     checkpoint = _checkpoint()
 
