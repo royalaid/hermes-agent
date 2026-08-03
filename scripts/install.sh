@@ -43,6 +43,7 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
+REPOSITORY="NousResearch/hermes-agent"
 REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -114,6 +115,10 @@ while [[ $# -gt 0 ]]; do
             BRANCH="$2"
             shift 2
             ;;
+        --repository|-Repository)
+            REPOSITORY="$2"
+            shift 2
+            ;;
         --commit|-Commit)
             INSTALL_COMMIT="$2"
             shift 2
@@ -169,6 +174,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --repository OWNER/REPO  GitHub repository to install"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "                   (ignored when it would roll an existing install back)"
             echo "  --force-commit Apply --commit even if it rolls the install backwards"
@@ -203,6 +209,18 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ ! "$REPOSITORY" =~ ^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$ ]]; then
+    echo "Invalid --repository '$REPOSITORY'. Expected owner/repo." >&2
+    exit 1
+fi
+IFS=/ read -r REPOSITORY_OWNER REPOSITORY_NAME <<< "$REPOSITORY"
+if [[ "$REPOSITORY_OWNER" == "." || "$REPOSITORY_OWNER" == ".." || "$REPOSITORY_NAME" == "." || "$REPOSITORY_NAME" == ".." ]]; then
+    echo "Invalid --repository '$REPOSITORY'. Expected owner/repo." >&2
+    exit 1
+fi
+REPO_URL_SSH="git@github.com:${REPOSITORY}.git"
+REPO_URL_HTTPS="https://github.com/${REPOSITORY}.git"
 
 # ============================================================================
 # Helper functions
