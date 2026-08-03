@@ -2900,6 +2900,7 @@ class TestPreLlmFeasibilityCheck:
 class TestRecordExternalCompaction:
     def test_records_successful_boundary_and_parks_usage(self, compressor):
         compressor.compression_count = 4
+        compressor.last_total_tokens = 92_000
         compressor.last_compression_rough_tokens = 91_000
 
         compressor.record_external_compaction(
@@ -2912,6 +2913,7 @@ class TestRecordExternalCompaction:
         assert compressor._last_compression_made_progress is True
         assert compressor.last_prompt_tokens == -1
         assert compressor.last_completion_tokens == 0
+        assert compressor.last_total_tokens == 0
         assert compressor.last_compression_rough_tokens == 0
         assert compressor.awaiting_real_usage_after_compression is True
         assert compressor._verify_compaction_cleared_threshold is True

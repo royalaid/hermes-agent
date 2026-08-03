@@ -1850,6 +1850,7 @@ class ContextCompressor(ContextEngine):
         self._last_compression_made_progress = True
         self.last_prompt_tokens = -1
         self.last_completion_tokens = 0
+        self.last_total_tokens = 0
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = True
 
