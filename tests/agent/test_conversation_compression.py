@@ -888,6 +888,34 @@ def test_checkpoint_construction_exception_uses_owned_text_fallback_once():
     assert agent._session_db.events == []
 
 
+def test_cancellation_during_request_client_creation_skips_endpoint_and_text():
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+    fence = CompressionCommitFence()
+
+    def _guarded_request(_agent, *, pre_dispatch_check, **_kwargs):
+        assert fence.cancel_before_commit() is True
+        assert pre_dispatch_check() is False
+        return NativeCompactionFailure("client", False, True)
+
+    with patch(
+        "agent.native_openai_compaction.request_native_compaction_candidate",
+        side_effect=_guarded_request,
+    ):
+        compress_context(
+            agent,
+            _messages(),
+            "sys",
+            force=True,
+            commit_fence=fence,
+        )
+
+    assert agent.context_compressor.text_calls == 0
+    assert agent.context_compressor.record_calls == []
+    assert agent._session_db.events == []
+    assert agent._last_native_compaction_succeeded is False
+
+
 def test_external_progress_failure_after_durable_checkpoint_remains_native_success(caplog):
     agent = _Agent()
     caplog.set_level("DEBUG", logger="agent.conversation_compression")

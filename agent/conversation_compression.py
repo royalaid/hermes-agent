@@ -2285,6 +2285,7 @@ def _try_native_openai_compaction(
             compact_instructions=NATIVE_OPENAI_COMPACTION_INSTRUCTIONS,
             resolved_timeout=resolved_timeout,
             previous_checkpoint=prior,
+            pre_dispatch_check=_commit_still_owned,
         )
     except Exception:
         return "abort" if not _commit_still_owned() else "fallback"
