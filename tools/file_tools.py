@@ -1326,6 +1326,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        # Apply lexical and resolved credential policy before any content I/O,
+        # including structured-document extraction, which can return early.
+        block_error = _task_read_block_error(path, task_id)
+        if block_error:
+            return tool_error(block_error)
+
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
@@ -1395,16 +1401,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         # ── Hermes internal path guard ────────────────────────────────
-        # Prevent prompt injection via catalog or hub metadata files,
-        # and block credential stores under HERMES_HOME.  Pass the
-        # already-resolved path so a relative-path read against
-        # TERMINAL_CWD == HERMES_HOME (e.g. "auth.json") still hits the
-        # denylist — get_read_block_error's own resolve() runs against
-        # the Python process cwd, which can differ.
-        block_error = _task_read_block_error(path, task_id)
-        if block_error:
-            return tool_error(block_error)
-
         # ── Negative-result cache ─────────────────────────────────────
         # If we already discovered this path doesn't exist (within TTL),
         # return the cached error without spawning the subprocess +
