@@ -120,10 +120,17 @@ Native compaction is a sidecar projection, not a transcript rewrite. Hermes
 keeps the complete readable conversation in `state.db` and stores the bounded
 opaque provider output separately. A later request replays that projection only
 when the finalized ordinary Responses input still has the same source prefix
-and the provider, API mode, model, endpoint, issuer, and replay policy all match.
-Rewinds and edits therefore fail open to readable history. Model or provider
-switches do not inject opaque output; switching back can reuse the checkpoint
-only while its original readable prefix still matches.
+and the provider, API mode, model, endpoint, issuer, replay policy, and
+credential scope all match. Credential-pool scopes hash the exact opaque pool
+entry ID. Direct API keys use an installation-keyed HMAC; the private 32-byte
+scope key lives at `$HERMES_HOME/cache/native_openai_scope.key`, never contains
+the provider credential, and is blocked from normal file, dashboard, and media
+surfaces. Preserve that key with `state.db` when migrating a profile if native
+checkpoint replay must survive the migration; losing or rotating it safely
+invalidates direct-key checkpoints. Rewinds and edits therefore fail open to
+readable history. Model or provider switches do not inject opaque output;
+switching back can reuse the checkpoint only while its original readable prefix
+still matches.
 
 If native preparation, dispatch, validation, or persistence fails while the
 compression lease is still valid, the same attempt uses Hermes text compression.
