@@ -32,7 +32,28 @@ class _FakeCompactClient:
         self.responses = SimpleNamespace(compact=compact)
 
 
-def _policy(*, enabled=True, builtin=True, session_db=object(), session_id="session-1"):
+class _CheckpointCapableDB:
+    def load_native_openai_checkpoint(self):
+        pass
+
+    def upsert_native_openai_checkpoint(self):
+        pass
+
+    def delete_native_openai_checkpoint(self):
+        pass
+
+
+_CHECKPOINT_DB = _CheckpointCapableDB()
+
+
+def _policy(
+    *,
+    enabled=True,
+    builtin=True,
+    session_db=_CHECKPOINT_DB,
+    session_id="session-1",
+    session_state_bound=True,
+):
     from agent.native_openai_compaction import NativeCompactionPolicy
 
     compressor = object.__new__(ContextCompressor) if builtin else object()
@@ -41,6 +62,7 @@ def _policy(*, enabled=True, builtin=True, session_db=object(), session_id="sess
         context_compressor=compressor,
         session_db=session_db,
         session_id=session_id,
+        session_state_bound=session_state_bound,
     )
 
 
@@ -109,6 +131,106 @@ def test_policy_rejects_disabled_custom_engine_or_missing_session_state(policy):
     )
 
 
+def test_policy_rejects_context_compressor_subclass():
+    class CustomCompressor(ContextCompressor):
+        pass
+
+    from agent.native_openai_compaction import NativeCompactionPolicy
+
+    policy = NativeCompactionPolicy.from_runtime(
+        feature_enabled=True,
+        context_compressor=object.__new__(CustomCompressor),
+        session_db=_CHECKPOINT_DB,
+        session_id="session-1",
+        session_state_bound=True,
+    )
+
+    assert not policy.built_in_compressor
+    assert not policy.is_eligible(
+        client=_FakeCompactClient(compact=lambda **_: None),
+        provider="openai",
+        api_mode="codex_responses",
+        base_url="https://api.openai.com/v1",
+    )
+
+
+class _RaisingRouteValue:
+    def __str__(self):
+        raise RuntimeError("must fail closed")
+
+    def __bool__(self):
+        raise RuntimeError("must fail closed")
+
+
+class _SpoofedRouteValue:
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return self.value
+
+
+@pytest.mark.parametrize("field", ["provider", "api_mode", "base_url"])
+@pytest.mark.parametrize("raising", [False, True])
+def test_policy_rejects_non_plain_string_route_fields_without_raising(field, raising):
+    route = {
+        "provider": "openai",
+        "api_mode": "codex_responses",
+        "base_url": "https://api.openai.com/v1",
+    }
+    route[field] = (
+        _RaisingRouteValue() if raising else _SpoofedRouteValue(route[field])
+    )
+
+    assert not _policy().is_eligible(
+        client=_FakeCompactClient(compact=lambda **_: None),
+        **route,
+    )
+
+
+class _RaisingSessionDB:
+    def __getattr__(self, name):
+        if name.endswith("_native_openai_checkpoint"):
+            raise RuntimeError(f"cannot inspect {name}")
+        raise AttributeError(name)
+
+
+@pytest.mark.parametrize(
+    "session_db",
+    [
+        object(),
+        SimpleNamespace(load_native_openai_checkpoint=lambda: None),
+        _RaisingSessionDB(),
+    ],
+)
+def test_policy_requires_all_checkpoint_persistence_capabilities(session_db):
+    assert not _policy(session_db=session_db).has_session_state
+
+
+def test_policy_requires_successful_session_state_binding():
+    assert not _policy(session_state_bound=False).has_session_state
+
+
+class _RaisingSessionID(str):
+    def strip(self, *args, **kwargs):
+        raise RuntimeError("must fail closed")
+
+
+def test_policy_rejects_malformed_session_id_without_raising():
+    assert not _policy(session_id=_RaisingSessionID("session-1")).has_session_state
+
+
+def test_policy_stores_booleans_only():
+    policy = _policy()
+
+    assert vars(policy) == {
+        "feature_enabled": True,
+        "built_in_compressor": True,
+        "has_session_state": True,
+    }
+    assert all(type(value) is bool for value in vars(policy).values())
+
+
 @pytest.mark.parametrize(
     "client",
     [
@@ -120,6 +242,31 @@ def test_policy_rejects_disabled_custom_engine_or_missing_session_state(policy):
     ],
 )
 def test_policy_rejects_client_without_callable_responses_compact(client):
+    assert not _policy().is_eligible(
+        client=client,
+        provider="openai",
+        api_mode="codex_responses",
+        base_url="https://api.openai.com/v1",
+    )
+
+
+class _RaisingResponsesClient:
+    @property
+    def responses(self):
+        raise RuntimeError("must fail closed")
+
+
+class _RaisingCompactResponses:
+    @property
+    def compact(self):
+        raise RuntimeError("must fail closed")
+
+
+@pytest.mark.parametrize(
+    "client",
+    [_RaisingResponsesClient(), SimpleNamespace(responses=_RaisingCompactResponses())],
+)
+def test_policy_rejects_raising_client_properties_without_raising(client):
     assert not _policy().is_eligible(
         client=client,
         provider="openai",

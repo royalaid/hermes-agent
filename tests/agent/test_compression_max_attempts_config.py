@@ -160,6 +160,25 @@ def test_agent_init_marks_missing_session_state_ineligible(monkeypatch, tmp_path
     )
 
 
+def test_agent_init_marks_failed_session_state_binding_ineligible(monkeypatch, tmp_path):
+    from agent.context_compressor import ContextCompressor
+
+    def fail_binding(self, *, session_db, session_id):
+        raise RuntimeError("binding failed")
+
+    monkeypatch.setattr(ContextCompressor, "bind_session_state", fail_binding)
+
+    agent = _make_agent(monkeypatch, tmp_path, openai_native=True)
+
+    assert not agent.native_compaction_policy.has_session_state
+    assert not agent.native_compaction_policy.is_eligible(
+        client=agent.client,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+        base_url=agent.base_url,
+    )
+
+
 def test_agent_init_marks_custom_context_engine_ineligible(monkeypatch, tmp_path):
     import plugins.context_engine as context_plugins
 
