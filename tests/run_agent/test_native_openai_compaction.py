@@ -95,7 +95,39 @@ def test_native_identity_uses_stable_credential_pool_entry_id():
 
     identity = native_openai_identity_for_agent(agent)
 
-    assert identity.credential_scope == "pool-entry-account-a"
+    assert identity.credential_scope.startswith("pool-entry-sha256:")
+    assert "pool-entry-account-a" not in identity.credential_scope
+
+
+def test_pool_entry_scope_preserves_case_sensitive_identity_without_raw_id():
+    agent = _agent(None)
+    agent._credential_pool_entry_id = "AccountA"
+    upper = native_openai_identity_for_agent(agent).credential_scope
+    agent._credential_pool_entry_id = "accounta"
+    lower = native_openai_identity_for_agent(agent).credential_scope
+
+    assert upper != lower
+    assert "AccountA" not in upper
+    assert "accounta" not in lower
+
+
+def test_direct_credential_scope_is_stable_per_key_without_persisting_key_hash():
+    import hashlib
+
+    agent = _agent(None)
+    first_key = "sk-test-direct-credential-alpha"
+    agent.api_key = first_key
+
+    first = native_openai_identity_for_agent(agent).credential_scope
+    repeated = native_openai_identity_for_agent(agent).credential_scope
+    agent.api_key = "sk-test-direct-credential-beta"
+    changed = native_openai_identity_for_agent(agent).credential_scope
+
+    assert first
+    assert first == repeated
+    assert changed != first
+    assert first_key not in first
+    assert hashlib.sha256(first_key.encode()).hexdigest() not in first
 
 
 def test_native_identity_ignores_non_string_credential_pool_entry_id():

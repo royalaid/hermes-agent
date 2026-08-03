@@ -601,6 +601,7 @@ class CompressionCommitFence:
         # The marker lets interrupts publish their Event without blocking
         # behind an in-flight request while durable lease release stays deferred.
         self._dispatch_phase = threading.Event()
+        self._dispatch_cancel_event: Any = None
         # Lock-free admission revocation (#76354 review F2). Set by
         # :meth:`revoke_commit_admission` on ANY host unwind (KeyboardInterrupt,
         # cancellation, unexpected exception) without touching the fence lock,
@@ -641,31 +642,32 @@ class CompressionCommitFence:
         """Cancel a pending commit, or wait for an active commit to finish.
 
         Returns ``True`` when cancellation won before the commit boundary.
-        Returns ``False`` when dispatch or commit was already admitted.
+        Returns ``False`` only when an irreversible commit was already admitted.
+        An admitted provider request is cancellable: future commit admission is
+        revoked and the caller may return while request cleanup finishes.
         """
-        if self._dispatch_phase.is_set():
-            self._cancelled = True
-            if cancel_event is not None:
-                cancel_event.set()
-            return False
-        with self._lock:
-            if self._commit_started:
-                if cancel_event is not None:
-                    cancel_event.set()
-                return False
-            self._cancelled = True
-            if cancel_event is not None:
-                cancel_event.set()
-            return True
+        if cancel_event is not None:
+            cancel_event.set()
+        while True:
+            if self._commit_phase.is_set():
+                with self._lock:
+                    return False
+            cancelled = self.try_cancel_before_commit()
+            if cancelled is not None:
+                return cancelled
+            time.sleep(0.001)
 
     def try_cancel_before_commit(self) -> Optional[bool]:
         """Non-blocking form of :meth:`cancel_before_commit`.
 
         Returns ``None`` while a transient fence operation owns the lock.
         """
+        # Revoke first so a request finishing between the lock-free phase probe
+        # and lock acquisition cannot slip into begin_commit().
+        self.revoke_commit_admission()
         if self._dispatch_phase.is_set():
             self._cancelled = True
-            return False
+            return True
         if not self._lock.acquire(blocking=False):
             return None
         try:
@@ -716,12 +718,14 @@ class CompressionCommitFence:
             if self._admission_revoked:
                 self.release_cancelled_compression_lock()
             return False
+        self._dispatch_cancel_event = cancel_event
         self._dispatch_phase.set()
         return True
 
     def finish_dispatch(self) -> None:
         """Leave an endpoint dispatch boundary entered by ``begin_dispatch``."""
         self._dispatch_phase.clear()
+        self._dispatch_cancel_event = None
         self._lock.release()
         if self._admission_revoked:
             self.release_cancelled_compression_lock()
@@ -788,6 +792,9 @@ class CompressionCommitFence:
           outer cleanup because the DB release is holder-qualified.
         """
         self._admission_revoked = True
+        dispatch_cancel_event = self._dispatch_cancel_event
+        if dispatch_cancel_event is not None:
+            dispatch_cancel_event.set()
         if self._lock.acquire(blocking=False):
             try:
                 self.release_cancelled_compression_lock()
@@ -855,6 +862,8 @@ class CompressionCommitFence:
         with self._lock_release_guard:
             self._cancelled_lock_release_requested = True
             release = self._cancelled_lock_release
+        if self._dispatch_phase.is_set():
+            return
         if release is not None:
             release()
 

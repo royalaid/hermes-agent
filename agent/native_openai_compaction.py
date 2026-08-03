@@ -1017,38 +1017,44 @@ def request_native_compaction_candidate(
                             except Exception:
                                 dispatch_entered = False
                             dispatch_allowed = dispatch_entered
-                            if dispatch_entered and pre_dispatch_check is not None:
-                                try:
-                                    dispatch_allowed = pre_dispatch_check() is True
-                                except Exception:
-                                    dispatch_allowed = False
-                                if not dispatch_allowed:
-                                    try:
-                                        type(dispatch_fence).finish_dispatch(
-                                            dispatch_fence
-                                        )
-                                    except Exception:
-                                        pass
-                                    dispatch_entered = False
                         if not dispatch_allowed:
                             result = _native_compaction_failure("client")
                         else:
+                            propagating_dispatch_base_exception = False
                             try:
-                                try:
-                                    response = compact(
-                                        model=model,
-                                        input=request_input,
-                                        instructions=compact_instructions,
-                                        timeout=resolved_timeout,
-                                    )
-                                except Exception as exc:
-                                    result = _classify_native_compaction_exception(exc)
+                                if (
+                                    dispatch_entered
+                                    and pre_dispatch_check is not None
+                                ):
+                                    try:
+                                        dispatch_allowed = (
+                                            pre_dispatch_check() is True
+                                        )
+                                    except Exception:
+                                        dispatch_allowed = False
+                                if not dispatch_allowed:
+                                    result = _native_compaction_failure("client")
                                 else:
-                                    result = _candidate_from_compact_response(
-                                        response,
-                                        cut=cut,
-                                        input_item_count=len(effective_input),
-                                    )
+                                    try:
+                                        response = compact(
+                                            model=model,
+                                            input=request_input,
+                                            instructions=compact_instructions,
+                                            timeout=resolved_timeout,
+                                        )
+                                    except Exception as exc:
+                                        result = _classify_native_compaction_exception(
+                                            exc
+                                        )
+                                    else:
+                                        result = _candidate_from_compact_response(
+                                            response,
+                                            cut=cut,
+                                            input_item_count=len(effective_input),
+                                        )
+                            except BaseException:
+                                propagating_dispatch_base_exception = True
+                                raise
                             finally:
                                 if dispatch_entered:
                                     try:
@@ -1056,7 +1062,8 @@ def request_native_compaction_candidate(
                                             dispatch_fence
                                         )
                                     except Exception:
-                                        result = _native_compaction_failure("client")
+                                        if not propagating_dispatch_base_exception:
+                                            result = _native_compaction_failure("client")
         except Exception:
             result = _native_compaction_failure("invalid_response")
     except BaseException:

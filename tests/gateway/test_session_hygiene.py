@@ -426,6 +426,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
     worker_started = threading.Event()
     release_worker = threading.Event()
+    hard_cancel = threading.Event()
     cleanup_done = threading.Event()
     fake_db = MagicMock()
     # The DB-backed cooldown check calls this before compressing; a bare
@@ -451,8 +452,13 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
         def _compress_context(
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
+            assert commit_fence is not None
+            assert commit_fence.begin_dispatch(hard_cancel)
             worker_started.set()
-            assert release_worker.wait(timeout=2)
+            try:
+                assert release_worker.wait(timeout=2)
+            finally:
+                commit_fence.finish_dispatch()
             if commit_fence is not None and not commit_fence.begin_commit():
                 return (messages, None)
             try:
@@ -547,6 +553,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     # busy CI shards twice on 2026-07-23.
     assert elapsed < 2.0
     assert worker_started.is_set()
+    assert hard_cancel.is_set()
     assert runner._run_agent.await_count == 1
     # Cooldown must be persisted to the state DB (survives restart, #74136),
     # not stashed in an in-memory dict.
