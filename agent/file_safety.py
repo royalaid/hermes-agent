@@ -7,6 +7,16 @@ from pathlib import Path
 from typing import Optional
 
 
+_NATIVE_OPENAI_SCOPE_KEY_BASENAME = "native_openai_scope.key"
+
+
+def _is_native_openai_scope_key_basename(path: str) -> bool:
+    basename = os.path.basename(os.path.normpath(os.path.expanduser(str(path))))
+    if os.name == "nt":
+        return basename.casefold() == _NATIVE_OPENAI_SCOPE_KEY_BASENAME.casefold()
+    return basename == _NATIVE_OPENAI_SCOPE_KEY_BASENAME
+
+
 def _hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME (profile-aware) without circular imports."""
     try:
@@ -103,13 +113,16 @@ def get_safe_write_roots() -> set[str]:
 
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+    if _is_native_openai_scope_key_basename(path):
+        return "credential"
+
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
     # This installation-private HMAC key may live under any Hermes profile.
     # Deny its unambiguous basename globally so an active profile cannot read
     # or replace a sibling profile's replay scope key.
-    if os.path.basename(resolved) == "native_openai_scope.key":
+    if _is_native_openai_scope_key_basename(resolved):
         return "credential"
 
     if resolved in build_write_denied_paths(home):
@@ -245,13 +258,16 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``"auth.json"`` would otherwise miss the denylist when the task's
     terminal cwd differs from the process cwd.
     """
+    if _is_native_openai_scope_key_basename(path):
+        return f"Read denied: '{path}' is a protected credential store."
+
     resolved = Path(path).expanduser().resolve()
 
     # Profile multiplexing places this key below
     # <HERMES_ROOT>/profiles/<name>/cache.  A global exact-basename denial is
     # deliberate: it protects sibling profiles without relying on their
     # existence at process startup.
-    if resolved.name == "native_openai_scope.key":
+    if _is_native_openai_scope_key_basename(resolved):
         return f"Read denied: '{path}' is a protected credential store."
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
