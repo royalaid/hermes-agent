@@ -2168,6 +2168,11 @@ def _try_native_openai_compaction(
         eligible = False
     if not eligible:
         return "fallback"
+    if (
+        (hard_cancel_event is not None and hard_cancel_event.is_set())
+        or (commit_fence is not None and commit_fence.is_cancelled)
+    ):
+        return "abort"
 
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
@@ -2175,7 +2180,7 @@ def _try_native_openai_compaction(
         return "fallback"
     active_holder = getattr(agent, "_active_compression_lock_holder", None)
     if type(active_holder) is not str or not active_holder:
-        return "fallback"
+        return "abort"
 
     def _commit_still_owned() -> bool:
         if hard_cancel_event is not None and hard_cancel_event.is_set():
