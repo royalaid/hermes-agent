@@ -702,6 +702,38 @@ def test_lease_loss_during_failed_checkpoint_upsert_aborts_without_text_fallback
     assert agent._last_native_compaction_succeeded is False
 
 
+def test_cancellation_during_native_eligibility_aborts_without_text_fallback():
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+    fence = CompressionCommitFence()
+
+    class _CancellingPolicy:
+        def is_eligible(self, **_kwargs):
+            assert fence.cancel_before_commit() is True
+            agent._active_compression_lock_holder = None
+            return True
+
+    agent.native_compaction_policy = _CancellingPolicy()
+
+    with patch(
+        "agent.native_openai_compaction.request_native_compaction_candidate"
+    ) as endpoint:
+        returned, _ = compress_context(
+            agent,
+            _messages(),
+            "sys",
+            force=True,
+            commit_fence=fence,
+        )
+
+    assert returned == _messages()
+    assert fence.is_cancelled is True
+    assert agent.context_compressor.text_calls == 0
+    assert agent.context_compressor.record_calls == []
+    assert agent._last_native_compaction_succeeded is False
+    endpoint.assert_not_called()
+
+
 def test_external_progress_failure_after_durable_checkpoint_remains_native_success(caplog):
     agent = _Agent()
     caplog.set_level("DEBUG", logger="agent.conversation_compression")
