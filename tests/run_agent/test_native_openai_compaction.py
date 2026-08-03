@@ -88,9 +88,13 @@ def _project(agent, ordinary=None, *, model=None):
     return maybe_apply_native_openai_projection(agent, kwargs)["input"]
 
 
-@pytest.mark.parametrize("in_place", [True, False])
+@pytest.mark.parametrize(
+    ("in_place", "prompt_update_fails"),
+    [(True, False), (False, False), (True, True)],
+    ids=("in-place", "rotation", "in-place-prompt-update-failure"),
+)
 def test_textual_compaction_deletes_old_session_checkpoint_and_cache(
-    tmp_path, in_place
+    tmp_path, monkeypatch, in_place, prompt_update_fails
 ):
     from run_agent import AIAgent
 
@@ -123,6 +127,12 @@ def test_textual_compaction_deletes_old_session_checkpoint_and_cache(
     compressor._last_summary_error = None
     compressor._last_compress_aborted = False
     agent.context_compressor = compressor
+    if prompt_update_fails:
+        monkeypatch.setattr(
+            db,
+            "update_system_prompt",
+            MagicMock(side_effect=RuntimeError("post-rewrite failure")),
+        )
 
     old_session_id = agent.session_id
     agent._compress_context(
