@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from agent import chat_completion_helpers
 
 from agent.chat_completion_helpers import (
     bind_native_openai_checkpoint_cache,
@@ -175,6 +178,35 @@ def test_direct_credential_scope_never_uses_symlinked_installation_key(
     assert second.startswith("direct-instance:")
     assert first != second
     assert target.read_bytes() == b"x" * 32
+
+
+def test_direct_scope_key_read_does_not_follow_post_validation_swap(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    key_path = tmp_path / "cache" / "native_openai_scope.key"
+    attacker = tmp_path / "cache" / "attacker-key.bin"
+    attacker_key = b"a" * 32
+    key_path.parent.mkdir(parents=True)
+    key_path.write_bytes(b"t" * 32)
+    attacker.write_bytes(attacker_key)
+
+    original_read_bytes = Path.read_bytes
+    swapped = False
+
+    def swap_before_read(path):
+        nonlocal swapped
+        if path == key_path and not swapped:
+            swapped = True
+            path.unlink()
+            path.symlink_to(attacker)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", swap_before_read)
+
+    loaded = chat_completion_helpers._load_or_create_native_scope_key()
+
+    assert loaded != attacker_key
 
 
 def test_native_identity_ignores_non_string_credential_pool_entry_id():
