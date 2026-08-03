@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from types import SimpleNamespace
 
@@ -607,3 +608,227 @@ def test_redacted_metadata_excludes_base_url_credentials_and_route_details():
         "/v1/compact",
     ):
         assert secret not in rendered
+
+
+def _serialize_rows(messages):
+    return [
+        {"role": message["role"], "content": copy.deepcopy(message.get("content", ""))}
+        for message in messages
+        if isinstance(message, dict) and message.get("role") != "system"
+    ]
+
+
+def test_cut_retains_newest_real_user_turn_despite_newer_synthetic_scaffolding():
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "newest human request"},
+        {"role": "assistant", "content": "working"},
+        {
+            "role": "user",
+            "content": "synthetic runtime note",
+            "_todo_snapshot_synthetic": True,
+        },
+        {"role": "assistant", "content": "still working"},
+    ]
+
+    cut = select_native_compaction_cut(
+        messages, protect_last_n=1, serialize_input=_serialize_rows
+    )
+
+    assert cut is not None
+    assert cut.message_count == 2
+    assert cut.source_input == _serialize_rows(messages[:2])
+
+
+def test_cut_keeps_multiple_tool_calls_and_results_atomic():
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "run both"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_a", "function": {"name": "a", "arguments": "{}"}},
+                {"id": "call_b", "function": {"name": "b", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+        {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+        {"role": "assistant", "content": "both done"},
+        {"role": "user", "content": "next request"},
+    ]
+
+    cut = select_native_compaction_cut(
+        messages, protect_last_n=3, serialize_input=_serialize_rows
+    )
+
+    assert cut is not None
+    assert cut.message_count == 3
+    assert messages[cut.message_count]["role"] == "assistant"
+
+
+def test_cut_refuses_malformed_detached_tool_history_when_no_safe_prefix_exists():
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "broken", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "unknown", "content": "secret-result"},
+        {"role": "user", "content": "real request"},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    assert (
+        select_native_compaction_cut(
+            messages, protect_last_n=1, serialize_input=_serialize_rows
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "messages,protect_last_n",
+    [
+        ([{"role": "user", "content": "only turn"}], 1),
+        (
+            [
+                {"role": "system", "content": "instructions"},
+                {"role": "user", "content": "request"},
+                {"role": "assistant", "content": "answer"},
+            ],
+            1,
+        ),
+    ],
+)
+def test_cut_refuses_too_short_or_no_item_prefix(messages, protect_last_n):
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    assert (
+        select_native_compaction_cut(
+            messages,
+            protect_last_n=protect_last_n,
+            serialize_input=_serialize_rows,
+        )
+        is None
+    )
+
+
+def test_repeated_cut_must_extend_strictly_beyond_previous_source_boundary():
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "one answer"},
+        {"role": "user", "content": "two"},
+        {"role": "assistant", "content": "two answer"},
+        {"role": "user", "content": "three"},
+    ]
+    first = select_native_compaction_cut(
+        messages, protect_last_n=1, serialize_input=_serialize_rows
+    )
+
+    assert first is not None
+    assert (
+        select_native_compaction_cut(
+            messages,
+            protect_last_n=1,
+            serialize_input=_serialize_rows,
+            previous_source_input_item_count=first.source_input_item_count,
+        )
+        is None
+    )
+
+    extended_messages = messages + [
+        {"role": "assistant", "content": "three answer"},
+        {"role": "user", "content": "four"},
+        {"role": "assistant", "content": "four answer"},
+    ]
+    extended = select_native_compaction_cut(
+        extended_messages,
+        protect_last_n=1,
+        serialize_input=_serialize_rows,
+        previous_source_input_item_count=first.source_input_item_count,
+    )
+
+    assert extended is not None
+    assert extended.source_input_item_count > first.source_input_item_count
+
+
+def test_cut_source_is_exact_ordinary_prefix_hashed_and_deep_copy_safe():
+    from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
+
+    transport = ResponsesApiTransport()
+    serialize = lambda rows: transport.build_input_items(  # noqa: E731
+        rows, is_codex_backend=True
+    )
+    messages = [
+        {"role": "user", "content": "old"},
+        {
+            "role": "assistant",
+            "content": "answer",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "encrypted_content": "opaque"}
+            ],
+        },
+        {"role": "user", "content": "new"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    ordinary = serialize(messages)
+
+    cut = select_native_compaction_cut(
+        messages, protect_last_n=1, serialize_input=serialize
+    )
+
+    assert cut is not None
+    assert cut.source_input == ordinary[: cut.source_input_item_count]
+    assert cut.source_input_item_count == len(cut.source_input)
+    assert cut.source_input_sha256 == canonical_input_sha256(cut.source_input)
+    fetched = cut.source_input
+    fetched[0]["content"] = "caller mutation"
+    assert cut.source_input == ordinary[: cut.source_input_item_count]
+
+
+def test_cut_repr_and_invalid_payload_errors_never_expose_payloads():
+    from agent.native_openai_compaction import (
+        NativeCompactionCut,
+        select_native_compaction_cut,
+    )
+
+    sentinel = "private-transcript-tool-args-encrypted-sentinel"
+    cut = NativeCompactionCut(
+        message_count=1,
+        source_input=[{"type": "reasoning", "encrypted_content": sentinel}],
+        source_input_item_count=1,
+        source_input_sha256=canonical_input_sha256(
+            [{"type": "reasoning", "encrypted_content": sentinel}]
+        ),
+    )
+    assert sentinel not in repr(cut)
+    assert "source_input=" not in repr(cut)
+
+    def invalid_serializer(_messages):
+        return [{"arguments": {sentinel: object()}}]
+
+    rendered = repr(
+        select_native_compaction_cut(
+            [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "new"},
+            ],
+            protect_last_n=1,
+            serialize_input=invalid_serializer,
+        )
+    )
+    assert sentinel not in rendered
+    assert rendered == "None"
