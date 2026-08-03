@@ -734,6 +734,73 @@ def test_cancellation_during_native_eligibility_aborts_without_text_fallback():
     endpoint.assert_not_called()
 
 
+def test_cancellation_during_ineligible_policy_aborts_without_text_fallback():
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+    fence = CompressionCommitFence()
+
+    class _CancellingPolicy:
+        def is_eligible(self, **_kwargs):
+            assert fence.cancel_before_commit() is True
+            return False
+
+    agent.native_compaction_policy = _CancellingPolicy()
+
+    with patch(
+        "agent.native_openai_compaction.request_native_compaction_candidate"
+    ) as endpoint:
+        compress_context(
+            agent,
+            _messages(),
+            "sys",
+            force=True,
+            commit_fence=fence,
+        )
+
+    assert agent.context_compressor.text_calls == 0
+    assert agent.context_compressor.record_calls == []
+    endpoint.assert_not_called()
+
+
+def _assert_cancellation_during_preflight_aborts(*, raise_after_cancel):
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+    fence = CompressionCommitFence()
+
+    class _CancellingTransport:
+        def preflight_kwargs(self, kwargs, **_options):
+            assert fence.cancel_before_commit() is True
+            if raise_after_cancel:
+                raise RuntimeError("SECRET_PREFLIGHT_FAILURE")
+            return kwargs
+
+    agent._get_transport = lambda: _CancellingTransport()
+
+    with patch(
+        "agent.native_openai_compaction.request_native_compaction_candidate"
+    ) as endpoint:
+        compress_context(
+            agent,
+            _messages(),
+            "sys",
+            force=True,
+            commit_fence=fence,
+        )
+
+    assert agent.context_compressor.text_calls == 0
+    assert agent.context_compressor.record_calls == []
+    assert agent._last_native_compaction_succeeded is False
+    endpoint.assert_not_called()
+
+
+def test_cancellation_during_successful_preflight_skips_endpoint_and_text_fallback():
+    _assert_cancellation_during_preflight_aborts(raise_after_cancel=False)
+
+
+def test_cancellation_during_failed_preflight_skips_endpoint_and_text_fallback():
+    _assert_cancellation_during_preflight_aborts(raise_after_cancel=True)
+
+
 def test_external_progress_failure_after_durable_checkpoint_remains_native_success(caplog):
     agent = _Agent()
     caplog.set_level("DEBUG", logger="agent.conversation_compression")
