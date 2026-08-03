@@ -13,6 +13,9 @@ _NATIVE_OPENAI_SCOPE_KEY_BASENAME = "native_openai_scope.key"
 def _is_native_openai_scope_key_basename(path: str) -> bool:
     basename = os.path.basename(os.path.normpath(os.path.expanduser(str(path))))
     if os.name == "nt":
+        # NTFS alternate data streams retain ``:<stream>`` in the final path
+        # component while addressing data attached to the base file.
+        basename = basename.split(":", 1)[0]
         return basename.casefold() == _NATIVE_OPENAI_SCOPE_KEY_BASENAME.casefold()
     return basename == _NATIVE_OPENAI_SCOPE_KEY_BASENAME
 
