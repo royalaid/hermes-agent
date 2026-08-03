@@ -65,7 +65,9 @@ def test_media_delivery_denies_sibling_profile_native_scope_key(
     )
     active.mkdir(parents=True)
     sibling_key.parent.mkdir(parents=True)
-    sibling_key.write_bytes(b"x" * 32)
+    target = sibling_key.parent / "replay-secret.bin"
+    target.write_bytes(b"x" * 32)
+    sibling_key.symlink_to(target)
     monkeypatch.setattr(base, "_HERMES_HOME", active)
     monkeypatch.setattr(base, "_HERMES_ROOT", root)
     monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
