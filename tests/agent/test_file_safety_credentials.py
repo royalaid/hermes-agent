@@ -56,6 +56,26 @@ def test_native_openai_scope_key_is_blocked(fake_home):
     assert "credential store" in error
 
 
+def test_sibling_profile_native_scope_key_is_blocked_for_reads_and_writes(
+    tmp_path, monkeypatch
+):
+    import agent.file_safety as fs
+
+    root = tmp_path / "hermes"
+    active = root / "profiles" / "active"
+    sibling_key = (
+        root / "profiles" / "sibling" / "cache" / "native_openai_scope.key"
+    )
+    active.mkdir(parents=True)
+    sibling_key.parent.mkdir(parents=True)
+    sibling_key.write_bytes(b"x" * 32)
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: active)
+    monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
+
+    assert "credential store" in (fs.get_read_block_error(str(sibling_key)) or "")
+    assert fs.is_write_denied(str(sibling_key))
+
+
 def test_arbitrary_hermes_home_file_not_blocked(fake_home):
     """Non-credential files inside HERMES_HOME stay readable."""
     from agent.file_safety import get_read_block_error

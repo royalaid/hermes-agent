@@ -53,6 +53,27 @@ def test_media_delivery_denies_native_openai_scope_key(tmp_path, monkeypatch):
     assert base.validate_media_delivery_path(str(path)) is None
 
 
+def test_media_delivery_denies_sibling_profile_native_scope_key(
+    tmp_path, monkeypatch
+):
+    import gateway.platforms.base as base
+
+    root = tmp_path / "hermes"
+    active = root / "profiles" / "active"
+    sibling_key = (
+        root / "profiles" / "sibling" / "cache" / "native_openai_scope.key"
+    )
+    active.mkdir(parents=True)
+    sibling_key.parent.mkdir(parents=True)
+    sibling_key.write_bytes(b"x" * 32)
+    monkeypatch.setattr(base, "_HERMES_HOME", active)
+    monkeypatch.setattr(base, "_HERMES_ROOT", root)
+    monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(root))
+
+    assert base.validate_media_delivery_path(str(sibling_key)) is None
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 
