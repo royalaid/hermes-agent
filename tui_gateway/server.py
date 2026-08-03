@@ -4650,6 +4650,10 @@ def _compress_session_history(
     )
 
     agent = session["agent"]
+    # This helper is the manual-attempt boundary for all TUI compression routes.
+    # Reset before every early return so feedback cannot inherit native success
+    # from an earlier attempt after rewind or history replacement.
+    agent._last_native_compaction_succeeded = False
     # Snapshot history under the lock so the LLM-bound compression call
     # below does NOT hold history_lock for the duration of the request —
     # otherwise other handlers acquiring the lock (prompt.submit etc.)
@@ -4739,6 +4743,7 @@ def _compress_session_history(
                 committed=False,
             )
             usage = _get_usage(agent)
+            agent._last_native_compaction_succeeded = False
             return 0, usage
         session["history"] = compressed
         session["history_version"] = history_version + 1

@@ -2433,15 +2433,17 @@ def _try_native_openai_compaction(
     # compacted source prefix is the prefix that will reach the provider. Fail
     # closed to same-attempt textual compression rather than commit an unusable
     # checkpoint and report false progress.
+    middleware_present = False
     try:
         from hermes_cli.middleware import has_llm_request_or_execution_middleware
 
-        if has_llm_request_or_execution_middleware():
-            return "fallback"
+        middleware_present = has_llm_request_or_execution_middleware()
     except Exception:
         return "abort" if _cancelled() or _observed_lease_lost() else "fallback"
     if _cancelled() or _observed_lease_lost():
         return "abort"
+    if middleware_present:
+        return "fallback"
 
     if session_db is None or type(session_id) is not str or not session_id:
         return _fallback("session_state")

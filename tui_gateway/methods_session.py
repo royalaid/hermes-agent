@@ -2536,6 +2536,9 @@ def _(rid, params: dict) -> dict:
                 before_tokens,
                 after_tokens,
                 compression_state=getattr(agent, "context_compressor", None),
+                native_succeeded=(
+                    getattr(agent, "_last_native_compaction_succeeded", False) is True
+                ),
             )
             info = _session_info(agent, session)
             _emit("session.info", sid, info)
