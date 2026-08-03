@@ -163,6 +163,56 @@ def test_canonical_hash_rejects_non_json_and_nan_without_payload_leak():
         assert "private" not in str(exc_info.value)
 
 
+@pytest.mark.parametrize(
+    "items",
+    [
+        [{"nested-secret-key": ["safe", ("tuple-secret-value",)]}],
+        [{7: "non-string-key-secret-value"}],
+    ],
+)
+def test_canonical_hash_rejects_values_outside_strict_json_domain_without_payload_leak(
+    items,
+):
+    with pytest.raises(ValueError) as exc_info:
+        canonical_input_sha256(items)
+
+    message = str(exc_info.value)
+    assert "nested-secret-key" not in message
+    assert "tuple-secret-value" not in message
+    assert "non-string-key-secret-value" not in message
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        [{"nested-secret-key": ["safe", ("tuple-secret-value",)]}],
+        [{7: "non-string-key-secret-value"}],
+    ],
+)
+def test_checkpoint_rejects_output_outside_strict_json_domain_without_payload_leak(
+    output,
+):
+    with pytest.raises(ValueError) as exc_info:
+        _checkpoint(output=output, output_item_count=1)
+
+    message = str(exc_info.value)
+    assert "nested-secret-key" not in message
+    assert "tuple-secret-value" not in message
+    assert "non-string-key-secret-value" not in message
+
+
+@pytest.mark.parametrize("field", ["created_at", "updated_at"])
+def test_checkpoint_rejects_none_for_required_timestamps(field):
+    with pytest.raises(ValueError, match=field):
+        _checkpoint(**{field: None})
+
+
+def test_checkpoint_accepts_none_for_optional_compact_created_at():
+    checkpoint = _checkpoint(compact_created_at=None)
+
+    assert checkpoint.compact_created_at is None
+
+
 def test_checkpoint_output_is_isolated_from_constructor_and_property_mutation():
     supplied = [{"nested": ["original"]}]
     checkpoint = _checkpoint(output=supplied, output_item_count=1)
@@ -182,7 +232,7 @@ def test_redacted_metadata_contains_only_safe_operational_fields():
         "provider": "openai",
         "api_mode": "codex_responses",
         "model": "gpt-5",
-        "base_url": "https://api.openai.com/v1",
+        "base_url_host": "api.openai.com",
         "issuer_kind": "api_key",
         "credential_scope": "account-1",
         "replay_encrypted_reasoning": True,
@@ -200,3 +250,25 @@ def test_redacted_metadata_contains_only_safe_operational_fields():
     assert "opaque-A" not in rendered
     assert "retained" not in rendered
     assert "output_json" not in rendered
+
+
+def test_redacted_metadata_excludes_base_url_credentials_and_route_details():
+    base_url = (
+        "https://route-user:route-password@api.example.com/v1/compact"
+        "?api_key=query-secret#private-fragment"
+    )
+    checkpoint = _checkpoint(identity=_identity(base_url=base_url))
+
+    metadata = checkpoint.redacted_metadata()
+
+    assert checkpoint.identity.base_url == base_url
+    assert metadata["base_url_host"] == "api.example.com"
+    rendered = repr(metadata)
+    for secret in (
+        "route-user",
+        "route-password",
+        "query-secret",
+        "private-fragment",
+        "/v1/compact",
+    ):
+        assert secret not in rendered
