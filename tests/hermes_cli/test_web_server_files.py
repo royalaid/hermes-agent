@@ -248,6 +248,7 @@ def test_other_credential_store_basenames_blocked(forced_files_client):
         "webhook_subscriptions.json",
         "bws_cache.json",
         "bws_cache.enc.json",
+        "native_openai_scope.key",
     ):
         p = root / name
         p.write_text("SECRET=abc123")

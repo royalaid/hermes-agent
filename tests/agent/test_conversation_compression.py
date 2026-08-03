@@ -596,6 +596,26 @@ def test_hard_cancel_rechecks_when_dispatch_wins_after_initial_phase_probe():
         fence.finish_dispatch()
 
 
+def test_dispatch_admission_rechecks_revocation_after_publishing_cancel_event():
+    fence = CompressionCommitFence()
+    hard_cancel = threading.Event()
+
+    class RevokeDuringFirstAdmissionCheck:
+        def __bool__(self):
+            fence.revoke_commit_admission()
+            return False
+
+    fence._admission_revoked = RevokeDuringFirstAdmissionCheck()
+    admitted = fence.begin_dispatch(hard_cancel)
+    try:
+        assert admitted is False
+        assert hard_cancel.is_set()
+        assert not fence._dispatch_phase.is_set()
+    finally:
+        if admitted:
+            fence.finish_dispatch()
+
+
 def test_native_failures_never_emit_payload_credentials_or_opaque_output(caplog):
     agent = _Agent()
     agent.context_compressor.raise_on_text = False

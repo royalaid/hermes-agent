@@ -38,6 +38,21 @@ def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
     assert base.validate_media_delivery_path(str(path)) is None
 
 
+def test_media_delivery_denies_native_openai_scope_key(tmp_path, monkeypatch):
+    import gateway.platforms.base as base
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    path = hermes_home / "cache" / "native_openai_scope.key"
+    path.parent.mkdir()
+    path.write_bytes(b"x" * 32)
+
+    assert path in base._media_delivery_denied_paths()
+    assert base.validate_media_delivery_path(str(path)) is None
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 

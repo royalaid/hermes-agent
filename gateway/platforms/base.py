@@ -1368,6 +1368,8 @@ def _media_delivery_denied_paths() -> List[Path]:
         # Bitwarden Secrets Manager plaintext and encrypted disk caches.
         os.path.join("cache", "bws_cache.json"),
         os.path.join("cache", "bws_cache.enc.json"),
+        # Installation-private HMAC key for direct native-replay scope.
+        os.path.join("cache", "native_openai_scope.key"),
     )
     # Directory trees whose every child is credential material.
     #

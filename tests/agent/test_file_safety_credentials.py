@@ -46,6 +46,16 @@ def _create(home: Path, rel: str | Path) -> Path:
 
 
 
+def test_native_openai_scope_key_is_blocked(fake_home):
+    from agent.file_safety import get_read_block_error
+
+    scope_key = _create(fake_home, Path("cache") / "native_openai_scope.key")
+    error = get_read_block_error(str(scope_key))
+
+    assert error is not None
+    assert "credential store" in error
+
+
 def test_arbitrary_hermes_home_file_not_blocked(fake_home):
     """Non-credential files inside HERMES_HOME stay readable."""
     from agent.file_safety import get_read_block_error
