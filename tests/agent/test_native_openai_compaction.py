@@ -1381,6 +1381,27 @@ def test_request_calls_compact_with_exact_payload_and_request_client_lifecycle()
     assert result.compact_created_at == 42.5
 
 
+def test_predispatch_guard_runs_after_client_creation_and_before_compact():
+    compact = _CompactRecorder(
+        SimpleNamespace(output=[{"type": "compaction", "encrypted_content": "opaque"}])
+    )
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+    guard_calls = []
+
+    result = _request(
+        agent,
+        _cut_for([{"role": "user", "content": "question"}]),
+        pre_dispatch_check=lambda: guard_calls.append("checked") or False,
+    )
+
+    assert result == NativeCompactionFailure("client", False, True)
+    assert guard_calls == ["checked"]
+    assert compact.calls == []
+    assert len(agent.create_calls) == 1
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
 def test_repeated_request_uses_opaque_output_plus_only_new_tail_without_mutation():
     old_source = [{"role": "user", "content": {"nested": "old"}}]
     extended = old_source + [{"role": "assistant", "content": {"nested": "new"}}]

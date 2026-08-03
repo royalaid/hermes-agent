@@ -911,6 +911,7 @@ def request_native_compaction_candidate(
     compact_instructions: str,
     resolved_timeout: float | None,
     previous_checkpoint: NativeCompactionCheckpoint | None = None,
+    pre_dispatch_check: Callable[[], bool] | None = None,
 ) -> NativeCompactionCandidate | NativeCompactionFailure:
     """Request one isolated native compact generation without mutating state."""
     if (
@@ -926,6 +927,7 @@ def request_native_compaction_candidate(
             )
         )
         or type(cut) is not NativeCompactionCut
+        or (pre_dispatch_check is not None and not callable(pre_dispatch_check))
         or (
             previous_checkpoint is not None
             and type(previous_checkpoint) is not NativeCompactionCheckpoint
@@ -964,31 +966,43 @@ def request_native_compaction_candidate(
     close_failed = False
     try:
         try:
-            try:
-                compact = getattr(getattr(client, "responses", None), "compact", None)
-            except Exception:
+            if pre_dispatch_check is not None:
+                try:
+                    dispatch_allowed = pre_dispatch_check() is True
+                except Exception:
+                    dispatch_allowed = False
+            else:
+                dispatch_allowed = True
+            if not dispatch_allowed:
                 result: NativeCompactionCandidate | NativeCompactionFailure = (
-                    _native_compaction_failure("unsupported")
+                    _native_compaction_failure("client")
                 )
             else:
-                if not callable(compact):
+                try:
+                    compact = getattr(
+                        getattr(client, "responses", None), "compact", None
+                    )
+                except Exception:
                     result = _native_compaction_failure("unsupported")
                 else:
-                    try:
-                        response = compact(
-                            model=model,
-                            input=copy.deepcopy(effective_input),
-                            instructions=compact_instructions,
-                            timeout=resolved_timeout,
-                        )
-                    except Exception as exc:
-                        result = _classify_native_compaction_exception(exc)
+                    if not callable(compact):
+                        result = _native_compaction_failure("unsupported")
                     else:
-                        result = _candidate_from_compact_response(
-                            response,
-                            cut=cut,
-                            input_item_count=len(effective_input),
-                        )
+                        try:
+                            response = compact(
+                                model=model,
+                                input=copy.deepcopy(effective_input),
+                                instructions=compact_instructions,
+                                timeout=resolved_timeout,
+                            )
+                        except Exception as exc:
+                            result = _classify_native_compaction_exception(exc)
+                        else:
+                            result = _candidate_from_compact_response(
+                                response,
+                                cut=cut,
+                                input_item_count=len(effective_input),
+                            )
         except Exception:
             result = _native_compaction_failure("invalid_response")
     except BaseException:
