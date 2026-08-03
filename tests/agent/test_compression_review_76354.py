@@ -43,6 +43,61 @@ def _drain_admission_slots():
         time.sleep(0.02)
 
 
+class TestDispatchTimeoutIsCancellable:
+    def test_sync_timeout_returns_while_native_dispatch_is_still_blocked(self):
+        original = [{"role": "user", "content": "a"}]
+        entered = threading.Event()
+        release = threading.Event()
+        hard_cancel = threading.Event()
+        host_done = threading.Event()
+        lease_released = threading.Event()
+        releases = []
+        result = {}
+
+        def worker(fence: CompressionCommitFence):
+            def release_lease():
+                releases.append("released")
+                lease_released.set()
+
+            fence.register_cancelled_lock_release(release_lease)
+            assert fence.begin_dispatch(hard_cancel)
+            entered.set()
+            try:
+                assert release.wait(timeout=10)
+                return ([{"role": "assistant", "content": "late"}], "late")
+            finally:
+                fence.finish_dispatch()
+
+        def host():
+            result["value"] = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.05,
+                total_ceiling_seconds=0.05,
+            )
+            host_done.set()
+
+        thread = threading.Thread(target=host, name="dispatch-timeout-host")
+        thread.start()
+        try:
+            assert entered.wait(timeout=2)
+            assert host_done.wait(timeout=1), (
+                "a provider request is cancellable and must not enter the "
+                "unbounded durable-commit overrun wait"
+            )
+            assert not release.is_set()
+            assert hard_cancel.is_set()
+            assert result["value"] == (original, "fallback")
+            assert releases == []
+        finally:
+            release.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert lease_released.wait(timeout=2)
+        assert releases == ["released"]
+
+
 class TestF1CommitOverrunWhileHung:
     def test_overrun_warning_fires_while_commit_still_blocked(self):
         """The warning + on_commit_overrun fire DURING the hang, not after.

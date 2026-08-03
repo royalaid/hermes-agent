@@ -1485,6 +1485,39 @@ def test_atomic_dispatch_fence_rechecks_lease_after_admission_before_compact():
     assert agent.close_calls == [(client, "native_openai_compaction")]
 
 
+def test_post_admission_lease_check_baseexception_releases_dispatch_fence():
+    from agent.conversation_compression import CompressionCommitFence
+
+    compact = _CompactRecorder(
+        SimpleNamespace(
+            output=[{"type": "compaction", "encrypted_content": "opaque"}]
+        )
+    )
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+    fence = CompressionCommitFence()
+    checks = iter((True, KeyboardInterrupt("stop")))
+
+    def _check():
+        value = next(checks)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    with pytest.raises(KeyboardInterrupt, match="stop"):
+        _request(
+            agent,
+            _cut_for([{"role": "user", "content": "question"}]),
+            pre_dispatch_check=_check,
+            dispatch_fence=fence,
+            hard_cancel_event=threading.Event(),
+        )
+
+    assert compact.calls == []
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+    assert fence.try_cancel_before_commit() is True
+
+
 def test_repeated_request_uses_opaque_output_plus_only_new_tail_without_mutation():
     old_source = [{"role": "user", "content": {"nested": "old"}}]
     extended = old_source + [{"role": "assistant", "content": {"nested": "new"}}]
