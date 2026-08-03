@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from agent.backend_identity import BackendIdentity
@@ -66,6 +66,173 @@ def canonical_input_sha256(items: list[dict]) -> str:
     if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
         raise ValueError("input must be a JSON list of objects")
     return hashlib.sha256(_canonical_json_bytes(items)).hexdigest()
+
+
+@dataclass(frozen=True, init=False)
+class NativeCompactionCut:
+    """Payload-safe immutable description of an ordinary-input prefix."""
+
+    message_count: int
+    source_input_item_count: int
+    source_input_sha256: str
+    _source_input_json: str = field(repr=False, compare=True)
+
+    def __init__(
+        self,
+        *,
+        message_count: int,
+        source_input: list[dict],
+        source_input_item_count: int,
+        source_input_sha256: str,
+    ) -> None:
+        if (
+            not isinstance(message_count, int)
+            or isinstance(message_count, bool)
+            or message_count <= 0
+        ):
+            raise ValueError("message_count must be a positive integer")
+        if not isinstance(source_input, list) or not source_input:
+            raise ValueError("source_input must be a non-empty JSON list of objects")
+        if (
+            not isinstance(source_input_item_count, int)
+            or isinstance(source_input_item_count, bool)
+            or source_input_item_count != len(source_input)
+        ):
+            raise ValueError("source_input_item_count must match source input length")
+        try:
+            source_input_json = _canonical_json_bytes(source_input).decode("utf-8")
+            actual_sha256 = canonical_input_sha256(source_input)
+        except ValueError:
+            raise ValueError(
+                "source_input must be a non-empty JSON list of objects"
+            ) from None
+        if not all(isinstance(item, dict) for item in source_input):
+            raise ValueError("source_input must be a non-empty JSON list of objects")
+        if source_input_sha256 != actual_sha256:
+            raise ValueError("source_input_sha256 must match source input")
+
+        object.__setattr__(self, "message_count", message_count)
+        object.__setattr__(
+            self, "source_input_item_count", source_input_item_count
+        )
+        object.__setattr__(self, "source_input_sha256", source_input_sha256)
+        object.__setattr__(self, "_source_input_json", source_input_json)
+
+    @property
+    def source_input(self) -> list[dict]:
+        """Return a fresh decode so callers cannot mutate the held prefix."""
+        return json.loads(self._source_input_json)
+
+
+def _tool_atomic_prefix(messages: list[dict]) -> bool:
+    """Return whether a message prefix contains only completed tool groups."""
+    pending: set[str] = set()
+    for message in messages:
+        role = message.get("role")
+        tool_calls = message.get("tool_calls") if role == "assistant" else None
+        if isinstance(tool_calls, list) and tool_calls:
+            if pending:
+                return False
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    return False
+                call_id = tool_call.get("call_id")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    call_id = tool_call.get("id")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    return False
+                call_id = call_id.strip()
+                if call_id in pending:
+                    return False
+                pending.add(call_id)
+            continue
+
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            if not isinstance(call_id, str) or call_id.strip() not in pending:
+                return False
+            pending.remove(call_id.strip())
+        elif pending:
+            return False
+    return not pending
+
+
+def select_native_compaction_cut(
+    messages: list[dict],
+    *,
+    protect_last_n: int,
+    serialize_input: Callable[[list[dict]], list[dict]],
+    previous_source_input_item_count: int = 0,
+) -> NativeCompactionCut | None:
+    """Select the latest protected, tool-atomic ordinary-input prefix."""
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or not all(isinstance(message, dict) for message in messages)
+        or not isinstance(protect_last_n, int)
+        or isinstance(protect_last_n, bool)
+        or protect_last_n < 0
+        or not isinstance(previous_source_input_item_count, int)
+        or isinstance(previous_source_input_item_count, bool)
+        or previous_source_input_item_count < 0
+        or not callable(serialize_input)
+    ):
+        return None
+
+    try:
+        from agent.conversation_compression import _is_real_user_message
+
+        newest_real_user_index = next(
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if _is_real_user_message(messages[index])
+        )
+        max_cut = min(len(messages) - protect_last_n, newest_real_user_index)
+        if max_cut <= 0:
+            return None
+
+        full_input = serialize_input(copy.deepcopy(messages))
+        if (
+            not isinstance(full_input, list)
+            or not full_input
+            or not all(isinstance(item, dict) for item in full_input)
+        ):
+            return None
+        canonical_input_sha256(full_input)
+
+        for message_count in range(max_cut, 0, -1):
+            prefix_messages = messages[:message_count]
+            if not _tool_atomic_prefix(prefix_messages):
+                continue
+            if messages[message_count].get("role") == "tool":
+                continue
+
+            source_input = serialize_input(copy.deepcopy(prefix_messages))
+            if (
+                not isinstance(source_input, list)
+                or not source_input
+                or not all(isinstance(item, dict) for item in source_input)
+            ):
+                continue
+            source_input_item_count = len(source_input)
+            if source_input_item_count <= previous_source_input_item_count:
+                continue
+            canonical_input_sha256(source_input)
+            if (
+                source_input_item_count >= len(full_input)
+                or full_input[:source_input_item_count] != source_input
+            ):
+                continue
+
+            return NativeCompactionCut(
+                message_count=message_count,
+                source_input=source_input,
+                source_input_item_count=source_input_item_count,
+                source_input_sha256=canonical_input_sha256(source_input),
+            )
+    except Exception:
+        return None
+    return None
 
 
 def _normalize_label(value: str | None) -> str:
