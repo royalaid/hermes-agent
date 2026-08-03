@@ -1002,13 +1002,14 @@ def _(rid, params: dict) -> dict:
                 if before_count
                 else 0
             )
-            removed, usage = _compress_session_history(
+            compression_result = _compress_session_history(
                 session,
                 arg.strip() or None,
                 approx_tokens=before_tokens,
                 before_messages=before_messages,
                 history_version=history_version,
             )
+            removed, usage = compression_result
             with session["history_lock"]:
                 after_messages = list(session.get("history", []))
             after_count = len(after_messages)
@@ -1033,7 +1034,7 @@ def _(rid, params: dict) -> dict:
                 after_tokens,
                 compression_state=getattr(_agent, "context_compressor", None),
                 native_succeeded=(
-                    getattr(_agent, "_last_native_compaction_succeeded", False) is True
+                    getattr(compression_result, "native_succeeded", False) is True
                 ),
             )
             _emit("session.info", sid, _session_info(session.get("agent"), session))
