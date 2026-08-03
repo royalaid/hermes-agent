@@ -695,9 +695,9 @@ def test_run_conversation_replays_checkpoint_at_shared_responses_seam(
 ):
     from agent.native_openai_compaction import (
         NativeCompactionCheckpoint,
-        NativeCompactionIdentity,
         canonical_input_sha256,
     )
+    from agent.chat_completion_helpers import native_openai_identity_for_agent
 
     agent = _build_agent(monkeypatch)
     agent._disable_streaming = not use_streaming
@@ -709,15 +709,7 @@ def test_run_conversation_replays_checkpoint_at_shared_responses_seam(
     opaque = {"type": "compaction", "encrypted_content": "OPAQUE"}
     agent._native_openai_checkpoint = NativeCompactionCheckpoint(
         session_id=agent.session_id,
-        identity=NativeCompactionIdentity(
-            provider=agent.provider,
-            api_mode=agent.api_mode,
-            model=agent.model,
-            base_url=agent.base_url,
-            issuer_kind="codex_backend",
-            credential_scope="",
-            replay_encrypted_reasoning=True,
-        ),
+        identity=native_openai_identity_for_agent(agent),
         source_input_item_count=1,
         source_input_sha256=canonical_input_sha256(prefix),
         output=[opaque],
