@@ -1565,6 +1565,16 @@ def init_agent(
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
     agent._parent_session_id = parent_session_id
+    # Native Responses checkpoints are loaded once when this agent binds its
+    # persistent session. Tool-loop requests consult only this immutable cache.
+    agent._native_openai_checkpoint = None
+    if session_db is not None and agent.session_id:
+        try:
+            agent._native_openai_checkpoint = (
+                session_db.load_native_openai_checkpoint(agent.session_id)
+            )
+        except Exception:
+            pass
     # A close flush and the worker's turn-start flush can overlap. The durable
     # marker is attached to each in-memory message dict, so its test-and-append
     # sequence must be serialized per agent rather than relying on SQLite alone.

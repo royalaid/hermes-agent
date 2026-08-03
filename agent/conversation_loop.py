@@ -2388,6 +2388,13 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                        from agent.chat_completion_helpers import (
+                            maybe_apply_native_openai_projection,
+                        )
+
+                        next_api_kwargs = maybe_apply_native_openai_projection(
+                            agent, next_api_kwargs
+                        )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
