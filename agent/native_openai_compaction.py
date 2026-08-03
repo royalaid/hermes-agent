@@ -12,11 +12,41 @@ import json
 import math
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from agent.backend_identity import BackendIdentity
 
 
+def _validate_json_value(value: Any, active_containers: set[int] | None = None) -> None:
+    if value is None or type(value) in (bool, int, str):
+        return
+    if type(value) is float:
+        if math.isfinite(value):
+            return
+        raise ValueError("value must contain only JSON-compatible data")
+    if type(value) not in (list, dict):
+        raise ValueError("value must contain only JSON-compatible data")
+
+    active_containers = active_containers or set()
+    container_id = id(value)
+    if container_id in active_containers:
+        raise ValueError("value must contain only JSON-compatible data")
+    active_containers.add(container_id)
+    try:
+        if type(value) is list:
+            for item in value:
+                _validate_json_value(item, active_containers)
+        else:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ValueError("value must contain only JSON-compatible data")
+                _validate_json_value(item, active_containers)
+    finally:
+        active_containers.remove(container_id)
+
+
 def _canonical_json_bytes(value: Any) -> bytes:
+    _validate_json_value(value)
     try:
         encoded = json.dumps(
             value,
@@ -39,6 +69,23 @@ def canonical_input_sha256(items: list[dict]) -> str:
 
 def _normalize_label(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+def _safe_base_url_host(base_url: str) -> str:
+    try:
+        parsed = urlsplit(base_url)
+        host = parsed.hostname
+        parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or not host
+        or any(character.isspace() or ord(character) < 32 for character in host)
+    ):
+        return ""
+    return host
 
 
 @dataclass(frozen=True)
@@ -116,14 +163,17 @@ class NativeCompactionCheckpoint:
                 raise ValueError(f"{name} must be a non-negative integer")
         if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
             raise ValueError("generation must be a positive integer")
-        for name, value in (
-            ("compact_created_at", compact_created_at),
-            ("created_at", created_at),
-            ("updated_at", updated_at),
+        if compact_created_at is not None and (
+            type(compact_created_at) not in (int, float)
+            or not math.isfinite(compact_created_at)
+            or compact_created_at < 0
         ):
-            if value is not None and (
-                not isinstance(value, (int, float))
-                or isinstance(value, bool)
+            raise ValueError(
+                "compact_created_at must be a non-negative finite timestamp"
+            )
+        for name, value in (("created_at", created_at), ("updated_at", updated_at)):
+            if (
+                type(value) not in (int, float)
                 or not math.isfinite(value)
                 or value < 0
             ):
@@ -168,7 +218,7 @@ class NativeCompactionCheckpoint:
             "provider": self.identity.provider,
             "api_mode": self.identity.api_mode,
             "model": self.identity.model,
-            "base_url": self.identity.base_url,
+            "base_url_host": _safe_base_url_host(self.identity.base_url),
             "issuer_kind": self.identity.issuer_kind,
             "credential_scope": self.identity.credential_scope,
             "replay_encrypted_reasoning": self.identity.replay_encrypted_reasoning,
