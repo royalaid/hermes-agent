@@ -645,6 +645,7 @@ def test_cut_retains_newest_real_user_turn_despite_newer_synthetic_scaffolding()
 
 def test_cut_keeps_multiple_tool_calls_and_results_atomic():
     from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
 
     messages = [
         {"role": "user", "content": "old request"},
@@ -664,8 +665,13 @@ def test_cut_keeps_multiple_tool_calls_and_results_atomic():
         {"role": "user", "content": "next request"},
     ]
 
+    transport = ResponsesApiTransport()
     cut = select_native_compaction_cut(
-        messages, protect_last_n=3, serialize_input=_serialize_rows
+        messages,
+        protect_last_n=3,
+        serialize_input=lambda rows: transport.build_input_items(
+            rows, is_codex_backend=True
+        ),
     )
 
     assert cut is not None
@@ -796,11 +802,75 @@ def test_cut_accepts_finalized_graph_with_additional_calls_while_calls_are_pendi
     graph = [
         {"type": "function_call", "call_id": "call_a", "name": "a", "arguments": "{}"},
         {"type": "function_call", "call_id": "call_b", "name": "b", "arguments": "{}"},
-        {"type": "function_call_output", "call_id": "call_a", "output": "A"},
         {"type": "function_call_output", "call_id": "call_b", "output": "B"},
+        {"type": "function_call_output", "call_id": "call_a", "output": "A"},
     ]
 
     assert _select_cut_for_serialized_tool_graph(graph) is not None
+
+
+def test_cut_accepts_finalized_no_tool_item_shapes():
+    graph = [
+        {"role": "user", "content": "question"},
+        {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "answer"}],
+        },
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    assert _select_cut_for_serialized_tool_graph(graph) is not None
+
+
+@pytest.mark.parametrize(
+    "interleaved_item",
+    [
+        {"type": "future_item", "private": "unknown-payload"},
+        {"role": "tool", "tool_call_id": "call_a", "content": "raw-result"},
+    ],
+)
+def test_cut_refuses_unknown_or_raw_tool_item_while_finalized_call_is_pending(
+    interleaved_item,
+):
+    graph = [
+        {"type": "function_call", "call_id": "call_a", "name": "a", "arguments": "{}"},
+        interleaved_item,
+        {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+    ]
+
+    assert _select_cut_for_serialized_tool_graph(graph) is None
+
+
+@pytest.mark.parametrize("name", [None, "", "   ", 7])
+def test_cut_refuses_finalized_function_call_with_invalid_name(name):
+    graph = [
+        {"type": "function_call", "call_id": "call_a", "name": name, "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+    ]
+
+    assert _select_cut_for_serialized_tool_graph(graph) is None
+
+
+@pytest.mark.parametrize(
+    "unknown_item",
+    [
+        {"type": "future_item", "private": "unknown-payload"},
+        {"role": "tool", "tool_call_id": "call_a", "content": "raw-result"},
+        {"type": "message", "role": "user", "content": []},
+        {},
+    ],
+)
+def test_cut_refuses_unknown_finalized_item_when_no_call_is_pending(unknown_item):
+    graph = [
+        {"role": "user", "content": "before"},
+        unknown_item,
+        {"role": "assistant", "content": "after"},
+    ]
+
+    assert _select_cut_for_serialized_tool_graph(graph) is None
 
 
 @pytest.mark.parametrize(

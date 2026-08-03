@@ -173,7 +173,13 @@ def _finalized_tool_graph_is_valid(items: list[dict]) -> bool:
         item_type = item.get("type")
         if item_type == "function_call":
             call_id = item.get("call_id")
-            if type(call_id) is not str or not call_id.strip():
+            name = item.get("name")
+            if (
+                type(call_id) is not str
+                or not call_id.strip()
+                or type(name) is not str
+                or not name.strip()
+            ):
                 return False
             call_id = call_id.strip()
             if call_id in seen_calls:
@@ -189,11 +195,19 @@ def _finalized_tool_graph_is_valid(items: list[dict]) -> bool:
             pending.remove(call_id.strip())
             continue
 
-        if pending and (
-            item_type in {"reasoning", "message"}
-            or item.get("role") in {"user", "assistant"}
-        ):
+        if pending:
             return False
+        if item_type == "reasoning":
+            if "role" in item:
+                return False
+            continue
+        if item_type == "message":
+            if item.get("role") != "assistant":
+                return False
+            continue
+        if "type" not in item and item.get("role") in {"user", "assistant"}:
+            continue
+        return False
 
     return not pending
 
