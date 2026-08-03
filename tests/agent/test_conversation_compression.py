@@ -663,9 +663,49 @@ def test_lease_loss_during_failed_native_request_aborts_without_text_fallback():
     assert agent._session_db.events == []
 
 
-def test_external_progress_failure_after_durable_checkpoint_remains_native_success():
+def test_lease_loss_during_failed_checkpoint_upsert_aborts_without_text_fallback():
     agent = _Agent()
-    agent.context_compressor.raise_on_record = True
+    agent.context_compressor.raise_on_text = False
+
+    def _failed_upsert(_checkpoint):
+        agent._session_db.holder = "replacement-holder"
+        raise RuntimeError("SECRET_UPSERT_FAILURE")
+
+    agent._session_db.upsert_native_openai_checkpoint = _failed_upsert
+
+    def _candidate(_agent, *, cut, **_kwargs):
+        return NativeCompactionCandidate(
+            source_input_item_count=cut.source_input_item_count,
+            source_input_sha256=cut.source_input_sha256,
+            compact_response_id=None,
+            compact_created_at=None,
+            input_item_count=cut.source_input_item_count,
+            output_item_count=1,
+            output=[{"type": "compaction", "encrypted_content": "OPAQUE"}],
+        )
+
+    with patch(
+        "agent.native_openai_compaction.request_native_compaction_candidate",
+        side_effect=_candidate,
+    ):
+        returned, _ = compress_context(agent, _messages(), "sys", force=True)
+
+    assert returned == _messages()
+    assert agent.context_compressor.text_calls == 0
+    assert agent.context_compressor.record_calls == []
+    assert agent._last_native_compaction_succeeded is False
+
+
+def test_external_progress_failure_after_durable_checkpoint_remains_native_success(caplog):
+    agent = _Agent()
+    caplog.set_level("DEBUG", logger="agent.conversation_compression")
+    secret_error = type("SECRET_RECORD_EXCEPTION_CLASS", (RuntimeError,), {})
+
+    def _failed_record(**_kwargs):
+        agent._session_db.events.append("record")
+        raise secret_error()
+
+    agent.context_compressor.record_external_compaction = _failed_record
 
     def _candidate(_agent, *, cut, **_kwargs):
         return NativeCompactionCandidate(
@@ -689,3 +729,6 @@ def test_external_progress_failure_after_durable_checkpoint_remains_native_succe
     assert agent._session_db.events == ["upsert", "record"]
     assert agent.context_compressor.text_calls == 0
     assert agent._last_native_compaction_succeeded is True
+    assert "SECRET_RECORD_EXCEPTION_CLASS" not in "\n".join(
+        record.getMessage() for record in caplog.records
+    )
