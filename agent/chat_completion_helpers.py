@@ -162,6 +162,13 @@ def native_openai_identity_for_agent(agent, *, model=None):
     from agent.codex_responses_adapter import _classify_responses_issuer
     from agent.native_openai_compaction import NativeCompactionIdentity
 
+    raw_credential_scope = getattr(agent, "_credential_pool_entry_id", None)
+    credential_scope = (
+        raw_credential_scope.strip()
+        if type(raw_credential_scope) is str and raw_credential_scope.strip()
+        else ""
+    )
+
     return NativeCompactionIdentity(
         provider=getattr(agent, "provider", ""),
         api_mode=getattr(agent, "api_mode", ""),
@@ -171,7 +178,7 @@ def native_openai_identity_for_agent(agent, *, model=None):
             is_codex_backend=_is_openai_codex_backend(agent),
             base_url=getattr(agent, "base_url", ""),
         ),
-        credential_scope="",
+        credential_scope=credential_scope,
         replay_encrypted_reasoning=bool(
             getattr(agent, "_codex_reasoning_replay_enabled", True)
         ),

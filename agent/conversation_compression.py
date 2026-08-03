@@ -597,6 +597,10 @@ class CompressionCommitFence:
         # flight" even while the commit itself is hung — which is exactly when
         # the overrun warning must be able to fire.
         self._commit_phase = threading.Event()
+        # Endpoint dispatch uses the same admission lock as hard cancellation.
+        # The marker lets interrupts publish their Event without blocking
+        # behind an in-flight request while durable lease release stays deferred.
+        self._dispatch_phase = threading.Event()
         # Lock-free admission revocation (#76354 review F2). Set by
         # :meth:`revoke_commit_admission` on ANY host unwind (KeyboardInterrupt,
         # cancellation, unexpected exception) without touching the fence lock,
@@ -637,9 +641,13 @@ class CompressionCommitFence:
         """Cancel a pending commit, or wait for an active commit to finish.
 
         Returns ``True`` when cancellation won before the commit boundary.
-        Returns ``False`` when the worker had already entered the boundary; in
-        that case acquiring this lock waits until all session mutation finishes.
+        Returns ``False`` when dispatch or commit was already admitted.
         """
+        if self._dispatch_phase.is_set():
+            self._cancelled = True
+            if cancel_event is not None:
+                cancel_event.set()
+            return False
         with self._lock:
             if self._commit_started:
                 if cancel_event is not None:
@@ -653,9 +661,11 @@ class CompressionCommitFence:
     def try_cancel_before_commit(self) -> Optional[bool]:
         """Non-blocking form of :meth:`cancel_before_commit`.
 
-        Returns ``None`` while an active commit owns the fence, allowing an
-        async caller to yield instead of blocking its event loop.
+        Returns ``None`` while a transient fence operation owns the lock.
         """
+        if self._dispatch_phase.is_set():
+            self._cancelled = True
+            return False
         if not self._lock.acquire(blocking=False):
             return None
         try:
@@ -688,6 +698,33 @@ class CompressionCommitFence:
         # commit_in_flight=True for a commit that lost to cancellation.
         self._commit_phase.set()
         return True
+
+    def begin_dispatch(self, cancel_event: Any = None) -> bool:
+        """Atomically admit endpoint dispatch against hard cancellation.
+
+        The caller retains the admission lock through the synchronous SDK call
+        and must pair success with :meth:`finish_dispatch`.
+        """
+        self._lock.acquire()
+        if (
+            self._cancelled
+            or self._admission_revoked
+            or (cancel_event is not None and bool(cancel_event.is_set()))
+        ):
+            self._cancelled = True
+            self._lock.release()
+            if self._admission_revoked:
+                self.release_cancelled_compression_lock()
+            return False
+        self._dispatch_phase.set()
+        return True
+
+    def finish_dispatch(self) -> None:
+        """Leave an endpoint dispatch boundary entered by ``begin_dispatch``."""
+        self._dispatch_phase.clear()
+        self._lock.release()
+        if self._admission_revoked:
+            self.release_cancelled_compression_lock()
 
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
@@ -2453,6 +2490,8 @@ def _try_native_openai_compaction(
             resolved_timeout=resolved_timeout,
             previous_checkpoint=prior,
             pre_dispatch_check=_commit_still_owned,
+            dispatch_fence=commit_fence,
+            hard_cancel_event=hard_cancel_event,
         )
     except Exception:
         return "abort" if not _commit_still_owned() else _fallback("client")

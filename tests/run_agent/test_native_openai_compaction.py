@@ -11,6 +11,7 @@ import pytest
 from agent.chat_completion_helpers import (
     bind_native_openai_checkpoint_cache,
     maybe_apply_native_openai_projection,
+    native_openai_identity_for_agent,
 )
 from agent.native_openai_compaction import (
     NativeCompactionCheckpoint,
@@ -86,6 +87,24 @@ def _project(agent, ordinary=None, *, model=None):
     ordinary = ORDINARY if ordinary is None else ordinary
     kwargs = {"model": model or agent.model, "input": ordinary}
     return maybe_apply_native_openai_projection(agent, kwargs)["input"]
+
+
+def test_native_identity_uses_stable_credential_pool_entry_id():
+    agent = _agent(None)
+    agent._credential_pool_entry_id = "pool-entry-account-a"
+
+    identity = native_openai_identity_for_agent(agent)
+
+    assert identity.credential_scope == "pool-entry-account-a"
+
+
+def test_native_identity_ignores_non_string_credential_pool_entry_id():
+    agent = _agent(None)
+    agent._credential_pool_entry_id = object()
+
+    identity = native_openai_identity_for_agent(agent)
+
+    assert identity.credential_scope == ""
 
 
 @pytest.mark.parametrize(
