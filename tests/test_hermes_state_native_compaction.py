@@ -239,6 +239,54 @@ def test_export_import_and_child_creation_do_not_copy_checkpoint(tmp_path):
         destination.close()
 
 
+def test_holder_qualified_upsert_is_atomic_with_the_active_unexpired_lease(db):
+    db.create_session("session-1", source="cli")
+    first = _checkpoint()
+    replacement = _checkpoint(
+        generation=2,
+        output=[{"type": "compaction", "new": "replacement"}],
+        output_item_count=1,
+        updated_at=13.0,
+    )
+
+    assert db.try_acquire_compression_lock(
+        "session-1", "holder-a", ttl_seconds=60.0
+    )
+    assert (
+        db.upsert_native_openai_checkpoint(
+            first, expected_lock_holder="holder-a"
+        )
+        is True
+    )
+    db.release_compression_lock("session-1", "holder-a")
+    assert db.try_acquire_compression_lock(
+        "session-1", "holder-b", ttl_seconds=60.0
+    )
+
+    assert (
+        db.upsert_native_openai_checkpoint(
+            replacement, expected_lock_holder="holder-a"
+        )
+        is False
+    )
+    assert db.load_native_openai_checkpoint("session-1") == first
+
+    def _expire_current_lease(conn):
+        conn.execute(
+            "UPDATE compression_locks SET expires_at = 0 WHERE session_id = ?",
+            ("session-1",),
+        )
+
+    db._execute_write(_expire_current_lease)
+    assert (
+        db.upsert_native_openai_checkpoint(
+            replacement, expected_lock_holder="holder-b"
+        )
+        is False
+    )
+    assert db.load_native_openai_checkpoint("session-1") == first
+
+
 def test_native_compaction_table_has_scoped_schema_and_cascade(db):
     expected_columns = [
         "session_id",

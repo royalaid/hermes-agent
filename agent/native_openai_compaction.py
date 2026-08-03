@@ -19,7 +19,18 @@ from agent.backend_identity import BackendIdentity
 from hermes_cli.route_identity import normalize_route_base_url
 
 
-def _validate_json_value(value: Any, active_containers: set[int] | None = None) -> None:
+MAX_NATIVE_COMPACTION_OUTPUT_ITEMS = 512
+MAX_NATIVE_COMPACTION_OUTPUT_DEPTH = 64
+MAX_NATIVE_COMPACTION_OUTPUT_JSON_BYTES = 4 * 1024 * 1024
+
+
+def _validate_json_value(
+    value: Any,
+    active_containers: set[int] | None = None,
+    *,
+    depth: int = 0,
+    max_depth: int | None = None,
+) -> None:
     if value is None or type(value) in (bool, int, str):
         return
     if type(value) is float:
@@ -28,8 +39,11 @@ def _validate_json_value(value: Any, active_containers: set[int] | None = None) 
         raise ValueError("value must contain only JSON-compatible data")
     if type(value) not in (list, dict):
         raise ValueError("value must contain only JSON-compatible data")
+    if max_depth is not None and depth > max_depth:
+        raise ValueError("value must contain only JSON-compatible data")
 
-    active_containers = active_containers or set()
+    if active_containers is None:
+        active_containers = set()
     container_id = id(value)
     if container_id in active_containers:
         raise ValueError("value must contain only JSON-compatible data")
@@ -37,18 +51,28 @@ def _validate_json_value(value: Any, active_containers: set[int] | None = None) 
     try:
         if type(value) is list:
             for item in value:
-                _validate_json_value(item, active_containers)
+                _validate_json_value(
+                    item,
+                    active_containers,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                )
         else:
             for key, item in value.items():
                 if type(key) is not str:
                     raise ValueError("value must contain only JSON-compatible data")
-                _validate_json_value(item, active_containers)
+                _validate_json_value(
+                    item,
+                    active_containers,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                )
     finally:
         active_containers.remove(container_id)
 
 
-def _canonical_json_bytes(value: Any) -> bytes:
-    _validate_json_value(value)
+def _canonical_json_bytes(value: Any, *, max_depth: int | None = None) -> bytes:
+    _validate_json_value(value, max_depth=max_depth)
     try:
         encoded = json.dumps(
             value,
@@ -60,6 +84,22 @@ def _canonical_json_bytes(value: Any) -> bytes:
     except (TypeError, ValueError):
         raise ValueError("value must contain only JSON-compatible data") from None
     return encoded.encode("utf-8")
+
+
+def _bounded_compaction_output_json(output: Any) -> str:
+    if (
+        type(output) is not list
+        or not output
+        or len(output) > MAX_NATIVE_COMPACTION_OUTPUT_ITEMS
+    ):
+        raise ValueError("output must be a bounded non-empty JSON list")
+    encoded = _canonical_json_bytes(
+        output,
+        max_depth=MAX_NATIVE_COMPACTION_OUTPUT_DEPTH,
+    )
+    if len(encoded) > MAX_NATIVE_COMPACTION_OUTPUT_JSON_BYTES:
+        raise ValueError("output must be a bounded non-empty JSON list")
+    return encoded.decode("utf-8")
 
 
 def canonical_input_sha256(items: list[dict]) -> str:
@@ -172,12 +212,10 @@ class NativeCompactionCandidate:
             raise ValueError(
                 "compact_created_at must be a non-negative finite timestamp"
             )
-        if type(output) is not list or not output:
-            raise ValueError("output must be a non-empty JSON list")
         try:
-            output_json = _canonical_json_bytes(output).decode("utf-8")
+            output_json = _bounded_compaction_output_json(output)
         except ValueError:
-            raise ValueError("output must be a non-empty JSON list") from None
+            raise ValueError("output must be a bounded non-empty JSON list") from None
         if output_item_count != len(output):
             raise ValueError("output_item_count must match output length")
 
@@ -684,12 +722,10 @@ class NativeCompactionCheckpoint:
                 or value < 0
             ):
                 raise ValueError(f"{name} must be a non-negative finite timestamp")
-        if not isinstance(output, list) or not output:
-            raise ValueError("output must be a non-empty JSON list")
         try:
-            output_json = _canonical_json_bytes(output).decode("utf-8")
+            output_json = _bounded_compaction_output_json(output)
         except ValueError:
-            raise ValueError("output must be a non-empty JSON list") from None
+            raise ValueError("output must be a bounded non-empty JSON list") from None
         if output_item_count != len(output):
             raise ValueError("output_item_count must match output length")
 
@@ -980,7 +1016,11 @@ def _candidate_from_compact_response(
 ) -> NativeCompactionCandidate | NativeCompactionFailure:
     try:
         output = response.output
-        if not isinstance(output, list) or not output:
+        if (
+            not isinstance(output, list)
+            or not output
+            or len(output) > MAX_NATIVE_COMPACTION_OUTPUT_ITEMS
+        ):
             return _native_compaction_failure("invalid_response")
 
         serialized_output: list[Any] = []
