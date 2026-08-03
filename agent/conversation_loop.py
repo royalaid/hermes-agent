@@ -32,6 +32,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    capture_compression_attempt_outcome,
     compression_attempt_made_progress,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
@@ -4376,6 +4377,7 @@ def run_conversation(
                             approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                             task_id=effective_task_id,
                         )
+                        attempt_outcome = capture_compression_attempt_outcome(agent)
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
@@ -4388,6 +4390,7 @@ def run_conversation(
                             after_tokens=new_tokens,
                             old_context_length=old_ctx,
                             new_context_length=_reduced_ctx,
+                            attempt_outcome=attempt_outcome,
                         ):
                             agent._buffer_status(
                                 COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE.format(
@@ -4644,6 +4647,7 @@ def run_conversation(
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
                     )
+                    attempt_outcome = capture_compression_attempt_outcome(agent)
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
                         # does not fit, but this compression pass no-oped only
@@ -4673,6 +4677,7 @@ def run_conversation(
                         after_count=len(messages),
                         before_tokens=original_tokens,
                         after_tokens=new_tokens,
+                        attempt_outcome=attempt_outcome,
                     ):
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
@@ -4916,6 +4921,7 @@ def run_conversation(
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
                     )
+                    attempt_outcome = capture_compression_attempt_outcome(agent)
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
                         # does not fit, but this compression pass no-oped only
@@ -4947,6 +4953,7 @@ def run_conversation(
                         after_tokens=new_tokens,
                         old_context_length=old_ctx,
                         new_context_length=new_ctx,
+                        attempt_outcome=attempt_outcome,
                     ):
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))

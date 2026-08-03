@@ -34,10 +34,12 @@ from typing import Any, Dict, List, Mapping, Optional
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    capture_compression_attempt_outcome,
     compression_attempt_made_progress,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
     recover_rotated_compression_session,
+    reset_compression_attempt_outcome,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
@@ -456,6 +458,7 @@ def build_turn_context(
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False
     agent._last_native_compaction_succeeded = False
+    reset_compression_attempt_outcome()
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
@@ -877,6 +880,7 @@ def build_turn_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
+                _attempt_outcome = capture_compression_attempt_outcome(agent)
                 if (
                     messages is _preflight_input
                     and compression_skipped_due_to_lock(agent)
@@ -910,6 +914,7 @@ def build_turn_context(
                     after_count=len(messages),
                     before_tokens=_orig_tokens,
                     after_tokens=_preflight_tokens,
+                    attempt_outcome=_attempt_outcome,
                 ):
                     _preflight_compression_blocked = True
                     break  # Cannot compress further: neither rows nor tokens moved

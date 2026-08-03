@@ -52,6 +52,7 @@ thread, not the conversation thread. Extension authors must assume:
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import copy
 import inspect
 import json
@@ -107,6 +108,72 @@ NATIVE_OPENAI_COMPACTION_INSTRUCTIONS = (
 )
 
 
+class _CompressionAttemptOutcome:
+    """Mutable, payload-free result shared with one compression caller context."""
+
+    __slots__ = ("agent_id", "attempt_id", "_native_succeeded", "_lock")
+
+    def __init__(self, agent: Any) -> None:
+        self.agent_id = id(agent)
+        self.attempt_id = uuid.uuid4().hex
+        self._native_succeeded = False
+        self._lock = threading.Lock()
+
+    @property
+    def native_succeeded(self) -> bool:
+        with self._lock:
+            return self._native_succeeded is True
+
+    def mark_native_succeeded(self) -> None:
+        with self._lock:
+            self._native_succeeded = True
+
+    def __repr__(self) -> str:
+        return (
+            "_CompressionAttemptOutcome("
+            f"attempt_id={self.attempt_id!r}, "
+            f"native_succeeded={self.native_succeeded!r})"
+        )
+
+
+_COMPRESSION_ATTEMPT_OUTCOME: contextvars.ContextVar[
+    Optional[_CompressionAttemptOutcome]
+] = contextvars.ContextVar("compression_attempt_outcome", default=None)
+
+
+def _begin_compression_attempt_outcome(
+    agent: Any,
+    outcome: Optional[_CompressionAttemptOutcome] = None,
+) -> _CompressionAttemptOutcome:
+    """Bind a fresh or caller-provided result to the current execution context."""
+    if outcome is None or outcome.agent_id != id(agent):
+        outcome = _CompressionAttemptOutcome(agent)
+    _COMPRESSION_ATTEMPT_OUTCOME.set(outcome)
+    return outcome
+
+
+def _mark_native_compression_attempt_succeeded(agent: Any) -> None:
+    """Mark only the compression attempt bound to this execution context."""
+    outcome = _COMPRESSION_ATTEMPT_OUTCOME.get()
+    if outcome is not None and outcome.agent_id == id(agent):
+        outcome.mark_native_succeeded()
+
+
+def capture_compression_attempt_outcome(
+    agent: Any,
+) -> Optional[_CompressionAttemptOutcome]:
+    """Capture the exact attempt result visible to the current caller context."""
+    outcome = _COMPRESSION_ATTEMPT_OUTCOME.get()
+    if outcome is None or outcome.agent_id != id(agent):
+        return None
+    return outcome
+
+
+def reset_compression_attempt_outcome() -> None:
+    """Clear any completed-attempt result at the start of a new turn."""
+    _COMPRESSION_ATTEMPT_OUTCOME.set(None)
+
+
 def compression_attempt_made_progress(
     agent: Any,
     *,
@@ -116,9 +183,16 @@ def compression_attempt_made_progress(
     after_tokens: int,
     old_context_length: Optional[int] = None,
     new_context_length: Optional[int] = None,
+    attempt_outcome: Optional[_CompressionAttemptOutcome] = None,
 ) -> bool:
     """Return whether one compression attempt produced retryable progress."""
-    if getattr(agent, "_last_native_compaction_succeeded", False) is True:
+    native_succeeded = getattr(agent, "_last_native_compaction_succeeded", False)
+    if attempt_outcome is not None:
+        native_succeeded = (
+            attempt_outcome.agent_id == id(agent)
+            and attempt_outcome.native_succeeded is True
+        )
+    if native_succeeded is True:
         return True
     if after_count < before_count:
         return True
@@ -2349,6 +2423,7 @@ def _try_native_openai_compaction(
             # textual fallback after that point or expose exception details.
             logger.debug("native compaction bookkeeping failed after commit")
         agent._last_native_compaction_succeeded = True
+        _mark_native_compression_attempt_succeeded(agent)
         agent._last_compression_attempt_in_place = None
         agent._last_compaction_in_place = False
         return "success"
@@ -2368,6 +2443,7 @@ def compress_context(
     force: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    attempt_outcome: Optional[_CompressionAttemptOutcome] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2390,6 +2466,8 @@ def compress_context(
         commit_fence: Optional cooperative fence for executor callers that
             may time out. It prevents a late worker from mutating session state
             after its caller has moved on.
+        attempt_outcome: Internal caller-owned result object. The timeout worker
+            marks this exact object so retry progress remains attempt-scoped.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -2398,7 +2476,8 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
-    # Dedicated per-attempt native outcome signal. Reset before every early
+    _begin_compression_attempt_outcome(agent, attempt_outcome)
+    # Dedicated legacy per-attempt native outcome signal. Reset before every early
     # return so a prior successful attempt can never leak into this one.
     agent._last_native_compaction_succeeded = False
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
@@ -4250,9 +4329,11 @@ __all__ = [
     "COMPACTION_STATUS",
     "COMPACTION_DONE_STATUS",
     "COMPACTION_STATUS_MARKER",
+    "capture_compression_attempt_outcome",
     "check_compression_model_feasibility",
     "compression_attempt_made_progress",
     "replay_compression_warning",
+    "reset_compression_attempt_outcome",
     "compress_context",
     "try_shrink_image_parts_in_messages",
 ]

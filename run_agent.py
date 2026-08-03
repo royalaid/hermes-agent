@@ -7132,6 +7132,7 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import (
+            _begin_compression_attempt_outcome,
             CompressionCommitFence,
             compress_context,
             resolve_context_compression_timeouts,
@@ -7165,6 +7166,7 @@ class AIAgent:
         # manual paths. hard_interrupt() uses this exact instance to serialize
         # cancel admission against begin_commit().
         active_fence = commit_fence or CompressionCommitFence()
+        attempt_outcome = _begin_compression_attempt_outcome(self)
         # A single agent can receive overlapping automatic/manual entrypoints.
         # Serialize fence publication so a waiter cannot replace the fence of
         # the attempt currently generating/committing a summary.
@@ -7190,6 +7192,7 @@ class AIAgent:
                         defer_context_engine_notification
                     ),
                     commit_fence=fence,
+                    attempt_outcome=attempt_outcome,
                 )
 
             # Callers that already own a progress-aware wait (gateway session
