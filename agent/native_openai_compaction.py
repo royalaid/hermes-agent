@@ -740,6 +740,42 @@ class NativeCompactionCheckpoint:
         }
 
 
+def checkpoint_from_candidate(
+    *,
+    candidate: NativeCompactionCandidate,
+    session_id: str,
+    identity: NativeCompactionIdentity,
+    previous_checkpoint: NativeCompactionCheckpoint | None,
+    now: float,
+) -> NativeCompactionCheckpoint:
+    """Freeze a validated candidate as the next immutable checkpoint generation."""
+    if type(candidate) is not NativeCompactionCandidate:
+        raise ValueError("candidate must be a native compaction candidate")
+    if type(identity) is not NativeCompactionIdentity:
+        raise ValueError("identity must be a native compaction identity")
+    matching_previous = (
+        type(previous_checkpoint) is NativeCompactionCheckpoint
+        and previous_checkpoint.session_id == session_id
+        and previous_checkpoint.identity == identity
+    )
+    generation = previous_checkpoint.generation + 1 if matching_previous else 1
+    created_at = previous_checkpoint.created_at if matching_previous else now
+    return NativeCompactionCheckpoint(
+        session_id=session_id,
+        identity=identity,
+        source_input_item_count=candidate.source_input_item_count,
+        source_input_sha256=candidate.source_input_sha256,
+        output=candidate.output,
+        compact_response_id=candidate.compact_response_id,
+        compact_created_at=candidate.compact_created_at,
+        input_item_count=candidate.input_item_count,
+        output_item_count=candidate.output_item_count,
+        generation=generation,
+        created_at=created_at,
+        updated_at=now,
+    )
+
+
 def checkpoint_matches(
     identity: NativeCompactionIdentity,
     checkpoint: NativeCompactionCheckpoint,
