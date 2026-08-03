@@ -695,6 +695,31 @@ def test_cut_refuses_malformed_detached_tool_history_when_no_safe_prefix_exists(
     )
 
 
+def test_cut_refuses_malformed_tool_group_in_retained_tail():
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_1", "function": {"name": "terminal", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "wrong", "content": "result"},
+    ]
+
+    assert (
+        select_native_compaction_cut(
+            messages, protect_last_n=2, serialize_input=_serialize_rows
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     "messages,protect_last_n",
     [

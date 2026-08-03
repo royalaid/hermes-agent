@@ -64,6 +64,70 @@ class TestCodexBuildKwargs:
         assert serialized == ordinary["input"]
         assert isinstance(serialized, list)
 
+    def test_build_input_items_matches_final_codex_wire_preflight(self, transport):
+        sentinel = "<" + "|" + "end" + "|" + ">"
+        messages = [
+            {"role": "user", "content": f"user {sentinel}"},
+            {
+                "role": "assistant",
+                "content": "answer",
+                "codex_reasoning_items": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "opaque",
+                        "summary": [
+                            {"type": "summary_text", "text": f"reasoning {sentinel}"}
+                        ],
+                    }
+                ],
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {"type": "output_text", "text": f"message {sentinel}"}
+                        ],
+                    }
+                ],
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": f'{{"command":"printf {sentinel}"}}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": f"output {sentinel}",
+            },
+        ]
+
+        serialized = transport.build_input_items(messages, is_codex_backend=True)
+        ordinary = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+        )
+        finalized = transport.preflight_kwargs(
+            ordinary,
+            is_github_responses=False,
+            sanitize_harmony_tokens=True,
+        )
+
+        assert serialized == finalized["input"]
+        assert sentinel not in json.dumps(serialized)
+        assert transport.preflight_kwargs(
+            finalized,
+            is_github_responses=False,
+            sanitize_harmony_tokens=True,
+        ) == finalized
+
     def test_build_input_items_substitutes_sidecars_without_mutating_messages(
         self, transport
     ):
