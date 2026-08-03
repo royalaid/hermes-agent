@@ -942,6 +942,20 @@ def _ensure_hermes_home_managed(home: Path):
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG, OPTIONAL_ENV_VARS  # noqa: F401
 
+
+def openai_native_compaction_enabled(config: Any) -> bool:
+    """Return the strict, default-off native Responses compaction flag.
+
+    Only a YAML/config boolean ``true`` enables the feature.  This accessor is
+    deliberately non-mutating and fail-closed for partial or invalid config.
+    """
+    if not isinstance(config, dict):
+        return False
+    compression = config.get("compression")
+    if not isinstance(compression, dict):
+        return False
+    return compression.get("openai_native") is True
+
 # =============================================================================
 # Config Migration System
 # =============================================================================

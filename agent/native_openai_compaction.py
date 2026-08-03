@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from agent.backend_identity import BackendIdentity
+from hermes_cli.route_identity import normalize_route_base_url
 
 
 def _validate_json_value(value: Any, active_containers: set[int] | None = None) -> None:
@@ -86,6 +87,77 @@ def _safe_base_url_host(base_url: str) -> str:
     ):
         return ""
     return host
+
+
+@dataclass(frozen=True)
+class NativeCompactionPolicy:
+    """Payload-safe, fail-closed eligibility gates for native compaction.
+
+    The policy stores only booleans established at agent initialization.  The
+    client and effective route are supplied to each check so provider fallback
+    or model switching cannot leave eligibility pinned to stale route state.
+    """
+
+    feature_enabled: bool = False
+    built_in_compressor: bool = False
+    has_session_state: bool = False
+
+    @classmethod
+    def from_runtime(
+        cls,
+        *,
+        feature_enabled: Any,
+        context_compressor: Any,
+        session_db: Any,
+        session_id: Any,
+    ) -> "NativeCompactionPolicy":
+        from agent.context_compressor import ContextCompressor
+
+        return cls(
+            feature_enabled=feature_enabled is True,
+            built_in_compressor=isinstance(context_compressor, ContextCompressor),
+            has_session_state=(
+                session_db is not None
+                and isinstance(session_id, str)
+                and bool(session_id.strip())
+            ),
+        )
+
+    def is_eligible(
+        self,
+        *,
+        client: Any,
+        provider: Any,
+        api_mode: Any,
+        base_url: Any,
+    ) -> bool:
+        """Evaluate the current client and effective route without retaining them."""
+        if not (
+            self.feature_enabled
+            and self.built_in_compressor
+            and self.has_session_state
+        ):
+            return False
+        if str(api_mode or "").strip().lower() != "codex_responses":
+            return False
+
+        try:
+            compact = getattr(getattr(client, "responses", None), "compact", None)
+            if not callable(compact):
+                return False
+
+            parsed = urlsplit(str(base_url or ""))
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                return False
+            route = normalize_route_base_url(base_url)
+        except Exception:
+            return False
+
+        provider_id = str(provider or "").strip().lower()
+        return (provider_id, route) in {
+            ("openai", "https://api.openai.com/v1"),
+            ("openai-codex", "https://chatgpt.com/backend-api/codex"),
+        }
 
 
 @dataclass(frozen=True)
