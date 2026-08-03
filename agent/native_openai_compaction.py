@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -122,6 +123,100 @@ class NativeCompactionCut:
     def source_input(self) -> list[dict]:
         """Return a fresh decode so callers cannot mutate the held prefix."""
         return json.loads(self._source_input_json)
+
+
+@dataclass(frozen=True, init=False)
+class NativeCompactionCandidate:
+    """Validated native compact output awaiting durable checkpoint creation."""
+
+    source_input_item_count: int
+    source_input_sha256: str
+    compact_response_id: str | None
+    compact_created_at: float | None
+    input_item_count: int
+    output_item_count: int
+    _output_json: str = field(repr=False, compare=True)
+
+    def __init__(
+        self,
+        *,
+        source_input_item_count: int,
+        source_input_sha256: str,
+        compact_response_id: str | None,
+        compact_created_at: float | None,
+        input_item_count: int,
+        output_item_count: int,
+        output: list[Any],
+    ) -> None:
+        for name, value in (
+            ("source_input_item_count", source_input_item_count),
+            ("input_item_count", input_item_count),
+            ("output_item_count", output_item_count),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if (
+            type(source_input_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", source_input_sha256) is None
+        ):
+            raise ValueError("source_input_sha256 must be a lowercase SHA-256 digest")
+        if compact_response_id is not None and (
+            type(compact_response_id) is not str or not compact_response_id.strip()
+        ):
+            raise ValueError("compact_response_id must be a non-empty plain string")
+        if compact_created_at is not None and (
+            type(compact_created_at) not in (int, float)
+            or not math.isfinite(compact_created_at)
+            or compact_created_at < 0
+        ):
+            raise ValueError(
+                "compact_created_at must be a non-negative finite timestamp"
+            )
+        if type(output) is not list or not output:
+            raise ValueError("output must be a non-empty JSON list")
+        try:
+            output_json = _canonical_json_bytes(output).decode("utf-8")
+        except ValueError:
+            raise ValueError("output must be a non-empty JSON list") from None
+        if output_item_count != len(output):
+            raise ValueError("output_item_count must match output length")
+
+        object.__setattr__(self, "source_input_item_count", source_input_item_count)
+        object.__setattr__(self, "source_input_sha256", source_input_sha256)
+        object.__setattr__(self, "compact_response_id", compact_response_id)
+        object.__setattr__(self, "compact_created_at", compact_created_at)
+        object.__setattr__(self, "input_item_count", input_item_count)
+        object.__setattr__(self, "output_item_count", output_item_count)
+        object.__setattr__(self, "_output_json", output_json)
+
+    @property
+    def output(self) -> list[Any]:
+        """Return a fresh decode so callers cannot mutate candidate output."""
+        return json.loads(self._output_json)
+
+
+@dataclass(frozen=True)
+class NativeCompactionFailure:
+    """Payload-free classification directing the caller to textual fallback."""
+
+    classification: str
+    retryable: bool
+    use_textual_fallback: bool
+
+    def __post_init__(self) -> None:
+        if self.classification not in {
+            "auth",
+            "unsupported",
+            "timeout",
+            "network",
+            "invalid_response",
+            "client",
+        }:
+            raise ValueError("classification must be a supported stable category")
+        if type(self.retryable) is not bool:
+            raise ValueError("retryable must be a boolean")
+        if self.use_textual_fallback is not True:
+            raise ValueError("use_textual_fallback must be true")
 
 
 def _tool_atomic_prefix(messages: list[dict]) -> bool:
@@ -675,3 +770,207 @@ def apply_checkpoint(
     if canonical_input_sha256(ordinary_input[:count]) != checkpoint.source_input_sha256:
         raise ValueError("ordinary input does not match checkpoint prefix")
     return checkpoint.output + copy.deepcopy(ordinary_input[count:])
+
+
+def _native_compaction_failure(
+    classification: str, *, retryable: bool = False
+) -> NativeCompactionFailure:
+    return NativeCompactionFailure(classification, retryable, True)
+
+
+def _classify_native_compaction_exception(exc: Exception) -> NativeCompactionFailure:
+    """Classify without formatting or retaining the exception."""
+    try:
+        status_code = getattr(exc, "status_code", None)
+    except Exception:
+        status_code = None
+    if type(status_code) is int:
+        if status_code in (401, 403):
+            return _native_compaction_failure("auth")
+        if status_code in (404, 405, 501):
+            return _native_compaction_failure("unsupported")
+
+    try:
+        import openai
+
+        auth_types = tuple(
+            exception_type
+            for exception_type in (
+                getattr(openai, "AuthenticationError", None),
+                getattr(openai, "PermissionDeniedError", None),
+            )
+            if isinstance(exception_type, type)
+        )
+        timeout_types = tuple(
+            exception_type
+            for exception_type in (getattr(openai, "APITimeoutError", None),)
+            if isinstance(exception_type, type)
+        )
+        network_types = tuple(
+            exception_type
+            for exception_type in (getattr(openai, "APIConnectionError", None),)
+            if isinstance(exception_type, type)
+        )
+    except Exception:
+        auth_types = timeout_types = network_types = ()
+
+    if auth_types and isinstance(exc, auth_types):
+        return _native_compaction_failure("auth")
+    if isinstance(exc, TimeoutError) or (
+        timeout_types and isinstance(exc, timeout_types)
+    ):
+        return _native_compaction_failure("timeout", retryable=True)
+    if isinstance(exc, ConnectionError) or (
+        network_types and isinstance(exc, network_types)
+    ):
+        return _native_compaction_failure("network", retryable=True)
+
+    exception_name = type(exc).__name__.lower()
+    if "unsupported" in exception_name or "notfound" in exception_name:
+        return _native_compaction_failure("unsupported")
+    return _native_compaction_failure("client")
+
+
+def request_native_compaction_candidate(
+    agent: Any,
+    *,
+    model: str,
+    cut: NativeCompactionCut,
+    compact_instructions: str,
+    resolved_timeout: float | None,
+    previous_checkpoint: NativeCompactionCheckpoint | None = None,
+) -> NativeCompactionCandidate | NativeCompactionFailure:
+    """Request one isolated native compact generation without mutating state."""
+    if (
+        type(model) is not str
+        or not model.strip()
+        or type(compact_instructions) is not str
+        or (
+            resolved_timeout is not None
+            and (
+                type(resolved_timeout) not in (int, float)
+                or not math.isfinite(resolved_timeout)
+                or resolved_timeout <= 0
+            )
+        )
+        or type(cut) is not NativeCompactionCut
+        or (
+            previous_checkpoint is not None
+            and type(previous_checkpoint) is not NativeCompactionCheckpoint
+        )
+    ):
+        return _native_compaction_failure("client")
+
+    source_input = cut.source_input
+    if previous_checkpoint is None:
+        effective_input = source_input
+    else:
+        old_count = previous_checkpoint.source_input_item_count
+        if old_count >= cut.source_input_item_count:
+            return _native_compaction_failure("invalid_response")
+        try:
+            prefix_matches = (
+                canonical_input_sha256(source_input[:old_count])
+                == previous_checkpoint.source_input_sha256
+            )
+        except ValueError:
+            prefix_matches = False
+        if not prefix_matches:
+            return _native_compaction_failure("invalid_response")
+        effective_input = previous_checkpoint.output + copy.deepcopy(
+            source_input[old_count:]
+        )
+
+    try:
+        client = agent._create_request_openai_client(
+            reason="native_openai_compaction", api_kwargs={"model": model}
+        )
+    except Exception as exc:
+        return _classify_native_compaction_exception(exc)
+
+    try:
+        try:
+            compact = getattr(getattr(client, "responses", None), "compact", None)
+        except Exception:
+            result: NativeCompactionCandidate | NativeCompactionFailure = (
+                _native_compaction_failure("unsupported")
+            )
+        else:
+            if not callable(compact):
+                result = _native_compaction_failure("unsupported")
+            else:
+                try:
+                    response = compact(
+                        model=model,
+                        input=copy.deepcopy(effective_input),
+                        instructions=compact_instructions,
+                        timeout=resolved_timeout,
+                    )
+                except Exception as exc:
+                    result = _classify_native_compaction_exception(exc)
+                else:
+                    result = _candidate_from_compact_response(
+                        response,
+                        cut=cut,
+                        input_item_count=len(effective_input),
+                    )
+    except Exception:
+        result = _native_compaction_failure("invalid_response")
+
+    try:
+        agent._close_request_openai_client(
+            client, reason="native_openai_compaction"
+        )
+    except Exception:
+        return _native_compaction_failure("client")
+    return result
+
+
+def _candidate_from_compact_response(
+    response: Any,
+    *,
+    cut: NativeCompactionCut,
+    input_item_count: int,
+) -> NativeCompactionCandidate | NativeCompactionFailure:
+    try:
+        output = response.output
+        if not isinstance(output, list) or not output:
+            return _native_compaction_failure("invalid_response")
+
+        serialized_output: list[Any] = []
+        for item in output:
+            model_dump = getattr(item, "model_dump", None)
+            if callable(model_dump):
+                serialized_output.append(model_dump(mode="json"))
+            else:
+                serialized_output.append(copy.deepcopy(item))
+
+        try:
+            response_id = response.id
+        except Exception:
+            response_id = None
+        if type(response_id) is not str or not response_id.strip():
+            response_id = None
+
+        try:
+            created_at = response.created_at
+        except Exception:
+            created_at = None
+        if (
+            type(created_at) not in (int, float)
+            or not math.isfinite(created_at)
+            or created_at < 0
+        ):
+            created_at = None
+
+        return NativeCompactionCandidate(
+            source_input_item_count=cut.source_input_item_count,
+            source_input_sha256=cut.source_input_sha256,
+            compact_response_id=response_id,
+            compact_created_at=created_at,
+            input_item_count=input_item_count,
+            output_item_count=len(serialized_output),
+            output=serialized_output,
+        )
+    except Exception:
+        return _native_compaction_failure("invalid_response")
