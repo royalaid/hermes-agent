@@ -41,7 +41,7 @@ class NativeOpenAICompactionStateMixin:
 
         def _do(conn):
             conn.execute(
-                """INSERT INTO native_openai_compaction (
+                """INSERT INTO native_openai_compaction_checkpoints (
                        session_id, provider, api_mode, model, base_url,
                        issuer_kind, credential_scope, replay_encrypted_reasoning,
                        source_input_item_count, source_input_sha256, output_json,
@@ -77,7 +77,7 @@ class NativeOpenAICompactionStateMixin:
         """Load and validate a checkpoint, failing open on malformed state."""
         with self._read_ctx() as conn:
             row = conn.execute(
-                "SELECT * FROM native_openai_compaction WHERE session_id = ?",
+                "SELECT * FROM native_openai_compaction_checkpoints WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
         if row is None:
@@ -158,7 +158,7 @@ class NativeOpenAICompactionStateMixin:
 
         def _do(conn):
             cursor = conn.execute(
-                "DELETE FROM native_openai_compaction WHERE session_id = ?",
+                "DELETE FROM native_openai_compaction_checkpoints WHERE session_id = ?",
                 (session_id,),
             )
             return cursor.rowcount > 0

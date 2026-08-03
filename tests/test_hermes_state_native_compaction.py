@@ -125,7 +125,7 @@ def test_upsert_replaces_the_complete_checkpoint_in_one_session_row(db):
 
     with db._read_ctx() as conn:
         row_count = conn.execute(
-            "SELECT COUNT(*) FROM native_openai_compaction WHERE session_id = ?",
+            "SELECT COUNT(*) FROM native_openai_compaction_checkpoints WHERE session_id = ?",
             ("session-1",),
         ).fetchone()[0]
     assert row_count == 1
@@ -156,7 +156,7 @@ def test_corrupt_rows_fail_open_without_logging_or_repr_payloads(db, caplog):
 
     def _corrupt_output(conn):
         conn.execute(
-            "UPDATE native_openai_compaction "
+            "UPDATE native_openai_compaction_checkpoints "
             "SET output_json = ?, credential_scope = ? WHERE session_id = ?",
             (f'not-json-{OPAQUE_PAYLOAD_SENTINEL}', API_KEY_SENTINEL, "session-1"),
         )
@@ -168,7 +168,7 @@ def test_corrupt_rows_fail_open_without_logging_or_repr_payloads(db, caplog):
 
     def _corrupt_scalar(conn):
         conn.execute(
-            "UPDATE native_openai_compaction "
+            "UPDATE native_openai_compaction_checkpoints "
             "SET generation = ?, output_json = ?, credential_scope = ? "
             "WHERE session_id = ?",
             (
@@ -226,7 +226,7 @@ def test_export_import_and_child_creation_do_not_copy_checkpoint(tmp_path):
 
         exported = source.export_session("session-1")
         assert exported is not None
-        assert "native_openai_compaction" not in exported
+        assert "native_openai_compaction_checkpoints" not in exported
         assert destination.import_sessions([exported])["ok"] is True
         assert destination.load_native_openai_checkpoint("session-1") is None
 
@@ -261,17 +261,19 @@ def test_native_compaction_table_has_scoped_schema_and_cascade(db):
         "updated_at",
     ]
     with db._read_ctx() as conn:
-        columns = [
-            row["name"]
-            for row in conn.execute(
-                'PRAGMA table_info("native_openai_compaction")'
-            ).fetchall()
-        ]
+        column_rows = conn.execute(
+            'PRAGMA table_info("native_openai_compaction_checkpoints")'
+        ).fetchall()
+        columns = [row["name"] for row in column_rows]
+        defaults = {row["name"]: row["dflt_value"] for row in column_rows}
         foreign_keys = conn.execute(
-            'PRAGMA foreign_key_list("native_openai_compaction")'
+            'PRAGMA foreign_key_list("native_openai_compaction_checkpoints")'
         ).fetchall()
 
     assert columns == expected_columns
+    assert defaults["credential_scope"] == "''"
+    assert defaults["replay_encrypted_reasoning"] == "0"
+    assert defaults["generation"] == "1"
     assert len(foreign_keys) == 1
     assert foreign_keys[0]["table"] == "sessions"
     assert foreign_keys[0]["from"] == "session_id"
