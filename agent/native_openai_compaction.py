@@ -1,7 +1,8 @@
-"""Opaque native OpenAI compaction checkpoint primitives.
+"""Opaque native OpenAI compaction identities, projection, and requests.
 
-This module owns only immutable identity/checkpoint data and pure prefix
-projection. Transport, persistence, and orchestration belong elsewhere.
+This module owns immutable checkpoint data, strict prefix/output validation,
+route policy, and the isolated request-client lifecycle. Durable persistence
+and transcript orchestration remain in their existing state/compression seams.
 """
 
 from __future__ import annotations
@@ -915,6 +916,8 @@ def request_native_compaction_candidate(
     resolved_timeout: float | None,
     previous_checkpoint: NativeCompactionCheckpoint | None = None,
     pre_dispatch_check: Callable[[], bool] | None = None,
+    dispatch_fence: Any = None,
+    hard_cancel_event: Any = None,
 ) -> NativeCompactionCandidate | NativeCompactionFailure:
     """Request one isolated native compact generation without mutating state."""
     if (
@@ -931,6 +934,15 @@ def request_native_compaction_candidate(
         )
         or type(cut) is not NativeCompactionCut
         or (pre_dispatch_check is not None and not callable(pre_dispatch_check))
+        or (
+            dispatch_fence is not None
+            and (
+                not callable(getattr(type(dispatch_fence), "begin_dispatch", None))
+                or not callable(
+                    getattr(type(dispatch_fence), "finish_dispatch", None)
+                )
+            )
+        )
         or (
             previous_checkpoint is not None
             and type(previous_checkpoint) is not NativeCompactionCheckpoint
@@ -993,24 +1005,58 @@ def request_native_compaction_candidate(
                                 dispatch_allowed = False
                         else:
                             dispatch_allowed = True
+                        dispatch_entered = False
+                        if dispatch_allowed and dispatch_fence is not None:
+                            try:
+                                dispatch_entered = (
+                                    type(dispatch_fence).begin_dispatch(
+                                        dispatch_fence, hard_cancel_event
+                                    )
+                                    is True
+                                )
+                            except Exception:
+                                dispatch_entered = False
+                            dispatch_allowed = dispatch_entered
+                            if dispatch_entered and pre_dispatch_check is not None:
+                                try:
+                                    dispatch_allowed = pre_dispatch_check() is True
+                                except Exception:
+                                    dispatch_allowed = False
+                                if not dispatch_allowed:
+                                    try:
+                                        type(dispatch_fence).finish_dispatch(
+                                            dispatch_fence
+                                        )
+                                    except Exception:
+                                        pass
+                                    dispatch_entered = False
                         if not dispatch_allowed:
                             result = _native_compaction_failure("client")
                         else:
                             try:
-                                response = compact(
-                                    model=model,
-                                    input=request_input,
-                                    instructions=compact_instructions,
-                                    timeout=resolved_timeout,
-                                )
-                            except Exception as exc:
-                                result = _classify_native_compaction_exception(exc)
-                            else:
-                                result = _candidate_from_compact_response(
-                                    response,
-                                    cut=cut,
-                                    input_item_count=len(effective_input),
-                                )
+                                try:
+                                    response = compact(
+                                        model=model,
+                                        input=request_input,
+                                        instructions=compact_instructions,
+                                        timeout=resolved_timeout,
+                                    )
+                                except Exception as exc:
+                                    result = _classify_native_compaction_exception(exc)
+                                else:
+                                    result = _candidate_from_compact_response(
+                                        response,
+                                        cut=cut,
+                                        input_item_count=len(effective_input),
+                                    )
+                            finally:
+                                if dispatch_entered:
+                                    try:
+                                        type(dispatch_fence).finish_dispatch(
+                                            dispatch_fence
+                                        )
+                                    except Exception:
+                                        result = _native_compaction_failure("client")
         except Exception:
             result = _native_compaction_failure("invalid_response")
     except BaseException:

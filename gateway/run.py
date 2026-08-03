@@ -22257,6 +22257,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("model", "context_length"),
         ("model", "max_tokens"),
         ("compression", "enabled"),
+        ("compression", "openai_native"),
         ("compression", "progress_notices"),
         ("compression", "threshold"),
         ("compression", "model_thresholds"),
