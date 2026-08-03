@@ -2285,12 +2285,9 @@ def _try_native_openai_compaction(
         )
         try:
             session_db.upsert_native_openai_checkpoint(checkpoint)
-        except Exception as exc:
-            logger.debug(
-                "native compaction checkpoint persistence failed (%s)",
-                type(exc).__name__,
-            )
-            return "fallback"
+        except Exception:
+            logger.debug("native compaction checkpoint persistence failed")
+            return "abort" if not _commit_still_owned() else "fallback"
 
         try:
             agent.context_compressor.record_external_compaction(
@@ -2298,13 +2295,10 @@ def _try_native_openai_compaction(
                 source_items=candidate.source_input_item_count,
                 output_items=candidate.output_item_count,
             )
-        except Exception as exc:
+        except Exception:
             # The durable checkpoint is authoritative once committed. Never run
-            # textual fallback after that point or expose exception contents.
-            logger.debug(
-                "native compaction bookkeeping failed after commit (%s)",
-                type(exc).__name__,
-            )
+            # textual fallback after that point or expose exception details.
+            logger.debug("native compaction bookkeeping failed after commit")
         agent._last_native_compaction_succeeded = True
         agent._last_compression_attempt_in_place = None
         agent._last_compaction_in_place = False
