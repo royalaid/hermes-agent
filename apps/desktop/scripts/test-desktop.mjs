@@ -322,6 +322,13 @@ function validateBundle() {
   if (!stamp.branch || typeof stamp.branch !== 'string') {
     die(`install-stamp.json is missing the branch field: ${JSON.stringify(stamp)}`)
   }
+  const repositoryParts = typeof stamp.repository === 'string' ? stamp.repository.split('/') : []
+  if (
+    repositoryParts.length !== 2 ||
+    !repositoryParts.every(part => /^[0-9A-Za-z_.-]+$/.test(part) && part !== '.' && part !== '..')
+  ) {
+    die(`install-stamp.json is missing a usable repository field: ${JSON.stringify(stamp)}`)
+  }
 
   // Positive assertion: node-pty native deps shipped
   const native = expectedNativeDepPaths()
@@ -390,7 +397,7 @@ function printArtifacts(options = {}) {
   }
   console.log(`  runtime: ${runtimeRoot}`)
   if (stamp) {
-    console.log(`  install-stamp: ${stamp.commit.slice(0, 12)} on ${stamp.branch}`)
+    console.log(`  install-stamp: ${stamp.repository}@${stamp.commit.slice(0, 12)} on ${stamp.branch}`)
   }
   if (options.nodeBinaries && options.nodeBinaries.length > 0) {
     console.log(`  node-pty binaries: ${options.nodeBinaries.join(', ')}`)

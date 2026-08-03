@@ -9,6 +9,7 @@
  *     "schemaVersion": 1,
  *     "commit":        "<40-char SHA>",
  *     "branch":        "<branch name>",
+ *     "repository":    "<owner/repo>",
  *     "builtAt":       "<ISO 8601 UTC timestamp>",
  *     "dirty":         true|false,
  *     "source":        "ci" | "local" | "fallback"
@@ -37,6 +38,35 @@ const STAMP_SCHEMA_VERSION = 1
 /** All-zero placeholder used when no real commit can be resolved. */
 export const FALLBACK_COMMIT = "0000000000000000000000000000000000000000"
 export const FALLBACK_BRANCH = "main"
+export const DEFAULT_REPOSITORY = "NousResearch/hermes-agent"
+
+function repositoryFromEnv(env = process.env) {
+  const repository = env.GITHUB_REPOSITORY
+  if (typeof repository !== "string" || !/^[0-9A-Za-z_.-]+\/[0-9A-Za-z_.-]+$/.test(repository)) {
+    return DEFAULT_REPOSITORY
+  }
+  const [owner, name] = repository.split("/")
+  return owner === "." || owner === ".." || name === "." || name === ".." ? DEFAULT_REPOSITORY : repository
+}
+
+function repositoryFromRemoteUrl(url) {
+  if (typeof url !== "string") return null
+  const match = url.match(
+    /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([0-9A-Za-z_.-]+)\/([0-9A-Za-z_.-]+?)(?:\.git)?$/
+  )
+  if (!match) return null
+  const [, owner, name] = match
+  return owner === "." || owner === ".." || name === "." || name === ".." ? null : `${owner}/${name}`
+}
+
+function repositoryFromUpstream(repoRoot, execFn) {
+  const upstream = execFn("git rev-parse --abbrev-ref --symbolic-full-name @{upstream}", { cwd: repoRoot })
+  if (!upstream) return null
+  const slash = upstream.indexOf("/")
+  const remote = slash > 0 ? upstream.slice(0, slash) : ""
+  if (!/^[0-9A-Za-z._-]+$/.test(remote)) return null
+  return repositoryFromRemoteUrl(execFn(`git remote get-url --push ${remote}`, { cwd: repoRoot }))
+}
 
 const DESKTOP_ROOT = resolve(import.meta.dirname, "..")
 const REPO_ROOT = resolve(DESKTOP_ROOT, "..", "..")
@@ -58,6 +88,7 @@ export function fromCI(env = process.env) {
   return {
     commit: sha,
     branch: branch,
+    repository: repositoryFromEnv(env),
     dirty: false, // CI builds from a checkout-of-ref by definition
     source: "ci"
   }
@@ -78,6 +109,7 @@ export function fromLocalGit(repoRoot = REPO_ROOT, execFn = tryExec) {
   return {
     commit: sha,
     branch: branch === "HEAD" ? null : branch, // detached HEAD -> null
+    repository: repositoryFromUpstream(repoRoot, execFn) || DEFAULT_REPOSITORY,
     dirty: dirty,
     source: "local"
   }
@@ -92,6 +124,7 @@ export function fromFallback(branch = FALLBACK_BRANCH) {
   return {
     commit: FALLBACK_COMMIT,
     branch: branch || FALLBACK_BRANCH,
+    repository: DEFAULT_REPOSITORY,
     dirty: false,
     source: "fallback"
   }
@@ -153,6 +186,7 @@ function main() {
     schemaVersion: STAMP_SCHEMA_VERSION,
     commit: stamp.commit,
     branch: stamp.branch,
+    repository: stamp.repository || DEFAULT_REPOSITORY,
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
     source: stamp.source
