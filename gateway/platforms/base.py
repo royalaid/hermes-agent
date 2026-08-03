@@ -1456,6 +1456,8 @@ _NATIVE_OPENAI_SCOPE_KEY_BASENAME = "native_openai_scope.key"
 def _is_native_openai_scope_key_basename(path: str | Path) -> bool:
     basename = os.path.basename(os.path.normpath(os.path.expanduser(str(path))))
     if os.name == "nt":
+        # Match NTFS alternate-data-stream aliases to their protected base file.
+        basename = basename.split(":", 1)[0]
         return basename.casefold() == _NATIVE_OPENAI_SCOPE_KEY_BASENAME.casefold()
     return basename == _NATIVE_OPENAI_SCOPE_KEY_BASENAME
 
