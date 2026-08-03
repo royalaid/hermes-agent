@@ -2502,6 +2502,19 @@ def init_agent(
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
         except Exception:
             pass
+
+    # Native Responses compaction is an explicit, fail-closed policy.  The
+    # policy retains no client or route credentials; future call sites must
+    # provide the then-current client/provider/api_mode/base_url to eligibility.
+    from agent.native_openai_compaction import NativeCompactionPolicy
+    from hermes_cli.config import openai_native_compaction_enabled
+
+    agent.native_compaction_policy = NativeCompactionPolicy.from_runtime(
+        feature_enabled=openai_native_compaction_enabled(_agent_cfg),
+        context_compressor=agent.context_compressor,
+        session_db=session_db,
+        session_id=agent.session_id,
+    )
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     # Apply micro-compaction settings to the compressor (feature is opt-in)

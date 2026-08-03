@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
+from agent.context_compressor import ContextCompressor
 from agent.native_openai_compaction import (
     NativeCompactionCheckpoint,
     NativeCompactionIdentity,
@@ -23,6 +25,158 @@ OPAQUE_OUTPUT = [
     },
     {"type": "compaction", "encrypted_content": "opaque-B"},
 ]
+
+
+class _FakeCompactClient:
+    def __init__(self, compact=object()):
+        self.responses = SimpleNamespace(compact=compact)
+
+
+def _policy(*, enabled=True, builtin=True, session_db=object(), session_id="session-1"):
+    from agent.native_openai_compaction import NativeCompactionPolicy
+
+    compressor = object.__new__(ContextCompressor) if builtin else object()
+    return NativeCompactionPolicy.from_runtime(
+        feature_enabled=enabled,
+        context_compressor=compressor,
+        session_db=session_db,
+        session_id=session_id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", "https://api.openai.com/v1"),
+        (" OPENAI ", "HTTPS://API.OPENAI.COM:443/v1/"),
+        ("openai-codex", "https://chatgpt.com/backend-api/codex"),
+        (" OPENAI-CODEX ", "HTTPS://CHATGPT.COM:443/backend-api/codex/"),
+    ],
+)
+def test_policy_allows_only_the_two_first_party_responses_routes(provider, base_url):
+    assert _policy().is_eligible(
+        client=_FakeCompactClient(compact=lambda **_: None),
+        provider=provider,
+        api_mode=" CODEX_RESPONSES ",
+        base_url=base_url,
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "api_mode", "base_url"),
+    [
+        ("openai", "chat_completions", "https://api.openai.com/v1"),
+        ("openai", "codex_app_server", "https://api.openai.com/v1"),
+        ("openai", "codex_responses", "https://example.com/v1"),
+        ("openai", "codex_responses", "https://api.openai.com.evil.test/v1"),
+        ("openai", "codex_responses", "https://api.openai.com/v1/extra"),
+        ("openai", "codex_responses", "https://api.openai.com/v1?token=secret"),
+        ("openai", "codex_responses", "https://user:pass@api.openai.com/v1"),
+        ("openai-codex", "codex_responses", "https://chatgpt.com.evil.test/backend-api/codex"),
+        ("openai-codex", "codex_responses", "https://chatgpt.com/backend-api/codex?token=secret"),
+        ("azure", "codex_responses", "https://example.openai.azure.com/openai/v1"),
+        ("xai", "codex_responses", "https://api.x.ai/v1"),
+        ("custom", "codex_responses", "https://api.openai.com/v1"),
+        ("openai-codex", "codex_responses", "https://api.openai.com/v1"),
+        ("openai", "codex_responses", "https://chatgpt.com/backend-api/codex"),
+    ],
+)
+def test_policy_rejects_non_allowlisted_effective_routes(provider, api_mode, base_url):
+    assert not _policy().is_eligible(
+        client=_FakeCompactClient(compact=lambda **_: None),
+        provider=provider,
+        api_mode=api_mode,
+        base_url=base_url,
+    )
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        _policy(enabled=False),
+        _policy(builtin=False),
+        _policy(session_db=None),
+        _policy(session_id=""),
+        _policy(session_id=None),
+    ],
+)
+def test_policy_rejects_disabled_custom_engine_or_missing_session_state(policy):
+    assert not policy.is_eligible(
+        client=_FakeCompactClient(compact=lambda **_: None),
+        provider="openai",
+        api_mode="codex_responses",
+        base_url="https://api.openai.com/v1",
+    )
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        None,
+        object(),
+        SimpleNamespace(responses=object()),
+        _FakeCompactClient(compact=None),
+        _FakeCompactClient(compact="not-callable"),
+    ],
+)
+def test_policy_rejects_client_without_callable_responses_compact(client):
+    assert not _policy().is_eligible(
+        client=client,
+        provider="openai",
+        api_mode="codex_responses",
+        base_url="https://api.openai.com/v1",
+    )
+
+
+def test_policy_uses_current_effective_route_state_on_every_check():
+    policy = _policy()
+    client = _FakeCompactClient(compact=lambda **_: None)
+
+    assert policy.is_eligible(
+        client=client,
+        provider="openai",
+        api_mode="codex_responses",
+        base_url="https://api.openai.com/v1",
+    )
+    assert not policy.is_eligible(
+        client=client,
+        provider="xai",
+        api_mode="codex_responses",
+        base_url="https://api.x.ai/v1",
+    )
+
+
+def test_policy_repr_and_error_paths_do_not_retain_or_expose_secrets():
+    sentinels = (
+        "fake-api-key-sentinel",
+        "credential-scope-sentinel",
+        "url-user-sentinel",
+        "url-password-sentinel",
+        "url-query-sentinel",
+        "url-fragment-sentinel",
+    )
+    secret_url = (
+        f"https://{sentinels[2]}:{sentinels[3]}@api.openai.com/v1"
+        f"?token={sentinels[4]}#{sentinels[5]}"
+    )
+    client = _FakeCompactClient(compact=lambda **_: None)
+    client.api_key = sentinels[0]
+    client.credential_scope = sentinels[1]
+    policy = _policy()
+
+    rendered = repr(policy)
+    try:
+        assert not policy.is_eligible(
+            client=client,
+            provider="openai",
+            api_mode="codex_responses",
+            base_url=secret_url,
+        )
+    except Exception as exc:  # pragma: no cover - fail-closed must not raise
+        rendered += repr(exc)
+
+    assert all(sentinel not in rendered for sentinel in sentinels)
+    assert "_FakeCompactClient" not in rendered
 
 
 def _identity(**overrides) -> NativeCompactionIdentity:
