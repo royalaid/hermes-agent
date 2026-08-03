@@ -110,15 +110,29 @@ class NativeCompactionPolicy:
         context_compressor: Any,
         session_db: Any,
         session_id: Any,
+        session_state_bound: Any,
     ) -> "NativeCompactionPolicy":
         from agent.context_compressor import ContextCompressor
 
+        try:
+            checkpoint_capable = all(
+                callable(getattr(session_db, method, None))
+                for method in (
+                    "load_native_openai_checkpoint",
+                    "upsert_native_openai_checkpoint",
+                    "delete_native_openai_checkpoint",
+                )
+            )
+        except Exception:
+            checkpoint_capable = False
+
         return cls(
             feature_enabled=feature_enabled is True,
-            built_in_compressor=isinstance(context_compressor, ContextCompressor),
+            built_in_compressor=type(context_compressor) is ContextCompressor,
             has_session_state=(
-                session_db is not None
-                and isinstance(session_id, str)
+                session_state_bound is True
+                and checkpoint_capable
+                and type(session_id) is str
                 and bool(session_id.strip())
             ),
         )
@@ -138,22 +152,24 @@ class NativeCompactionPolicy:
             and self.has_session_state
         ):
             return False
-        if str(api_mode or "").strip().lower() != "codex_responses":
+        if not all(type(value) is str for value in (provider, api_mode, base_url)):
             return False
 
         try:
+            if api_mode.strip().lower() != "codex_responses":
+                return False
             compact = getattr(getattr(client, "responses", None), "compact", None)
             if not callable(compact):
                 return False
 
-            parsed = urlsplit(str(base_url or ""))
+            parsed = urlsplit(base_url)
             if parsed.username or parsed.password or parsed.query or parsed.fragment:
                 return False
             route = normalize_route_base_url(base_url)
+            provider_id = provider.strip().lower()
         except Exception:
             return False
 
-        provider_id = str(provider or "").strip().lower()
         return (provider_id, route) in {
             ("openai", "https://api.openai.com/v1"),
             ("openai-codex", "https://chatgpt.com/backend-api/codex"),
