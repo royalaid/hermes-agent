@@ -9,6 +9,119 @@ from agent.transports import get_transport
 from agent.transports.types import NormalizedResponse
 
 
+def _native_projection_fixture():
+    from agent.native_openai_compaction import (
+        NativeCompactionCheckpoint,
+        NativeCompactionIdentity,
+        canonical_input_sha256,
+    )
+
+    prefix = [{"role": "user", "content": "old"}]
+    tail = [{"role": "user", "content": "fresh"}]
+    opaque = {"type": "compaction", "encrypted_content": "OPAQUE"}
+    identity = NativeCompactionIdentity(
+        provider="openai",
+        api_mode="codex_responses",
+        model="gpt-5",
+        base_url="https://api.openai.com/v1",
+        issuer_kind="other:https://api.openai.com/v1",
+        credential_scope="",
+        replay_encrypted_reasoning=True,
+    )
+    checkpoint = NativeCompactionCheckpoint(
+        session_id="session-1",
+        identity=identity,
+        source_input_item_count=1,
+        source_input_sha256=canonical_input_sha256(prefix),
+        output=[opaque],
+        compact_response_id="resp-1",
+        compact_created_at=1.0,
+        input_item_count=1,
+        output_item_count=1,
+        generation=1,
+        created_at=1.0,
+        updated_at=1.0,
+    )
+    ordinary = {
+        "model": "gpt-5",
+        "instructions": "fresh instructions",
+        "input": prefix + tail,
+        "tools": [{"type": "function", "name": "terminal"}],
+        "tool_choice": "auto",
+        "reasoning": {"effort": "high"},
+        "stream": False,
+        "timeout": 19.0,
+        "transport_marker": object(),
+    }
+    agent = SimpleNamespace(
+        session_id="session-1",
+        provider="openai",
+        api_mode="codex_responses",
+        model="gpt-5",
+        base_url="https://api.openai.com/v1",
+        _base_url_hostname="api.openai.com",
+        _base_url_lower="https://api.openai.com/v1",
+        _codex_reasoning_replay_enabled=True,
+        _native_openai_checkpoint=checkpoint,
+        native_compaction_policy=SimpleNamespace(
+            is_eligible=lambda **_kwargs: True
+        ),
+    )
+    return agent, ordinary, prefix, tail, opaque
+
+
+def test_native_checkpoint_projection_replaces_only_preflighted_input():
+    from agent.chat_completion_helpers import maybe_apply_native_openai_projection
+
+    agent, ordinary, prefix, tail, opaque = _native_projection_fixture()
+    original = copy.deepcopy(
+        {key: value for key, value in ordinary.items() if key != "transport_marker"}
+    )
+
+    projected = maybe_apply_native_openai_projection(agent, ordinary)
+
+    assert projected is not ordinary
+    assert projected["input"] == [opaque] + tail
+    assert {key: value for key, value in projected.items() if key not in {"input", "transport_marker"}} == {
+        key: value for key, value in original.items() if key != "input"
+    }
+    assert projected["transport_marker"] is ordinary["transport_marker"]
+    assert ordinary["input"] == prefix + tail
+    assert "previous_response_id" not in projected
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["no_checkpoint", "disabled_policy", "session", "identity", "prefix"],
+)
+def test_native_checkpoint_projection_fails_open_without_mutation(mismatch):
+    from agent.chat_completion_helpers import maybe_apply_native_openai_projection
+
+    agent, ordinary, _prefix, _tail, _opaque = _native_projection_fixture()
+    if mismatch == "no_checkpoint":
+        agent._native_openai_checkpoint = None
+    elif mismatch == "disabled_policy":
+        agent.native_compaction_policy = SimpleNamespace(
+            is_eligible=lambda **_kwargs: False
+        )
+    elif mismatch == "session":
+        agent.session_id = "other-session"
+    elif mismatch == "identity":
+        agent.model = "gpt-5-different"
+    elif mismatch == "prefix":
+        ordinary["input"][0] = {"role": "user", "content": "rewound"}
+    snapshot = copy.deepcopy(
+        {key: value for key, value in ordinary.items() if key != "transport_marker"}
+    )
+
+    projected = maybe_apply_native_openai_projection(agent, ordinary)
+
+    assert projected is ordinary
+    assert {
+        key: value for key, value in ordinary.items() if key != "transport_marker"
+    } == snapshot
+
+
 @pytest.fixture
 def transport():
     import agent.transports.codex  # noqa: F401

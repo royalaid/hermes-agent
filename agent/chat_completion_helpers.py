@@ -140,6 +140,66 @@ def _is_openai_codex_backend(agent) -> bool:
     )
 
 
+def native_openai_identity_for_agent(agent):
+    """Build the single native-compaction identity used for create and replay."""
+    from agent.codex_responses_adapter import _classify_responses_issuer
+    from agent.native_openai_compaction import NativeCompactionIdentity
+
+    return NativeCompactionIdentity(
+        provider=getattr(agent, "provider", ""),
+        api_mode=getattr(agent, "api_mode", ""),
+        model=getattr(agent, "model", ""),
+        base_url=getattr(agent, "base_url", ""),
+        issuer_kind=_classify_responses_issuer(
+            is_codex_backend=_is_openai_codex_backend(agent),
+            base_url=getattr(agent, "base_url", ""),
+        ),
+        credential_scope="",
+        replay_encrypted_reasoning=bool(
+            getattr(agent, "_codex_reasoning_replay_enabled", True)
+        ),
+    )
+
+
+def maybe_apply_native_openai_projection(agent, api_kwargs: dict) -> dict:
+    """Replay a matching cached native checkpoint over finalized Responses input."""
+    from agent.native_openai_compaction import (
+        NativeCompactionCheckpoint,
+        apply_checkpoint,
+        checkpoint_matches,
+    )
+
+    checkpoint = getattr(agent, "_native_openai_checkpoint", None)
+    ordinary_input = api_kwargs.get("input")
+    if (
+        getattr(agent, "api_mode", None) != "codex_responses"
+        or type(checkpoint) is not NativeCompactionCheckpoint
+        or checkpoint.session_id != getattr(agent, "session_id", None)
+        or type(ordinary_input) is not list
+    ):
+        return api_kwargs
+    try:
+        policy = getattr(agent, "native_compaction_policy", None)
+        if not (
+            callable(getattr(policy, "is_eligible", None))
+            and policy.is_eligible(
+                client=getattr(agent, "client", None),
+                provider=getattr(agent, "provider", None),
+                api_mode=getattr(agent, "api_mode", None),
+                base_url=getattr(agent, "base_url", None),
+            )
+        ):
+            return api_kwargs
+        identity = native_openai_identity_for_agent(agent)
+        if not checkpoint_matches(identity, checkpoint, ordinary_input):
+            return api_kwargs
+        projected = dict(api_kwargs)
+        projected["input"] = apply_checkpoint(checkpoint, ordinary_input)
+        return projected
+    except Exception:
+        return api_kwargs
+
+
 def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     """Minimum wall-clock stale timeout for openai-codex by estimated context.
 

@@ -1,3 +1,4 @@
+import copy
 import sys
 import types
 from types import SimpleNamespace
@@ -686,6 +687,98 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["final_response"] == "OK"
     assert result["messages"][-1]["role"] == "assistant"
     assert result["messages"][-1]["content"] == "OK"
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_run_conversation_replays_checkpoint_at_shared_responses_seam(
+    monkeypatch, use_streaming
+):
+    from agent.native_openai_compaction import (
+        NativeCompactionCheckpoint,
+        NativeCompactionIdentity,
+        canonical_input_sha256,
+    )
+
+    agent = _build_agent(monkeypatch)
+    agent._disable_streaming = not use_streaming
+    agent.native_compaction_policy = SimpleNamespace(
+        is_eligible=lambda **_kwargs: True
+    )
+    prefix = [{"role": "user", "content": "old"}]
+    tail = [{"role": "user", "content": "fresh"}]
+    opaque = {"type": "compaction", "encrypted_content": "OPAQUE"}
+    agent._native_openai_checkpoint = NativeCompactionCheckpoint(
+        session_id=agent.session_id,
+        identity=NativeCompactionIdentity(
+            provider=agent.provider,
+            api_mode=agent.api_mode,
+            model=agent.model,
+            base_url=agent.base_url,
+            issuer_kind="codex_backend",
+            credential_scope="",
+            replay_encrypted_reasoning=True,
+        ),
+        source_input_item_count=1,
+        source_input_sha256=canonical_input_sha256(prefix),
+        output=[opaque],
+        compact_response_id="resp-1",
+        compact_created_at=1.0,
+        input_item_count=1,
+        output_item_count=1,
+        generation=1,
+        created_at=1.0,
+        updated_at=1.0,
+    )
+    ordinary = {
+        "model": agent.model,
+        "instructions": "fresh instructions",
+        "input": prefix + tail,
+        "tools": [
+            {
+                "type": "function",
+                "name": "terminal",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": False,
+            }
+        ],
+        "tool_choice": "auto",
+        "reasoning": {"effort": "high"},
+        "timeout": 19.0,
+    }
+    ordinary_snapshot = copy.deepcopy(ordinary)
+    monkeypatch.setattr(agent, "_build_api_kwargs", lambda *_args, **_kwargs: ordinary)
+
+    transport = agent._get_transport()
+    original_preflight = transport.preflight_kwargs
+    preflight_inputs = []
+
+    def _ordinary_only_preflight(kwargs, **options):
+        preflight_inputs.append(copy.deepcopy(kwargs["input"]))
+        assert opaque not in kwargs["input"]
+        return original_preflight(kwargs, **options)
+
+    monkeypatch.setattr(transport, "preflight_kwargs", _ordinary_only_preflight)
+    captured = {}
+
+    def _capture(api_kwargs, **_kwargs):
+        captured.update(api_kwargs)
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _capture)
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", _capture)
+
+    result = agent.run_conversation("Say OK")
+
+    assert result["completed"] is True
+    assert preflight_inputs == [prefix + tail, prefix + tail]
+    assert captured["input"] == [opaque] + tail
+    assert all(
+        captured[key] == value
+        for key, value in ordinary_snapshot.items()
+        if key != "input"
+    )
+    assert ordinary == ordinary_snapshot
 
 
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):
