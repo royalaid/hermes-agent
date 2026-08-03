@@ -1238,6 +1238,9 @@ def _adopt_live_compression_child(
         return None
 
     agent.session_id = child_session_id
+    from agent.chat_completion_helpers import bind_native_openai_checkpoint_cache
+
+    bind_native_openai_checkpoint_cache(agent, child_session_id)
     try:
         from gateway.session_context import set_current_session_id
 
@@ -2307,6 +2310,7 @@ def _try_native_openai_compaction(
         if persisted is not True:
             return "abort"
         agent._native_openai_checkpoint = checkpoint
+        agent._native_openai_checkpoint_session_id = checkpoint.session_id
 
         try:
             agent.context_compressor.record_external_compaction(
@@ -3513,6 +3517,11 @@ def compress_context(
                         require_compression_lease=_lock_holder is not None,
                     )
                     agent.session_id = new_session_id
+                    from agent.chat_completion_helpers import (
+                        bind_native_openai_checkpoint_cache,
+                    )
+
+                    bind_native_openai_checkpoint_cache(agent, new_session_id)
                     try:
                         from gateway.session_context import set_current_session_id
 
