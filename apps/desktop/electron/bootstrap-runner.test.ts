@@ -12,6 +12,8 @@ import {
   hasExistingGitCheckout,
   installedAgentInstallScript,
   installRefForStamp,
+  installScriptUrl,
+  installStampForScript,
   isPinnedCommit,
   resolveInstallScript,
   resolveMarkerPinnedCommit,
@@ -95,6 +97,42 @@ test('fresh bootstrap args include the packaged commit pin', () => {
   )
 })
 
+test('custom repository is forwarded to the Windows installer', () => {
+  const installStamp = {
+    commit: 'a'.repeat(40),
+    branch: 'local/openai-native-windows',
+    repository: 'royalaid/hermes-agent'
+  }
+
+  assert.deepEqual(buildPinArgs(installStamp), [
+    '-Commit',
+    installStamp.commit,
+    '-Branch',
+    installStamp.branch,
+    '-Repository',
+    installStamp.repository
+  ])
+  assert.deepEqual(
+    buildPosixPinArgs({
+      installStamp,
+      activeRoot: '/tmp/hermes-agent',
+      hermesHome: '/tmp/hermes'
+    }),
+    [
+      '--dir',
+      '/tmp/hermes-agent',
+      '--hermes-home',
+      '/tmp/hermes',
+      '--branch',
+      installStamp.branch,
+      '--commit',
+      installStamp.commit,
+      '--repository',
+      installStamp.repository
+    ]
+  )
+})
+
 test('existing-checkout bootstrap args keep branch but skip the packaged commit pin', () => {
   const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
 
@@ -154,6 +192,47 @@ test('resolveMarkerPinnedCommit prefers real HEAD over fallback stamp zeros', ()
   )
 })
 
+test('custom repository selects the matching raw installer URL', () => {
+  const ref = 'a'.repeat(40)
+  assert.equal(
+    installScriptUrl(ref, 'royalaid/hermes-agent'),
+    `https://raw.githubusercontent.com/royalaid/hermes-agent/${ref}/scripts/${SCRIPT_NAME}`
+  )
+  assert.equal(
+    installScriptUrl(ref, '../invalid'),
+    `https://raw.githubusercontent.com/NousResearch/hermes-agent/${ref}/scripts/${SCRIPT_NAME}`
+  )
+})
+
+test('older fallback installers do not receive repository arguments they cannot parse', () => {
+  const home = mkTmpHome()
+
+  try {
+    const stamp = { commit: 'a'.repeat(40), branch: 'main', repository: 'royalaid/hermes-agent' }
+    const oldScript = path.join(home, 'old-install.sh')
+    fs.writeFileSync(oldScript, '#!/bin/bash\ncase "$1" in --branch) ;; esac\n')
+    const compatible = installStampForScript(stamp, oldScript, 'posix')
+    assert.equal(compatible.repository, null)
+    assert.deepEqual(
+      buildPosixPinArgs({
+        installStamp: compatible,
+        activeRoot: '/tmp/hermes-agent',
+        hermesHome: '/tmp/hermes'
+      }),
+      [
+        '--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes',
+        '--branch', 'main', '--commit', stamp.commit
+      ]
+    )
+
+    const currentScript = path.join(home, 'current-install.sh')
+    fs.writeFileSync(currentScript, '#!/bin/bash\ncase "$1" in --repository|-Repository) ;; esac\n')
+    assert.equal(installStampForScript(stamp, currentScript, 'posix'), stamp)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('resolveInstallScript downloads fallback stamps by branch instead of zero commit', async () => {
   const home = mkTmpHome()
 
@@ -183,6 +262,40 @@ test('resolveInstallScript downloads fallback stamps by branch instead of zero c
       logs.some(ev => /fallback, unpinned/.test(ev.line || '')),
       'emits an unpinned fallback log line'
     )
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('resolveInstallScript downloads from the repository stamped into the package', async () => {
+  const home = mkTmpHome()
+
+  try {
+    const repositories = []
+    const commit = 'e'.repeat(40)
+
+    const result = await resolveInstallScript({
+      installStamp: {
+        commit,
+        branch: 'local/openai-native-windows',
+        repository: 'royalaid/hermes-agent'
+      },
+      sourceRepoRoot: null,
+      hermesHome: home,
+      emit: () => {},
+      _download: async (ref, destPath, repository) => {
+        assert.equal(ref, commit)
+        repositories.push(repository)
+        fs.mkdirSync(path.dirname(destPath), { recursive: true })
+        fs.writeFileSync(destPath, '# installer')
+
+        return destPath
+      }
+    })
+
+    assert.deepEqual(repositories, ['royalaid/hermes-agent'])
+    assert.equal(result.source, 'download')
+    assert.match(result.path, /royalaid-hermes-agent/)
   } finally {
     fs.rmSync(home, { recursive: true, force: true })
   }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  DEFAULT_REPOSITORY,
   FALLBACK_BRANCH,
   FALLBACK_COMMIT,
   fromCI,
@@ -14,9 +15,30 @@ import {
 test('fromCI reads GITHUB_SHA / GITHUB_REF_NAME', () => {
   assert.deepEqual(
     fromCI({ GITHUB_SHA: 'a'.repeat(40), GITHUB_REF_NAME: 'release' }),
-    { commit: 'a'.repeat(40), branch: 'release', dirty: false, source: 'ci' }
+    {
+      commit: 'a'.repeat(40),
+      branch: 'release',
+      repository: DEFAULT_REPOSITORY,
+      dirty: false,
+      source: 'ci'
+    }
   )
   assert.equal(fromCI({}), null)
+})
+
+test('fromCI carries a validated GitHub repository into the install stamp', () => {
+  assert.equal(
+    fromCI({
+      GITHUB_SHA: 'a'.repeat(40),
+      GITHUB_REF_NAME: 'local/openai-native-windows',
+      GITHUB_REPOSITORY: 'royalaid/hermes-agent'
+    }).repository,
+    'royalaid/hermes-agent'
+  )
+  assert.equal(
+    fromCI({ GITHUB_SHA: 'a'.repeat(40), GITHUB_REPOSITORY: '../invalid' }).repository,
+    DEFAULT_REPOSITORY
+  )
 })
 
 test('fromLocalGit returns null when git rev-parse fails', () => {
@@ -36,16 +58,33 @@ test('fromLocalGit reads HEAD + branch + dirty status', () => {
   assert.deepEqual(fromLocalGit('/repo', execFn), {
     commit: 'b'.repeat(40),
     branch: 'main',
+    repository: DEFAULT_REPOSITORY,
     dirty: true,
     source: 'local'
   })
   assert.ok(calls.includes('git rev-parse HEAD'))
 })
 
+test('fromLocalGit derives repository from the branch upstream remote', () => {
+  const execFn = cmd => {
+    if (cmd === 'git rev-parse HEAD') return 'b'.repeat(40)
+    if (cmd === 'git rev-parse --abbrev-ref HEAD') return 'local/openai-native-windows'
+    if (cmd === 'git status --porcelain -uno') return ''
+    if (cmd === 'git rev-parse --abbrev-ref --symbolic-full-name @{upstream}') {
+      return 'fork/local/openai-native-windows'
+    }
+    if (cmd === 'git remote get-url --push fork') return 'https://github.com/royalaid/hermes-agent.git'
+    return null
+  }
+
+  assert.equal(fromLocalGit('/repo', execFn).repository, 'royalaid/hermes-agent')
+})
+
 test('fromFallback uses the all-zero placeholder commit', () => {
   assert.deepEqual(fromFallback(), {
     commit: FALLBACK_COMMIT,
     branch: FALLBACK_BRANCH,
+    repository: DEFAULT_REPOSITORY,
     dirty: false,
     source: 'fallback'
   })
@@ -80,6 +119,7 @@ test('resolveStamp falls back when neither CI nor git is available', () => {
   assert.deepEqual(stamp, {
     commit: FALLBACK_COMMIT,
     branch: FALLBACK_BRANCH,
+    repository: DEFAULT_REPOSITORY,
     dirty: false,
     source: 'fallback'
   })

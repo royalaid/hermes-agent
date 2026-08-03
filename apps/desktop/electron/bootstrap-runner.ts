@@ -45,6 +45,20 @@ const IS_WINDOWS = process.platform === 'win32'
 const STAMP_COMMIT_RE = /^[0-9a-f]{7,40}$/i
 const FALLBACK_COMMIT_RE = /^0{7,40}$/
 const FALLBACK_BRANCH = 'main'
+const DEFAULT_REPOSITORY = 'NousResearch/hermes-agent'
+const REPOSITORY_RE = /^[0-9A-Za-z_.-]+\/[0-9A-Za-z_.-]+$/
+
+function repositoryForStamp(installStamp) {
+  const repository = installStamp && installStamp.repository
+
+  if (typeof repository !== 'string' || !REPOSITORY_RE.test(repository)) {
+    return DEFAULT_REPOSITORY
+  }
+
+  const [owner, name] = repository.split('/')
+
+  return owner === '.' || owner === '..' || name === '.' || name === '..' ? DEFAULT_REPOSITORY : repository
+}
 
 function isPinnedCommit(commit) {
   return typeof commit === 'string' && STAMP_COMMIT_RE.test(commit) && !FALLBACK_COMMIT_RE.test(commit)
@@ -171,6 +185,25 @@ function installScriptKind() {
   return process.platform === 'win32' ? 'powershell' : 'posix'
 }
 
+function installStampForScript(installStamp, scriptPath, installerKind) {
+  if (!installStamp || !installStamp.repository) {
+    return installStamp
+  }
+
+  try {
+    const source = fs.readFileSync(scriptPath, 'utf8')
+
+    const supported =
+      installerKind === 'posix'
+        ? source.includes('--repository|-Repository)')
+        : source.includes('[string]$Repository')
+
+    return supported ? installStamp : { ...installStamp, repository: null }
+  } catch {
+    return { ...installStamp, repository: null }
+  }
+}
+
 function resolveLocalInstallScript(sourceRepoRoot) {
   if (!sourceRepoRoot) {
     return null
@@ -223,17 +256,29 @@ function hasExistingGitCheckout(activeRoot) {
   }
 }
 
-function cachedScriptPath(hermesHome, commit) {
-  return path.join(bootstrapCacheDir(hermesHome), `install-${commit}.${process.platform === 'win32' ? 'ps1' : 'sh'}`)
+function cachedScriptPath(hermesHome, commit, repository = DEFAULT_REPOSITORY) {
+  const safeRepository = repositoryForStamp({ repository })
+  const namespace = safeRepository === DEFAULT_REPOSITORY ? '' : `${safeRepository.replace('/', '-')}-`
+
+  return path.join(
+    bootstrapCacheDir(hermesHome),
+    `install-${namespace}${commit}.${process.platform === 'win32' ? 'ps1' : 'sh'}`
+  )
 }
 
-function downloadInstallScript(ref, destPath) {
+function installScriptUrl(ref, repository = DEFAULT_REPOSITORY) {
+  const safeRepository = repositoryForStamp({ repository })
+
+  return `https://raw.githubusercontent.com/${safeRepository}/${ref}/scripts/${installScriptName()}`
+}
+
+function downloadInstallScript(ref, destPath, repository = DEFAULT_REPOSITORY) {
   // Fetch from GitHub raw at the install ref. Normal production builds pass a
   // pinned SHA (immutable). Non-git fallback builds pass an unpinned branch
   // ref so local builds can still bootstrap without pretending the all-zero
   // placeholder is a real GitHub commit.
   const scriptName = installScriptName()
-  const url = `https://raw.githubusercontent.com/NousResearch/hermes-agent/${ref}/scripts/${scriptName}`
+  const url = installScriptUrl(ref, repository)
 
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(destPath), { recursive: true })
@@ -344,7 +389,8 @@ async function resolveInstallScript({
     )
   }
 
-  const cached = cachedScriptPath(hermesHome, installRef.cacheKey)
+  const repository = repositoryForStamp(installStamp)
+  const cached = cachedScriptPath(hermesHome, installRef.cacheKey, repository)
   const resolvedCommit = installRef.pinned ? installRef.ref : null
 
   try {
@@ -367,7 +413,7 @@ async function resolveInstallScript({
   })
 
   try {
-    await _download(installRef.ref, cached)
+    await _download(installRef.ref, cached, repository)
     emit({ type: 'log', line: `[bootstrap] saved to ${cached}` })
 
     return { path: cached, source: 'download', commit: resolvedCommit, kind: installScriptKind() }
@@ -673,6 +719,10 @@ function buildPinArgs(installStamp, { pinCommit = true } = {}) {
     args.push('-Branch', installStamp.branch)
   }
 
+  if (installStamp && installStamp.repository) {
+    args.push('-Repository', repositoryForStamp(installStamp))
+  }
+
   return args
 }
 
@@ -685,6 +735,10 @@ function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = t
 
   if (pinCommit && installStamp && isPinnedCommit(installStamp.commit)) {
     args.push('--commit', installStamp.commit)
+  }
+
+  if (installStamp && installStamp.repository) {
+    args.push('--repository', repositoryForStamp(installStamp))
   }
 
   return args
@@ -929,6 +983,14 @@ async function runBootstrap(opts) {
     // 1. Resolve the platform installer.
     const scriptInfo = await resolveInstallScript({ installStamp, sourceRepoRoot, hermesHome, emit })
     const installerKind = scriptInfo.kind || 'powershell'
+    const compatibleInstallStamp = installStampForScript(installStamp, scriptInfo.path, installerKind)
+
+    if (installStamp && installStamp.repository && compatibleInstallStamp.repository === null) {
+      emit({
+        type: 'log',
+        line: `[bootstrap] resolved ${installerKind} installer predates repository selection; using its default repository`
+      })
+    }
 
     // 2. Fetch manifest
     const manifest = await fetchManifest({
@@ -937,7 +999,7 @@ async function runBootstrap(opts) {
       emit,
       hermesHome,
       activeRoot,
-      installStamp,
+      installStamp: compatibleInstallStamp,
       pinCommit
     })
 
@@ -966,7 +1028,7 @@ async function runBootstrap(opts) {
         hermesHome,
         activeRoot,
         abortSignal,
-        installStamp,
+        installStamp: compatibleInstallStamp,
         pinCommit
       })
 
@@ -1026,6 +1088,8 @@ export {
   hasExistingGitCheckout,
   installedAgentInstallScript,
   installRefForStamp,
+  installScriptUrl,
+  installStampForScript,
   isPinnedCommit,
   // Exposed for testability
   parseStageResult,
