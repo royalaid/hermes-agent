@@ -152,6 +152,31 @@ def test_direct_credential_scope_is_stable_across_agents_without_persisting_key_
     assert first_key.encode() not in scope_key.read_bytes()
 
 
+def test_direct_credential_scope_never_uses_symlinked_installation_key(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    target = cache_dir / "replay-secret.bin"
+    target.write_bytes(b"x" * 32)
+    scope_key = cache_dir / "native_openai_scope.key"
+    scope_key.symlink_to(target)
+
+    first_agent = _agent(None)
+    first_agent.api_key = "sk-test-direct-symlink"
+    second_agent = _agent(None)
+    second_agent.api_key = "sk-test-direct-symlink"
+
+    first = native_openai_identity_for_agent(first_agent).credential_scope
+    second = native_openai_identity_for_agent(second_agent).credential_scope
+
+    assert first.startswith("direct-instance:")
+    assert second.startswith("direct-instance:")
+    assert first != second
+    assert target.read_bytes() == b"x" * 32
+
+
 def test_native_identity_ignores_non_string_credential_pool_entry_id():
     agent = _agent(None)
     agent._credential_pool_entry_id = object()

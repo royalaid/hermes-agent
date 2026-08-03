@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -170,6 +171,18 @@ def _load_or_create_native_scope_key():
         return None
 
     for _attempt in range(8):
+        try:
+            key_stat = key_path.lstat()
+        except FileNotFoundError:
+            key_stat = None
+        except OSError:
+            return None
+        if key_stat is not None and (
+            stat.S_ISLNK(key_stat.st_mode) or key_stat.st_nlink != 1
+        ):
+            # Never treat another file as credential-scope material through a
+            # symlink or hard link. Fall back to per-agent random scoping.
+            return None
         try:
             existing = key_path.read_bytes()
         except FileNotFoundError:
