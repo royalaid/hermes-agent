@@ -180,33 +180,44 @@ def test_direct_credential_scope_never_uses_symlinked_installation_key(
     assert target.read_bytes() == b"x" * 32
 
 
-def test_direct_scope_key_read_does_not_follow_post_validation_swap(
+def test_direct_scope_key_read_rejects_post_open_path_identity_change(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     key_path = tmp_path / "cache" / "native_openai_scope.key"
-    attacker = tmp_path / "cache" / "attacker-key.bin"
-    attacker_key = b"a" * 32
+    replacement = tmp_path / "cache" / "replacement-key.bin"
     key_path.parent.mkdir(parents=True)
     key_path.write_bytes(b"t" * 32)
-    attacker.write_bytes(attacker_key)
+    replacement.write_bytes(b"a" * 32)
 
-    original_read_bytes = Path.read_bytes
-    swapped = False
+    original_open = os.open
+    original_lstat = Path.lstat
+    opened_fds = []
+    identity_changed = False
 
-    def swap_before_read(path):
-        nonlocal swapped
-        if path == key_path and not swapped:
-            swapped = True
-            path.unlink()
-            path.symlink_to(attacker)
-        return original_read_bytes(path)
+    def record_open(path, flags, *args):
+        fd = original_open(path, flags, *args)
+        if Path(path) == key_path:
+            opened_fds.append(fd)
+        return fd
 
-    monkeypatch.setattr(Path, "read_bytes", swap_before_read)
+    def report_replacement_identity(path):
+        nonlocal identity_changed
+        if path == key_path:
+            identity_changed = True
+            return original_lstat(replacement)
+        return original_lstat(path)
+
+    monkeypatch.setattr(chat_completion_helpers.os, "open", record_open)
+    monkeypatch.setattr(Path, "lstat", report_replacement_identity)
 
     loaded = chat_completion_helpers._load_or_create_native_scope_key()
 
-    assert loaded != attacker_key
+    assert identity_changed is True
+    assert loaded is None
+    assert len(opened_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_fds[0])
 
 
 def test_native_identity_ignores_non_string_credential_pool_entry_id():

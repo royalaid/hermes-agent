@@ -834,6 +834,58 @@ def test_search_files_blocks_scope_key_lexical_name_before_resolved_task_path(
     assert "scope-key-marker" not in json.dumps(result)
 
 
+def test_read_file_blocks_scope_key_symlink_before_structured_document_extraction(
+    tmp_path, monkeypatch
+):
+    import agent.file_safety as fs
+    import tools.file_tools as ft
+
+    root = tmp_path / "hermes"
+    active = root / "profiles" / "active"
+    key_path = root / "profiles" / "sibling" / "cache" / "native_openai_scope.key"
+    notebook = key_path.parent / "replay-secret.ipynb"
+    key_path.parent.mkdir(parents=True)
+    active.mkdir(parents=True)
+    notebook.write_text(
+        json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "markdown",
+                        "metadata": {},
+                        "source": ["scope-key-marker"],
+                    }
+                ],
+                "metadata": {},
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        key_path.symlink_to(notebook)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: active)
+    monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
+    original_resolver = ft._resolve_path_for_task
+    monkeypatch.setattr(
+        ft,
+        "_resolve_path_for_task",
+        lambda path, task_id="default": (
+            notebook if str(path) == str(key_path) else original_resolver(path, task_id)
+        ),
+    )
+
+    result = json.loads(
+        ft.read_file_tool(str(key_path), task_id="scope-key-structured-read")
+    )
+
+    assert "protected credential store" in result["error"]
+    assert "scope-key-marker" not in json.dumps(result)
+
+
 def test_read_file_blocks_native_scope_key_windows_data_stream_alias(
     tmp_path, monkeypatch
 ):
