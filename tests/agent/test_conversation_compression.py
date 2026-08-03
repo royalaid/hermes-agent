@@ -801,6 +801,93 @@ def test_cancellation_during_failed_preflight_skips_endpoint_and_text_fallback()
     _assert_cancellation_during_preflight_aborts(raise_after_cancel=True)
 
 
+def test_lease_loss_during_ineligible_policy_aborts_without_text_fallback():
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+
+    class _LeaseLosingPolicy:
+        def is_eligible(self, **_kwargs):
+            agent._session_db.holder = "replacement-holder"
+            return False
+
+    agent.native_compaction_policy = _LeaseLosingPolicy()
+
+    with patch(
+        "agent.native_openai_compaction.request_native_compaction_candidate"
+    ) as endpoint:
+        compress_context(agent, _messages(), "sys", force=True)
+
+    assert agent.context_compressor.text_calls == 0
+    assert agent.context_compressor.record_calls == []
+    endpoint.assert_not_called()
+
+
+def test_identity_construction_exception_uses_owned_text_fallback_once():
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+
+    with (
+        patch(
+            "agent.codex_responses_adapter._classify_responses_issuer",
+            side_effect=RuntimeError("SECRET_IDENTITY_FAILURE"),
+        ),
+        patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate"
+        ) as endpoint,
+    ):
+        compress_context(agent, _messages(), "sys", force=True)
+
+    assert agent.context_compressor.text_calls == 1
+    assert agent.context_compressor.record_calls == []
+    endpoint.assert_not_called()
+
+
+def test_endpoint_helper_exception_uses_owned_text_fallback_once():
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+
+    with patch(
+        "agent.native_openai_compaction.request_native_compaction_candidate",
+        side_effect=RuntimeError("SECRET_ENDPOINT_HELPER_FAILURE"),
+    ):
+        compress_context(agent, _messages(), "sys", force=True)
+
+    assert agent.context_compressor.text_calls == 1
+    assert agent.context_compressor.record_calls == []
+
+
+def test_checkpoint_construction_exception_uses_owned_text_fallback_once():
+    agent = _Agent()
+    agent.context_compressor.raise_on_text = False
+
+    def _candidate(_agent, *, cut, **_kwargs):
+        return NativeCompactionCandidate(
+            source_input_item_count=cut.source_input_item_count,
+            source_input_sha256=cut.source_input_sha256,
+            compact_response_id=None,
+            compact_created_at=None,
+            input_item_count=cut.source_input_item_count,
+            output_item_count=1,
+            output=[{"type": "compaction", "encrypted_content": "OPAQUE"}],
+        )
+
+    with (
+        patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate",
+            side_effect=_candidate,
+        ),
+        patch(
+            "agent.native_openai_compaction.checkpoint_from_candidate",
+            side_effect=RuntimeError("SECRET_CHECKPOINT_FAILURE"),
+        ),
+    ):
+        compress_context(agent, _messages(), "sys", force=True)
+
+    assert agent.context_compressor.text_calls == 1
+    assert agent.context_compressor.record_calls == []
+    assert agent._session_db.events == []
+
+
 def test_external_progress_failure_after_durable_checkpoint_remains_native_success(caplog):
     agent = _Agent()
     caplog.set_level("DEBUG", logger="agent.conversation_compression")

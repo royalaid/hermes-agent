@@ -2155,6 +2155,26 @@ def _try_native_openai_compaction(
         select_native_compaction_cut,
     )
 
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    active_holder = getattr(agent, "_active_compression_lock_holder", None)
+
+    def _cancelled() -> bool:
+        return bool(
+            (hard_cancel_event is not None and hard_cancel_event.is_set())
+            or (commit_fence is not None and commit_fence.is_cancelled)
+        )
+
+    def _observed_lease_lost() -> bool:
+        if type(active_holder) is not str or not active_holder:
+            return False
+        if session_db is None or type(session_id) is not str or not session_id:
+            return True
+        try:
+            return session_db.get_compression_lock_holder(session_id) != active_holder
+        except Exception:
+            return True
+
     policy = getattr(agent, "native_compaction_policy", None)
     client = getattr(agent, "client", None)
     try:
@@ -2166,19 +2186,13 @@ def _try_native_openai_compaction(
         )
     except Exception:
         eligible = False
-    if (
-        (hard_cancel_event is not None and hard_cancel_event.is_set())
-        or (commit_fence is not None and commit_fence.is_cancelled)
-    ):
+    if _cancelled() or _observed_lease_lost():
         return "abort"
     if not eligible:
         return "fallback"
 
-    session_db = getattr(agent, "_session_db", None)
-    session_id = getattr(agent, "session_id", None)
     if session_db is None or type(session_id) is not str or not session_id:
         return "fallback"
-    active_holder = getattr(agent, "_active_compression_lock_holder", None)
     if type(active_holder) is not str or not active_holder:
         return "abort"
 
@@ -2199,26 +2213,29 @@ def _try_native_openai_compaction(
     if not _commit_still_owned():
         return "abort"
 
-    provider = getattr(agent, "provider", "")
-    base_url = getattr(agent, "base_url", "")
-    is_codex_backend = provider == "openai-codex" or (
-        getattr(agent, "_base_url_hostname", "") == "chatgpt.com"
-        and "/backend-api/codex" in getattr(agent, "_base_url_lower", "")
-    )
-    identity = NativeCompactionIdentity(
-        provider=provider,
-        api_mode=getattr(agent, "api_mode", ""),
-        model=getattr(agent, "model", ""),
-        base_url=base_url,
-        issuer_kind=_classify_responses_issuer(
-            is_codex_backend=is_codex_backend,
+    try:
+        provider = getattr(agent, "provider", "")
+        base_url = getattr(agent, "base_url", "")
+        is_codex_backend = provider == "openai-codex" or (
+            getattr(agent, "_base_url_hostname", "") == "chatgpt.com"
+            and "/backend-api/codex" in getattr(agent, "_base_url_lower", "")
+        )
+        identity = NativeCompactionIdentity(
+            provider=provider,
+            api_mode=getattr(agent, "api_mode", ""),
+            model=getattr(agent, "model", ""),
             base_url=base_url,
-        ),
-        credential_scope="",
-        replay_encrypted_reasoning=bool(
-            getattr(agent, "_codex_reasoning_replay_enabled", True)
-        ),
-    )
+            issuer_kind=_classify_responses_issuer(
+                is_codex_backend=is_codex_backend,
+                base_url=base_url,
+            ),
+            credential_scope="",
+            replay_encrypted_reasoning=bool(
+                getattr(agent, "_codex_reasoning_replay_enabled", True)
+            ),
+        )
+    except Exception:
+        return "abort" if not _commit_still_owned() else "fallback"
 
     def _serialize(candidate_messages: list[dict]) -> list[dict]:
         built = agent._build_api_kwargs(copy.deepcopy(candidate_messages))
@@ -2260,14 +2277,17 @@ def _try_native_openai_compaction(
         resolved_timeout = None
     if not _commit_still_owned():
         return "abort"
-    candidate = request_native_compaction_candidate(
-        agent,
-        model=getattr(agent, "model", ""),
-        cut=cut,
-        compact_instructions=NATIVE_OPENAI_COMPACTION_INSTRUCTIONS,
-        resolved_timeout=resolved_timeout,
-        previous_checkpoint=prior,
-    )
+    try:
+        candidate = request_native_compaction_candidate(
+            agent,
+            model=getattr(agent, "model", ""),
+            cut=cut,
+            compact_instructions=NATIVE_OPENAI_COMPACTION_INSTRUCTIONS,
+            resolved_timeout=resolved_timeout,
+            previous_checkpoint=prior,
+        )
+    except Exception:
+        return "abort" if not _commit_still_owned() else "fallback"
     # Re-check every abort condition before interpreting endpoint failures. A
     # cancellation or lease loss that races with a failed request still aborts
     # the whole attempt and must never launch textual fallback.
@@ -2276,11 +2296,6 @@ def _try_native_openai_compaction(
     if type(candidate) is not NativeCompactionCandidate:
         return "fallback"
 
-    fence_entered = False
-    if commit_fence is not None:
-        fence_entered = commit_fence.begin_commit(hard_cancel_event)
-        if not fence_entered:
-            return "abort"
     try:
         checkpoint = checkpoint_from_candidate(
             candidate=candidate,
@@ -2289,6 +2304,17 @@ def _try_native_openai_compaction(
             previous_checkpoint=prior,
             now=time.time(),
         )
+    except Exception:
+        return "abort" if not _commit_still_owned() else "fallback"
+    if not _commit_still_owned():
+        return "abort"
+
+    fence_entered = False
+    if commit_fence is not None:
+        fence_entered = commit_fence.begin_commit(hard_cancel_event)
+        if not fence_entered:
+            return "abort"
+    try:
         try:
             persisted = session_db.upsert_native_openai_checkpoint(
                 checkpoint,
