@@ -148,6 +148,22 @@ def test_agent_init_loads_native_compaction_config_and_current_route(monkeypatch
     )
 
 
+def test_agent_init_caches_bound_session_native_checkpoint_once(monkeypatch, tmp_path):
+    sentinel = object()
+    loads = []
+
+    def _load_checkpoint(_db, session_id):
+        loads.append(session_id)
+        return sentinel
+
+    monkeypatch.setattr(SessionDB, "load_native_openai_checkpoint", _load_checkpoint)
+
+    agent = _make_agent(monkeypatch, tmp_path, openai_native=True)
+
+    assert agent._native_openai_checkpoint is sentinel
+    assert loads == [agent.session_id]
+
+
 def test_agent_init_marks_missing_session_state_ineligible(monkeypatch, tmp_path):
     agent = _make_agent(monkeypatch, tmp_path, openai_native=True, session_db=False)
 

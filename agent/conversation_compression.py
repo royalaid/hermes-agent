@@ -2144,11 +2144,10 @@ def _try_native_openai_compaction(
     hard_cancel_event: Any,
 ) -> str:
     """Return ``success``, ``fallback``, or ``abort`` for one native attempt."""
-    from agent.codex_responses_adapter import _classify_responses_issuer
+    from agent.chat_completion_helpers import native_openai_identity_for_agent
     from agent.native_openai_compaction import (
         NativeCompactionCandidate,
         NativeCompactionCheckpoint,
-        NativeCompactionIdentity,
         checkpoint_from_candidate,
         checkpoint_matches,
         request_native_compaction_candidate,
@@ -2214,26 +2213,7 @@ def _try_native_openai_compaction(
         return "abort"
 
     try:
-        provider = getattr(agent, "provider", "")
-        base_url = getattr(agent, "base_url", "")
-        is_codex_backend = provider == "openai-codex" or (
-            getattr(agent, "_base_url_hostname", "") == "chatgpt.com"
-            and "/backend-api/codex" in getattr(agent, "_base_url_lower", "")
-        )
-        identity = NativeCompactionIdentity(
-            provider=provider,
-            api_mode=getattr(agent, "api_mode", ""),
-            model=getattr(agent, "model", ""),
-            base_url=base_url,
-            issuer_kind=_classify_responses_issuer(
-                is_codex_backend=is_codex_backend,
-                base_url=base_url,
-            ),
-            credential_scope="",
-            replay_encrypted_reasoning=bool(
-                getattr(agent, "_codex_reasoning_replay_enabled", True)
-            ),
-        )
+        identity = native_openai_identity_for_agent(agent)
     except Exception:
         return "abort" if not _commit_still_owned() else "fallback"
 
@@ -2326,6 +2306,7 @@ def _try_native_openai_compaction(
             return "abort" if not _commit_still_owned() else "fallback"
         if persisted is not True:
             return "abort"
+        agent._native_openai_checkpoint = checkpoint
 
         try:
             agent.context_compressor.record_external_compaction(
