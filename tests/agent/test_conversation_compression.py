@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -553,6 +554,19 @@ def test_commit_fence_cancellation_after_endpoint_denies_native_and_text_commit(
     assert returned is messages
     assert agent._session_db.events == []
     assert agent.context_compressor.text_calls == 0
+
+
+def test_hard_cancel_during_native_dispatch_sets_event_without_waiting_for_request():
+    fence = CompressionCommitFence()
+    hard_cancel = threading.Event()
+
+    assert fence.begin_dispatch(hard_cancel) is True
+    try:
+        assert fence.cancel_before_commit(hard_cancel) is False
+        assert hard_cancel.is_set()
+        assert fence.is_cancelled is True
+    finally:
+        fence.finish_dispatch()
 
 
 def test_native_failures_never_emit_payload_credentials_or_opaque_output(caplog):
