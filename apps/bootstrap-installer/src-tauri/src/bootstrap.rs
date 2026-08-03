@@ -33,6 +33,8 @@ use crate::AppState;
 /// Frontend → Rust: kick off the install.
 #[derive(Debug, Deserialize)]
 pub struct StartBootstrapArgs {
+    /// Optional GitHub owner/repo override. Defaults to BUILD_PIN_REPOSITORY.
+    pub repository: Option<String>,
     /// Optional override for the commit pin. Defaults to the build-time
     /// pin baked in via `BUILD_PIN_COMMIT`.
     pub commit: Option<String>,
@@ -163,17 +165,18 @@ pub async fn get_bootstrap_status(
 /// (e.g. when Stage-Desktop was skipped) so the frontend can present
 /// actionable failure UI rather than silently doing nothing.
 #[tauri::command]
-pub async fn launch_hermes_desktop(
-    app: AppHandle,
-    install_root: String,
-) -> Result<(), String> {
+pub async fn launch_hermes_desktop(app: AppHandle, install_root: String) -> Result<(), String> {
     let install_root = PathBuf::from(install_root);
     let exe_path = resolve_hermes_desktop_exe(&install_root).ok_or_else(|| {
         format!(
             "Couldn't find a built Hermes desktop at {}. The desktop build step \
              may have been skipped or failed. Run `hermes desktop` from a \
              terminal to build and launch it.",
-            install_root.join("apps").join("desktop").join("release").display()
+            install_root
+                .join("apps")
+                .join("desktop")
+                .join("release")
+                .display()
         )
     })?;
 
@@ -191,12 +194,8 @@ pub async fn launch_hermes_desktop(
         cmd.creation_flags(0x0000_0008);
     }
 
-    cmd.spawn().map_err(|e| {
-        format!(
-            "failed to launch {}: {e}",
-            exe_path.display()
-        )
-    })?;
+    cmd.spawn()
+        .map_err(|e| format!("failed to launch {}: {e}", exe_path.display()))?;
 
     // Give Windows ~150ms to actually start the new process before we exit.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -449,8 +448,16 @@ async fn run_bootstrap(
     let kind = ScriptKind::for_current_os();
 
     let pin = Pin {
-        commit: args.commit.or_else(|| option_env_string("BUILD_PIN_COMMIT")),
-        branch: args.branch.or_else(|| option_env_string("BUILD_PIN_BRANCH")),
+        repository: args
+            .repository
+            .or_else(|| option_env_string("BUILD_PIN_REPOSITORY"))
+            .unwrap_or_else(|| "NousResearch/hermes-agent".to_string()),
+        commit: args
+            .commit
+            .or_else(|| option_env_string("BUILD_PIN_COMMIT")),
+        branch: args
+            .branch
+            .or_else(|| option_env_string("BUILD_PIN_BRANCH")),
     };
 
     tracing::info!(
@@ -544,20 +551,21 @@ async fn run_bootstrap(
         return Err(anyhow!(err));
     }
 
-    let manifest: Manifest = powershell::parse_manifest(&manifest_result.stdout).ok_or_else(|| {
-        let err = format!(
-            "install.ps1 -Manifest produced no parseable JSON payload\n{}",
-            truncate(&manifest_result.stdout, 4000)
-        );
-        emit_event(
-            &app,
-            BootstrapEvent::Failed {
-                stage: None,
-                error: err.clone(),
-            },
-        );
-        anyhow!(err)
-    })?;
+    let manifest: Manifest =
+        powershell::parse_manifest(&manifest_result.stdout).ok_or_else(|| {
+            let err = format!(
+                "install.ps1 -Manifest produced no parseable JSON payload\n{}",
+                truncate(&manifest_result.stdout, 4000)
+            );
+            emit_event(
+                &app,
+                BootstrapEvent::Failed {
+                    stage: None,
+                    error: err.clone(),
+                },
+            );
+            anyhow!(err)
+        })?;
 
     emit_event(
         &app,
@@ -768,7 +776,10 @@ async fn run_bootstrap(
     // we're already running from that path. Best-effort — a failure here must
     // not fail an otherwise-successful install.
     if let Err(err) = crate::paths::copy_self_to_hermes_home() {
-        tracing::warn!(?err, "failed to copy installer into HERMES_HOME (non-fatal)");
+        tracing::warn!(
+            ?err,
+            "failed to copy installer into HERMES_HOME (non-fatal)"
+        );
         emit_log(&format!(
             "[bootstrap] warning: could not stage updater binary: {err}"
         ));
@@ -859,7 +870,7 @@ async fn run_install_script(
 }
 
 fn build_pin_args(script: &install_script::ResolvedScript) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = vec!["-Repository".to_string(), script.repository.clone()];
     if let Some(c) = &script.commit {
         out.push("-Commit".to_string());
         out.push(c.clone());
@@ -920,6 +931,7 @@ fn option_env_string(key: &str) -> Option<String> {
     let val = match key {
         "BUILD_PIN_COMMIT" => option_env!("BUILD_PIN_COMMIT"),
         "BUILD_PIN_BRANCH" => option_env!("BUILD_PIN_BRANCH"),
+        "BUILD_PIN_REPOSITORY" => option_env!("BUILD_PIN_REPOSITORY"),
         _ => None,
     };
     val.map(|s| s.to_string())
@@ -936,8 +948,8 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::path::Path;
+    use std::path::PathBuf;
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -978,6 +990,29 @@ mod tests {
             std::fs::write(&exe, b"stub").unwrap();
             exe
         }
+    }
+
+    #[test]
+    fn build_pin_args_forward_repository_commit_and_branch() {
+        let script = crate::install_script::ResolvedScript {
+            path: PathBuf::from("install.ps1"),
+            source: crate::install_script::ScriptSource::Cached,
+            repository: "royalaid/hermes-agent".to_string(),
+            commit: Some("4398d0920571f1eb8bdccc8a8d57dad0d7404a7f".to_string()),
+            branch: Some("local/openai-native-windows".to_string()),
+        };
+
+        assert_eq!(
+            build_pin_args(&script),
+            vec![
+                "-Repository",
+                "royalaid/hermes-agent",
+                "-Commit",
+                "4398d0920571f1eb8bdccc8a8d57dad0d7404a7f",
+                "-Branch",
+                "local/openai-native-windows",
+            ]
+        );
     }
 
     // The relaunch / install target is derived from the rebuilt desktop app.
@@ -1023,6 +1058,7 @@ mod tests {
     fn bootstrap_complete_marker_uses_desktop_compatible_schema() {
         let root = unique_tmp_dir("marker-schema");
         let pin = Pin {
+            repository: "NousResearch/hermes-agent".to_string(),
             commit: Some("abcdef1234567890".to_string()),
             branch: Some("main".to_string()),
         };
@@ -1049,6 +1085,7 @@ mod tests {
         let root = unique_tmp_dir("marker-atomic");
         make_release_tree(&root);
         let pin = Pin {
+            repository: "NousResearch/hermes-agent".to_string(),
             commit: Some("abcdef1234567890".to_string()),
             branch: Some("main".to_string()),
         };
@@ -1096,6 +1133,7 @@ mod tests {
         let not_a_dir = base.join("not-a-dir");
         std::fs::write(&not_a_dir, b"not a directory").unwrap();
         let pin = Pin {
+            repository: "NousResearch/hermes-agent".to_string(),
             commit: Some("abcdef1234567890".to_string()),
             branch: Some("main".to_string()),
         };
