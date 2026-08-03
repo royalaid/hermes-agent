@@ -721,6 +721,28 @@ def test_cut_refuses_malformed_tool_group_in_retained_tail():
 
 
 @pytest.mark.parametrize(
+    "tool_calls",
+    [{"id": "call_1"}, "call_1", "", 1, ("call_1",)],
+)
+def test_cut_refuses_non_list_assistant_tool_calls_in_retained_tail(tool_calls):
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new request"},
+        {"role": "assistant", "content": "", "tool_calls": tool_calls},
+    ]
+
+    assert (
+        select_native_compaction_cut(
+            messages, protect_last_n=1, serialize_input=_serialize_rows
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
     "messages,protect_last_n",
     [
         ([{"role": "user", "content": "only turn"}], 1),
