@@ -95,9 +95,9 @@ class NativeCompactionIdentity:
     provider: str = ""
     api_mode: str = ""
     model: str = ""
-    base_url: str = ""
+    base_url: str = field(default="", repr=False)
     issuer_kind: str = ""
-    credential_scope: str = ""
+    credential_scope: str = field(default="", repr=False)
     replay_encrypted_reasoning: bool = False
 
     def __post_init__(self) -> None:
