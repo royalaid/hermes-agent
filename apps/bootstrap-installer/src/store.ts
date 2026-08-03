@@ -316,6 +316,7 @@ export async function startInstall(opts?: { branch?: string }): Promise<void> {
     args: {
       commit: null,
       branch: opts?.branch ?? null,
+      repository: null,
       include_desktop: true,
       hermes_home: null
     }
