@@ -1062,3 +1062,26 @@ class TestCrossProcessInvalidationDefersCleanup:
         assert "telegram:s1" not in runner._agent_cache
         runner._cleanup_agent_resources.assert_not_called()
 
+
+def test_gateway_cached_agent_sessions_keep_native_checkpoints_isolated():
+    """A gateway cache key may be reused while its durable session changes."""
+    from gateway.run import _sync_cached_agent_native_checkpoint
+
+    checkpoint_a = object()
+    checkpoint_b = object()
+    loads = []
+    agent = MagicMock()
+    agent.session_id = "session-a"
+    agent._native_openai_checkpoint = checkpoint_a
+    agent._native_openai_checkpoint_session_id = "session-a"
+    agent._session_db.load_native_openai_checkpoint.side_effect = lambda session_id: (
+        loads.append(session_id)
+        or {"session-a": checkpoint_a, "session-b": checkpoint_b}.get(session_id)
+    )
+
+    _sync_cached_agent_native_checkpoint(agent, "session-b")
+
+    assert agent._native_openai_checkpoint_session_id == "session-b"
+    assert agent._native_openai_checkpoint is checkpoint_b
+    assert loads == ["session-b"]
+

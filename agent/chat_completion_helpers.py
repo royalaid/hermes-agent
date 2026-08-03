@@ -178,6 +178,19 @@ def native_openai_identity_for_agent(agent, *, model=None):
     )
 
 
+def _discard_invalid_native_openai_checkpoint(agent, checkpoint) -> None:
+    """Forget a same-route projection whose readable source prefix diverged."""
+    agent._native_openai_checkpoint = None
+    session_db = getattr(agent, "_session_db", None)
+    delete_checkpoint = getattr(session_db, "delete_native_openai_checkpoint", None)
+    if not callable(delete_checkpoint):
+        return
+    try:
+        delete_checkpoint(checkpoint.session_id)
+    except Exception:
+        pass
+
+
 def maybe_apply_native_openai_projection(agent, api_kwargs: dict) -> dict:
     """Replay a matching cached native checkpoint over finalized Responses input."""
     from agent.native_openai_compaction import (
@@ -215,7 +228,10 @@ def maybe_apply_native_openai_projection(agent, api_kwargs: dict) -> dict:
         identity = native_openai_identity_for_agent(
             agent, model=api_kwargs.get("model", "")
         )
+        if identity != checkpoint.identity:
+            return api_kwargs
         if not checkpoint_matches(identity, checkpoint, ordinary_input):
+            _discard_invalid_native_openai_checkpoint(agent, checkpoint)
             return api_kwargs
         projected = dict(api_kwargs)
         projected["input"] = apply_checkpoint(checkpoint, ordinary_input)

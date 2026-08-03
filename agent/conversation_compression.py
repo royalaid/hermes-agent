@@ -2239,6 +2239,28 @@ def _current_system_prompt(agent: Any, system_message: str) -> str:
     return existing if existing else agent._build_system_prompt(system_message)
 
 
+def _invalidate_native_checkpoint_after_textual_compaction(
+    agent: Any,
+    compacted_session_id: str,
+) -> None:
+    """Best-effort removal of an opaque projection invalidated by text rewrite."""
+    if type(compacted_session_id) is not str or not compacted_session_id:
+        return
+    if (
+        getattr(agent, "_native_openai_checkpoint_session_id", None)
+        == compacted_session_id
+    ):
+        agent._native_openai_checkpoint = None
+    session_db = getattr(agent, "_session_db", None)
+    delete_checkpoint = getattr(session_db, "delete_native_openai_checkpoint", None)
+    if not callable(delete_checkpoint):
+        return
+    try:
+        delete_checkpoint(compacted_session_id)
+    except Exception:
+        logger.debug("native checkpoint deletion after textual compaction failed")
+
+
 def _try_native_openai_compaction(
     agent: Any,
     messages: list,
@@ -3703,6 +3725,12 @@ def compress_context(
                     )
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+
+        if _session_commit_succeeded:
+            _invalidate_native_checkpoint_after_textual_compaction(
+                agent,
+                locals().get("old_session_id") or agent.session_id or "",
+            )
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
