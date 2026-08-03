@@ -128,7 +128,19 @@ def _tool_atomic_prefix(messages: list[dict]) -> bool:
     """Return whether a message prefix contains only completed tool groups."""
     pending: set[str] = set()
     for message in messages:
+        if type(message) is not dict:
+            return False
         role = message.get("role")
+        if type(role) is not str or role not in {"system", "user", "assistant", "tool"}:
+            return False
+        if "api_content" in message and message["api_content"] is not None:
+            if type(message["api_content"]) is not str:
+                return False
+        if role == "assistant":
+            for sidecar in ("codex_reasoning_items", "codex_message_items"):
+                if sidecar in message and message[sidecar] is not None:
+                    if type(message[sidecar]) is not list:
+                        return False
         tool_calls = message.get("tool_calls") if role == "assistant" else None
         if tool_calls is not None and not isinstance(tool_calls, list):
             return False
@@ -165,23 +177,116 @@ def _tool_atomic_prefix(messages: list[dict]) -> bool:
     return not pending
 
 
+def _content_part_is_valid(part: Any, *, text_type: str) -> bool:
+    if type(part) is not dict:
+        return False
+    part_type = part.get("type")
+    if part_type == text_type:
+        return set(part) == {"type", "text"} and type(part.get("text")) is str
+    if part_type == "input_image":
+        if set(part) not in (
+            {"type", "image_url"},
+            {"type", "image_url", "detail"},
+        ):
+            return False
+        image_url = part.get("image_url")
+        if type(image_url) is not str or not image_url.strip():
+            return False
+        return "detail" not in part or type(part["detail"]) is str
+    return False
+
+
+def _content_is_valid(content: Any, *, text_type: str) -> bool:
+    if type(content) is str:
+        return True
+    return type(content) is list and all(
+        _content_part_is_valid(part, text_type=text_type) for part in content
+    )
+
+
+def _finalized_item_schema_is_valid(item: Any) -> bool:
+    if type(item) is not dict:
+        return False
+
+    item_type = item.get("type")
+    if item_type == "function_call":
+        return (
+            set(item) == {"type", "call_id", "name", "arguments"}
+            and type(item.get("call_id")) is str
+            and bool(item["call_id"].strip())
+            and type(item.get("name")) is str
+            and bool(item["name"].strip())
+            and type(item.get("arguments")) is str
+        )
+    if item_type == "function_call_output":
+        return (
+            set(item) == {"type", "call_id", "output"}
+            and type(item.get("call_id")) is str
+            and bool(item["call_id"].strip())
+            and _content_is_valid(item.get("output"), text_type="input_text")
+        )
+    if item_type == "reasoning":
+        summary = item.get("summary")
+        return (
+            set(item) == {"type", "encrypted_content", "summary"}
+            and type(item.get("encrypted_content")) is str
+            and bool(item["encrypted_content"].strip())
+            and type(summary) is list
+            and all(
+                type(entry) is dict
+                and set(entry) == {"type", "text"}
+                and entry.get("type") == "summary_text"
+                and type(entry.get("text")) is str
+                for entry in summary
+            )
+        )
+    if item_type == "message":
+        allowed_keys = {"type", "role", "status", "content", "id", "phase"}
+        required_keys = {"type", "role", "status", "content"}
+        content = item.get("content")
+        return (
+            required_keys <= set(item) <= allowed_keys
+            and item.get("role") == "assistant"
+            and type(item.get("role")) is str
+            and type(item.get("status")) is str
+            and bool(item["status"].strip())
+            and type(content) is list
+            and bool(content)
+            and all(
+                type(part) is dict
+                and set(part) == {"type", "text"}
+                and part.get("type") == "output_text"
+                and type(part.get("text")) is str
+                for part in content
+            )
+            and all(
+                key not in item
+                or (type(item[key]) is str and bool(item[key].strip()))
+                for key in ("id", "phase")
+            )
+        )
+    if "type" in item:
+        return False
+
+    role = item.get("role")
+    if type(role) is not str or role not in {"user", "assistant"}:
+        return False
+    return set(item) == {"role", "content"} and _content_is_valid(
+        item.get("content"),
+        text_type="input_text" if role == "user" else "output_text",
+    )
+
+
 def _finalized_tool_graph_is_valid(items: list[dict]) -> bool:
-    """Validate completed tool-call relationships in finalized Responses items."""
+    """Validate exact finalized Responses schemas and completed call relationships."""
     pending: set[str] = set()
     seen_calls: set[str] = set()
     for item in items:
+        if not _finalized_item_schema_is_valid(item):
+            return False
         item_type = item.get("type")
         if item_type == "function_call":
-            call_id = item.get("call_id")
-            name = item.get("name")
-            if (
-                type(call_id) is not str
-                or not call_id.strip()
-                or type(name) is not str
-                or not name.strip()
-            ):
-                return False
-            call_id = call_id.strip()
+            call_id = item["call_id"].strip()
             if call_id in seen_calls:
                 return False
             seen_calls.add(call_id)
@@ -189,25 +294,14 @@ def _finalized_tool_graph_is_valid(items: list[dict]) -> bool:
             continue
 
         if item_type == "function_call_output":
-            call_id = item.get("call_id")
-            if type(call_id) is not str or call_id.strip() not in pending:
+            call_id = item["call_id"].strip()
+            if call_id not in pending:
                 return False
-            pending.remove(call_id.strip())
+            pending.remove(call_id)
             continue
 
         if pending:
             return False
-        if item_type == "reasoning":
-            if "role" in item:
-                return False
-            continue
-        if item_type == "message":
-            if item.get("role") != "assistant":
-                return False
-            continue
-        if "type" not in item and item.get("role") in {"user", "assistant"}:
-            continue
-        return False
 
     return not pending
 
@@ -223,7 +317,7 @@ def select_native_compaction_cut(
     if (
         not isinstance(messages, list)
         or not messages
-        or not all(isinstance(message, dict) for message in messages)
+        or not all(type(message) is dict for message in messages)
         or not isinstance(protect_last_n, int)
         or isinstance(protect_last_n, bool)
         or protect_last_n < 0
