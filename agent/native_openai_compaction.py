@@ -754,26 +754,29 @@ class NativeCompactionCheckpoint:
         """Return the validated canonical JSON representation for persistence."""
         return self._output_json
 
-    def redacted_metadata(self) -> dict[str, Any]:
-        """Return operational metadata without opaque or transcript payloads."""
-        return {
+    def redacted_metadata(
+        self,
+        *,
+        tail_item_count: int | None = None,
+        elapsed_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Return the narrow payload-free lifecycle metadata contract."""
+        metadata: dict[str, Any] = {
+            "strategy": "openai_native",
             "provider": self.identity.provider,
             "api_mode": self.identity.api_mode,
             "model": self.identity.model,
             "base_url_host": _safe_base_url_host(self.identity.base_url),
-            "issuer_kind": self.identity.issuer_kind,
-            "credential_scope_present": bool(self.identity.credential_scope),
-            "replay_encrypted_reasoning": self.identity.replay_encrypted_reasoning,
-            "source_input_item_count": self.source_input_item_count,
-            "source_input_sha256": self.source_input_sha256[:12],
             "input_item_count": self.input_item_count,
             "output_item_count": self.output_item_count,
             "generation": self.generation,
-            "compact_response_id": self.compact_response_id,
-            "compact_created_at": self.compact_created_at,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
+            "prefix_sha256": self.source_input_sha256[:12],
         }
+        if type(tail_item_count) is int and tail_item_count >= 0:
+            metadata["tail_item_count"] = tail_item_count
+        if type(elapsed_ms) is int and elapsed_ms >= 0:
+            metadata["elapsed_ms"] = elapsed_ms
+        return metadata
 
 
 def checkpoint_from_candidate(
