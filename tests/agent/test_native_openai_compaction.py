@@ -695,6 +695,168 @@ def test_cut_refuses_malformed_detached_tool_history_when_no_safe_prefix_exists(
     )
 
 
+@pytest.mark.parametrize(
+    "function",
+    [None, {}, "not-an-object", {"name": ""}, {"name": "   "}, {"name": 7}],
+)
+def test_cut_refuses_raw_tool_call_with_invalid_function_name(function):
+    from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "function": function}],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "private result"},
+        {"role": "user", "content": "new request"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    transport = ResponsesApiTransport()
+
+    assert (
+        select_native_compaction_cut(
+            messages,
+            protect_last_n=1,
+            serialize_input=lambda rows: transport.build_input_items(
+                rows, is_codex_backend=True
+            ),
+        )
+        is None
+    )
+
+
+def test_cut_refuses_finalized_call_id_collision_across_completed_groups():
+    from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
+
+    messages = [
+        {"role": "user", "content": "first request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_reused", "function": {"name": "a", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_reused", "content": "first"},
+        {"role": "assistant", "content": "first done"},
+        {"role": "user", "content": "second request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": " call_reused ", "function": {"name": "b", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_reused", "content": "second"},
+        {"role": "assistant", "content": "second done"},
+        {"role": "user", "content": "newest request"},
+        {"role": "assistant", "content": "newest answer"},
+    ]
+    transport = ResponsesApiTransport()
+
+    assert (
+        select_native_compaction_cut(
+            messages,
+            protect_last_n=1,
+            serialize_input=lambda rows: transport.build_input_items(
+                rows, is_codex_backend=True
+            ),
+        )
+        is None
+    )
+
+
+def _select_cut_for_serialized_tool_graph(graph):
+    from agent.native_openai_compaction import select_native_compaction_cut
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new request"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+
+    def serialize(rows):
+        items = copy.deepcopy(graph)
+        if len(rows) > 2:
+            items.append({"role": "user", "content": "tail"})
+        return items
+
+    return select_native_compaction_cut(
+        messages, protect_last_n=1, serialize_input=serialize
+    )
+
+
+def test_cut_accepts_finalized_graph_with_additional_calls_while_calls_are_pending():
+    graph = [
+        {"type": "function_call", "call_id": "call_a", "name": "a", "arguments": "{}"},
+        {"type": "function_call", "call_id": "call_b", "name": "b", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+        {"type": "function_call_output", "call_id": "call_b", "output": "B"},
+    ]
+
+    assert _select_cut_for_serialized_tool_graph(graph) is not None
+
+
+@pytest.mark.parametrize(
+    "graph",
+    [
+        [{"type": "function_call_output", "call_id": "unknown", "output": "x"}],
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "x"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "duplicate"},
+        ],
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "x"},
+            {"type": "function_call", "call_id": "call_1", "name": "b", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "y"},
+        ],
+        [
+            {"type": "function_call", "call_id": "call_1", "name": "a", "arguments": "{}"},
+            {"role": "assistant", "content": "interleaved"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "x"},
+        ],
+        [{"type": "function_call", "call_id": "call_1", "name": "a", "arguments": "{}"}],
+    ],
+)
+def test_cut_refuses_invalid_finalized_tool_graph(graph):
+    assert _select_cut_for_serialized_tool_graph(graph) is None
+
+
+def test_input_override_cannot_form_a_strict_ordinary_prefix_cut():
+    from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new request"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    override = {"input": [{"role": "user", "content": "fixed override"}]}
+    transport = ResponsesApiTransport()
+
+    assert (
+        select_native_compaction_cut(
+            messages,
+            protect_last_n=1,
+            serialize_input=lambda rows: transport.build_input_items(
+                rows,
+                is_codex_backend=True,
+                request_overrides=override,
+            ),
+        )
+        is None
+    )
+
+
 def test_cut_refuses_malformed_tool_group_in_retained_tail():
     from agent.native_openai_compaction import select_native_compaction_cut
 
