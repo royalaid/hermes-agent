@@ -6,7 +6,11 @@ import copy
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.conversation_compression import CompressionCommitFence, compress_context
+from agent.conversation_compression import (
+    CompressionCommitFence,
+    capture_compression_attempt_outcome,
+    compress_context,
+)
 from agent.native_openai_compaction import (
     NativeCompactionCandidate,
     NativeCompactionFailure,
@@ -206,6 +210,8 @@ def test_eligible_native_success_keeps_readable_transcript_and_skips_text_bounda
         {"strategy": "openai_native", "source_items": 2, "output_items": 1}
     ]
     assert agent._last_native_compaction_succeeded is True
+    outcome = capture_compression_attempt_outcome(agent)
+    assert outcome is not None and outcome.native_succeeded is True
     assert agent._last_compression_attempt_in_place is None
     assert agent._last_compaction_in_place is False
     assert agent.session_id == "session-native"
