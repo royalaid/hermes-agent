@@ -12583,6 +12583,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 _before_tokens,
                 _after_tokens,
                 compression_state=getattr(agent, "context_compressor", None),
+                native_succeeded=(
+                    getattr(agent, "_last_native_compaction_succeeded", False) is True
+                ),
             )
             _lines = [_fb["headline"], _fb["token_line"]]
             if _fb.get("note"):
