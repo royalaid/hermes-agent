@@ -2166,13 +2166,13 @@ def _try_native_openai_compaction(
         )
     except Exception:
         eligible = False
-    if not eligible:
-        return "fallback"
     if (
         (hard_cancel_event is not None and hard_cancel_event.is_set())
         or (commit_fence is not None and commit_fence.is_cancelled)
     ):
         return "abort"
+    if not eligible:
+        return "fallback"
 
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
@@ -2250,14 +2250,16 @@ def _try_native_openai_compaction(
             ),
         )
     except Exception:
-        return "fallback"
+        return "abort" if not _commit_still_owned() else "fallback"
     if cut is None:
-        return "fallback"
+        return "abort" if not _commit_still_owned() else "fallback"
 
     try:
         resolved_timeout = agent._resolved_api_call_timeout()
     except Exception:
         resolved_timeout = None
+    if not _commit_still_owned():
+        return "abort"
     candidate = request_native_compaction_candidate(
         agent,
         model=getattr(agent, "model", ""),
