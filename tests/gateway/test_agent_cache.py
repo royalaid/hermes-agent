@@ -118,6 +118,7 @@ class TestExtractCacheBustingConfig:
             {
                 "compression": {
                     "enabled": False,
+                    "openai_native": True,
                     "threshold": 0.6,
                     "codex_gpt55_autoraise": False,
                     "target_ratio": 0.3,
@@ -128,11 +129,34 @@ class TestExtractCacheBustingConfig:
             }
         )
         assert out["compression.enabled"] is False
+        assert out["compression.openai_native"] is True
         assert out["compression.threshold"] == 0.6
         assert out["compression.codex_gpt55_autoraise"] is False
         assert out["compression.target_ratio"] == 0.3
         assert out["compression.protect_last_n"] == 25
         assert out["compression.codex_app_server_auto"] == "hermes"
+
+    def test_openai_native_toggle_changes_cached_agent_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {
+            "api_key": "test",
+            "base_url": "https://api.openai.com/v1",
+            "provider": "openai",
+            "api_mode": "codex_responses",
+        }
+        disabled = GatewayRunner._extract_cache_busting_config(
+            {"compression": {"openai_native": False}}
+        )
+        enabled = GatewayRunner._extract_cache_busting_config(
+            {"compression": {"openai_native": True}}
+        )
+
+        assert GatewayRunner._agent_config_signature(
+            "gpt-5", runtime, [], "", cache_keys=disabled
+        ) != GatewayRunner._agent_config_signature(
+            "gpt-5", runtime, [], "", cache_keys=enabled
+        )
 
 
     def test_missing_keys_yield_none(self):

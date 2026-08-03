@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1423,6 +1424,61 @@ def test_predispatch_guard_runs_after_request_payload_copy():
             _cut_for(source),
             pre_dispatch_check=lambda: dispatch_allowed,
         )
+
+    assert result == NativeCompactionFailure("client", False, True)
+    assert compact.calls == []
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+def test_atomic_dispatch_fence_denies_compact_when_hard_cancel_wins_after_precheck():
+    from agent.conversation_compression import CompressionCommitFence
+
+    compact = _CompactRecorder(
+        SimpleNamespace(
+            output=[{"type": "compaction", "encrypted_content": "opaque"}]
+        )
+    )
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+    fence = CompressionCommitFence()
+    hard_cancel = threading.Event()
+
+    def _check_then_cancel():
+        assert fence.cancel_before_commit(hard_cancel) is True
+        return True
+
+    result = _request(
+        agent,
+        _cut_for([{"role": "user", "content": "question"}]),
+        pre_dispatch_check=_check_then_cancel,
+        dispatch_fence=fence,
+        hard_cancel_event=hard_cancel,
+    )
+
+    assert result == NativeCompactionFailure("client", False, True)
+    assert compact.calls == []
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+def test_atomic_dispatch_fence_rechecks_lease_after_admission_before_compact():
+    from agent.conversation_compression import CompressionCommitFence
+
+    compact = _CompactRecorder(
+        SimpleNamespace(
+            output=[{"type": "compaction", "encrypted_content": "opaque"}]
+        )
+    )
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+    checks = iter((True, False))
+
+    result = _request(
+        agent,
+        _cut_for([{"role": "user", "content": "question"}]),
+        pre_dispatch_check=lambda: next(checks),
+        dispatch_fence=CompressionCommitFence(),
+        hard_cancel_event=threading.Event(),
+    )
 
     assert result == NativeCompactionFailure("client", False, True)
     assert compact.calls == []
