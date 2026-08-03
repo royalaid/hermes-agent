@@ -11185,6 +11185,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     compression_state=getattr(
                         self.agent, "context_compressor", None
                     ),
+                    native_succeeded=(
+                        getattr(
+                            self.agent, "_last_native_compaction_succeeded", False
+                        )
+                        is True
+                    ),
                 )
                 if summary.get("aborted") or summary.get("fallback_used"):
                     icon = "⚠️"
