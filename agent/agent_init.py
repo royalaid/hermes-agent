@@ -2496,10 +2496,12 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
         )
+    _session_state_bound = False
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
+            _session_state_bound = True
         except Exception:
             pass
 
@@ -2514,6 +2516,7 @@ def init_agent(
         context_compressor=agent.context_compressor,
         session_db=session_db,
         session_id=agent.session_id,
+        session_state_bound=_session_state_bound,
     )
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
