@@ -888,40 +888,50 @@ def request_native_compaction_candidate(
     except Exception as exc:
         return _classify_native_compaction_exception(exc)
 
+    propagating_base_exception = False
+    close_failed = False
     try:
         try:
-            compact = getattr(getattr(client, "responses", None), "compact", None)
-        except Exception:
-            result: NativeCompactionCandidate | NativeCompactionFailure = (
-                _native_compaction_failure("unsupported")
-            )
-        else:
-            if not callable(compact):
-                result = _native_compaction_failure("unsupported")
+            try:
+                compact = getattr(getattr(client, "responses", None), "compact", None)
+            except Exception:
+                result: NativeCompactionCandidate | NativeCompactionFailure = (
+                    _native_compaction_failure("unsupported")
+                )
             else:
-                try:
-                    response = compact(
-                        model=model,
-                        input=copy.deepcopy(effective_input),
-                        instructions=compact_instructions,
-                        timeout=resolved_timeout,
-                    )
-                except Exception as exc:
-                    result = _classify_native_compaction_exception(exc)
+                if not callable(compact):
+                    result = _native_compaction_failure("unsupported")
                 else:
-                    result = _candidate_from_compact_response(
-                        response,
-                        cut=cut,
-                        input_item_count=len(effective_input),
-                    )
-    except Exception:
-        result = _native_compaction_failure("invalid_response")
+                    try:
+                        response = compact(
+                            model=model,
+                            input=copy.deepcopy(effective_input),
+                            instructions=compact_instructions,
+                            timeout=resolved_timeout,
+                        )
+                    except Exception as exc:
+                        result = _classify_native_compaction_exception(exc)
+                    else:
+                        result = _candidate_from_compact_response(
+                            response,
+                            cut=cut,
+                            input_item_count=len(effective_input),
+                        )
+        except Exception:
+            result = _native_compaction_failure("invalid_response")
+    except BaseException:
+        propagating_base_exception = True
+        raise
+    finally:
+        try:
+            agent._close_request_openai_client(
+                client, reason="native_openai_compaction"
+            )
+        except Exception:
+            if not propagating_base_exception:
+                close_failed = True
 
-    try:
-        agent._close_request_openai_client(
-            client, reason="native_openai_compaction"
-        )
-    except Exception:
+    if close_failed:
         return _native_compaction_failure("client")
     return result
 
