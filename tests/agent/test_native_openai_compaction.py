@@ -556,25 +556,20 @@ def test_identity_and_checkpoint_reprs_exclude_route_and_credential_secrets():
 def test_redacted_metadata_contains_only_safe_operational_fields():
     checkpoint = _checkpoint()
 
-    metadata = checkpoint.redacted_metadata()
+    metadata = checkpoint.redacted_metadata(tail_item_count=2, elapsed_ms=7)
 
     assert metadata == {
+        "strategy": "openai_native",
         "provider": "openai",
         "api_mode": "codex_responses",
         "model": "gpt-5",
         "base_url_host": "api.openai.com",
-        "issuer_kind": "api_key",
-        "credential_scope_present": True,
-        "replay_encrypted_reasoning": True,
-        "source_input_item_count": 1,
-        "source_input_sha256": checkpoint.source_input_sha256[:12],
         "input_item_count": 1,
         "output_item_count": 3,
+        "tail_item_count": 2,
         "generation": 1,
-        "compact_response_id": "resp_123",
-        "compact_created_at": 10.5,
-        "created_at": 11.0,
-        "updated_at": 12.0,
+        "prefix_sha256": checkpoint.source_input_sha256[:12],
+        "elapsed_ms": 7,
     }
     rendered = repr(metadata)
     assert "opaque-A" not in rendered
@@ -588,7 +583,6 @@ def test_redacted_metadata_never_exposes_arbitrary_credential_scope_values():
 
     metadata = checkpoint.redacted_metadata()
 
-    assert metadata["credential_scope_present"] is True
     assert "credential_scope" not in metadata
     assert credential_scope not in repr(metadata)
 
@@ -1707,3 +1701,266 @@ def test_raising_exception_status_property_is_redacted_and_client_still_closes()
 
     assert result == NativeCompactionFailure("client", False, True)
     assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+class _ObservabilityDB:
+    def __init__(self):
+        self.holder = "holder-1"
+        self.checkpoint = None
+
+    def get_compression_lock_holder(self, _session_id):
+        return self.holder
+
+    def load_native_openai_checkpoint(self, _session_id):
+        return None
+
+    def upsert_native_openai_checkpoint(self, checkpoint, *, expected_lock_holder):
+        assert expected_lock_holder == self.holder
+        self.checkpoint = checkpoint
+        return True
+
+
+class _ObservabilityAgent:
+    def __init__(self, *, eligible=True, status_error=None):
+        self.native_compaction_policy = SimpleNamespace(
+            is_eligible=lambda **_kwargs: eligible
+        )
+        self.client = _FakeCompactClient(compact=lambda **_: None)
+        self.provider = "openai"
+        self.api_mode = "codex_responses"
+        self.base_url = "https://api.openai.com/v1"
+        self.model = "gpt-5"
+        self.session_id = "session-observability"
+        self._session_db = _ObservabilityDB()
+        self._active_compression_lock_holder = "holder-1"
+        self.context_compressor = SimpleNamespace(
+            protect_last_n=1,
+            record_external_compaction=lambda **_kwargs: None,
+        )
+        self.statuses = []
+        self._status_error = status_error
+
+    def _emit_status(self, message):
+        if self._status_error is not None:
+            raise self._status_error
+        self.statuses.append(message)
+
+    def _build_api_kwargs(self, messages):
+        return {
+            "input": [
+                {
+                    "role": message["role"],
+                    "content": message.get("api_content", message.get("content", "")),
+                }
+                for message in copy.deepcopy(messages)
+            ]
+        }
+
+    def _get_transport(self):
+        return SimpleNamespace(preflight_kwargs=lambda kwargs, **_options: kwargs)
+
+    def _is_copilot_url(self):
+        return False
+
+    def _is_codex_backend(self):
+        return False
+
+    def _resolved_api_call_timeout(self):
+        return 10.0
+
+
+def _observability_messages(sentinel="ordinary-transcript-sentinel"):
+    return [
+        {"role": "user", "content": sentinel},
+        {"role": "assistant", "content": "answer-one"},
+        {"role": "user", "content": "question-two"},
+        {"role": "assistant", "content": "answer-two"},
+    ]
+
+
+def test_native_lifecycle_observability_is_structured_and_payload_safe(caplog):
+    from agent.conversation_compression import _try_native_openai_compaction
+
+    sentinels = {
+        "api_key": "api-key-sentinel",
+        "authorization": "authorization-header-sentinel",
+        "input": "compact-input-sentinel",
+        "output": "encrypted-output-sentinel",
+        "transcript": "ordinary-transcript-sentinel",
+    }
+    agent = _ObservabilityAgent()
+    agent.api_key = sentinels["api_key"]
+    agent.default_headers = {"Authorization": sentinels["authorization"]}
+    messages = _observability_messages(sentinels["transcript"])
+    messages[1]["api_content"] = sentinels["input"]
+
+    def _candidate(_agent, *, cut, **_kwargs):
+        return NativeCompactionCandidate(
+            source_input_item_count=cut.source_input_item_count,
+            source_input_sha256=cut.source_input_sha256,
+            compact_response_id="response-id-omitted-by-policy",
+            compact_created_at=123.0,
+            input_item_count=cut.source_input_item_count,
+            output_item_count=1,
+            output=[{"type": "compaction", "encrypted_content": sentinels["output"]}],
+        )
+
+    caplog.set_level("DEBUG", logger="agent.conversation_compression")
+    with (
+        patch(
+            "agent.chat_completion_helpers.native_openai_identity_for_agent",
+            return_value=_identity(),
+        ),
+        patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate",
+            side_effect=_candidate,
+        ),
+    ):
+        outcome = _try_native_openai_compaction(
+            agent, messages, commit_fence=None, hard_cancel_event=None
+        )
+
+    assert outcome == "success"
+    assert agent.statuses == [
+        "Context compacted with OpenAI native Responses projection "
+        "(generation 1; readable history retained)."
+    ]
+    records = [record for record in caplog.records if hasattr(record, "native_compaction")]
+    assert len(records) == 1
+    metadata = records[0].native_compaction
+    assert set(metadata) == {
+        "strategy", "provider", "api_mode", "model", "base_url_host",
+        "input_item_count", "output_item_count", "tail_item_count", "generation",
+        "prefix_sha256", "elapsed_ms",
+    }
+    rendered = caplog.text + repr(metadata) + repr(agent.statuses)
+    assert "response-id-omitted-by-policy" not in rendered
+    assert all(sentinel not in rendered for sentinel in sentinels.values())
+
+
+def test_enabled_native_failure_warns_once_per_turn_and_reset_allows_next_turn(caplog):
+    from agent.conversation_compression import (
+        _try_native_openai_compaction,
+        reset_native_compaction_observability,
+    )
+
+    agent = _ObservabilityAgent()
+    caplog.set_level("INFO", logger="agent.conversation_compression")
+    failure = NativeCompactionFailure("network", True, True)
+    with (
+        patch(
+            "agent.chat_completion_helpers.native_openai_identity_for_agent",
+            return_value=_identity(),
+        ),
+        patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate",
+            return_value=failure,
+        ),
+    ):
+        assert _try_native_openai_compaction(
+            agent, _observability_messages(), commit_fence=None, hard_cancel_event=None
+        ) == "fallback"
+        assert _try_native_openai_compaction(
+            agent, _observability_messages(), commit_fence=None, hard_cancel_event=None
+        ) == "fallback"
+        reset_native_compaction_observability(agent)
+        assert _try_native_openai_compaction(
+            agent, _observability_messages(), commit_fence=None, hard_cancel_event=None
+        ) == "fallback"
+
+    warning = "OpenAI native compaction unavailable; using Hermes text compression."
+    assert agent.statuses == [warning, warning]
+    metadata = [
+        record.native_compaction
+        for record in caplog.records
+        if hasattr(record, "native_compaction")
+    ]
+    assert len(metadata) == 3
+    assert all(item["fallback_category"] == "network" for item in metadata)
+    assert all("elapsed_ms" in item for item in metadata)
+
+
+def test_disabled_native_policy_does_not_emit_fallback_status(caplog):
+    from agent.conversation_compression import _try_native_openai_compaction
+
+    agent = _ObservabilityAgent(eligible=False)
+    assert _try_native_openai_compaction(
+        agent, _observability_messages(), commit_fence=None, hard_cancel_event=None
+    ) == "fallback"
+    assert agent.statuses == []
+    assert not any(hasattr(record, "native_compaction") for record in caplog.records)
+
+
+def test_status_callback_error_cannot_change_success_or_fallback(caplog):
+    from agent.conversation_compression import _try_native_openai_compaction
+
+    status_error = RuntimeError("status-callback-secret")
+    success_agent = _ObservabilityAgent(status_error=status_error)
+    failure_agent = _ObservabilityAgent(status_error=status_error)
+
+    def _candidate(_agent, *, cut, **_kwargs):
+        return NativeCompactionCandidate(
+            source_input_item_count=cut.source_input_item_count,
+            source_input_sha256=cut.source_input_sha256,
+            compact_response_id=None,
+            compact_created_at=None,
+            input_item_count=cut.source_input_item_count,
+            output_item_count=1,
+            output=[{"type": "compaction", "encrypted_content": "opaque"}],
+        )
+
+    with patch(
+        "agent.chat_completion_helpers.native_openai_identity_for_agent",
+        return_value=_identity(),
+    ):
+        with patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate",
+            side_effect=_candidate,
+        ):
+            assert _try_native_openai_compaction(
+                success_agent,
+                _observability_messages(),
+                commit_fence=None,
+                hard_cancel_event=None,
+            ) == "success"
+        with patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate",
+            return_value=NativeCompactionFailure("timeout", True, True),
+        ):
+            assert _try_native_openai_compaction(
+                failure_agent,
+                _observability_messages(),
+                commit_fence=None,
+                hard_cancel_event=None,
+            ) == "fallback"
+
+    assert "status-callback-secret" not in caplog.text
+
+
+def test_malformed_native_result_property_fails_open_without_rendering(caplog):
+    from agent.conversation_compression import _try_native_openai_compaction
+
+    class MalformedResult:
+        @property
+        def classification(self):
+            raise RuntimeError("malformed-result-secret")
+
+    agent = _ObservabilityAgent()
+    with (
+        patch(
+            "agent.chat_completion_helpers.native_openai_identity_for_agent",
+            return_value=_identity(),
+        ),
+        patch(
+            "agent.native_openai_compaction.request_native_compaction_candidate",
+            return_value=MalformedResult(),
+        ),
+    ):
+        assert _try_native_openai_compaction(
+            agent,
+            _observability_messages(),
+            commit_fence=None,
+            hard_cancel_event=None,
+        ) == "fallback"
+
+    assert "malformed-result-secret" not in caplog.text
