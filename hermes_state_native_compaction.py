@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from agent.native_openai_compaction import (
     NativeCompactionCheckpoint,
@@ -14,9 +15,16 @@ class NativeOpenAICompactionStateMixin:
     """Persist opaque native compaction state outside visible transcripts."""
 
     def upsert_native_openai_checkpoint(
-        self, checkpoint: NativeCompactionCheckpoint
-    ) -> None:
-        """Atomically replace the checkpoint row for its session."""
+        self,
+        checkpoint: NativeCompactionCheckpoint,
+        *,
+        expected_lock_holder: str | None = None,
+    ) -> bool:
+        """Atomically replace a checkpoint, optionally fenced by its live lease."""
+        if expected_lock_holder is not None and (
+            type(expected_lock_holder) is not str or not expected_lock_holder
+        ):
+            return False
         identity = checkpoint.identity
         values = (
             checkpoint.session_id,
@@ -40,6 +48,18 @@ class NativeOpenAICompactionStateMixin:
         )
 
         def _do(conn):
+            if expected_lock_holder is not None:
+                lock_row = conn.execute(
+                    "SELECT holder, expires_at FROM compression_locks "
+                    "WHERE session_id = ?",
+                    (checkpoint.session_id,),
+                ).fetchone()
+                if lock_row is None:
+                    return False
+                holder = lock_row["holder"]
+                expires_at = lock_row["expires_at"]
+                if holder != expected_lock_holder or expires_at < time.time():
+                    return False
             conn.execute(
                 """INSERT INTO native_openai_compaction_checkpoints (
                        session_id, provider, api_mode, model, base_url,
@@ -68,8 +88,9 @@ class NativeOpenAICompactionStateMixin:
                        updated_at = excluded.updated_at""",
                 values,
             )
+            return True
 
-        self._execute_write(_do)
+        return bool(self._execute_write(_do))
 
     def load_native_openai_checkpoint(
         self, session_id: str

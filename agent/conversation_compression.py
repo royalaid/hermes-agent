@@ -2173,22 +2173,21 @@ def _try_native_openai_compaction(
     session_id = getattr(agent, "session_id", None)
     if session_db is None or type(session_id) is not str or not session_id:
         return "fallback"
+    active_holder = getattr(agent, "_active_compression_lock_holder", None)
+    if type(active_holder) is not str or not active_holder:
+        return "fallback"
 
     def _commit_still_owned() -> bool:
         if hard_cancel_event is not None and hard_cancel_event.is_set():
             return False
         if commit_fence is not None and commit_fence.is_cancelled:
             return False
-        active_holder = getattr(agent, "_active_compression_lock_holder", None)
-        if active_holder is not None:
-            try:
-                return (
-                    session_db.get_compression_lock_holder(session_id)
-                    == active_holder
-                )
-            except Exception:
-                return False
-        return True
+        try:
+            return (
+                session_db.get_compression_lock_holder(session_id) == active_holder
+            )
+        except Exception:
+            return False
 
     # Explicit cancellation or a reclaimed lease must prevent endpoint dispatch,
     # not merely deny publication after paid work has already started.
@@ -2284,10 +2283,15 @@ def _try_native_openai_compaction(
             now=time.time(),
         )
         try:
-            session_db.upsert_native_openai_checkpoint(checkpoint)
+            persisted = session_db.upsert_native_openai_checkpoint(
+                checkpoint,
+                expected_lock_holder=active_holder,
+            )
         except Exception:
             logger.debug("native compaction checkpoint persistence failed")
             return "abort" if not _commit_still_owned() else "fallback"
+        if persisted is not True:
+            return "abort"
 
         try:
             agent.context_compressor.record_external_compaction(

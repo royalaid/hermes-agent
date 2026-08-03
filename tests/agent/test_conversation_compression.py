@@ -50,11 +50,16 @@ class _DB:
     def load_native_openai_checkpoint(self, session_id):
         return self.checkpoint
 
-    def upsert_native_openai_checkpoint(self, checkpoint):
+    def upsert_native_openai_checkpoint(
+        self, checkpoint, *, expected_lock_holder=None
+    ):
         if self.fail_upsert:
             raise RuntimeError("SECRET_UPSERT_FAILURE")
+        if expected_lock_holder != self.holder:
+            return False
         self.events.append("upsert")
         self.checkpoint = checkpoint
+        return True
 
 
 class _Compressor:
@@ -667,7 +672,8 @@ def test_lease_loss_during_failed_checkpoint_upsert_aborts_without_text_fallback
     agent = _Agent()
     agent.context_compressor.raise_on_text = False
 
-    def _failed_upsert(_checkpoint):
+    def _failed_upsert(_checkpoint, *, expected_lock_holder):
+        assert expected_lock_holder == agent._active_compression_lock_holder
         agent._session_db.holder = "replacement-holder"
         raise RuntimeError("SECRET_UPSERT_FAILURE")
 
