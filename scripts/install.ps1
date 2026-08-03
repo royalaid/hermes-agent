@@ -3224,9 +3224,12 @@ function Install-Desktop {
     if (-not $env:GITHUB_REF_NAME) {
         $env:GITHUB_REF_NAME = if ($Branch) { $Branch } else { "main" }
     }
+    # The explicit, validated -Repository pin is authoritative. Override any
+    # stale ambient CI value so commit, branch, and repository stay coherent.
+    $env:GITHUB_REPOSITORY = $Repository
     if ($env:GITHUB_SHA) {
         $shaPreview = if ($env:GITHUB_SHA.Length -ge 12) { $env:GITHUB_SHA.Substring(0, 12) } else { $env:GITHUB_SHA }
-        Write-Info "Desktop build stamp: $shaPreview ($($env:GITHUB_REF_NAME))"
+        Write-Info "Desktop build stamp: $shaPreview ($($env:GITHUB_REF_NAME)) from $env:GITHUB_REPOSITORY"
     } else {
         Write-Warn "Could not resolve a git commit for the desktop stamp -- write-build-stamp will use its non-git fallback"
     }
