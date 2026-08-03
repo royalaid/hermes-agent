@@ -118,6 +118,7 @@ class TestExtractCacheBustingConfig:
             {
                 "compression": {
                     "enabled": False,
+                    "openai_native": True,
                     "threshold": 0.6,
                     "codex_gpt55_autoraise": False,
                     "target_ratio": 0.3,
@@ -128,11 +129,34 @@ class TestExtractCacheBustingConfig:
             }
         )
         assert out["compression.enabled"] is False
+        assert out["compression.openai_native"] is True
         assert out["compression.threshold"] == 0.6
         assert out["compression.codex_gpt55_autoraise"] is False
         assert out["compression.target_ratio"] == 0.3
         assert out["compression.protect_last_n"] == 25
         assert out["compression.codex_app_server_auto"] == "hermes"
+
+    def test_openai_native_toggle_changes_cached_agent_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {
+            "api_key": "test",
+            "base_url": "https://api.openai.com/v1",
+            "provider": "openai",
+            "api_mode": "codex_responses",
+        }
+        disabled = GatewayRunner._extract_cache_busting_config(
+            {"compression": {"openai_native": False}}
+        )
+        enabled = GatewayRunner._extract_cache_busting_config(
+            {"compression": {"openai_native": True}}
+        )
+
+        assert GatewayRunner._agent_config_signature(
+            "gpt-5", runtime, [], "", cache_keys=disabled
+        ) != GatewayRunner._agent_config_signature(
+            "gpt-5", runtime, [], "", cache_keys=enabled
+        )
 
 
     def test_missing_keys_yield_none(self):
@@ -1061,4 +1085,27 @@ class TestCrossProcessInvalidationDefersCleanup:
         # Stale entry was popped, hard-teardown path never used.
         assert "telegram:s1" not in runner._agent_cache
         runner._cleanup_agent_resources.assert_not_called()
+
+
+def test_gateway_cached_agent_sessions_keep_native_checkpoints_isolated():
+    """A gateway cache key may be reused while its durable session changes."""
+    from gateway.run import _sync_cached_agent_native_checkpoint
+
+    checkpoint_a = object()
+    checkpoint_b = object()
+    loads = []
+    agent = MagicMock()
+    agent.session_id = "session-a"
+    agent._native_openai_checkpoint = checkpoint_a
+    agent._native_openai_checkpoint_session_id = "session-a"
+    agent._session_db.load_native_openai_checkpoint.side_effect = lambda session_id: (
+        loads.append(session_id)
+        or {"session-a": checkpoint_a, "session-b": checkpoint_b}.get(session_id)
+    )
+
+    _sync_cached_agent_native_checkpoint(agent, "session-b")
+
+    assert agent._native_openai_checkpoint_session_id == "session-b"
+    assert agent._native_openai_checkpoint is checkpoint_b
+    assert loads == ["session-b"]
 

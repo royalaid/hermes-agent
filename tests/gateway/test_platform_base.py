@@ -38,6 +38,65 @@ def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
     assert base.validate_media_delivery_path(str(path)) is None
 
 
+def test_media_delivery_denies_native_openai_scope_key(tmp_path, monkeypatch):
+    import gateway.platforms.base as base
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    path = hermes_home / "cache" / "native_openai_scope.key"
+    path.parent.mkdir()
+    path.write_bytes(b"x" * 32)
+
+    assert path in base._media_delivery_denied_paths()
+    assert base.validate_media_delivery_path(str(path)) is None
+
+
+def test_media_delivery_denies_sibling_profile_native_scope_key(
+    tmp_path, monkeypatch
+):
+    import gateway.platforms.base as base
+
+    root = tmp_path / "hermes"
+    active = root / "profiles" / "active"
+    sibling_key = (
+        root / "profiles" / "sibling" / "cache" / "native_openai_scope.key"
+    )
+    active.mkdir(parents=True)
+    sibling_key.parent.mkdir(parents=True)
+    target = sibling_key.parent / "replay-secret.bin"
+    target.write_bytes(b"x" * 32)
+    sibling_key.symlink_to(target)
+    monkeypatch.setattr(base, "_HERMES_HOME", active)
+    monkeypatch.setattr(base, "_HERMES_ROOT", root)
+    monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(root))
+
+    assert base.validate_media_delivery_path(str(sibling_key)) is None
+
+
+def test_media_delivery_denies_native_scope_key_windows_data_stream_alias(
+    tmp_path, monkeypatch
+):
+    if os.name != "nt":
+        pytest.skip("NTFS stream aliases are Windows-only")
+
+    import gateway.platforms.base as base
+
+    root = tmp_path / "hermes"
+    key = root / "cache" / "native_openai_scope.key"
+    key.parent.mkdir(parents=True)
+    key.write_bytes(b"x" * 32)
+    alias = f"{key.parent}\\NaTiVe_OpEnAi_ScOpE.KeY::$DATA"
+    monkeypatch.setattr(base, "_HERMES_HOME", root)
+    monkeypatch.setattr(base, "_HERMES_ROOT", root)
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(root))
+
+    assert base._is_native_openai_scope_key_basename(alias) is True
+    assert base.validate_media_delivery_path(alias) is None
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 

@@ -7307,6 +7307,59 @@ def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
     assert ("session.info", "sid", {"model": "?"}) in emits
 
 
+def test_compress_session_history_short_noop_ignores_stale_native_success():
+    agent = types.SimpleNamespace(_last_native_compaction_succeeded=True)
+    session = {
+        "agent": agent,
+        "history": [{"role": "user", "content": "short"}],
+        "history_version": 0,
+        "history_lock": threading.Lock(),
+    }
+
+    result = server._compress_session_history(session)
+
+    removed, _usage = result
+    assert removed == 0
+    assert result.native_succeeded is False
+    assert agent._last_native_compaction_succeeded is True
+
+
+@pytest.mark.parametrize(
+    ("attempt_native_succeeded", "shared_native_succeeded"),
+    [(True, False), (False, True)],
+)
+def test_compress_session_history_returns_attempt_scoped_native_outcome(
+    attempt_native_succeeded,
+    shared_native_succeeded,
+):
+    from agent.conversation_compression import _begin_compression_attempt_outcome
+
+    agent = types.SimpleNamespace(
+        context_compressor=None,
+        _cached_system_prompt="",
+        tools=None,
+        _compression_skipped_due_to_lock=False,
+    )
+    history = [{"role": "user", "content": f"m{i}"} for i in range(4)]
+
+    def _compress_context(messages, *_args, **_kwargs):
+        outcome = _begin_compression_attempt_outcome(agent)
+        if attempt_native_succeeded:
+            outcome.mark_native_succeeded()
+        # Simulate an overlapping attempt mutating the legacy shared signal.
+        agent._last_native_compaction_succeeded = shared_native_succeeded
+        return messages, ""
+
+    agent._compress_context = _compress_context
+    session = _session(agent=agent, history=history)
+
+    result = server._compress_session_history(session)
+
+    assert result.native_succeeded is attempt_native_succeeded
+    removed, _usage = result
+    assert removed == 0
+
+
 def test_compress_session_history_passes_force():
     """_compress_session_history is manual-only (session.compress RPC, slash
     compress/compact, slash-worker mirror) — it must bypass the
@@ -7392,6 +7445,35 @@ def test_session_compress_uses_compress_helper(monkeypatch):
     # Final status.update clears the pinned "compressing" indicator so the
     # status bar can revert to the neutral state when compaction finishes.
     emit.assert_any_call("status.update", "sid", {"kind": "status", "text": "ready"})
+
+
+def test_session_compress_reports_native_checkpoint_success(monkeypatch):
+    agent = types.SimpleNamespace(
+        _last_native_compaction_succeeded=False,
+        context_compressor=None,
+        _cached_system_prompt="",
+        tools=None,
+    )
+    history = [{"role": "user", "content": f"m{i}"} for i in range(6)]
+    server._sessions["sid"] = _session(agent=agent, history=history)
+    monkeypatch.setattr(
+        server,
+        "_compress_session_history",
+        lambda *_args, **_kwargs: server._ManualCompressionResult(0, {}, True),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+
+    try:
+        response = server.handle_request(
+            {"id": "1", "method": "session.compress", "params": {"session_id": "sid"}}
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    summary = response["result"]["summary"]
+    assert summary["native_succeeded"] is True
+    assert "native compaction checkpoint committed" in summary["headline"]
+    assert "No changes from compression" not in summary["headline"]
 
 
 def test_session_compress_normalizes_messages_for_desktop_transcript(monkeypatch):
@@ -10515,6 +10597,68 @@ def test_command_dispatch_compress_honors_here_argument(monkeypatch):
     assert head_passed == _PARTIAL_FAKE_HISTORY[:-2]
     assert focus_passed is None
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD + _PARTIAL_FAKE_HISTORY[-2:]
+
+
+def test_command_dispatch_compress_reports_native_checkpoint_success(monkeypatch):
+    agent = types.SimpleNamespace(
+        _last_native_compaction_succeeded=False,
+        context_compressor=None,
+        _cached_system_prompt="",
+        tools=None,
+    )
+    history = [{"role": "user", "content": f"m{i}"} for i in range(6)]
+    server._sessions["sid"] = _session(agent=agent, history=history)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a, **_kw: False)
+    monkeypatch.setattr(
+        server,
+        "_compress_session_history",
+        lambda *_args, **_kwargs: server._ManualCompressionResult(0, {}, True),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {"session_id": "sid", "name": "compress", "arg": ""},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    output = response["result"]["output"]
+    assert "native compaction checkpoint committed" in output
+    assert "No changes from compression" not in output
+
+
+def test_mirror_slash_compress_reports_attempt_scoped_native_success(monkeypatch):
+    agent = types.SimpleNamespace(
+        _last_native_compaction_succeeded=False,
+        context_compressor=None,
+        _cached_system_prompt="",
+        tools=None,
+    )
+    session = _session(
+        agent=agent,
+        history=[{"role": "user", "content": f"m{i}"} for i in range(6)],
+        running=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_compress_session_history",
+        lambda *_args, **_kwargs: server._ManualCompressionResult(0, {}, True),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_emit", lambda *args: None)
+
+    output = server._mirror_slash_side_effects("sid", session, "/compress")
+
+    assert "native compaction checkpoint committed" in output
+    assert "No changes from compression" not in output
 
 
 def test_mirror_slash_compress_honors_here_argument(monkeypatch):

@@ -4119,6 +4119,12 @@ class GatewaySlashCommandsMixin:
                     approx_tokens,
                     new_tokens,
                     compression_state=compressor,
+                    native_succeeded=(
+                        getattr(
+                            tmp_agent, "_last_native_compaction_succeeded", False
+                        )
+                        is True
+                    ),
                 )
                 # Detect summary-generation failure so we can surface a
                 # visible warning to the user even on the manual /compress

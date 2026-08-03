@@ -7,6 +7,19 @@ from pathlib import Path
 from typing import Optional
 
 
+_NATIVE_OPENAI_SCOPE_KEY_BASENAME = "native_openai_scope.key"
+
+
+def _is_native_openai_scope_key_basename(path: str) -> bool:
+    basename = os.path.basename(os.path.normpath(os.path.expanduser(str(path))))
+    if os.name == "nt":
+        # NTFS alternate data streams retain ``:<stream>`` in the final path
+        # component while addressing data attached to the base file.
+        basename = basename.split(":", 1)[0]
+        return basename.casefold() == _NATIVE_OPENAI_SCOPE_KEY_BASENAME.casefold()
+    return basename == _NATIVE_OPENAI_SCOPE_KEY_BASENAME
+
+
 def _hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME (profile-aware) without circular imports."""
     try:
@@ -49,6 +62,9 @@ def build_write_denied_paths(home: str) -> set[str]:
             # Bitwarden Secrets Manager encrypted disk cache.
             str(hermes_home / "cache" / "bws_cache.enc.json"),
             str(hermes_root / "cache" / "bws_cache.enc.json"),
+            # Installation-private HMAC key for direct-credential replay scope.
+            str(hermes_home / "cache" / "native_openai_scope.key"),
+            str(hermes_root / "cache" / "native_openai_scope.key"),
             os.path.join(home, ".netrc"),
             os.path.join(home, ".pgpass"),
             os.path.join(home, ".npmrc"),
@@ -100,8 +116,17 @@ def get_safe_write_roots() -> set[str]:
 
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+    if _is_native_openai_scope_key_basename(path):
+        return "credential"
+
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
+
+    # This installation-private HMAC key may live under any Hermes profile.
+    # Deny its unambiguous basename globally so an active profile cannot read
+    # or replace a sibling profile's replay scope key.
+    if _is_native_openai_scope_key_basename(resolved):
+        return "credential"
 
     if resolved in build_write_denied_paths(home):
         return "credential"
@@ -236,7 +261,17 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``"auth.json"`` would otherwise miss the denylist when the task's
     terminal cwd differs from the process cwd.
     """
+    if _is_native_openai_scope_key_basename(path):
+        return f"Read denied: '{path}' is a protected credential store."
+
     resolved = Path(path).expanduser().resolve()
+
+    # Profile multiplexing places this key below
+    # <HERMES_ROOT>/profiles/<name>/cache.  A global exact-basename denial is
+    # deliberate: it protects sibling profiles without relying on their
+    # existence at process startup.
+    if _is_native_openai_scope_key_basename(resolved):
+        return f"Read denied: '{path}' is a protected credential store."
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
     # Hermes root so credential stores at <root>/auth.json etc. are also
@@ -282,6 +317,7 @@ def get_read_block_error(path: str) -> Optional[str]:
         # to avoid re-fetching across back-to-back CLI invocations. The file
         # was introduced by #31968 but not added to this guard.
         os.path.join("cache", "bws_cache.json"),
+        os.path.join("cache", "native_openai_scope.key"),
     )
     for hd in hermes_dirs:
         for name in credential_file_names:

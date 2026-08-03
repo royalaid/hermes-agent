@@ -1321,6 +1321,20 @@ def _select_cached_agent_history(
     return persisted_history
 
 
+def _sync_cached_agent_native_checkpoint(agent: Any, session_id: Any) -> None:
+    """Rebind native replay state only when a cached gateway agent switches session."""
+    current = getattr(
+        agent,
+        "_native_openai_checkpoint_session_id",
+        getattr(agent, "session_id", None),
+    )
+    if current == session_id:
+        return
+    from agent.chat_completion_helpers import bind_native_openai_checkpoint_cache
+
+    bind_native_openai_checkpoint_cache(agent, session_id)
+
+
 def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
     """Prepend observed Telegram context to the API-only current user turn."""
 
@@ -4649,6 +4663,7 @@ class TurnRunner:
             self._runner._apply_fallback_chain_to_agent(
                 agent, self._runner._refresh_fallback_model(),
             )
+            _sync_cached_agent_native_checkpoint(agent, ctx.session_id)
 
         # Lock released — now schedule cleanup of any cross-process-evicted
         # agent on a daemon thread so memory-provider shutdown / socket
@@ -22242,6 +22257,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("model", "context_length"),
         ("model", "max_tokens"),
         ("compression", "enabled"),
+        ("compression", "openai_native"),
         ("compression", "progress_notices"),
         ("compression", "threshold"),
         ("compression", "model_thresholds"),

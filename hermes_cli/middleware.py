@@ -233,6 +233,13 @@ def run_api_execution_middleware(
     return run_llm_execution_middleware(request, next_call, **context)
 
 
+def has_llm_request_or_execution_middleware() -> bool:
+    """Return whether middleware can rewrite the finalized provider request."""
+    return _has_middleware(LLM_REQUEST_MIDDLEWARE) or _has_middleware(
+        LLM_EXECUTION_MIDDLEWARE
+    )
+
+
 def _invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     from hermes_cli.plugins import invoke_middleware
 

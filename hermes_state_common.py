@@ -249,6 +249,27 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
 
+CREATE TABLE IF NOT EXISTS native_openai_compaction_checkpoints (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    api_mode TEXT NOT NULL,
+    model TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    issuer_kind TEXT NOT NULL,
+    credential_scope TEXT NOT NULL DEFAULT '',
+    replay_encrypted_reasoning INTEGER NOT NULL DEFAULT 0,
+    source_input_item_count INTEGER NOT NULL,
+    source_input_sha256 TEXT NOT NULL,
+    output_json TEXT NOT NULL,
+    compact_response_id TEXT,
+    compact_created_at REAL,
+    input_item_count INTEGER NOT NULL,
+    output_item_count INTEGER NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),

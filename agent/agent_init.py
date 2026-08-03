@@ -1554,6 +1554,11 @@ def init_agent(
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
     agent._parent_session_id = parent_session_id
+    # Native Responses checkpoints are loaded once when this agent binds its
+    # persistent session. Tool-loop requests consult only this immutable cache.
+    from agent.chat_completion_helpers import bind_native_openai_checkpoint_cache
+
+    bind_native_openai_checkpoint_cache(agent, agent.session_id)
     # A close flush and the worker's turn-start flush can overlap. The durable
     # marker is attached to each in-memory message dict, so its test-and-append
     # sequence must be serialized per agent rather than relying on SQLite alone.
@@ -2485,12 +2490,28 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
         )
+    _session_state_bound = False
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
+            _session_state_bound = True
         except Exception:
             pass
+
+    # Native Responses compaction is an explicit, fail-closed policy.  The
+    # policy retains no client or route credentials; future call sites must
+    # provide the then-current client/provider/api_mode/base_url to eligibility.
+    from agent.native_openai_compaction import NativeCompactionPolicy
+    from hermes_cli.config import openai_native_compaction_enabled
+
+    agent.native_compaction_policy = NativeCompactionPolicy.from_runtime(
+        feature_enabled=openai_native_compaction_enabled(_agent_cfg),
+        context_compressor=agent.context_compressor,
+        session_db=session_db,
+        session_id=agent.session_id,
+        session_state_bound=_session_state_bound,
+    )
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     # Apply micro-compaction settings to the compressor (feature is opt-in)

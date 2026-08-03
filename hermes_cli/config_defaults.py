@@ -560,6 +560,7 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        "openai_native": False,        # opt-in: use first-party Responses compaction
         "progress_notices": False,    # opt-in (#52995): when True, routine compression
                                       # progress statuses (compacting/preflight/pre-API/
                                       # idle/retry) are delivered to chat gateway

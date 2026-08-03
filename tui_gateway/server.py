@@ -4615,13 +4615,29 @@ class CompressionLockHeld(Exception):
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
 
 
+class _ManualCompressionResult:
+    """Backward-compatible two-value result with attempt-local native state."""
+
+    __slots__ = ("removed", "usage", "native_succeeded")
+
+    def __init__(self, removed: int, usage: dict, native_succeeded: bool):
+        self.removed = removed
+        self.usage = usage
+        self.native_succeeded = native_succeeded is True
+
+    def __iter__(self):
+        # Existing internal callers and tests historically unpacked two values.
+        yield self.removed
+        yield self.usage
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
     approx_tokens: int | None = None,
     before_messages: list | None = None,
     history_version: int | None = None,
-) -> tuple[int, dict]:
+) -> _ManualCompressionResult:
     """Compress a session's history — the single choke point shared by all
     three manual-compress routes (session.compress RPC, command.dispatch
     /compress|/compact, and the slash-exec mirror).
@@ -4637,6 +4653,7 @@ def _compress_session_history(
     text "here 3".
     """
     from agent.conversation_compression import (
+        capture_compression_attempt_outcome,
         finalize_context_engine_compression_notification,
     )
     from agent.model_metadata import estimate_request_tokens_rough
@@ -4658,7 +4675,7 @@ def _compress_session_history(
     history = before_messages
     if len(history) < 4:
         usage = _get_usage(agent)
-        return 0, usage
+        return _ManualCompressionResult(0, usage, False)
     partial, keep_last, focus_topic = parse_partial_compress_args(focus_topic or "")
     # Boundary-aware split: only the head is summarized; the most recent
     # `keep_last` exchanges ride along verbatim. A degenerate split (empty
@@ -4701,6 +4718,10 @@ def _compress_session_history(
             force=True,
             defer_context_engine_notification=True,
         )
+        attempt_outcome = capture_compression_attempt_outcome(agent)
+        native_succeeded = bool(
+            attempt_outcome is not None and attempt_outcome.native_succeeded
+        )
     except Exception:
         finalize_context_engine_compression_notification(
             agent,
@@ -4736,11 +4757,13 @@ def _compress_session_history(
                 committed=False,
             )
             usage = _get_usage(agent)
-            return 0, usage
+            return _ManualCompressionResult(0, usage, False)
         session["history"] = compressed
         session["history_version"] = history_version + 1
     usage = _get_usage(agent)
-    return len(history) - len(compressed), usage
+    return _ManualCompressionResult(
+        len(history) - len(compressed), usage, native_succeeded
+    )
 
 
 def _sync_session_key_after_compress(
@@ -12554,7 +12577,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             # parses the boundary-aware forms (here [N], up to here, --keep N)
             # and does the partial head/tail split there (#35533).
             try:
-                _compress_session_history(session, arg)
+                compression_result = _compress_session_history(session, arg)
             except CompressionLockHeld as e:
                 from agent.manual_compression_feedback import (
                     describe_compression_lock_skip,
@@ -12580,6 +12603,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 _before_tokens,
                 _after_tokens,
                 compression_state=getattr(agent, "context_compressor", None),
+                native_succeeded=(
+                    getattr(compression_result, "native_succeeded", False) is True
+                ),
             )
             _lines = [_fb["headline"], _fb["token_line"]]
             if _fb.get("note"):

@@ -16,11 +16,14 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -138,6 +141,229 @@ def _is_openai_codex_backend(agent) -> bool:
             and "/backend-api/codex" in base_url_lower
         )
     )
+
+
+def bind_native_openai_checkpoint_cache(agent, session_id) -> None:
+    """Clear and load the one cached checkpoint for a persistent session binding."""
+    agent._native_openai_checkpoint = None
+    agent._native_openai_checkpoint_session_id = (
+        session_id if type(session_id) is str and session_id else None
+    )
+    session_db = getattr(agent, "_session_db", None)
+    if session_db is None or agent._native_openai_checkpoint_session_id is None:
+        return
+    try:
+        agent._native_openai_checkpoint = session_db.load_native_openai_checkpoint(
+            agent._native_openai_checkpoint_session_id
+        )
+    except Exception:
+        pass
+
+
+def _load_or_create_native_scope_key():
+    """Return this Hermes profile's private native-replay scope key."""
+    from hermes_constants import get_hermes_home
+
+    key_path = get_hermes_home() / "cache" / "native_openai_scope.key"
+    try:
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    missing = object()
+
+    def read_existing_key():
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(key_path, flags)
+        except FileNotFoundError:
+            return missing
+        except OSError:
+            return None
+
+        try:
+            opened_stat = os.fstat(fd)
+            path_stat = key_path.lstat()
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or opened_stat.st_nlink != 1
+                or stat.S_ISLNK(path_stat.st_mode)
+                or not stat.S_ISREG(path_stat.st_mode)
+                or path_stat.st_nlink != 1
+                or (opened_stat.st_dev, opened_stat.st_ino)
+                != (path_stat.st_dev, path_stat.st_ino)
+            ):
+                return None
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                return handle.read(33)
+        except (FileNotFoundError, OSError):
+            return None
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    for _attempt in range(8):
+        existing = read_existing_key()
+        if existing is None:
+            # Never treat another file as credential-scope material through a
+            # symlink, hard link, or path swap. Fall back conservatively.
+            return None
+        if existing is missing:
+            candidate = os.urandom(32)
+            try:
+                fd = os.open(
+                    key_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                time.sleep(0.005)
+                continue
+            except OSError:
+                return None
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    if handle.write(candidate) != len(candidate):
+                        return None
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.chmod(key_path, 0o600)
+                except OSError:
+                    pass
+                return candidate
+            except OSError:
+                return None
+        if len(existing) == 32:
+            return existing
+        if existing:
+            return None
+        time.sleep(0.005)
+    return None
+
+
+def _direct_native_credential_scope(agent, raw_api_key):
+    installation_key = _load_or_create_native_scope_key()
+    if installation_key is not None:
+        digest = hmac.new(
+            installation_key,
+            b"native-openai-direct-credential\0" + raw_api_key.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"direct-hmac-sha256:{digest}"
+
+    # A read-only or malformed key store conservatively disables cross-agent
+    # replay.  Only this fallback retains an in-memory direct-key fingerprint.
+    fingerprint = hashlib.sha256(raw_api_key.encode("utf-8")).digest()
+    prior_fingerprint = getattr(
+        agent, "_native_compaction_direct_credential_fingerprint", None
+    )
+    prior_scope = getattr(agent, "_native_compaction_direct_credential_scope", None)
+    if prior_fingerprint != fingerprint or type(prior_scope) is not str:
+        prior_scope = f"direct-instance:{uuid.uuid4().hex}"
+        setattr(agent, "_native_compaction_direct_credential_fingerprint", fingerprint)
+        setattr(agent, "_native_compaction_direct_credential_scope", prior_scope)
+    return prior_scope
+
+
+def native_openai_identity_for_agent(agent, *, model=None):
+    """Build the single native-compaction identity used for create and replay."""
+    from agent.codex_responses_adapter import _classify_responses_issuer
+    from agent.native_openai_compaction import NativeCompactionIdentity
+
+    raw_credential_scope = getattr(agent, "_credential_pool_entry_id", None)
+    if type(raw_credential_scope) is str and raw_credential_scope:
+        credential_scope = "pool-entry-sha256:" + hashlib.sha256(
+            b"native-openai-pool-entry\0"
+            + raw_credential_scope.encode("utf-8")
+        ).hexdigest()
+    else:
+        raw_api_key = getattr(agent, "api_key", None)
+        credential_scope = ""
+        if type(raw_api_key) is str and raw_api_key:
+            credential_scope = _direct_native_credential_scope(agent, raw_api_key)
+
+    return NativeCompactionIdentity(
+        provider=getattr(agent, "provider", ""),
+        api_mode=getattr(agent, "api_mode", ""),
+        model=getattr(agent, "model", "") if model is None else model,
+        base_url=getattr(agent, "base_url", ""),
+        issuer_kind=_classify_responses_issuer(
+            is_codex_backend=_is_openai_codex_backend(agent),
+            base_url=getattr(agent, "base_url", ""),
+        ),
+        credential_scope=credential_scope,
+        replay_encrypted_reasoning=bool(
+            getattr(agent, "_codex_reasoning_replay_enabled", True)
+        ),
+    )
+
+
+def _discard_invalid_native_openai_checkpoint(agent, checkpoint) -> None:
+    """Forget a same-route projection whose readable source prefix diverged."""
+    agent._native_openai_checkpoint = None
+    session_db = getattr(agent, "_session_db", None)
+    delete_checkpoint = getattr(session_db, "delete_native_openai_checkpoint", None)
+    if not callable(delete_checkpoint):
+        return
+    try:
+        delete_checkpoint(checkpoint.session_id)
+    except Exception:
+        pass
+
+
+def maybe_apply_native_openai_projection(agent, api_kwargs: dict) -> dict:
+    """Replay a matching cached native checkpoint over finalized Responses input."""
+    from agent.native_openai_compaction import (
+        NativeCompactionCheckpoint,
+        apply_checkpoint,
+        checkpoint_matches,
+    )
+
+    checkpoint = getattr(agent, "_native_openai_checkpoint", None)
+    ordinary_input = api_kwargs.get("input")
+    if (
+        getattr(agent, "api_mode", None) != "codex_responses"
+        or type(checkpoint) is not NativeCompactionCheckpoint
+        or checkpoint.session_id
+        != getattr(
+            agent,
+            "_native_openai_checkpoint_session_id",
+            getattr(agent, "session_id", None),
+        )
+        or type(ordinary_input) is not list
+    ):
+        return api_kwargs
+    try:
+        policy = getattr(agent, "native_compaction_policy", None)
+        if not (
+            callable(getattr(policy, "is_eligible", None))
+            and policy.is_eligible(
+                client=getattr(agent, "client", None),
+                provider=getattr(agent, "provider", None),
+                api_mode=getattr(agent, "api_mode", None),
+                base_url=getattr(agent, "base_url", None),
+            )
+        ):
+            return api_kwargs
+        identity = native_openai_identity_for_agent(
+            agent, model=api_kwargs.get("model", "")
+        )
+        if identity != checkpoint.identity:
+            return api_kwargs
+        if not checkpoint_matches(identity, checkpoint, ordinary_input):
+            _discard_invalid_native_openai_checkpoint(agent, checkpoint)
+            return api_kwargs
+        projected = dict(api_kwargs)
+        projected["input"] = apply_checkpoint(checkpoint, ordinary_input)
+        return projected
+    except Exception:
+        return api_kwargs
 
 
 def openai_codex_stale_timeout_floor(est_tokens: int) -> float:

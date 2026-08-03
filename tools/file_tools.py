@@ -398,6 +398,58 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     return resolved.resolve()
 
 
+def _lexical_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
+    """Return a task-absolute path without dereferencing its final symlink.
+
+    Read guards need both this lexical name and the resolved target.  The
+    ordinary resolver dereferences host paths on POSIX, which otherwise erases
+    protected credential-store basenames before policy sees them.
+    """
+    if _uses_container_paths(task_id):
+        expanded = _expand_tilde(filepath)
+        if posixpath.isabs(expanded):
+            return _normalize_without_host_deref(expanded)
+        return _normalize_without_host_deref(
+            _resolve_base_dir(task_id, container_paths=True) / expanded
+        )
+
+    from tools.environments.local import _msys_to_windows_path
+
+    expanded = _expand_tilde(_msys_to_windows_path(filepath))
+    if sys.platform == "win32":
+        import ntpath
+
+        if ntpath.isabs(expanded):
+            return Path(ntpath.normpath(expanded))
+        base = _resolve_base_dir(task_id, container_paths=False)
+        return Path(ntpath.normpath(ntpath.join(str(base), expanded)))
+
+    path = Path(expanded)
+    if path.is_absolute():
+        return Path(os.path.normpath(os.fspath(path)))
+    base = _resolve_base_dir(task_id, container_paths=False)
+    return Path(os.path.normpath(os.fspath(base / path)))
+
+
+def _task_read_block_error(path: str, task_id: str = "default") -> str | None:
+    """Apply read policy to both the lexical task path and resolved target."""
+    try:
+        lexical = _lexical_path_for_task(path, task_id)
+    except (OSError, ValueError, RuntimeError):
+        lexical = path
+    error = get_read_block_error(str(lexical))
+    if error:
+        return error
+
+    try:
+        resolved = _resolve_path_for_task(path, task_id)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if str(resolved) == str(lexical):
+        return None
+    return get_read_block_error(str(resolved))
+
+
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
     """Warn when a relative path resolved OUTSIDE the task's workspace root.
 
@@ -596,11 +648,7 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
     can differ from the Python process cwd. Mirror ``read_file_tool``'s path
     resolution before applying the shared read guard.
     """
-    try:
-        resolved = _resolve_path_for_task(path, task_id)
-    except (OSError, ValueError, RuntimeError):
-        return get_read_block_error(path)
-    return get_read_block_error(str(resolved))
+    return _task_read_block_error(path, task_id)
 
 
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
@@ -1278,6 +1326,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        # Apply lexical and resolved credential policy before any content I/O,
+        # including structured-document extraction, which can return early.
+        block_error = _task_read_block_error(path, task_id)
+        if block_error:
+            return tool_error(block_error)
+
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
@@ -1347,16 +1401,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         # ── Hermes internal path guard ────────────────────────────────
-        # Prevent prompt injection via catalog or hub metadata files,
-        # and block credential stores under HERMES_HOME.  Pass the
-        # already-resolved path so a relative-path read against
-        # TERMINAL_CWD == HERMES_HOME (e.g. "auth.json") still hits the
-        # denylist — get_read_block_error's own resolve() runs against
-        # the Python process cwd, which can differ.
-        block_error = get_read_block_error(str(_resolved))
-        if block_error:
-            return tool_error(block_error)
-
         # ── Negative-result cache ─────────────────────────────────────
         # If we already discovered this path doesn't exist (within TTL),
         # return the cached error without spawning the subprocess +
@@ -2079,11 +2123,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 already_searched=count,
             )
 
-        try:
-            resolved_path = _resolve_path_for_task(path, task_id)
-        except (OSError, ValueError, RuntimeError):
-            resolved_path = None
-        block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
+        block_error = _task_read_block_error(path, task_id)
         if block_error:
             return tool_error(block_error)
 

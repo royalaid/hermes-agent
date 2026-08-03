@@ -1368,6 +1368,8 @@ def _media_delivery_denied_paths() -> List[Path]:
         # Bitwarden Secrets Manager plaintext and encrypted disk caches.
         os.path.join("cache", "bws_cache.json"),
         os.path.join("cache", "bws_cache.enc.json"),
+        # Installation-private HMAC key for direct native-replay scope.
+        os.path.join("cache", "native_openai_scope.key"),
     )
     # Directory trees whose every child is credential material.
     #
@@ -1448,6 +1450,18 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
+_NATIVE_OPENAI_SCOPE_KEY_BASENAME = "native_openai_scope.key"
+
+
+def _is_native_openai_scope_key_basename(path: str | Path) -> bool:
+    basename = os.path.basename(os.path.normpath(os.path.expanduser(str(path))))
+    if os.name == "nt":
+        # Match NTFS alternate-data-stream aliases to their protected base file.
+        basename = basename.split(":", 1)[0]
+        return basename.casefold() == _NATIVE_OPENAI_SCOPE_KEY_BASENAME.casefold()
+    return basename == _NATIVE_OPENAI_SCOPE_KEY_BASENAME
+
+
 def validate_media_delivery_path(path: str) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
@@ -1477,6 +1491,8 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     candidate = candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
     if not candidate:
         return None
+    if _is_native_openai_scope_key_basename(candidate):
+        return None
 
     try:
         expanded = Path(os.path.expanduser(candidate))
@@ -1492,6 +1508,12 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         return None
 
     if not resolved.is_file():
+        return None
+
+    # Installation-private replay scope keys can exist beneath any profile.
+    # Deny the unambiguous basename before cache/operator allowlists and before
+    # default non-strict acceptance so one profile cannot deliver another's key.
+    if _is_native_openai_scope_key_basename(resolved):
         return None
 
     # Cache / operator allowlist is always honored — these are unconditionally

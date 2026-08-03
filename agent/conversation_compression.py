@@ -52,6 +52,7 @@ thread, not the conversation thread. Extension authors must assume:
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import copy
 import inspect
 import json
@@ -99,6 +100,138 @@ COMPACTION_STATUS = (
 )
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
+
+# Stable and deliberately payload-free. This instruction is not derived from
+# transcript, memory-provider output, credentials, or user text.
+NATIVE_OPENAI_COMPACTION_INSTRUCTIONS = (
+    "Preserve the conversation state needed to continue the current task."
+)
+NATIVE_OPENAI_COMPACTION_SUCCESS_STATUS = (
+    "Context compacted with OpenAI native Responses projection "
+    "(generation {generation}; readable history retained)."
+)
+NATIVE_OPENAI_COMPACTION_FALLBACK_STATUS = (
+    "OpenAI native compaction unavailable; using Hermes text compression."
+)
+
+
+class _CompressionAttemptOutcome:
+    """Mutable, payload-free result shared with one compression caller context."""
+
+    __slots__ = ("agent_id", "attempt_id", "_native_succeeded", "_lock")
+
+    def __init__(self, agent: Any) -> None:
+        self.agent_id = id(agent)
+        self.attempt_id = uuid.uuid4().hex
+        self._native_succeeded = False
+        self._lock = threading.Lock()
+
+    @property
+    def native_succeeded(self) -> bool:
+        with self._lock:
+            return self._native_succeeded is True
+
+    def mark_native_succeeded(self) -> None:
+        with self._lock:
+            self._native_succeeded = True
+
+    def __repr__(self) -> str:
+        return (
+            "_CompressionAttemptOutcome("
+            f"attempt_id={self.attempt_id!r}, "
+            f"native_succeeded={self.native_succeeded!r})"
+        )
+
+
+_COMPRESSION_ATTEMPT_OUTCOME: contextvars.ContextVar[
+    Optional[_CompressionAttemptOutcome]
+] = contextvars.ContextVar("compression_attempt_outcome", default=None)
+
+
+def _begin_compression_attempt_outcome(
+    agent: Any,
+    outcome: Optional[_CompressionAttemptOutcome] = None,
+) -> _CompressionAttemptOutcome:
+    """Bind a fresh or caller-provided result to the current execution context."""
+    if outcome is None or outcome.agent_id != id(agent):
+        outcome = _CompressionAttemptOutcome(agent)
+    _COMPRESSION_ATTEMPT_OUTCOME.set(outcome)
+    return outcome
+
+
+def _mark_native_compression_attempt_succeeded(agent: Any) -> None:
+    """Mark only the compression attempt bound to this execution context."""
+    outcome = _COMPRESSION_ATTEMPT_OUTCOME.get()
+    if outcome is not None and outcome.agent_id == id(agent):
+        outcome.mark_native_succeeded()
+
+
+def capture_compression_attempt_outcome(
+    agent: Any,
+) -> Optional[_CompressionAttemptOutcome]:
+    """Capture the exact attempt result visible to the current caller context."""
+    outcome = _COMPRESSION_ATTEMPT_OUTCOME.get()
+    if outcome is None or outcome.agent_id != id(agent):
+        return None
+    return outcome
+
+
+def reset_compression_attempt_outcome() -> None:
+    """Clear any completed-attempt result at the start of a new turn."""
+    _COMPRESSION_ATTEMPT_OUTCOME.set(None)
+
+
+def reset_native_compaction_observability(agent: Any) -> None:
+    """Reset the per-turn native fallback status latch."""
+    agent._native_compaction_fallback_status_emitted = False
+
+
+def _emit_native_compaction_status(agent: Any, message: str) -> None:
+    """Emit a fixed payload-free status without affecting control flow."""
+    try:
+        emitter = getattr(agent, "_emit_status", None)
+        if callable(emitter):
+            emitter(message)
+            return
+        callback = getattr(agent, "status_callback", None)
+        if callable(callback):
+            callback("lifecycle", message)
+    except Exception:
+        # Exception details may contain adapter payloads or credentials.
+        logger.debug("native compaction status callback failed")
+
+
+def compression_attempt_made_progress(
+    agent: Any,
+    *,
+    before_count: int,
+    after_count: int,
+    before_tokens: int,
+    after_tokens: int,
+    old_context_length: Optional[int] = None,
+    new_context_length: Optional[int] = None,
+    attempt_outcome: Optional[_CompressionAttemptOutcome] = None,
+) -> bool:
+    """Return whether one compression attempt produced retryable progress."""
+    native_succeeded = getattr(agent, "_last_native_compaction_succeeded", False)
+    if attempt_outcome is not None:
+        native_succeeded = (
+            attempt_outcome.agent_id == id(agent)
+            and attempt_outcome.native_succeeded is True
+        )
+    if native_succeeded is True:
+        return True
+    if after_count < before_count:
+        return True
+    if before_tokens > 0 and after_tokens > 0 and after_tokens < before_tokens * 0.95:
+        return True
+    return bool(
+        type(old_context_length) is int
+        and old_context_length > 0
+        and type(new_context_length) is int
+        and new_context_length > 0
+        and new_context_length < old_context_length
+    )
 
 
 def _emit_compaction_done(agent: Any) -> None:
@@ -464,6 +597,11 @@ class CompressionCommitFence:
         # flight" even while the commit itself is hung — which is exactly when
         # the overrun warning must be able to fire.
         self._commit_phase = threading.Event()
+        # Endpoint dispatch uses the same admission lock as hard cancellation.
+        # The marker lets interrupts publish their Event without blocking
+        # behind an in-flight request while durable lease release stays deferred.
+        self._dispatch_phase = threading.Event()
+        self._dispatch_cancel_event: Any = None
         # Lock-free admission revocation (#76354 review F2). Set by
         # :meth:`revoke_commit_admission` on ANY host unwind (KeyboardInterrupt,
         # cancellation, unexpected exception) without touching the fence lock,
@@ -504,25 +642,32 @@ class CompressionCommitFence:
         """Cancel a pending commit, or wait for an active commit to finish.
 
         Returns ``True`` when cancellation won before the commit boundary.
-        Returns ``False`` when the worker had already entered the boundary; in
-        that case acquiring this lock waits until all session mutation finishes.
+        Returns ``False`` only when an irreversible commit was already admitted.
+        An admitted provider request is cancellable: future commit admission is
+        revoked and the caller may return while request cleanup finishes.
         """
-        with self._lock:
-            if self._commit_started:
-                if cancel_event is not None:
-                    cancel_event.set()
-                return False
-            self._cancelled = True
-            if cancel_event is not None:
-                cancel_event.set()
-            return True
+        if cancel_event is not None:
+            cancel_event.set()
+        while True:
+            if self._commit_phase.is_set():
+                with self._lock:
+                    return False
+            cancelled = self.try_cancel_before_commit()
+            if cancelled is not None:
+                return cancelled
+            time.sleep(0.001)
 
     def try_cancel_before_commit(self) -> Optional[bool]:
         """Non-blocking form of :meth:`cancel_before_commit`.
 
-        Returns ``None`` while an active commit owns the fence, allowing an
-        async caller to yield instead of blocking its event loop.
+        Returns ``None`` while a transient fence operation owns the lock.
         """
+        # Revoke first so a request finishing between the lock-free phase probe
+        # and lock acquisition cannot slip into begin_commit().
+        self.revoke_commit_admission()
+        if self._dispatch_phase.is_set():
+            self._cancelled = True
+            return True
         if not self._lock.acquire(blocking=False):
             return None
         try:
@@ -555,6 +700,39 @@ class CompressionCommitFence:
         # commit_in_flight=True for a commit that lost to cancellation.
         self._commit_phase.set()
         return True
+
+    def begin_dispatch(self, cancel_event: Any = None) -> bool:
+        """Atomically admit endpoint dispatch against hard cancellation.
+
+        The caller retains the admission lock through the synchronous SDK call
+        and must pair success with :meth:`finish_dispatch`.
+        """
+        self._lock.acquire()
+        # Publish the event before the final under-lock admission check so a
+        # lock-free revoker cannot miss the request-cancellation channel in
+        # the check-to-publication window.
+        self._dispatch_cancel_event = cancel_event
+        if (
+            self._cancelled
+            or self._admission_revoked
+            or (cancel_event is not None and bool(cancel_event.is_set()))
+        ):
+            self._cancelled = True
+            self._dispatch_cancel_event = None
+            self._lock.release()
+            if self._admission_revoked:
+                self.release_cancelled_compression_lock()
+            return False
+        self._dispatch_phase.set()
+        return True
+
+    def finish_dispatch(self) -> None:
+        """Leave an endpoint dispatch boundary entered by ``begin_dispatch``."""
+        self._dispatch_phase.clear()
+        self._dispatch_cancel_event = None
+        self._lock.release()
+        if self._admission_revoked:
+            self.release_cancelled_compression_lock()
 
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
@@ -618,6 +796,9 @@ class CompressionCommitFence:
           outer cleanup because the DB release is holder-qualified.
         """
         self._admission_revoked = True
+        dispatch_cancel_event = self._dispatch_cancel_event
+        if dispatch_cancel_event is not None:
+            dispatch_cancel_event.set()
         if self._lock.acquire(blocking=False):
             try:
                 self.release_cancelled_compression_lock()
@@ -685,6 +866,8 @@ class CompressionCommitFence:
         with self._lock_release_guard:
             self._cancelled_lock_release_requested = True
             release = self._cancelled_lock_release
+        if self._dispatch_phase.is_set():
+            return
         if release is not None:
             release()
 
@@ -1232,6 +1415,9 @@ def _adopt_live_compression_child(
         return None
 
     agent.session_id = child_session_id
+    from agent.chat_completion_helpers import bind_native_openai_checkpoint_cache
+
+    bind_native_openai_checkpoint_cache(agent, child_session_id)
     try:
         from gateway.session_context import set_current_session_id
 
@@ -2125,6 +2311,302 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+def _current_system_prompt(agent: Any, system_message: str) -> str:
+    existing = getattr(agent, "_cached_system_prompt", None)
+    return existing if existing else agent._build_system_prompt(system_message)
+
+
+def _invalidate_native_checkpoint_after_textual_compaction(
+    agent: Any,
+    compacted_session_id: str,
+) -> None:
+    """Best-effort removal of an opaque projection invalidated by text rewrite."""
+    if type(compacted_session_id) is not str or not compacted_session_id:
+        return
+    if (
+        getattr(agent, "_native_openai_checkpoint_session_id", None)
+        == compacted_session_id
+    ):
+        agent._native_openai_checkpoint = None
+    session_db = getattr(agent, "_session_db", None)
+    delete_checkpoint = getattr(session_db, "delete_native_openai_checkpoint", None)
+    if not callable(delete_checkpoint):
+        return
+    try:
+        delete_checkpoint(compacted_session_id)
+    except Exception:
+        logger.debug("native checkpoint deletion after textual compaction failed")
+
+
+def _try_native_openai_compaction(
+    agent: Any,
+    messages: list,
+    *,
+    commit_fence: Optional[CompressionCommitFence],
+    hard_cancel_event: Any,
+) -> str:
+    """Return ``success``, ``fallback``, or ``abort`` for one native attempt."""
+    from agent.chat_completion_helpers import native_openai_identity_for_agent
+    from agent.native_openai_compaction import (
+        NativeCompactionCandidate,
+        NativeCompactionCheckpoint,
+        NativeCompactionFailure,
+        _safe_base_url_host,
+        checkpoint_from_candidate,
+        checkpoint_matches,
+        request_native_compaction_candidate,
+        select_native_compaction_cut,
+    )
+
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    active_holder = getattr(agent, "_active_compression_lock_holder", None)
+    attempt_started_at = time.monotonic()
+    identity = None
+
+    def _elapsed_ms() -> int:
+        return max(0, int((time.monotonic() - attempt_started_at) * 1000))
+
+    def _fallback(category: str) -> str:
+        metadata: dict[str, Any] = {
+            "strategy": "openai_native",
+            "elapsed_ms": _elapsed_ms(),
+            "fallback_category": category,
+        }
+        if identity is not None:
+            metadata.update(
+                {
+                    "provider": identity.provider,
+                    "api_mode": identity.api_mode,
+                    "model": identity.model,
+                    "base_url_host": _safe_base_url_host(identity.base_url),
+                }
+            )
+        logger.info(
+            "OpenAI native compaction falling back to text compression",
+            extra={"native_compaction": metadata},
+        )
+        if not bool(
+            getattr(agent, "_native_compaction_fallback_status_emitted", False)
+        ):
+            agent._native_compaction_fallback_status_emitted = True
+            _emit_native_compaction_status(
+                agent, NATIVE_OPENAI_COMPACTION_FALLBACK_STATUS
+            )
+        return "fallback"
+
+    def _cancelled() -> bool:
+        return bool(
+            (hard_cancel_event is not None and hard_cancel_event.is_set())
+            or (commit_fence is not None and commit_fence.is_cancelled)
+        )
+
+    def _observed_lease_lost() -> bool:
+        if type(active_holder) is not str or not active_holder:
+            return False
+        if session_db is None or type(session_id) is not str or not session_id:
+            return True
+        try:
+            return session_db.get_compression_lock_holder(session_id) != active_holder
+        except Exception:
+            return True
+
+    policy = getattr(agent, "native_compaction_policy", None)
+    client = getattr(agent, "client", None)
+    try:
+        eligible = callable(getattr(policy, "is_eligible", None)) and policy.is_eligible(
+            client=client,
+            provider=getattr(agent, "provider", None),
+            api_mode=getattr(agent, "api_mode", None),
+            base_url=getattr(agent, "base_url", None),
+        )
+    except Exception:
+        eligible = False
+    if _cancelled() or _observed_lease_lost():
+        return "abort"
+    if not eligible:
+        return "fallback"
+
+    # Native creation serializes candidate prefixes before request and execution
+    # middleware run, while replay sees the finalized post-middleware request.
+    # Unless those middleware stacks are empty, Hermes cannot prove that the
+    # compacted source prefix is the prefix that will reach the provider. Fail
+    # closed to same-attempt textual compression rather than commit an unusable
+    # checkpoint and report false progress.
+    middleware_present = False
+    try:
+        from hermes_cli.middleware import has_llm_request_or_execution_middleware
+
+        middleware_present = has_llm_request_or_execution_middleware()
+    except Exception:
+        return "abort" if _cancelled() or _observed_lease_lost() else "fallback"
+    if _cancelled() or _observed_lease_lost():
+        return "abort"
+    if middleware_present:
+        return "fallback"
+
+    if session_db is None or type(session_id) is not str or not session_id:
+        return _fallback("session_state")
+    if type(active_holder) is not str or not active_holder:
+        return "abort"
+
+    def _commit_still_owned() -> bool:
+        if hard_cancel_event is not None and hard_cancel_event.is_set():
+            return False
+        if commit_fence is not None and commit_fence.is_cancelled:
+            return False
+        try:
+            return (
+                session_db.get_compression_lock_holder(session_id) == active_holder
+            )
+        except Exception:
+            return False
+
+    # Explicit cancellation or a reclaimed lease must prevent endpoint dispatch,
+    # not merely deny publication after paid work has already started.
+    if not _commit_still_owned():
+        return "abort"
+
+    try:
+        identity = native_openai_identity_for_agent(agent)
+    except Exception:
+        return "abort" if not _commit_still_owned() else _fallback("identity")
+
+    def _serialize(candidate_messages: list[dict]) -> list[dict]:
+        built = agent._build_api_kwargs(copy.deepcopy(candidate_messages))
+        built = agent._get_transport().preflight_kwargs(
+            built,
+            allow_stream=False,
+            is_github_responses=agent._is_copilot_url(),
+            sanitize_harmony_tokens=agent._is_codex_backend(),
+        )
+        ordinary_input = built["input"]
+        if type(ordinary_input) is not list:
+            raise ValueError("Responses input must be a list")
+        return copy.deepcopy(ordinary_input)
+
+    try:
+        ordinary_input = _serialize(messages)
+        prior = session_db.load_native_openai_checkpoint(session_id)
+        if not (
+            type(prior) is NativeCompactionCheckpoint
+            and checkpoint_matches(identity, prior, ordinary_input)
+        ):
+            prior = None
+        cut = select_native_compaction_cut(
+            messages,
+            protect_last_n=getattr(agent.context_compressor, "protect_last_n", 0),
+            serialize_input=_serialize,
+            previous_source_input_item_count=(
+                prior.source_input_item_count if prior is not None else 0
+            ),
+        )
+    except Exception:
+        return "abort" if not _commit_still_owned() else _fallback("input")
+    if cut is None:
+        return "abort" if not _commit_still_owned() else _fallback("boundary")
+
+    try:
+        resolved_timeout = agent._resolved_api_call_timeout()
+    except Exception:
+        resolved_timeout = None
+    if not _commit_still_owned():
+        return "abort"
+    try:
+        candidate = request_native_compaction_candidate(
+            agent,
+            model=getattr(agent, "model", ""),
+            cut=cut,
+            compact_instructions=NATIVE_OPENAI_COMPACTION_INSTRUCTIONS,
+            resolved_timeout=resolved_timeout,
+            previous_checkpoint=prior,
+            pre_dispatch_check=_commit_still_owned,
+            dispatch_fence=commit_fence,
+            hard_cancel_event=hard_cancel_event,
+        )
+    except Exception:
+        return "abort" if not _commit_still_owned() else _fallback("client")
+    # Re-check every abort condition before interpreting endpoint failures. A
+    # cancellation or lease loss that races with a failed request still aborts
+    # the whole attempt and must never launch textual fallback.
+    if not _commit_still_owned():
+        return "abort"
+    if type(candidate) is not NativeCompactionCandidate:
+        category = (
+            candidate.classification
+            if type(candidate) is NativeCompactionFailure
+            else "invalid_response"
+        )
+        return _fallback(category)
+
+    try:
+        checkpoint = checkpoint_from_candidate(
+            candidate=candidate,
+            session_id=session_id,
+            identity=identity,
+            previous_checkpoint=prior,
+            now=time.time(),
+        )
+    except Exception:
+        return "abort" if not _commit_still_owned() else _fallback("invalid_response")
+    if not _commit_still_owned():
+        return "abort"
+
+    fence_entered = False
+    if commit_fence is not None:
+        fence_entered = commit_fence.begin_commit(hard_cancel_event)
+        if not fence_entered:
+            return "abort"
+    try:
+        try:
+            persisted = session_db.upsert_native_openai_checkpoint(
+                checkpoint,
+                expected_lock_holder=active_holder,
+            )
+        except Exception:
+            logger.debug("native compaction checkpoint persistence failed")
+            return "abort" if not _commit_still_owned() else _fallback("persistence")
+        if persisted is not True:
+            return "abort"
+        agent._native_openai_checkpoint = checkpoint
+        agent._native_openai_checkpoint_session_id = checkpoint.session_id
+
+        try:
+            agent.context_compressor.record_external_compaction(
+                strategy="openai_native",
+                source_items=candidate.source_input_item_count,
+                output_items=candidate.output_item_count,
+            )
+        except Exception:
+            # The durable checkpoint is authoritative once committed. Never run
+            # textual fallback after that point or expose exception details.
+            logger.debug("native compaction bookkeeping failed after commit")
+        agent._last_native_compaction_succeeded = True
+        _mark_native_compression_attempt_succeeded(agent)
+        agent._last_compression_attempt_in_place = None
+        agent._last_compaction_in_place = False
+        metadata = checkpoint.redacted_metadata(
+            tail_item_count=max(
+                0, len(ordinary_input) - checkpoint.source_input_item_count
+            ),
+            elapsed_ms=_elapsed_ms(),
+        )
+        logger.info(
+            "OpenAI native compaction checkpoint committed",
+            extra={"native_compaction": metadata},
+        )
+        _emit_native_compaction_status(
+            agent,
+            NATIVE_OPENAI_COMPACTION_SUCCESS_STATUS.format(
+                generation=checkpoint.generation
+            ),
+        )
+        return "success"
+    finally:
+        if fence_entered:
+            commit_fence.finish_commit()
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -2136,6 +2618,7 @@ def compress_context(
     force: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    attempt_outcome: Optional[_CompressionAttemptOutcome] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2158,6 +2641,8 @@ def compress_context(
         commit_fence: Optional cooperative fence for executor callers that
             may time out. It prevents a late worker from mutating session state
             after its caller has moved on.
+        attempt_outcome: Internal caller-owned result object. The timeout worker
+            marks this exact object so retry progress remains attempt-scoped.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -2166,6 +2651,10 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    _begin_compression_attempt_outcome(agent, attempt_outcome)
+    # Dedicated legacy per-attempt native outcome signal. Reset before every early
+    # return so a prior successful attempt can never leak into this one.
+    agent._last_native_compaction_succeeded = False
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
@@ -2810,22 +3299,25 @@ def compress_context(
             commit_fence.touch_progress if commit_fence is not None
             else (lambda: None)
         )
+        # Incoming-message interrupts and active-turn redirects must not tear an
+        # atomic summary in half (#23975). Explicit stop surfaces set a separate
+        # Event atomically; never infer cause from the racy message fields.
+        _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
         # F4 state-ordering (#76354): a LATE successful summary must not undo
         # the timeout cooldown the host recorded. Install a cancellation
         # check the compressor consults BEFORE clearing the failure cooldown;
         # removed in the finally below so it cannot leak into later attempts
         # (e.g. a manual /compress force-clear).
-        if commit_fence is not None:
-            try:
-                agent.context_compressor._compression_cancelled_check = (
-                    lambda: commit_fence.is_cancelled
+        try:
+            agent.context_compressor._compression_cancelled_check = lambda: bool(
+                (commit_fence is not None and commit_fence.is_cancelled)
+                or (
+                    _hard_cancel_event is not None
+                    and _hard_cancel_event.is_set()
                 )
-            except Exception:
-                pass
-        # Incoming-message interrupts and active-turn redirects must not tear an
-        # atomic summary in half (#23975). Explicit stop surfaces set a separate
-        # Event atomically; never infer cause from the racy message fields.
-        _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+            )
+        except Exception:
+            pass
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -2837,6 +3329,42 @@ def compress_context(
                 )
                 compressed = messages
             else:
+                _native_outcome = _try_native_openai_compaction(
+                    agent,
+                    messages,
+                    commit_fence=commit_fence,
+                    hard_cancel_event=_hard_cancel_event,
+                )
+                if _native_outcome == "success":
+                    _activity_heartbeat.stop("context compression completed")
+                    _activity_heartbeat = None
+                    _emit_compression_attempt_telemetry(
+                        agent,
+                        started_at=_attempt_started_at,
+                        commit_status="committed",
+                        split_status="not_applicable",
+                    )
+                    _release_lock()
+                    return messages, _current_system_prompt(agent, system_message)
+                if _native_outcome == "abort":
+                    _restore_compressor_attempt_state(
+                        agent.context_compressor,
+                        _compressor_attempt_snapshot,
+                        durable_cooldown_authoritative=_durable_cooldown_authoritative,
+                        durable_cooldown_state=_durable_cooldown_state,
+                    )
+                    agent._last_compaction_in_place = False
+                    _activity_heartbeat.stop("context compression cancelled")
+                    _activity_heartbeat = None
+                    _emit_compression_attempt_telemetry(
+                        agent,
+                        started_at=_attempt_started_at,
+                        commit_status="aborted",
+                        split_status="aborted",
+                        failure_class="commit_fence_cancelled",
+                    )
+                    _release_lock()
+                    return messages, _current_system_prompt(agent, system_message)
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
@@ -2850,11 +3378,10 @@ def compress_context(
                     ):
                         raise AuxiliaryExplicitCancellation()
         finally:
-            if commit_fence is not None:
-                try:
-                    agent.context_compressor._compression_cancelled_check = None
-                except Exception:
-                    pass
+            try:
+                agent.context_compressor._compression_cancelled_check = None
+            except Exception:
+                pass
     except AuxiliaryExplicitCancellation:
         try:
             _restore_compressor_attempt_state(
@@ -3193,6 +3720,12 @@ def compress_context(
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
                     agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    # The readable history rewrite above is irreversible even if a
+                    # later metadata update fails. Invalidate at that exact boundary
+                    # so an old opaque projection can never replace the new summary.
+                    _invalidate_native_checkpoint_after_textual_compaction(
+                        agent, agent.session_id or ""
+                    )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3269,7 +3802,17 @@ def compress_context(
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
                     )
+                    # Publication atomically commits the textual child. Delete the
+                    # parent's now-stale projection before any later bookkeeping.
+                    _invalidate_native_checkpoint_after_textual_compaction(
+                        agent, old_session_id
+                    )
                     agent.session_id = new_session_id
+                    from agent.chat_completion_helpers import (
+                        bind_native_openai_checkpoint_cache,
+                    )
+
+                    bind_native_openai_checkpoint_cache(agent, new_session_id)
                     try:
                         from gateway.session_context import set_current_session_id
 
@@ -3972,8 +4515,11 @@ __all__ = [
     "COMPACTION_STATUS",
     "COMPACTION_DONE_STATUS",
     "COMPACTION_STATUS_MARKER",
+    "capture_compression_attempt_outcome",
     "check_compression_model_feasibility",
+    "compression_attempt_made_progress",
     "replay_compression_warning",
+    "reset_compression_attempt_outcome",
     "compress_context",
     "try_shrink_image_parts_in_messages",
 ]

@@ -1,11 +1,134 @@
 """Tests for the ResponsesApiTransport (Codex)."""
 
+import copy
 import json
 import pytest
 from types import SimpleNamespace
 
 from agent.transports import get_transport
 from agent.transports.types import NormalizedResponse
+
+
+def _native_projection_fixture():
+    from agent.native_openai_compaction import (
+        NativeCompactionCheckpoint,
+        NativeCompactionIdentity,
+        canonical_input_sha256,
+    )
+
+    prefix = [{"role": "user", "content": "old"}]
+    tail = [{"role": "user", "content": "fresh"}]
+    opaque = {"type": "compaction", "encrypted_content": "OPAQUE"}
+    identity = NativeCompactionIdentity(
+        provider="openai",
+        api_mode="codex_responses",
+        model="gpt-5",
+        base_url="https://api.openai.com/v1",
+        issuer_kind="other:https://api.openai.com/v1",
+        credential_scope="",
+        replay_encrypted_reasoning=True,
+    )
+    checkpoint = NativeCompactionCheckpoint(
+        session_id="session-1",
+        identity=identity,
+        source_input_item_count=1,
+        source_input_sha256=canonical_input_sha256(prefix),
+        output=[opaque],
+        compact_response_id="resp-1",
+        compact_created_at=1.0,
+        input_item_count=1,
+        output_item_count=1,
+        generation=1,
+        created_at=1.0,
+        updated_at=1.0,
+    )
+    ordinary = {
+        "model": "gpt-5",
+        "instructions": "fresh instructions",
+        "input": prefix + tail,
+        "tools": [{"type": "function", "name": "terminal"}],
+        "tool_choice": "auto",
+        "reasoning": {"effort": "high"},
+        "stream": False,
+        "timeout": 19.0,
+        "transport_marker": object(),
+    }
+    agent = SimpleNamespace(
+        session_id="session-1",
+        provider="openai",
+        api_mode="codex_responses",
+        model="gpt-5",
+        base_url="https://api.openai.com/v1",
+        _base_url_hostname="api.openai.com",
+        _base_url_lower="https://api.openai.com/v1",
+        _codex_reasoning_replay_enabled=True,
+        _native_openai_checkpoint=checkpoint,
+        native_compaction_policy=SimpleNamespace(
+            is_eligible=lambda **_kwargs: True
+        ),
+    )
+    return agent, ordinary, prefix, tail, opaque
+
+
+def test_native_checkpoint_projection_replaces_only_preflighted_input():
+    from agent.chat_completion_helpers import maybe_apply_native_openai_projection
+
+    agent, ordinary, prefix, tail, opaque = _native_projection_fixture()
+    original = copy.deepcopy(
+        {key: value for key, value in ordinary.items() if key != "transport_marker"}
+    )
+
+    projected = maybe_apply_native_openai_projection(agent, ordinary)
+
+    assert projected is not ordinary
+    assert projected["input"] == [opaque] + tail
+    assert {key: value for key, value in projected.items() if key not in {"input", "transport_marker"}} == {
+        key: value for key, value in original.items() if key != "input"
+    }
+    assert projected["transport_marker"] is ordinary["transport_marker"]
+    assert ordinary["input"] == prefix + tail
+    assert "previous_response_id" not in projected
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "no_checkpoint",
+        "disabled_policy",
+        "session",
+        "identity",
+        "effective_model",
+        "prefix",
+    ],
+)
+def test_native_checkpoint_projection_fails_open_without_mutation(mismatch):
+    from agent.chat_completion_helpers import maybe_apply_native_openai_projection
+
+    agent, ordinary, _prefix, _tail, _opaque = _native_projection_fixture()
+    if mismatch == "no_checkpoint":
+        agent._native_openai_checkpoint = None
+    elif mismatch == "disabled_policy":
+        agent.native_compaction_policy = SimpleNamespace(
+            is_eligible=lambda **_kwargs: False
+        )
+    elif mismatch == "session":
+        agent.session_id = "other-session"
+    elif mismatch == "identity":
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+    elif mismatch == "effective_model":
+        ordinary["model"] = "gpt-5-effective"
+    elif mismatch == "prefix":
+        ordinary["input"][0] = {"role": "user", "content": "rewound"}
+    snapshot = copy.deepcopy(
+        {key: value for key, value in ordinary.items() if key != "transport_marker"}
+    )
+
+    projected = maybe_apply_native_openai_projection(agent, ordinary)
+
+    assert projected is ordinary
+    assert {
+        key: value for key, value in ordinary.items() if key != "transport_marker"
+    } == snapshot
 
 
 @pytest.fixture
@@ -38,6 +161,233 @@ class TestCodexTransportBasic:
 
 
 class TestCodexBuildKwargs:
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {},
+            {"instructions": "Explicit instructions", "is_codex_backend": True},
+            {"is_github_responses": True},
+            {"is_xai_responses": True, "replay_encrypted_reasoning": False},
+        ],
+    )
+    def test_build_input_items_matches_ordinary_request_input(self, transport, params):
+        messages = [
+            {"role": "system", "content": "System instructions"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ]
+
+        serialized = transport.build_input_items(messages, **params)
+        ordinary = transport.build_kwargs(
+            model="gpt-5.5", messages=messages, tools=[], **params
+        )
+
+        assert serialized == ordinary["input"]
+        assert isinstance(serialized, list)
+
+    def test_build_input_items_matches_final_codex_wire_preflight(self, transport):
+        sentinel = "<" + "|" + "end" + "|" + ">"
+        messages = [
+            {"role": "user", "content": f"user {sentinel}"},
+            {
+                "role": "assistant",
+                "content": "answer",
+                "codex_reasoning_items": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "opaque",
+                        "summary": [
+                            {"type": "summary_text", "text": f"reasoning {sentinel}"}
+                        ],
+                    }
+                ],
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {"type": "output_text", "text": f"message {sentinel}"}
+                        ],
+                    }
+                ],
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": f'{{"command":"printf {sentinel}"}}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": f"output {sentinel}",
+            },
+        ]
+
+        serialized = transport.build_input_items(messages, is_codex_backend=True)
+        ordinary = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=messages,
+            tools=[],
+            is_codex_backend=True,
+        )
+        finalized = transport.preflight_kwargs(
+            ordinary,
+            is_github_responses=False,
+            sanitize_harmony_tokens=True,
+        )
+
+        assert serialized == finalized["input"]
+        assert sentinel not in json.dumps(serialized)
+        assert transport.preflight_kwargs(
+            finalized,
+            is_github_responses=False,
+            sanitize_harmony_tokens=True,
+        ) == finalized
+
+    def test_build_input_items_uses_final_preflighted_input_override_without_mutation(
+        self, transport
+    ):
+        sentinel = "<" + "|" + "end" + "|" + ">"
+        override_input = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": f"override {sentinel}"},
+                    {"type": "input_image", "image_url": "https://example.test/a.png"},
+                ],
+            }
+        ]
+        request_overrides = {"input": override_input}
+        original_overrides = copy.deepcopy(request_overrides)
+
+        serialized = transport.build_input_items(
+            [{"role": "user", "content": "ignored"}],
+            is_codex_backend=True,
+            request_overrides=request_overrides,
+        )
+        ordinary = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "ignored"}],
+            tools=[],
+            is_codex_backend=True,
+            request_overrides=request_overrides,
+        )
+        finalized = transport.preflight_kwargs(
+            ordinary,
+            is_github_responses=False,
+            sanitize_harmony_tokens=True,
+        )
+
+        assert serialized == finalized["input"]
+        assert sentinel not in json.dumps(serialized)
+        assert transport.preflight_kwargs(
+            finalized,
+            is_github_responses=False,
+            sanitize_harmony_tokens=True,
+        ) == finalized
+        assert request_overrides == original_overrides
+        serialized[0]["content"][0]["text"] = "mutated helper output"
+        assert request_overrides == original_overrides
+
+    def test_build_input_items_substitutes_sidecars_without_mutating_messages(
+        self, transport
+    ):
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "clean stored text"}],
+                "api_content": "exact wire text",
+                "metadata": {"nested": ["untouched"]},
+            },
+            {
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": {"command": "pwd"},
+                        },
+                    }
+                ],
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        serialized = transport.build_input_items(messages, is_codex_backend=True)
+
+        assert serialized[0] == {"role": "user", "content": "exact wire text"}
+        assert messages == original
+        assert "api_content" in messages[0]
+        assert messages[1]["tool_calls"][0]["function"]["arguments"] == {
+            "command": "pwd"
+        }
+
+    def test_build_input_items_preserves_supported_response_item_order(self, transport):
+        reasoning = {
+            "type": "reasoning",
+            "id": "reasoning-store-id",
+            "encrypted_content": "opaque-reasoning",
+            "summary": [{"type": "summary_text", "text": "summary"}],
+        }
+        assistant_message = {
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [{"type": "output_text", "text": "answer"}],
+            "id": "msg_1",
+            "phase": "final_answer",
+        }
+        messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "answer",
+                "codex_reasoning_items": [reasoning],
+                "codex_message_items": [assistant_message],
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "terminal", "arguments": "{\"command\":\"pwd\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+
+        serialized = transport.build_input_items(messages, is_codex_backend=True)
+
+        assert [item.get("type", item.get("role")) for item in serialized] == [
+            "user",
+            "reasoning",
+            "message",
+            "function_call",
+            "function_call_output",
+        ]
+        assert serialized[1] == {
+            "type": "reasoning",
+            "encrypted_content": "opaque-reasoning",
+            "summary": [{"type": "summary_text", "text": "summary"}],
+        }
+        assert serialized[2] == assistant_message
+        assert serialized[3] == {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "terminal",
+            "arguments": "{\"command\":\"pwd\"}",
+        }
+        assert serialized[4] == {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "result",
+        }
 
 
 

@@ -8231,6 +8231,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if self.agent:
             self.agent.session_id = self.session_id
+            from agent.chat_completion_helpers import (
+                bind_native_openai_checkpoint_cache,
+            )
+
+            bind_native_openai_checkpoint_cache(self.agent, self.session_id)
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
             self.agent.reset_session_state()
@@ -11175,6 +11180,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     new_tokens,
                     compression_state=getattr(
                         self.agent, "context_compressor", None
+                    ),
+                    native_succeeded=(
+                        getattr(
+                            self.agent, "_last_native_compaction_succeeded", False
+                        )
+                        is True
                     ),
                 )
                 if summary.get("aborted") or summary.get("fallback_used"):

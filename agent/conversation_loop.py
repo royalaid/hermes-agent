@@ -32,6 +32,8 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    capture_compression_attempt_outcome,
+    compression_attempt_made_progress,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
@@ -2375,6 +2377,13 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                        from agent.chat_completion_helpers import (
+                            maybe_apply_native_openai_projection,
+                        )
+
+                        next_api_kwargs = maybe_apply_native_openai_projection(
+                            agent, next_api_kwargs
+                        )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -4360,6 +4369,7 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
+                        original_tokens = estimate_messages_tokens_rough(messages)
                         # Option A (LCM issue 441): overhead-aware request size so recovery arms on
                         # the true request (msgs + tools + system), not the tool-blind message count.
                         messages, active_system_prompt = agent._compress_context(
@@ -4367,10 +4377,21 @@ def run_conversation(
                             approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                             task_id=effective_task_id,
                         )
+                        attempt_outcome = capture_compression_attempt_outcome(agent)
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
-                        if len(messages) < original_len or old_ctx > _reduced_ctx:
+                        new_tokens = estimate_messages_tokens_rough(messages)
+                        if compression_attempt_made_progress(
+                            agent,
+                            before_count=original_len,
+                            after_count=len(messages),
+                            before_tokens=original_tokens,
+                            after_tokens=new_tokens,
+                            old_context_length=old_ctx,
+                            new_context_length=_reduced_ctx,
+                            attempt_outcome=attempt_outcome,
+                        ):
                             agent._buffer_status(
                                 COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE.format(
                                     new_ctx=_reduced_ctx, old_ctx=old_ctx
@@ -4626,6 +4647,7 @@ def run_conversation(
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
                     )
+                    attempt_outcome = capture_compression_attempt_outcome(agent)
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
                         # does not fit, but this compression pass no-oped only
@@ -4649,7 +4671,14 @@ def run_conversation(
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
+                    if compression_attempt_made_progress(
+                        agent,
+                        before_count=original_len,
+                        after_count=len(messages),
+                        before_tokens=original_tokens,
+                        after_tokens=new_tokens,
+                        attempt_outcome=attempt_outcome,
+                    ):
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         else:
@@ -4892,6 +4921,7 @@ def run_conversation(
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
                     )
+                    attempt_outcome = capture_compression_attempt_outcome(agent)
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
                         # does not fit, but this compression pass no-oped only
@@ -4915,7 +4945,16 @@ def run_conversation(
                     new_tokens = estimate_messages_tokens_rough(messages)
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
+                    if compression_attempt_made_progress(
+                        agent,
+                        before_count=original_len,
+                        after_count=len(messages),
+                        before_tokens=original_tokens,
+                        after_tokens=new_tokens,
+                        old_context_length=old_ctx,
+                        new_context_length=new_ctx,
+                        attempt_outcome=attempt_outcome,
+                    ):
                         if len(messages) < original_len:
                             agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:

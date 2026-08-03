@@ -81,6 +81,7 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
+  openai_native: false       # Opt in to direct OpenAI Responses native compaction
   threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
   # model_thresholds:        # Per-model threshold overrides (substring match,
   #   "glm-5.2": 0.40        # longest key wins). See "Per-model threshold
@@ -100,6 +101,49 @@ auxiliary:
     provider: auto           # Provider: "auto", "openrouter", "nous", "main", etc.
     base_url: null           # Custom OpenAI-compatible endpoint
 ```
+
+### Native OpenAI Responses projection (local fork, opt-in)
+
+`compression.openai_native` defaults to `false`. When explicitly enabled, the
+built-in compressor first tries OpenAI's native Responses compaction on exactly
+these first-party routes using `api_mode: codex_responses`:
+
+- OpenAI API key: `provider: openai` with `https://api.openai.com/v1`;
+- ChatGPT Codex OAuth: `provider: openai-codex` with
+  `https://chatgpt.com/backend-api/codex`.
+
+It does not activate for OpenAI-compatible third-party endpoints or Codex
+app-server sessions. Other providers, hosts, and API modes fail closed to the
+existing text-compression path.
+
+Native compaction is a sidecar projection, not a transcript rewrite. Hermes
+keeps the complete readable conversation in `state.db` and stores the bounded
+opaque provider output separately. A later request replays that projection only
+when the finalized ordinary Responses input still has the same source prefix
+and the provider, API mode, model, endpoint, issuer, replay policy, and
+credential scope all match. Credential-pool scopes hash the exact opaque pool
+entry ID. Direct API keys use an installation-keyed HMAC; the private 32-byte
+scope key lives at `$HERMES_HOME/cache/native_openai_scope.key`, never contains
+the provider credential, and is blocked from normal file, dashboard, and media
+surfaces. Preserve that key with `state.db` when migrating a profile if native
+checkpoint replay must survive the migration; losing or rotating it safely
+invalidates direct-key checkpoints. Rewinds and edits therefore fail open to
+readable history. Model or provider switches do not inject opaque output;
+switching back can reuse the checkpoint only while its original readable prefix
+still matches.
+
+If native preparation, dispatch, validation, or persistence fails while the
+compression lease is still valid, the same attempt uses Hermes text compression.
+Cancellation or lease loss aborts instead of starting fallback work. Successful
+text compression invalidates the old native projection. Disable the feature to
+roll back (a running gateway applies the change on its next message):
+
+```bash
+hermes config set compression.openai_native false
+```
+
+This integration is maintained in this local fork and has no upstream support
+or compatibility guarantee.
 
 ### Parameter Details
 

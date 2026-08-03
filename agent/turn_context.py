@@ -34,9 +34,13 @@ from typing import Any, Dict, List, Mapping, Optional
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    capture_compression_attempt_outcome,
+    compression_attempt_made_progress,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
     recover_rotated_compression_session,
+    reset_compression_attempt_outcome,
+    reset_native_compaction_observability,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
@@ -199,24 +203,14 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
 def _compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:
-    """Return ``True`` if a compression pass materially reduced the request.
-
-    Compression can succeed by summarising message contents — reducing the
-    estimated request token count — without reducing the message row
-    count.  Treating row count as the sole progress signal false-positives
-    on size-only wins and surfaces a misleading "Cannot compress further"
-    failure even when post-compression tokens are well below the model
-    context window.  See issue #39548 for an observed case: 220 → 220
-    messages, ~288k → ~183k tokens on a 1M-context model still triggered
-    auto-reset.
-
-    The token reduction must be *material* (>5%) to count as progress — the
-    same floor the overflow-handler retry path uses (conversation_loop.py,
-    #39550) — so a sub-5% wobble doesn't keep the multi-pass loop spinning.
-    """
-    if new_len < orig_len:
-        return True
-    return orig_tokens > 0 and new_tokens < orig_tokens * 0.95
+    """Backward-compatible wrapper for the centralized progress predicate."""
+    return compression_attempt_made_progress(
+        None,
+        before_count=orig_len,
+        after_count=new_len,
+        before_tokens=orig_tokens,
+        after_tokens=new_tokens,
+    )
 
 
 def _compression_warrants_another_preflight_pass(
@@ -464,6 +458,9 @@ def build_turn_context(
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False
+    agent._last_native_compaction_succeeded = False
+    reset_compression_attempt_outcome()
+    reset_native_compaction_observability(agent)
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
@@ -885,6 +882,7 @@ def build_turn_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
+                _attempt_outcome = capture_compression_attempt_outcome(agent)
                 if (
                     messages is _preflight_input
                     and compression_skipped_due_to_lock(agent)
@@ -912,8 +910,13 @@ def build_turn_context(
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
                 )
-                if not _compression_made_progress(
-                    _orig_len, len(messages), _orig_tokens, _preflight_tokens
+                if not compression_attempt_made_progress(
+                    agent,
+                    before_count=_orig_len,
+                    after_count=len(messages),
+                    before_tokens=_orig_tokens,
+                    after_tokens=_preflight_tokens,
+                    attempt_outcome=_attempt_outcome,
                 ):
                     _preflight_compression_blocked = True
                     break  # Cannot compress further: neither rows nor tokens moved
