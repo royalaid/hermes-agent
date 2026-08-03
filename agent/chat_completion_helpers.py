@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -158,43 +159,95 @@ def bind_native_openai_checkpoint_cache(agent, session_id) -> None:
         pass
 
 
+def _load_or_create_native_scope_key():
+    """Return this Hermes profile's private native-replay scope key."""
+    from hermes_constants import get_hermes_home
+
+    key_path = get_hermes_home() / "cache" / "native_openai_scope.key"
+    try:
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    for _attempt in range(8):
+        try:
+            existing = key_path.read_bytes()
+        except FileNotFoundError:
+            candidate = os.urandom(32)
+            try:
+                fd = os.open(
+                    key_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                time.sleep(0.005)
+                continue
+            except OSError:
+                return None
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    if handle.write(candidate) != len(candidate):
+                        return None
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.chmod(key_path, 0o600)
+                except OSError:
+                    pass
+                return candidate
+            except OSError:
+                return None
+        except OSError:
+            return None
+        if len(existing) == 32:
+            return existing
+        if existing:
+            return None
+        time.sleep(0.005)
+    return None
+
+
+def _direct_native_credential_scope(agent, raw_api_key):
+    installation_key = _load_or_create_native_scope_key()
+    if installation_key is not None:
+        digest = hmac.new(
+            installation_key,
+            b"native-openai-direct-credential\0" + raw_api_key.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"direct-hmac-sha256:{digest}"
+
+    # A read-only or malformed key store conservatively disables cross-agent
+    # replay.  Only this fallback retains an in-memory direct-key fingerprint.
+    fingerprint = hashlib.sha256(raw_api_key.encode("utf-8")).digest()
+    prior_fingerprint = getattr(
+        agent, "_native_compaction_direct_credential_fingerprint", None
+    )
+    prior_scope = getattr(agent, "_native_compaction_direct_credential_scope", None)
+    if prior_fingerprint != fingerprint or type(prior_scope) is not str:
+        prior_scope = f"direct-instance:{uuid.uuid4().hex}"
+        setattr(agent, "_native_compaction_direct_credential_fingerprint", fingerprint)
+        setattr(agent, "_native_compaction_direct_credential_scope", prior_scope)
+    return prior_scope
+
+
 def native_openai_identity_for_agent(agent, *, model=None):
     """Build the single native-compaction identity used for create and replay."""
     from agent.codex_responses_adapter import _classify_responses_issuer
     from agent.native_openai_compaction import NativeCompactionIdentity
 
     raw_credential_scope = getattr(agent, "_credential_pool_entry_id", None)
-    if type(raw_credential_scope) is str and raw_credential_scope.strip():
+    if type(raw_credential_scope) is str and raw_credential_scope:
         credential_scope = "pool-entry-sha256:" + hashlib.sha256(
             b"native-openai-pool-entry\0"
-            + raw_credential_scope.strip().encode("utf-8")
+            + raw_credential_scope.encode("utf-8")
         ).hexdigest()
     else:
-        # No stable non-secret account identifier exists for a direct key.
-        # Retain only an in-memory key fingerprint to rotate a random,
-        # payload-safe checkpoint scope when the live credential changes.
-        # The fingerprint itself is never persisted in checkpoint identity.
         raw_api_key = getattr(agent, "api_key", None)
         credential_scope = ""
         if type(raw_api_key) is str and raw_api_key:
-            fingerprint = hashlib.sha256(raw_api_key.encode("utf-8")).digest()
-            prior_fingerprint = getattr(
-                agent, "_native_compaction_direct_credential_fingerprint", None
-            )
-            prior_scope = getattr(
-                agent, "_native_compaction_direct_credential_scope", None
-            )
-            if prior_fingerprint != fingerprint or type(prior_scope) is not str:
-                prior_scope = f"direct-instance:{uuid.uuid4().hex}"
-                setattr(
-                    agent,
-                    "_native_compaction_direct_credential_fingerprint",
-                    fingerprint,
-                )
-                setattr(
-                    agent, "_native_compaction_direct_credential_scope", prior_scope
-                )
-            credential_scope = prior_scope
+            credential_scope = _direct_native_credential_scope(agent, raw_api_key)
 
     return NativeCompactionIdentity(
         provider=getattr(agent, "provider", ""),

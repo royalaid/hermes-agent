@@ -99,35 +99,57 @@ def test_native_identity_uses_stable_credential_pool_entry_id():
     assert "pool-entry-account-a" not in identity.credential_scope
 
 
-def test_pool_entry_scope_preserves_case_sensitive_identity_without_raw_id():
+def test_pool_entry_scope_preserves_exact_opaque_id_bytes():
     agent = _agent(None)
     agent._credential_pool_entry_id = "AccountA"
-    upper = native_openai_identity_for_agent(agent).credential_scope
+    unpadded = native_openai_identity_for_agent(agent).credential_scope
     agent._credential_pool_entry_id = "accounta"
     lower = native_openai_identity_for_agent(agent).credential_scope
+    agent._credential_pool_entry_id = " AccountA "
+    padded = native_openai_identity_for_agent(agent).credential_scope
+    agent._credential_pool_entry_id = "   "
+    whitespace_only = native_openai_identity_for_agent(agent).credential_scope
 
-    assert upper != lower
-    assert "AccountA" not in upper
-    assert "accounta" not in lower
+    assert len({unpadded, lower, padded, whitespace_only}) == 4
+    assert all(
+        scope.startswith("pool-entry-sha256:")
+        for scope in (unpadded, lower, padded, whitespace_only)
+    )
+    assert all(
+        raw not in scope
+        for raw in ("AccountA", "accounta")
+        for scope in (unpadded, lower, padded, whitespace_only)
+    )
 
 
-def test_direct_credential_scope_is_stable_per_key_without_persisting_key_hash():
+def test_direct_credential_scope_is_stable_across_agents_without_persisting_key_hash(
+    monkeypatch, tmp_path
+):
     import hashlib
 
-    agent = _agent(None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    first_agent = _agent(None)
+    second_agent = _agent(None)
+    changed_agent = _agent(None)
     first_key = "sk-test-direct-credential-alpha"
-    agent.api_key = first_key
+    first_agent.api_key = first_key
+    second_agent.api_key = first_key
+    changed_agent.api_key = "sk-test-direct-credential-beta"
 
-    first = native_openai_identity_for_agent(agent).credential_scope
-    repeated = native_openai_identity_for_agent(agent).credential_scope
-    agent.api_key = "sk-test-direct-credential-beta"
-    changed = native_openai_identity_for_agent(agent).credential_scope
+    first = native_openai_identity_for_agent(first_agent).credential_scope
+    repeated = native_openai_identity_for_agent(first_agent).credential_scope
+    recreated = native_openai_identity_for_agent(second_agent).credential_scope
+    changed = native_openai_identity_for_agent(changed_agent).credential_scope
 
     assert first
-    assert first == repeated
+    assert first.startswith("direct-hmac-sha256:")
+    assert first == repeated == recreated
     assert changed != first
     assert first_key not in first
     assert hashlib.sha256(first_key.encode()).hexdigest() not in first
+    scope_key = tmp_path / "cache" / "native_openai_scope.key"
+    assert scope_key.stat().st_size == 32
+    assert first_key.encode() not in scope_key.read_bytes()
 
 
 def test_native_identity_ignores_non_string_credential_pool_entry_id():

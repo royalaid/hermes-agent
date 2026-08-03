@@ -708,17 +708,21 @@ class CompressionCommitFence:
         and must pair success with :meth:`finish_dispatch`.
         """
         self._lock.acquire()
+        # Publish the event before the final under-lock admission check so a
+        # lock-free revoker cannot miss the request-cancellation channel in
+        # the check-to-publication window.
+        self._dispatch_cancel_event = cancel_event
         if (
             self._cancelled
             or self._admission_revoked
             or (cancel_event is not None and bool(cancel_event.is_set()))
         ):
             self._cancelled = True
+            self._dispatch_cancel_event = None
             self._lock.release()
             if self._admission_revoked:
                 self.release_cancelled_compression_lock()
             return False
-        self._dispatch_cancel_event = cancel_event
         self._dispatch_phase.set()
         return True
 
