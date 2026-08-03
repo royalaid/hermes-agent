@@ -1469,6 +1469,28 @@ def test_compact_errors_are_redacted_classified_failures(error, classification, 
     assert agent.close_calls == [(client, "native_openai_compaction")]
 
 
+def test_compact_interruption_propagates_after_closing_once():
+    compact = _CompactRecorder(error=KeyboardInterrupt())
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+
+    with pytest.raises(KeyboardInterrupt):
+        _request(agent, _cut_for([{"x": 1}]))
+
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+def test_close_failure_does_not_replace_compact_interruption():
+    compact = _CompactRecorder(error=KeyboardInterrupt())
+    client = _request_client(compact)
+    agent = _RequestAgent(client, close_error=RuntimeError("close failed"))
+
+    with pytest.raises(KeyboardInterrupt):
+        _request(agent, _cut_for([{"x": 1}]))
+
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
 def test_creation_failure_and_missing_compact_capability_are_safe_failures():
     create_agent = _RequestAgent(create_error=RuntimeError("token-secret URL-secret payload-secret"))
     create_failure = _request(create_agent, _cut_for([{"private": "payload-secret"}]))
