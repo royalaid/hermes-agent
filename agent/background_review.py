@@ -861,6 +861,11 @@ def _run_review_in_thread(
                 # if a future code path bypasses the cache.
                 review_agent.session_start = agent.session_start
             review_agent.session_id = agent.session_id
+            from agent.chat_completion_helpers import (
+                bind_native_openai_checkpoint_cache,
+            )
+
+            bind_native_openai_checkpoint_cache(review_agent, agent.session_id)
             # The fork shares the parent's live session_id (pinned above for
             # prefix-cache parity). It is single-lifecycle and calls close()
             # right after this run_conversation(); without opting out, close()

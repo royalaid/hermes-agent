@@ -8231,6 +8231,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if self.agent:
             self.agent.session_id = self.session_id
+            from agent.chat_completion_helpers import (
+                bind_native_openai_checkpoint_cache,
+            )
+
+            bind_native_openai_checkpoint_cache(self.agent, self.session_id)
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
             self.agent.reset_session_state()

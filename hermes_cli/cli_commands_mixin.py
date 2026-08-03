@@ -1081,6 +1081,11 @@ class CLICommandsMixin:
         # Sync the agent if already initialised
         if self.agent:
             self.agent.session_id = target_id
+            from agent.chat_completion_helpers import (
+                bind_native_openai_checkpoint_cache,
+            )
+
+            bind_native_openai_checkpoint_cache(self.agent, target_id)
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
@@ -1289,6 +1294,11 @@ class CLICommandsMixin:
         # Sync the agent
         if self.agent:
             self.agent.session_id = new_session_id
+            from agent.chat_completion_helpers import (
+                bind_native_openai_checkpoint_cache,
+            )
+
+            bind_native_openai_checkpoint_cache(self.agent, new_session_id)
             self.agent.session_start = now
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):
