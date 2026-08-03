@@ -1496,6 +1496,12 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     if not resolved.is_file():
         return None
 
+    # Installation-private replay scope keys can exist beneath any profile.
+    # Deny the unambiguous basename before cache/operator allowlists and before
+    # default non-strict acceptance so one profile cannot deliver another's key.
+    if resolved.name == "native_openai_scope.key":
+        return None
+
     # Cache / operator allowlist is always honored — these are unconditionally
     # trusted regardless of mode.
     for root in _media_delivery_allowed_roots():

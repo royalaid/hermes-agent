@@ -106,6 +106,12 @@ def _classify_write_denial(path: str) -> Optional[str]:
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
+    # This installation-private HMAC key may live under any Hermes profile.
+    # Deny its unambiguous basename globally so an active profile cannot read
+    # or replace a sibling profile's replay scope key.
+    if os.path.basename(resolved) == "native_openai_scope.key":
+        return "credential"
+
     if resolved in build_write_denied_paths(home):
         return "credential"
     for prefix in build_write_denied_prefixes(home):
@@ -240,6 +246,13 @@ def get_read_block_error(path: str) -> Optional[str]:
     terminal cwd differs from the process cwd.
     """
     resolved = Path(path).expanduser().resolve()
+
+    # Profile multiplexing places this key below
+    # <HERMES_ROOT>/profiles/<name>/cache.  A global exact-basename denial is
+    # deliberate: it protects sibling profiles without relying on their
+    # existence at process startup.
+    if resolved.name == "native_openai_scope.key":
+        return f"Read denied: '{path}' is a protected credential store."
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
     # Hermes root so credential stores at <root>/auth.json etc. are also
