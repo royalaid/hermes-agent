@@ -10,11 +10,15 @@ import pytest
 
 from agent.context_compressor import ContextCompressor
 from agent.native_openai_compaction import (
+    NativeCompactionCandidate,
     NativeCompactionCheckpoint,
+    NativeCompactionCut,
+    NativeCompactionFailure,
     NativeCompactionIdentity,
     apply_checkpoint,
     canonical_input_sha256,
     checkpoint_matches,
+    request_native_compaction_candidate,
 )
 
 OPAQUE_OUTPUT = [
@@ -1290,3 +1294,302 @@ def test_cut_accepts_all_exact_finalized_responses_schemas():
     ]
 
     assert _select_cut_for_serialized_tool_graph(graph) is not None
+
+
+
+class _RequestAgent:
+    def __init__(self, client=None, *, create_error=None, close_error=None):
+        self.client = client
+        self.create_error = create_error
+        self.close_error = close_error
+        self.create_calls = []
+        self.close_calls = []
+
+    def _create_request_openai_client(self, *, reason, api_kwargs):
+        self.create_calls.append((reason, copy.deepcopy(api_kwargs)))
+        if self.create_error is not None:
+            raise self.create_error
+        return self.client
+
+    def _close_request_openai_client(self, client, *, reason):
+        self.close_calls.append((client, reason))
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class _CompactRecorder:
+    def __init__(self, response=None, *, error=None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(copy.deepcopy(kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def _request_client(compact):
+    return SimpleNamespace(responses=SimpleNamespace(compact=compact))
+
+
+def _cut_for(items):
+    return NativeCompactionCut(
+        message_count=1,
+        source_input=items,
+        source_input_item_count=len(items),
+        source_input_sha256=canonical_input_sha256(items),
+    )
+
+
+def _request(agent, cut, **overrides):
+    values = {
+        "model": "gpt-5",
+        "cut": cut,
+        "compact_instructions": "compact safely",
+        "resolved_timeout": 12.5,
+    }
+    values.update(overrides)
+    return request_native_compaction_candidate(agent, **values)
+
+
+def test_request_calls_compact_with_exact_payload_and_request_client_lifecycle():
+    source = [{"role": "user", "content": {"private": "source"}}]
+    response = SimpleNamespace(
+        output=[{"type": "compaction", "encrypted_content": "opaque"}],
+        id="resp_1",
+        created_at=42.5,
+    )
+    compact = _CompactRecorder(response)
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+
+    result = _request(agent, _cut_for(source))
+
+    assert isinstance(result, NativeCompactionCandidate)
+    assert compact.calls == [{
+        "model": "gpt-5", "input": source,
+        "instructions": "compact safely", "timeout": 12.5,
+    }]
+    assert "previous_response_id" not in compact.calls[0]
+    assert agent.create_calls == [("native_openai_compaction", {"model": "gpt-5"})]
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+    assert vars(result) | {} == vars(result)  # frozen value object remains inspectable
+    assert (result.source_input_item_count, result.input_item_count, result.output_item_count) == (1, 1, 1)
+    assert result.compact_response_id == "resp_1"
+    assert result.compact_created_at == 42.5
+
+
+def test_repeated_request_uses_opaque_output_plus_only_new_tail_without_mutation():
+    old_source = [{"role": "user", "content": {"nested": "old"}}]
+    extended = old_source + [{"role": "assistant", "content": {"nested": "new"}}]
+    checkpoint = _checkpoint(old_source)
+    source_before = copy.deepcopy(extended)
+    checkpoint_before = checkpoint.output
+    compact = _CompactRecorder(SimpleNamespace(output=[{"type": "compaction", "future": 2}]))
+
+    result = _request(_RequestAgent(_request_client(compact)), _cut_for(extended), previous_checkpoint=checkpoint)
+
+    assert isinstance(result, NativeCompactionCandidate)
+    assert compact.calls[0]["input"] == OPAQUE_OUTPUT + extended[1:]
+    assert result.input_item_count == len(OPAQUE_OUTPUT) + 1
+    assert extended == source_before
+    assert checkpoint.output == checkpoint_before
+
+
+@pytest.mark.parametrize("source", [[{"value": 1}], [{"value": 2}, {"value": 3}]])
+def test_repeated_request_rejects_non_extension_or_prefix_mismatch_without_client(source):
+    checkpoint = _checkpoint([{"value": 1}])
+    agent = _RequestAgent(object())
+
+    result = _request(agent, _cut_for(source), previous_checkpoint=checkpoint)
+
+    assert result == NativeCompactionFailure("invalid_response", False, True)
+    assert agent.create_calls == []
+    assert agent.close_calls == []
+
+
+def test_sdk_output_items_dump_once_and_preserve_unknown_fields_and_order():
+    class Item:
+        def __init__(self, value):
+            self.value = value
+            self.calls = []
+        def model_dump(self, **kwargs):
+            self.calls.append(kwargs)
+            return copy.deepcopy(self.value)
+
+    items = [Item({"type": "future_a", "unknown": 1}), Item({"type": "future_b", "unknown": 2})]
+    compact = _CompactRecorder(SimpleNamespace(output=items))
+    result = _request(_RequestAgent(_request_client(compact)), _cut_for([{"x": 1}]))
+
+    assert result.output == [item.value for item in items]
+    assert [item.calls for item in items] == [[{"mode": "json"}], [{"mode": "json"}]]
+
+
+@pytest.mark.parametrize("response", [
+    object(), SimpleNamespace(output=None), SimpleNamespace(output={}),
+    SimpleNamespace(output=[]), SimpleNamespace(output=[object()]),
+    SimpleNamespace(output=[{"bad": math.nan}]),
+])
+def test_invalid_compact_outputs_fail_safely_and_close_once(response):
+    compact = _CompactRecorder(response)
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+
+    result = _request(agent, _cut_for([{"x": 1}]))
+
+    assert result.classification == "invalid_response"
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+def test_cyclic_compact_output_fails_safely():
+    cyclic = []
+    cyclic.append(cyclic)
+    compact = _CompactRecorder(SimpleNamespace(output=cyclic))
+    result = _request(_RequestAgent(_request_client(compact)), _cut_for([{"x": 1}]))
+    assert result.classification == "invalid_response"
+
+
+@pytest.mark.parametrize("error,classification,retryable", [
+    (type("AuthFailure", (Exception,), {"status_code": 401})(), "auth", False),
+    (type("PermissionFailure", (Exception,), {"status_code": 403})(), "auth", False),
+    (type("UnsupportedFailure", (Exception,), {"status_code": 404})(), "unsupported", False),
+    (TimeoutError(), "timeout", True),
+    (ConnectionError(), "network", True),
+])
+def test_compact_errors_are_redacted_classified_failures(error, classification, retryable):
+    compact = _CompactRecorder(error=error)
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+
+    result = _request(agent, _cut_for([{"x": 1}]))
+
+    assert result == NativeCompactionFailure(classification, retryable, True)
+    assert agent.close_calls == [(client, "native_openai_compaction")]
+
+
+def test_creation_failure_and_missing_compact_capability_are_safe_failures():
+    create_agent = _RequestAgent(create_error=RuntimeError("token-secret URL-secret payload-secret"))
+    create_failure = _request(create_agent, _cut_for([{"private": "payload-secret"}]))
+    missing_agent = _RequestAgent(SimpleNamespace(responses=SimpleNamespace()))
+    missing = _request(missing_agent, _cut_for([{"private": "payload-secret"}]))
+
+    assert create_failure.classification == "client"
+    assert create_agent.close_calls == []
+    assert missing.classification == "unsupported"
+    assert len(missing_agent.close_calls) == 1
+    assert "payload-secret" not in repr(create_failure) + repr(missing)
+
+
+def test_call_failure_closes_once_and_close_failure_discards_candidate():
+    call_client = _request_client(_CompactRecorder(error=RuntimeError("call payload")))
+    call_agent = _RequestAgent(call_client)
+    call_result = _request(call_agent, _cut_for([{"x": 1}]))
+    close_client = _request_client(_CompactRecorder(SimpleNamespace(output=[{"private": "compact-output-secret"}])))
+    close_agent = _RequestAgent(close_client, close_error=RuntimeError("close token-secret"))
+    close_result = _request(close_agent, _cut_for([{"x": 1}]))
+
+    assert call_result.classification == "client"
+    assert call_agent.close_calls == [(call_client, "native_openai_compaction")]
+    assert close_result.classification == "client"
+    assert close_agent.close_calls == [(close_client, "native_openai_compaction")]
+    assert "compact-output-secret" not in repr(close_result)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"model": ""}, {"model": "   "}, {"model": type("Model", (str,), {})("gpt-5")},
+    {"compact_instructions": 7},
+    {"compact_instructions": type("Instructions", (str,), {})("compact")},
+    {"resolved_timeout": 0}, {"resolved_timeout": -1},
+    {"resolved_timeout": math.inf}, {"resolved_timeout": math.nan},
+    {"resolved_timeout": True},
+])
+def test_invalid_request_arguments_fail_before_client_creation(overrides):
+    agent = _RequestAgent(object())
+    result = _request(agent, _cut_for([{"x": 1}]), **overrides)
+    assert result.classification == "client"
+    assert agent.create_calls == []
+
+
+def test_response_metadata_is_accepted_only_when_plain_and_valid():
+    class ID(str):
+        pass
+    compact = _CompactRecorder(SimpleNamespace(output=[{"x": 1}], id=ID("resp_secret"), created_at=math.inf))
+    result = _request(_RequestAgent(_request_client(compact)), _cut_for([{"x": 1}]))
+    assert result.compact_response_id is None
+    assert result.compact_created_at is None
+
+
+def test_candidate_output_is_deep_copy_safe_and_repr_never_contains_payload():
+    sentinel = "transcript-tool-args-encrypted-output-sentinel"
+    compact = _CompactRecorder(SimpleNamespace(output=[{"private": {"value": sentinel}}]))
+    result = _request(_RequestAgent(_request_client(compact)), _cut_for([{"x": 1}]))
+
+    fetched = result.output
+    fetched[0]["private"]["value"] = "mutated"
+    assert result.output == [{"private": {"value": sentinel}}]
+    assert sentinel not in repr(result)
+    assert "_output_json" not in repr(result)
+    with pytest.raises(Exception):
+        result.input_item_count = 99
+
+
+def test_candidate_constructor_enforces_hash_counts_timestamp_and_strict_json():
+    valid = dict(source_input_item_count=1, source_input_sha256="a" * 64,
+                 compact_response_id=None, compact_created_at=None,
+                 input_item_count=1, output_item_count=1, output=[{"x": 1}])
+    for field, value in (
+        ("source_input_item_count", -1), ("source_input_sha256", "not-a-hash"),
+        ("compact_created_at", math.nan), ("input_item_count", -1),
+        ("output_item_count", 2), ("output", []), ("output", [{"x": math.nan}]),
+    ):
+        kwargs = dict(valid)
+        kwargs[field] = value
+        with pytest.raises(ValueError):
+            NativeCompactionCandidate(**kwargs)
+
+
+def test_failure_is_immutable_narrow_and_payload_safe():
+    failure = NativeCompactionFailure("network", True, True)
+    with pytest.raises(Exception):
+        failure.retryable = False
+    assert vars(failure) == {"classification": "network", "retryable": True, "use_textual_fallback": True}
+    with pytest.raises(ValueError):
+        NativeCompactionFailure("payload-secret", False, True)
+
+
+def test_failure_paths_do_not_log_or_render_payload_token_url_or_output(caplog):
+    sentinels = (
+        "payload-secret",
+        "token-secret",
+        "https://secret.test/path",
+        "opaque-secret",
+    )
+
+    class RaisingResponses:
+        @property
+        def compact(self):
+            raise RuntimeError(" ".join(sentinels))
+
+    agent = _RequestAgent(SimpleNamespace(responses=RaisingResponses()))
+    result = _request(agent, _cut_for([{"private": sentinels[0]}]))
+    rendered = repr(result) + caplog.text
+    assert isinstance(result, NativeCompactionFailure)
+    assert all(sentinel not in rendered for sentinel in sentinels)
+
+
+def test_raising_exception_status_property_is_redacted_and_client_still_closes():
+    class RaisingStatusError(Exception):
+        @property
+        def status_code(self):
+            raise RuntimeError("token-url-payload-secret")
+
+    compact = _CompactRecorder(error=RaisingStatusError("opaque-secret"))
+    client = _request_client(compact)
+    agent = _RequestAgent(client)
+
+    result = _request(agent, _cut_for([{"private": "payload-secret"}]))
+
+    assert result == NativeCompactionFailure("client", False, True)
+    assert agent.close_calls == [(client, "native_openai_compaction")]
