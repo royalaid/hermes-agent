@@ -128,6 +128,51 @@ class TestCodexBuildKwargs:
             sanitize_harmony_tokens=True,
         ) == finalized
 
+    def test_build_input_items_uses_final_preflighted_input_override_without_mutation(
+        self, transport
+    ):
+        sentinel = "<" + "|" + "end" + "|" + ">"
+        override_input = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": f"override {sentinel}"},
+                    {"type": "input_image", "image_url": "https://example.test/a.png"},
+                ],
+            }
+        ]
+        request_overrides = {"input": override_input}
+        original_overrides = copy.deepcopy(request_overrides)
+
+        serialized = transport.build_input_items(
+            [{"role": "user", "content": "ignored"}],
+            is_codex_backend=True,
+            request_overrides=request_overrides,
+        )
+        ordinary = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "ignored"}],
+            tools=[],
+            is_codex_backend=True,
+            request_overrides=request_overrides,
+        )
+        finalized = transport.preflight_kwargs(
+            ordinary,
+            is_github_responses=False,
+            sanitize_harmony_tokens=True,
+        )
+
+        assert serialized == finalized["input"]
+        assert sentinel not in json.dumps(serialized)
+        assert transport.preflight_kwargs(
+            finalized,
+            is_github_responses=False,
+            sanitize_harmony_tokens=True,
+        ) == finalized
+        assert request_overrides == original_overrides
+        serialized[0]["content"][0]["text"] = "mutated helper output"
+        assert request_overrides == original_overrides
+
     def test_build_input_items_substitutes_sidecars_without_mutating_messages(
         self, transport
     ):
