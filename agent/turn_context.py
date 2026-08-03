@@ -40,6 +40,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
     recover_rotated_compression_session,
     reset_compression_attempt_outcome,
+    reset_native_compaction_observability,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
@@ -459,6 +460,7 @@ def build_turn_context(
     agent._mute_post_response = False
     agent._last_native_compaction_succeeded = False
     reset_compression_attempt_outcome()
+    reset_native_compaction_observability(agent)
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None

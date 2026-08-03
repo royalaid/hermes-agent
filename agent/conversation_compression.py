@@ -106,6 +106,13 @@ COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn...
 NATIVE_OPENAI_COMPACTION_INSTRUCTIONS = (
     "Preserve the conversation state needed to continue the current task."
 )
+NATIVE_OPENAI_COMPACTION_SUCCESS_STATUS = (
+    "Context compacted with OpenAI native Responses projection "
+    "(generation {generation}; readable history retained)."
+)
+NATIVE_OPENAI_COMPACTION_FALLBACK_STATUS = (
+    "OpenAI native compaction unavailable; using Hermes text compression."
+)
 
 
 class _CompressionAttemptOutcome:
@@ -172,6 +179,26 @@ def capture_compression_attempt_outcome(
 def reset_compression_attempt_outcome() -> None:
     """Clear any completed-attempt result at the start of a new turn."""
     _COMPRESSION_ATTEMPT_OUTCOME.set(None)
+
+
+def reset_native_compaction_observability(agent: Any) -> None:
+    """Reset the per-turn native fallback status latch."""
+    agent._native_compaction_fallback_status_emitted = False
+
+
+def _emit_native_compaction_status(agent: Any, message: str) -> None:
+    """Emit a fixed payload-free status without affecting control flow."""
+    try:
+        emitter = getattr(agent, "_emit_status", None)
+        if callable(emitter):
+            emitter(message)
+            return
+        callback = getattr(agent, "status_callback", None)
+        if callable(callback):
+            callback("lifecycle", message)
+    except Exception:
+        # Exception details may contain adapter payloads or credentials.
+        logger.debug("native compaction status callback failed")
 
 
 def compression_attempt_made_progress(
@@ -2273,6 +2300,8 @@ def _try_native_openai_compaction(
     from agent.native_openai_compaction import (
         NativeCompactionCandidate,
         NativeCompactionCheckpoint,
+        NativeCompactionFailure,
+        _safe_base_url_host,
         checkpoint_from_candidate,
         checkpoint_matches,
         request_native_compaction_candidate,
@@ -2282,6 +2311,39 @@ def _try_native_openai_compaction(
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     active_holder = getattr(agent, "_active_compression_lock_holder", None)
+    attempt_started_at = time.monotonic()
+    identity = None
+
+    def _elapsed_ms() -> int:
+        return max(0, int((time.monotonic() - attempt_started_at) * 1000))
+
+    def _fallback(category: str) -> str:
+        metadata: dict[str, Any] = {
+            "strategy": "openai_native",
+            "elapsed_ms": _elapsed_ms(),
+            "fallback_category": category,
+        }
+        if identity is not None:
+            metadata.update(
+                {
+                    "provider": identity.provider,
+                    "api_mode": identity.api_mode,
+                    "model": identity.model,
+                    "base_url_host": _safe_base_url_host(identity.base_url),
+                }
+            )
+        logger.info(
+            "OpenAI native compaction falling back to text compression",
+            extra={"native_compaction": metadata},
+        )
+        if not bool(
+            getattr(agent, "_native_compaction_fallback_status_emitted", False)
+        ):
+            agent._native_compaction_fallback_status_emitted = True
+            _emit_native_compaction_status(
+                agent, NATIVE_OPENAI_COMPACTION_FALLBACK_STATUS
+            )
+        return "fallback"
 
     def _cancelled() -> bool:
         return bool(
@@ -2316,7 +2378,7 @@ def _try_native_openai_compaction(
         return "fallback"
 
     if session_db is None or type(session_id) is not str or not session_id:
-        return "fallback"
+        return _fallback("session_state")
     if type(active_holder) is not str or not active_holder:
         return "abort"
 
@@ -2340,7 +2402,7 @@ def _try_native_openai_compaction(
     try:
         identity = native_openai_identity_for_agent(agent)
     except Exception:
-        return "abort" if not _commit_still_owned() else "fallback"
+        return "abort" if not _commit_still_owned() else _fallback("identity")
 
     def _serialize(candidate_messages: list[dict]) -> list[dict]:
         built = agent._build_api_kwargs(copy.deepcopy(candidate_messages))
@@ -2372,9 +2434,9 @@ def _try_native_openai_compaction(
             ),
         )
     except Exception:
-        return "abort" if not _commit_still_owned() else "fallback"
+        return "abort" if not _commit_still_owned() else _fallback("input")
     if cut is None:
-        return "abort" if not _commit_still_owned() else "fallback"
+        return "abort" if not _commit_still_owned() else _fallback("boundary")
 
     try:
         resolved_timeout = agent._resolved_api_call_timeout()
@@ -2393,14 +2455,19 @@ def _try_native_openai_compaction(
             pre_dispatch_check=_commit_still_owned,
         )
     except Exception:
-        return "abort" if not _commit_still_owned() else "fallback"
+        return "abort" if not _commit_still_owned() else _fallback("client")
     # Re-check every abort condition before interpreting endpoint failures. A
     # cancellation or lease loss that races with a failed request still aborts
     # the whole attempt and must never launch textual fallback.
     if not _commit_still_owned():
         return "abort"
     if type(candidate) is not NativeCompactionCandidate:
-        return "fallback"
+        category = (
+            candidate.classification
+            if type(candidate) is NativeCompactionFailure
+            else "invalid_response"
+        )
+        return _fallback(category)
 
     try:
         checkpoint = checkpoint_from_candidate(
@@ -2411,7 +2478,7 @@ def _try_native_openai_compaction(
             now=time.time(),
         )
     except Exception:
-        return "abort" if not _commit_still_owned() else "fallback"
+        return "abort" if not _commit_still_owned() else _fallback("invalid_response")
     if not _commit_still_owned():
         return "abort"
 
@@ -2428,7 +2495,7 @@ def _try_native_openai_compaction(
             )
         except Exception:
             logger.debug("native compaction checkpoint persistence failed")
-            return "abort" if not _commit_still_owned() else "fallback"
+            return "abort" if not _commit_still_owned() else _fallback("persistence")
         if persisted is not True:
             return "abort"
         agent._native_openai_checkpoint = checkpoint
@@ -2448,6 +2515,22 @@ def _try_native_openai_compaction(
         _mark_native_compression_attempt_succeeded(agent)
         agent._last_compression_attempt_in_place = None
         agent._last_compaction_in_place = False
+        metadata = checkpoint.redacted_metadata(
+            tail_item_count=max(
+                0, len(ordinary_input) - checkpoint.source_input_item_count
+            ),
+            elapsed_ms=_elapsed_ms(),
+        )
+        logger.info(
+            "OpenAI native compaction checkpoint committed",
+            extra={"native_compaction": metadata},
+        )
+        _emit_native_compaction_status(
+            agent,
+            NATIVE_OPENAI_COMPACTION_SUCCESS_STATUS.format(
+                generation=checkpoint.generation
+            ),
+        )
         return "success"
     finally:
         if fence_entered:
