@@ -130,7 +130,9 @@ def _tool_atomic_prefix(messages: list[dict]) -> bool:
     for message in messages:
         role = message.get("role")
         tool_calls = message.get("tool_calls") if role == "assistant" else None
-        if isinstance(tool_calls, list) and tool_calls:
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            return False
+        if tool_calls:
             if pending:
                 return False
             for tool_call in tool_calls:
