@@ -53,7 +53,7 @@ interface MessageStreamOptions {
 
 interface QueuedStreamDeltas {
   assistant: string
-  reasoning: string
+  reasoning: Array<{ sourceId?: string; text: string }>
 }
 
 // Date.now() alone can collide when an interim seal and the next segment's
@@ -220,11 +220,16 @@ export function useMessageStream({
           )
         }
 
-        if (queued.reasoning) {
+        if (queued.reasoning.length) {
           mutateStream(
             id,
-            parts => appendReasoningPart(parts, queued.reasoning),
-            () => [reasoningPart(queued.reasoning)]
+            parts =>
+              queued.reasoning.reduce((next, delta) => appendReasoningPart(next, delta.text, delta.sourceId), parts),
+            () =>
+              queued.reasoning.reduce<ChatMessagePart[]>(
+                (parts, delta) => appendReasoningPart(parts, delta.text, delta.sourceId),
+                []
+              )
           )
         }
       }
@@ -287,6 +292,7 @@ export function useMessageStream({
       // stays as the fallback.
       const writeCost = performance.now() - startedAt
       lastFlushCostRef.current = writeCost
+
       // At most one measurement rAF may be pending: only the newest flush's
       // measurement matters (the guard below discards stale frames), and a
       // hidden renderer parks rAF callbacks — without cancellation a long
@@ -295,8 +301,10 @@ export function useMessageStream({
       if (measureRafRef.current !== null) {
         window.cancelAnimationFrame(measureRafRef.current)
       }
+
       measureRafRef.current = window.requestAnimationFrame(frameStart => {
         measureRafRef.current = null
+
         // A newer flush already started; its own measurement wins.
         if (lastFlushAtRef.current !== startedAt) {
           return
@@ -325,14 +333,14 @@ export function useMessageStream({
     flushHandleRef.current = window.setTimeout(runFlush, Math.max(0, adaptiveFloor - sinceLast))
   }, [flushQueuedDeltas])
 
-  const queueDelta = useCallback(
-    (sessionId: string, key: keyof QueuedStreamDeltas, delta: string) => {
+  const queueAssistantDelta = useCallback(
+    (sessionId: string, delta: string) => {
       if (!delta) {
         return
       }
 
-      const queued = queuedDeltasRef.current.get(sessionId) ?? { assistant: '', reasoning: '' }
-      queued[key] += delta
+      const queued = queuedDeltasRef.current.get(sessionId) ?? { assistant: '', reasoning: [] }
+      queued.assistant += delta
       queuedDeltasRef.current.set(sessionId, queued)
       scheduleDeltaFlush()
     },
@@ -392,19 +400,40 @@ export function useMessageStream({
         return
       }
 
-      queueDelta(sessionId, 'assistant', delta)
+      queueAssistantDelta(sessionId, delta)
     },
-    [queueDelta]
+    [queueAssistantDelta]
+  )
+
+  const queueReasoningDelta = useCallback(
+    (sessionId: string, text: string, sourceId?: string) => {
+      if (!text) {
+        return
+      }
+
+      const queued = queuedDeltasRef.current.get(sessionId) ?? { assistant: '', reasoning: [] }
+      const previous = queued.reasoning.at(-1)
+
+      if (previous && previous.sourceId === sourceId) {
+        previous.text += text
+      } else {
+        queued.reasoning.push({ sourceId, text })
+      }
+
+      queuedDeltasRef.current.set(sessionId, queued)
+      scheduleDeltaFlush()
+    },
+    [scheduleDeltaFlush]
   )
 
   const appendReasoningDelta = useCallback(
-    (sessionId: string, delta: string, replace = false) => {
+    (sessionId: string, delta: string, replace = false, sourceId?: string) => {
       if (!delta) {
         return
       }
 
       if (!replace) {
-        queueDelta(sessionId, 'reasoning', delta)
+        queueReasoningDelta(sessionId, delta, sourceId)
 
         return
       }
@@ -419,15 +448,15 @@ export function useMessageStream({
           }
 
           if (replace) {
-            return [...parts.filter(part => part.type !== 'reasoning'), reasoningPart(delta)]
+            return [...parts.filter(part => part.type !== 'reasoning'), reasoningPart(delta, sourceId)]
           }
 
-          return appendReasoningPart(parts, delta)
+          return appendReasoningPart(parts, delta, sourceId)
         },
-        () => [reasoningPart(delta)]
+        () => [reasoningPart(delta, sourceId)]
       )
     },
-    [flushQueuedDeltas, mutateStream, queueDelta]
+    [flushQueuedDeltas, mutateStream, queueReasoningDelta]
   )
 
   const upsertToolCall = useCallback(
