@@ -644,6 +644,12 @@ describe('assistant-ui streaming renderer', () => {
     expect(reasoningParts.length).toBe(2)
     expect(reasoningParts[0]?.textContent).toBe('First thought.')
     expect(reasoningParts[1]?.textContent).toBe('Second thought.')
+
+    // This fixture is the isolated rendering seam for Codex reasoning items.
+    // Distinct source items must not merely survive as separate state parts:
+    // each rendered item owns a block formatting context, so adjacent items
+    // cannot collapse back into one continuous visual line.
+    expect([...reasoningParts].every(part => part.classList.contains('block'))).toBe(true)
   })
 
   it('does not reopen an earlier completed thinking group when a later group is running', () => {
