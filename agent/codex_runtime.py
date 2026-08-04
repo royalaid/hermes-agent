@@ -517,6 +517,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # item/started and consumed on item/completed so duration is correct
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    # Current Codex app-server releases put `itemId` on reasoning deltas.
+    # Older releases can omit it while retaining the enclosing item lifecycle,
+    # so keep that active item as a narrow compatibility fallback.
+    active_reasoning_item_id: str | None = None
 
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
@@ -618,6 +622,14 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        item_id = params.get("itemId") or params.get("item_id") or active_reasoning_item_id
+        structured = getattr(agent, "reasoning_event_callback", None)
+        if isinstance(item_id, str) and item_id and structured is not None:
+            try:
+                structured("delta", item_id, text)
+                return
+            except Exception:
+                logger.debug("reasoning_event_callback raised", exc_info=True)
         fn = getattr(agent, "_fire_reasoning_delta", None)
         if fn is None:
             return
@@ -625,6 +637,21 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             fn(text)
         except Exception:
             logger.debug("_fire_reasoning_delta raised", exc_info=True)
+
+    def _fire_reasoning_item_event(event: str, item: dict) -> None:
+        nonlocal active_reasoning_item_id
+        item_id = item.get("id")
+        callback = getattr(agent, "reasoning_event_callback", None)
+        if not isinstance(item_id, str) or not item_id or callback is None:
+            return
+        try:
+            callback(event, item_id, "")
+            if event == "start":
+                active_reasoning_item_id = item_id
+            elif event == "end" and active_reasoning_item_id == item_id:
+                active_reasoning_item_id = None
+        except Exception:
+            logger.debug("reasoning_event_callback raised", exc_info=True)
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
@@ -662,6 +689,12 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(item, dict):
             return
         item_type = item.get("type") or ""
+        if item_type == "reasoning":
+            if method == "item/started":
+                _fire_reasoning_item_event("start", item)
+            elif method == "item/completed":
+                _fire_reasoning_item_event("end", item)
+            return
         if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
             _fire_tool_started(item)
             return
