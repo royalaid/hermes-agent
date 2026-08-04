@@ -416,6 +416,63 @@ def test_projection_returns_deep_copies_and_does_not_mutate_inputs():
     assert checkpoint.output == OPAQUE_OUTPUT
 
 
+def test_projection_omits_null_sdk_fields_without_mutating_persisted_output():
+    ordinary = [
+        {"role": "user", "content": "prefix"},
+        {"role": "user", "content": "tail"},
+    ]
+    compacted = [
+        {
+            "type": "message",
+            "role": "user",
+            "phase": None,
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "retained",
+                    "annotations": None,
+                    "logprobs": None,
+                }
+            ],
+        },
+        {
+            "type": "compaction_summary",
+            "content": None,
+            "phase": None,
+            "role": None,
+            "status": None,
+            "encrypted_content": "opaque",
+            "future_false": False,
+            "future_zero": 0,
+            "future_empty": "",
+            "future_list": [],
+        },
+    ]
+    checkpoint = _checkpoint(
+        ordinary[:1], output=compacted, output_item_count=len(compacted)
+    )
+
+    projected = apply_checkpoint(checkpoint, ordinary)
+
+    assert projected == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "retained"}],
+        },
+        {
+            "type": "compaction_summary",
+            "encrypted_content": "opaque",
+            "future_false": False,
+            "future_zero": 0,
+            "future_empty": "",
+            "future_list": [],
+        },
+        ordinary[1],
+    ]
+    assert checkpoint.output == compacted
+
+
 def test_identity_normalizes_all_route_fields_consistently():
     identity = NativeCompactionIdentity(
         provider=" OpenAI ",
@@ -1535,6 +1592,51 @@ def test_repeated_request_uses_opaque_output_plus_only_new_tail_without_mutation
     assert checkpoint.output == checkpoint_before
 
 
+def test_repeated_request_omits_null_fields_from_previous_checkpoint_output():
+    old_source = [{"role": "user", "content": "old"}]
+    extended = old_source + [{"role": "user", "content": "new"}]
+    compacted = [
+        {
+            "type": "message",
+            "role": "user",
+            "phase": None,
+            "content": [{"type": "input_text", "text": "retained"}],
+        },
+        {
+            "type": "compaction_summary",
+            "content": None,
+            "phase": None,
+            "role": None,
+            "status": None,
+            "encrypted_content": "opaque",
+        },
+    ]
+    checkpoint = _checkpoint(
+        old_source, output=compacted, output_item_count=len(compacted)
+    )
+    compact = _CompactRecorder(
+        SimpleNamespace(output=[{"type": "compaction_summary", "future": 2}])
+    )
+
+    result = _request(
+        _RequestAgent(_request_client(compact)),
+        _cut_for(extended),
+        previous_checkpoint=checkpoint,
+    )
+
+    assert isinstance(result, NativeCompactionCandidate)
+    assert compact.calls[0]["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "retained"}],
+        },
+        {"type": "compaction_summary", "encrypted_content": "opaque"},
+        extended[1],
+    ]
+    assert checkpoint.output == compacted
+
+
 @pytest.mark.parametrize("source", [[{"value": 1}], [{"value": 2}, {"value": 3}]])
 def test_repeated_request_rejects_non_extension_or_prefix_mismatch_without_client(source):
     checkpoint = _checkpoint([{"value": 1}])
@@ -1561,7 +1663,10 @@ def test_sdk_output_items_dump_once_and_preserve_unknown_fields_and_order():
     result = _request(_RequestAgent(_request_client(compact)), _cut_for([{"x": 1}]))
 
     assert result.output == [item.value for item in items]
-    assert [item.calls for item in items] == [[{"mode": "json"}], [{"mode": "json"}]]
+    assert [item.calls for item in items] == [
+        [{"mode": "json", "exclude_none": True}],
+        [{"mode": "json", "exclude_none": True}],
+    ]
 
 
 @pytest.mark.parametrize("response", [
