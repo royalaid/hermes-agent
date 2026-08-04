@@ -435,6 +435,16 @@ describe('interleaved reasoning/text boundaries', () => {
     expect(parts.map(p => p.completedAt)).toEqual([2, 3, undefined])
   })
 
+  it('keeps separate Codex reasoning items as separate parts', () => {
+    let parts: ChatMessagePart[] = appendReasoningPart([], 'Inspecting the transcript', 'reasoning-1')
+    parts = appendReasoningPart(parts, 'Comparing the event lifecycle', 'reasoning-2')
+    parts = appendReasoningPart(parts, ' before rendering', 'reasoning-1')
+
+    expect(parts.map(p => p.type)).toEqual(['reasoning', 'reasoning'])
+    expect((parts[0] as { text: string }).text).toBe('Inspecting the transcript before rendering')
+    expect((parts[1] as { text: string }).text).toBe('Comparing the event lifecycle')
+  })
+
   it('starts a fresh text part after a tool call (segment boundary)', () => {
     let parts: ChatMessagePart[] = appendAssistantTextPart([], 'Let me check.', 10.125)
     parts = upsertToolPart(parts, { name: 'read_file', tool_id: 'tc-1' }, 'running', 11.25)
