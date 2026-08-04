@@ -55,6 +55,7 @@ interface MessageStreamOptions {
 
 interface QueuedStreamDelta {
   occurredAt: number
+  sourceId?: string
   text: string
   type: 'assistant' | 'reasoning'
 }
@@ -222,7 +223,7 @@ export function useMessageStream({
             (next, delta) =>
               delta.type === 'assistant'
                 ? dedupeGeneratedImageEchoesInParts(appendAssistantTextPart(next, delta.text, delta.occurredAt))
-                : appendReasoningPart(next, delta.text, delta.occurredAt),
+                : appendReasoningPart(next, delta.text, delta.occurredAt, delta.sourceId),
             parts
           )
 
@@ -329,7 +330,13 @@ export function useMessageStream({
   }, [flushQueuedDeltas])
 
   const queueDelta = useCallback(
-    (sessionId: string, key: 'assistant' | 'reasoning', delta: string, occurredAt = Date.now() / 1000) => {
+    (
+      sessionId: string,
+      key: 'assistant' | 'reasoning',
+      delta: string,
+      occurredAt = Date.now() / 1000,
+      sourceId?: string
+    ) => {
       if (!delta) {
         return
       }
@@ -337,10 +344,10 @@ export function useMessageStream({
       const queued = queuedDeltasRef.current.get(sessionId) ?? []
       const tail = queued.at(-1)
 
-      if (tail?.type === key) {
+      if (tail?.type === key && (key === 'assistant' || tail.sourceId === sourceId)) {
         tail.text += delta
       } else {
-        queued.push({ occurredAt, text: delta, type: key })
+        queued.push({ occurredAt, sourceId, text: delta, type: key })
       }
 
       queuedDeltasRef.current.set(sessionId, queued)
@@ -408,13 +415,22 @@ export function useMessageStream({
   )
 
   const appendReasoningDelta = useCallback(
-    (sessionId: string, delta: string, replace = false, occurredAt = Date.now() / 1000) => {
+    (
+      sessionId: string,
+      delta: string,
+      replace = false,
+      occurredAtOrSourceId: number | string = Date.now() / 1000,
+      sourceId?: string
+    ) => {
       if (!delta) {
         return
       }
 
+      const occurredAt = typeof occurredAtOrSourceId === 'number' ? occurredAtOrSourceId : Date.now() / 1000
+      const resolvedSourceId = typeof occurredAtOrSourceId === 'string' ? occurredAtOrSourceId : sourceId
+
       if (!replace) {
-        queueDelta(sessionId, 'reasoning', delta, occurredAt)
+        queueDelta(sessionId, 'reasoning', delta, occurredAt, resolvedSourceId)
 
         return
       }
@@ -429,12 +445,12 @@ export function useMessageStream({
           }
 
           if (replace) {
-            return [...parts.filter(part => part.type !== 'reasoning'), reasoningPart(delta, occurredAt)]
+            return [...parts.filter(part => part.type !== 'reasoning'), reasoningPart(delta, occurredAt, resolvedSourceId)]
           }
 
-          return appendReasoningPart(parts, delta, occurredAt)
+          return appendReasoningPart(parts, delta, occurredAt, resolvedSourceId)
         },
-        () => [reasoningPart(delta, occurredAt)],
+        () => [reasoningPart(delta, occurredAt, resolvedSourceId)],
         {},
         occurredAt
       )
