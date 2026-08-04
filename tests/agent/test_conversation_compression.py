@@ -414,12 +414,36 @@ def test_native_endpoint_runs_under_lease_heartbeat_and_one_memory_prehook():
         on_pre_compress=lambda seen: prehook_calls.append(seen) or "memory insight"
     )
     messages = _messages()
+    tools = [
+        {
+            "type": "function",
+            "name": "read_file",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
 
-    def _candidate(_agent, *, cut, compact_instructions, resolved_timeout, **_kwargs):
+    def _build_api_kwargs(candidate_messages):
+        return {
+            "model": agent.model,
+            "instructions": "current prompt",
+            "input": copy.deepcopy(candidate_messages),
+            "tools": copy.deepcopy(tools),
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "pck_current_prompt",
+            "store": False,
+        }
+
+    agent._build_api_kwargs = _build_api_kwargs
+
+    def _candidate(_agent, *, cut, request_context, resolved_timeout, **_kwargs):
         assert agent._session_db.holder == agent._active_compression_lock_holder
         assert agent.touches[0] == "context compression started"
-        assert compact_instructions
-        assert "memory insight" not in compact_instructions
+        assert request_context == _build_api_kwargs(messages)
+        assert request_context["instructions"] == "current prompt"
+        assert "memory insight" not in request_context["instructions"]
         assert resolved_timeout == 19.0
         assert prehook_calls == [messages]
         assert agent.context_compressor._compression_cancelled_check() is False
