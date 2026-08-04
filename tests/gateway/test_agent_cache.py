@@ -159,6 +159,44 @@ class TestExtractCacheBustingConfig:
         )
 
 
+    def test_context_engine_and_native_budget_change_cached_agent_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {
+            "api_key": "test",
+            "base_url": "https://api.openai.com/v1",
+            "provider": "openai",
+            "api_mode": "codex_responses",
+        }
+        compressor = GatewayRunner._extract_cache_busting_config(
+            {"context": {"engine": "compressor"}}
+        )
+        native_20k = GatewayRunner._extract_cache_busting_config(
+            {
+                "context": {
+                    "engine": "openai-native",
+                    "openai_native": {"keep_recent_tokens": 20_000},
+                }
+            }
+        )
+        native_32k = GatewayRunner._extract_cache_busting_config(
+            {
+                "context": {
+                    "engine": "openai-native",
+                    "openai_native": {"keep_recent_tokens": 32_000},
+                }
+            }
+        )
+
+        signatures = {
+            GatewayRunner._agent_config_signature(
+                "gpt-5", runtime, [], "", cache_keys=keys
+            )
+            for keys in (compressor, native_20k, native_32k)
+        }
+        assert len(signatures) == 3
+
+
     def test_missing_keys_yield_none(self):
         """Absent config keys must produce None values (still contribute to signature)."""
         from gateway.run import GatewayRunner

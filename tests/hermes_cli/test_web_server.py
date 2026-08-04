@@ -1668,6 +1668,18 @@ class TestWebServerEndpoints:
 
 class TestBuildSchemaFromConfig:
 
+    def test_context_engine_options_include_built_in_openai_native(self):
+        from hermes_cli.web_server import CONFIG_SCHEMA
+
+        entry = CONFIG_SCHEMA["context.engine"]
+        assert entry["type"] == "select"
+        assert entry["options"] == [
+            "compressor",
+            "openai-native",
+            "default",
+            "custom",
+        ]
+
 
     def test_overrides_applied(self):
         from hermes_cli.web_server import CONFIG_SCHEMA

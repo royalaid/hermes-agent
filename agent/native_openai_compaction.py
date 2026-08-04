@@ -449,6 +449,7 @@ def select_native_compaction_cut(
     messages: list[dict],
     *,
     protect_last_n: int,
+    keep_recent_tokens: int | None = None,
     serialize_input: Callable[[list[dict]], list[dict]],
     previous_source_input_item_count: int = 0,
 ) -> NativeCompactionCut | None:
@@ -460,6 +461,13 @@ def select_native_compaction_cut(
         or not isinstance(protect_last_n, int)
         or isinstance(protect_last_n, bool)
         or protect_last_n < 0
+        or (
+            keep_recent_tokens is not None
+            and (
+                type(keep_recent_tokens) is not int
+                or keep_recent_tokens <= 0
+            )
+        )
         or not isinstance(previous_source_input_item_count, int)
         or isinstance(previous_source_input_item_count, bool)
         or previous_source_input_item_count < 0
@@ -478,13 +486,31 @@ def select_native_compaction_cut(
             for index in range(len(messages) - 1, -1, -1)
             if _is_real_user_message(messages[index])
         )
-        effective_protect_last_n = min(
-            protect_last_n, MAX_NATIVE_PROTECTED_TAIL_MESSAGES
-        )
-        max_cut = min(
-            len(messages) - effective_protect_last_n,
-            newest_real_user_index,
-        )
+        if keep_recent_tokens is not None:
+            from agent.context_compressor import _estimate_msg_budget_tokens
+
+            accumulated_tokens = 0
+            token_cut = None
+            for index in range(len(messages) - 1, -1, -1):
+                accumulated_tokens += _estimate_msg_budget_tokens(messages[index])
+                if accumulated_tokens >= keep_recent_tokens:
+                    token_cut = index
+                    break
+            if token_cut is None:
+                return None
+            max_cut = newest_real_user_index
+            candidate_message_counts = range(
+                max(1, min(token_cut, max_cut)), max_cut + 1
+            )
+        else:
+            effective_protect_last_n = min(
+                protect_last_n, MAX_NATIVE_PROTECTED_TAIL_MESSAGES
+            )
+            max_cut = min(
+                len(messages) - effective_protect_last_n,
+                newest_real_user_index,
+            )
+            candidate_message_counts = range(max_cut, 0, -1)
         if max_cut <= 0:
             return None
 
@@ -499,7 +525,7 @@ def select_native_compaction_cut(
         if not _finalized_tool_graph_is_valid(full_input):
             return None
 
-        for message_count in range(max_cut, 0, -1):
+        for message_count in candidate_message_counts:
             prefix_messages = messages[:message_count]
             if not _tool_atomic_prefix(prefix_messages):
                 continue
@@ -581,6 +607,7 @@ class NativeCompactionPolicy:
         session_state_bound: Any,
     ) -> "NativeCompactionPolicy":
         from agent.context_compressor import ContextCompressor
+        from agent.openai_native_context_engine import OpenAINativeContextEngine
 
         try:
             checkpoint_capable = all(
@@ -596,7 +623,8 @@ class NativeCompactionPolicy:
 
         return cls(
             feature_enabled=feature_enabled is True,
-            built_in_compressor=type(context_compressor) is ContextCompressor,
+            built_in_compressor=type(context_compressor)
+            in {ContextCompressor, OpenAINativeContextEngine},
             has_session_state=(
                 session_state_bound is True
                 and checkpoint_capable

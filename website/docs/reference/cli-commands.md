@@ -1379,7 +1379,8 @@ Unified plugin management — general plugins, memory providers, and context eng
 
 Provider plugin selections are saved to `config.yaml`:
 - `memory.provider` — active memory provider (empty = built-in only)
-- `context.engine` — active context engine (`"compressor"` = built-in default)
+- `context.engine` — active context engine (`"compressor"` = textual default,
+  `"openai-native"` = OpenAI Responses native compaction with textual fallback)
 
 General plugin disabled list is stored in `config.yaml` under `plugins.disabled`.
 
