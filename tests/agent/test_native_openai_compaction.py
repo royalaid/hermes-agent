@@ -1543,6 +1543,68 @@ def test_request_calls_compact_with_exact_payload_and_request_client_lifecycle()
     assert result.compact_created_at == 42.5
 
 
+def test_request_forwards_the_model_visible_responses_envelope_to_compaction():
+    source = [{"role": "user", "content": "continue the task"}]
+    response = SimpleNamespace(
+        output=[{"type": "compaction", "encrypted_content": "opaque"}]
+    )
+    compact = _CompactRecorder(response)
+    request_context = {
+        "instructions": "actual system and developer instructions",
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        "parallel_tool_calls": True,
+        "reasoning": {"effort": "high", "summary": "auto"},
+        "service_tier": "priority",
+        "prompt_cache_key": "pck_static_prefix",
+        "text": {"verbosity": "medium"},
+        "extra_headers": {
+            "session_id": "session-native",
+            "x-client-request-id": "session-native",
+        },
+        # These normal-response fields are not part of Codex's compact payload.
+        "tool_choice": "auto",
+        "include": ["reasoning.encrypted_content"],
+        "store": False,
+    }
+    original_context = copy.deepcopy(request_context)
+
+    result = _request(
+        _RequestAgent(_request_client(compact)),
+        _cut_for(source),
+        request_context=request_context,
+    )
+
+    assert isinstance(result, NativeCompactionCandidate)
+    assert compact.calls == [
+        {
+            "model": "gpt-5",
+            "input": source,
+            "instructions": "actual system and developer instructions",
+            "prompt_cache_key": "pck_static_prefix",
+            "extra_headers": {
+                "session_id": "session-native",
+                "x-client-request-id": "session-native",
+            },
+            "extra_body": {
+                "tools": request_context["tools"],
+                "parallel_tool_calls": True,
+                "reasoning": {"effort": "high", "summary": "auto"},
+                "service_tier": "priority",
+                "text": {"verbosity": "medium"},
+            },
+            "timeout": 12.5,
+        }
+    ]
+    assert request_context == original_context
+
+
 def test_predispatch_guard_runs_after_client_creation_and_before_compact():
     compact = _CompactRecorder(
         SimpleNamespace(output=[{"type": "compaction", "encrypted_content": "opaque"}])
