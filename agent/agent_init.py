@@ -2382,11 +2382,21 @@ def init_agent(
     _engine_name = "compressor"  # default
     try:
         _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
+        _engine_name = str(
+            _ctx_cfg.get("engine", "compressor") or "compressor"
+        ).strip().lower()
     except Exception:
+        _ctx_cfg = {}
         pass
 
-    if _engine_name != "compressor":
+    _native_engine_cfg = _ctx_cfg.get("openai_native", {})
+    if not isinstance(_native_engine_cfg, dict):
+        _native_engine_cfg = {}
+    _native_keep_recent_tokens = _native_engine_cfg.get(
+        "keep_recent_tokens", 20_000
+    )
+
+    if _engine_name not in {"compressor", "openai-native"}:
         # Try loading from plugins/context_engine/<name>/
         try:
             from plugins.context_engine import load_context_engine
@@ -2429,7 +2439,7 @@ def init_agent(
                 "Context engine '%s' not found — falling back to built-in compressor",
                 _engine_name,
             )
-    # else: config says "compressor" — use built-in, don't auto-activate plugins
+    # Built-in engines do not go through plugin discovery.
 
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
@@ -2470,7 +2480,7 @@ def init_agent(
         if not agent.quiet_mode:
             _ra().logger.info("Using context engine: %s", _selected_engine.name)
     else:
-        agent.context_compressor = ContextCompressor(
+        _compressor_kwargs = dict(
             model=agent.model,
             threshold_percent=compression_threshold,
             protect_first_n=compression_protect_first,
@@ -2492,6 +2502,15 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
         )
+        if _engine_name == "openai-native":
+            from agent.openai_native_context_engine import OpenAINativeContextEngine
+
+            agent.context_compressor = OpenAINativeContextEngine(
+                **_compressor_kwargs,
+                native_keep_recent_tokens=_native_keep_recent_tokens,
+            )
+        else:
+            agent.context_compressor = ContextCompressor(**_compressor_kwargs)
     _session_state_bound = False
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
@@ -2508,7 +2527,10 @@ def init_agent(
     from hermes_cli.config import openai_native_compaction_enabled
 
     agent.native_compaction_policy = NativeCompactionPolicy.from_runtime(
-        feature_enabled=openai_native_compaction_enabled(_agent_cfg),
+        feature_enabled=(
+            _engine_name == "openai-native"
+            or openai_native_compaction_enabled(_agent_cfg)
+        ),
         context_compressor=agent.context_compressor,
         session_db=session_db,
         session_id=agent.session_id,

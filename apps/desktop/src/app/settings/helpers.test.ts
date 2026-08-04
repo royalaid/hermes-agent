@@ -185,6 +185,15 @@ describe('settings helpers', () => {
   describe('enumOptionsFor — backend selector dropdowns', () => {
     const config: HermesConfigRecord = {}
 
+    it('offers OpenAI native compaction as a built-in context engine', () => {
+      expect(enumOptionsFor('context.engine', 'compressor', config)).toEqual([
+        'compressor',
+        'openai-native',
+        'default',
+        'custom'
+      ])
+    })
+
     it('renders a dropdown for the TTS provider including xAI (Grok)', () => {
       const opts = enumOptionsFor('tts.provider', 'edge', config)
       expect(opts).toBeDefined()

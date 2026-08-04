@@ -783,7 +783,7 @@ All compression settings live in `config.yaml` (no environment variables).
 ```yaml
 compression:
   enabled: true                                     # Toggle compression on/off
-  openai_native: false                              # Opt in to direct OpenAI Responses native compaction — see below
+  openai_native: false                              # Legacy native opt-in; prefer context.engine — see below
   progress_notices: false                           # Opt-in: deliver routine compression progress notices to chat platforms — see below
   threshold: 0.50                                   # Compress at this % of context limit
   threshold_tokens: null                            # Absolute token cap (optional) — takes lower of ratio vs absolute
@@ -816,8 +816,13 @@ Older configs with `compression.summary_model`, `compression.summary_provider`, 
 
 `progress_notices` (default `false`) controls whether **routine** compression progress statuses reach chat platforms (Telegram, Discord, Slack, etc.). By design, automatic compression is silent on chat surfaces — it runs in the background with server-side logging only. Set `progress_notices: true` to opt into seeing the routine lifecycle on chat platforms: the "Compacting context…" start notice, preflight/pre-API compression triggers, idle compaction, retry progress ("Compressed 30 → 12 messages, retrying…"), and the "Context compaction complete" notice. The gate is scoped to compression statuses only — unrelated operational noise (auxiliary model failures, provider rate-limit/retry chatter) stays suppressed either way. Compression **failure** notices and manual `/compress` feedback are always visible regardless of this setting. Editing this value on a running gateway takes effect on the next message.
 
-`openai_native` (default `false`) is a local-fork, opt-in first step for the
-built-in compressor. With `api_mode: codex_responses`, it is eligible on exactly
+`context.engine: openai-native` is the preferred opt-in. It keeps approximately
+`context.openai_native.keep_recent_tokens` (default `20000`) recent tokens and
+uses the textual compressor if native preparation or dispatch is unavailable.
+The cut is placed at the nearest valid whole-message/tool-atomic boundary;
+Hermes does not synthesize missing tool results to force a split.
+The legacy `compression.openai_native: true` switch remains supported for
+existing profiles. With `api_mode: codex_responses`, native compaction is eligible on exactly
 two first-party routes: `provider: openai` at `https://api.openai.com/v1` using
 an API key, and `provider: openai-codex` at
 `https://chatgpt.com/backend-api/codex` using ChatGPT Codex OAuth.
@@ -831,7 +836,7 @@ fallback activation therefore use readable history instead of stale opaque
 state. Eligible native failures fall back to Hermes text compression in the same
 attempt while the compression lease remains valid; cancellation and lease loss
 abort without launching fallback. To roll back, run
-`hermes config set compression.openai_native false`. This local integration has
+`hermes config set context.engine compressor`. This local integration has
 no upstream support or compatibility guarantee.
 
 `hygiene_hard_message_limit` is a gateway-only **pre-compression safety valve**. It exists to break a death spiral: when API calls keep disconnecting on an oversized session, the gateway never receives token-usage data, so the token-based threshold can't fire, so the transcript keeps growing and disconnects get worse. This count-based floor fires on message count alone (always known, regardless of API failures) to force compression and recover the session. Default `5000` — far above any normal session, including large-context (1M+) models doing thousands of short turns, which compress on the token threshold long before this. Raise it further for unusual platforms, lower it to force more aggressive compression. Editing this value on a running gateway takes effect on the next message (see below).
@@ -921,11 +926,20 @@ agent:
 
 ## Context Engine
 
-The context engine controls how conversations are managed when approaching the model's token limit. The built-in `compressor` engine uses lossy summarization (see [Context Compression](/developer-guide/context-compression-and-caching)). Plugin engines can replace it with alternative strategies.
+The context engine controls how conversations are managed when approaching the model's token limit. Hermes includes textual `compressor` and OpenAI-native `openai-native` engines; plugins can add other strategies.
 
 ```yaml
 context:
-  engine: "compressor"    # default — built-in lossy summarization
+  engine: "compressor"    # default — built-in textual summarization
+```
+
+For provider-native OpenAI Responses compaction with textual fallback:
+
+```yaml
+context:
+  engine: "openai-native"
+  openai_native:
+    keep_recent_tokens: 20000
 ```
 
 To use a plugin engine (e.g., LCM for lossless context management):

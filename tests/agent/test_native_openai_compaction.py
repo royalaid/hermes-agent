@@ -779,6 +779,72 @@ def test_cut_caps_default_tail_floor_so_large_parallel_tool_turn_is_compacted():
     assert cut.source_input_item_count > 1
 
 
+def test_token_budget_keeps_small_recent_turns_and_compacts_large_tool_prefix():
+    from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
+
+    calls = [
+        {"id": f"call_{i}", "function": {"name": "terminal", "arguments": "{}"}}
+        for i in range(20)
+    ]
+    messages = [
+        {"role": "user", "content": "run the large batch"},
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        *[
+            {"role": "tool", "tool_call_id": f"call_{i}", "content": "x" * 13_000}
+            for i in range(20)
+        ],
+        {"role": "assistant", "content": "large batch done"},
+    ]
+    for i in range(30):
+        messages.extend(
+            [
+                {"role": "user", "content": f"small follow-up {i}"},
+                {"role": "assistant", "content": f"small answer {i}"},
+            ]
+        )
+    transport = ResponsesApiTransport()
+
+    cut = select_native_compaction_cut(
+        messages,
+        protect_last_n=20,
+        keep_recent_tokens=20_000,
+        serialize_input=lambda rows: transport.build_input_items(
+            rows, is_codex_backend=True
+        ),
+    )
+
+    assert cut is not None
+    assert cut.message_count == 22
+    assert messages[cut.message_count]["content"] == "large batch done"
+
+
+def test_token_budget_uses_newest_user_as_anchor_without_raw_message_floor():
+    from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "x" * 8_000},
+        {"role": "assistant", "content": "recent answer"},
+    ]
+    transport = ResponsesApiTransport()
+
+    cut = select_native_compaction_cut(
+        messages,
+        protect_last_n=20,
+        keep_recent_tokens=1_000,
+        serialize_input=lambda rows: transport.build_input_items(
+            rows, is_codex_backend=True
+        ),
+    )
+
+    assert cut is not None
+    assert cut.message_count == 2
+    assert messages[cut.message_count]["content"] == "x" * 8_000
+
+
 def test_cut_refuses_malformed_detached_tool_history_when_no_safe_prefix_exists():
     from agent.native_openai_compaction import select_native_compaction_cut
 

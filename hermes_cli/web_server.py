@@ -968,7 +968,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "context.engine": {
         "type": "select",
         "description": "Context management engine",
-        "options": ["default", "custom"],
+        "options": ["compressor", "openai-native", "default", "custom"],
     },
     "human_delay.mode": {
         "type": "select",
