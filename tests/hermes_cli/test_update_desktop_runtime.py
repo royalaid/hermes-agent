@@ -49,4 +49,3 @@ def test_pause_and_resume_only_replays_recorded_plugin_launcher(tmp_path):
     ) == 1
     assert spawned[0][0] == ["python.exe", str(plugin_file)]
     assert resume_desktop_plugins_after_update(token, popen=lambda *_a, **_k: None) == 0
-

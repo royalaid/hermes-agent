@@ -134,4 +134,3 @@ def resume_desktop_plugins_after_update(
         except (OSError, ValueError) as exc:
             logger.warning("Could not restart managed desktop plugin %r: %s", argv[0], exc)
     return restarted
-
