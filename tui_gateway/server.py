@@ -5804,6 +5804,14 @@ def _agent_cbs(sid: str) -> dict:
             sid,
             {"text": text, **({"verbose": True} if _session_verbose(sid) else {})},
         ),
+        # Codex app-server exposes reasoning as independently addressable turn
+        # items. Keep that identity through the gateway so Desktop can update
+        # the correct disclosure instead of concatenating separate summaries.
+        "reasoning_event_callback": lambda phase, item_id, text="": _emit(
+            f"reasoning.{phase}",
+            sid,
+            {"reasoning_id": item_id, "text": text},
+        ),
         "status_callback": lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
         ),
