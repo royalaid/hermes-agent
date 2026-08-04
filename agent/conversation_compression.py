@@ -2472,7 +2472,7 @@ def _try_native_openai_compaction(
     except Exception:
         return "abort" if not _commit_still_owned() else _fallback("identity")
 
-    def _serialize(candidate_messages: list[dict]) -> list[dict]:
+    def _build_request(candidate_messages: list[dict]) -> dict[str, Any]:
         built = agent._build_api_kwargs(copy.deepcopy(candidate_messages))
         built = agent._get_transport().preflight_kwargs(
             built,
@@ -2480,13 +2480,19 @@ def _try_native_openai_compaction(
             is_github_responses=agent._is_copilot_url(),
             sanitize_harmony_tokens=agent._is_codex_backend(),
         )
-        ordinary_input = built["input"]
+        if type(built) is not dict:
+            raise ValueError("Responses request must be a dictionary")
+        ordinary_input = built.get("input")
         if type(ordinary_input) is not list:
             raise ValueError("Responses input must be a list")
-        return copy.deepcopy(ordinary_input)
+        return copy.deepcopy(built)
+
+    def _serialize(candidate_messages: list[dict]) -> list[dict]:
+        return _build_request(candidate_messages)["input"]
 
     try:
-        ordinary_input = _serialize(messages)
+        ordinary_request = _build_request(messages)
+        ordinary_input = ordinary_request["input"]
         prior = session_db.load_native_openai_checkpoint(session_id)
         if not (
             type(prior) is NativeCompactionCheckpoint
@@ -2521,6 +2527,7 @@ def _try_native_openai_compaction(
             model=getattr(agent, "model", ""),
             cut=cut,
             compact_instructions=NATIVE_OPENAI_COMPACTION_INSTRUCTIONS,
+            request_context=ordinary_request,
             resolved_timeout=resolved_timeout,
             previous_checkpoint=prior,
             pre_dispatch_check=_commit_still_owned,

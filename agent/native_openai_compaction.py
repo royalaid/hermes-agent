@@ -966,12 +966,82 @@ def _classify_native_compaction_exception(exc: Exception) -> NativeCompactionFai
     return _native_compaction_failure("client")
 
 
+_NATIVE_COMPACTION_EXTRA_BODY_FIELDS = (
+    "tools",
+    "parallel_tool_calls",
+    "reasoning",
+    "service_tier",
+    "text",
+)
+
+
+def _native_compaction_call_kwargs(
+    *,
+    model: str,
+    input_items: list[dict],
+    compact_instructions: str,
+    request_context: dict[str, Any] | None,
+    resolved_timeout: float | None,
+) -> dict[str, Any]:
+    """Build the compact endpoint payload from the normal Responses envelope.
+
+    The OpenAI SDK's typed ``responses.compact`` method currently exposes only
+    part of the provider payload. Codex sends the model-visible tool and
+    reasoning fields in the request body as well, so pass that narrow allowlist
+    through ``extra_body`` while keeping transport-only response fields out.
+    """
+    if request_context is not None and type(request_context) is not dict:
+        raise ValueError("request_context must be a plain dictionary")
+    context = request_context or {}
+
+    instructions = context.get("instructions", compact_instructions)
+    if type(instructions) is not str:
+        raise ValueError("instructions must be a plain string")
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "input": copy.deepcopy(input_items),
+        "instructions": instructions,
+        "timeout": resolved_timeout,
+    }
+
+    if "prompt_cache_key" in context:
+        prompt_cache_key = context["prompt_cache_key"]
+        if type(prompt_cache_key) is not str or not prompt_cache_key:
+            raise ValueError("prompt_cache_key must be a non-empty plain string")
+        kwargs["prompt_cache_key"] = prompt_cache_key
+
+    if "extra_headers" in context:
+        extra_headers = context["extra_headers"]
+        if type(extra_headers) is not dict or not all(
+            type(key) is str and type(value) is str
+            for key, value in extra_headers.items()
+        ):
+            raise ValueError("extra_headers must contain plain string pairs")
+        kwargs["extra_headers"] = copy.deepcopy(extra_headers)
+
+    extra_body: dict[str, Any] = {}
+    for field_name in _NATIVE_COMPACTION_EXTRA_BODY_FIELDS:
+        if field_name not in context:
+            continue
+        field_value = context[field_name]
+        if field_value is None:
+            continue
+        _validate_json_value(field_value)
+        extra_body[field_name] = copy.deepcopy(field_value)
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+
+    return kwargs
+
+
 def request_native_compaction_candidate(
     agent: Any,
     *,
     model: str,
     cut: NativeCompactionCut,
     compact_instructions: str,
+    request_context: dict[str, Any] | None = None,
     resolved_timeout: float | None,
     previous_checkpoint: NativeCompactionCheckpoint | None = None,
     pre_dispatch_check: Callable[[], bool] | None = None,
@@ -992,6 +1062,7 @@ def request_native_compaction_candidate(
             )
         )
         or type(cut) is not NativeCompactionCut
+        or (request_context is not None and type(request_context) is not dict)
         or (pre_dispatch_check is not None and not callable(pre_dispatch_check))
         or (
             dispatch_fence is not None
@@ -1053,7 +1124,13 @@ def request_native_compaction_candidate(
                     result = _native_compaction_failure("unsupported")
                 else:
                     try:
-                        request_input = copy.deepcopy(effective_input)
+                        request_kwargs = _native_compaction_call_kwargs(
+                            model=model,
+                            input_items=effective_input,
+                            compact_instructions=compact_instructions,
+                            request_context=request_context,
+                            resolved_timeout=resolved_timeout,
+                        )
                     except Exception:
                         result = _native_compaction_failure("invalid_response")
                     else:
@@ -1095,12 +1172,7 @@ def request_native_compaction_candidate(
                                     result = _native_compaction_failure("client")
                                 else:
                                     try:
-                                        response = compact(
-                                            model=model,
-                                            input=request_input,
-                                            instructions=compact_instructions,
-                                            timeout=resolved_timeout,
-                                        )
+                                        response = compact(**request_kwargs)
                                     except Exception as exc:
                                         result = _classify_native_compaction_exception(
                                             exc
