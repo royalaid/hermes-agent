@@ -845,7 +845,27 @@ def apply_checkpoint(
         raise ValueError("ordinary input does not match checkpoint prefix")
     if canonical_input_sha256(ordinary_input[:count]) != checkpoint.source_input_sha256:
         raise ValueError("ordinary input does not match checkpoint prefix")
-    return checkpoint.output + copy.deepcopy(ordinary_input[count:])
+    return _omit_none_dict_fields(checkpoint.output) + copy.deepcopy(
+        ordinary_input[count:]
+    )
+
+
+def _omit_none_dict_fields(value: Any) -> Any:
+    """Mirror Pydantic ``exclude_none`` on an isolated JSON-compatible copy.
+
+    Keep the persisted compacted window raw and normalize only its wire replay,
+    following the record/rewrite split used by
+    https://github.com/jordyvandomselaar/pi-openai-compaction.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _omit_none_dict_fields(nested)
+            for key, nested in value.items()
+            if nested is not None
+        }
+    if isinstance(value, list):
+        return [_omit_none_dict_fields(item) for item in value]
+    return copy.deepcopy(value)
 
 
 def _native_compaction_failure(
@@ -966,9 +986,9 @@ def request_native_compaction_candidate(
             prefix_matches = False
         if not prefix_matches:
             return _native_compaction_failure("invalid_response")
-        effective_input = previous_checkpoint.output + copy.deepcopy(
-            source_input[old_count:]
-        )
+        effective_input = _omit_none_dict_fields(
+            previous_checkpoint.output
+        ) + copy.deepcopy(source_input[old_count:])
 
     try:
         client = agent._create_request_openai_client(
@@ -1102,7 +1122,7 @@ def _candidate_from_compact_response(
         for item in output:
             model_dump = getattr(item, "model_dump", None)
             if callable(model_dump):
-                serialized_output.append(model_dump(mode="json"))
+                serialized_output.append(model_dump(mode="json", exclude_none=True))
             else:
                 serialized_output.append(copy.deepcopy(item))
 
