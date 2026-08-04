@@ -154,6 +154,7 @@ roll back (a running gateway applies the change on its next message):
 
 ```bash
 hermes config set context.engine compressor
+hermes config set compression.openai_native false
 ```
 
 This integration is maintained in this local fork and has no upstream support
