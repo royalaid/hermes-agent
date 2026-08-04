@@ -1670,7 +1670,41 @@ def test_sdk_output_items_dump_once_and_preserve_unknown_fields_and_order():
     result = _request(_RequestAgent(_request_client(compact)), _cut_for([{"x": 1}]))
 
     assert result.output == [item.value for item in items]
-    assert [item.calls for item in items] == [[{"mode": "json"}], [{"mode": "json"}]]
+    assert [item.calls for item in items] == [
+        [{"mode": "json", "exclude_none": True}],
+        [{"mode": "json", "exclude_none": True}],
+    ]
+
+
+def test_sdk_output_serialization_omits_none_fields_rejected_by_codex_replay():
+    class Item:
+        def __init__(self):
+            self.calls = []
+
+        def model_dump(self, **kwargs):
+            self.calls.append(kwargs)
+            value = {
+                "type": "message",
+                "role": "user",
+                "phase": None,
+                "unknown": "preserved",
+            }
+            if kwargs.get("exclude_none"):
+                value = {key: item for key, item in value.items() if item is not None}
+            return value
+
+    item = Item()
+    compact = _CompactRecorder(SimpleNamespace(output=[item]))
+
+    result = _request(
+        _RequestAgent(_request_client(compact)),
+        _cut_for([{"role": "user", "content": "question"}]),
+    )
+
+    assert result.output == [
+        {"type": "message", "role": "user", "unknown": "preserved"}
+    ]
+    assert item.calls == [{"mode": "json", "exclude_none": True}]
 
 
 @pytest.mark.parametrize("response", [

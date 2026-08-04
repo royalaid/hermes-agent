@@ -1141,7 +1141,9 @@ def _candidate_from_compact_response(
         for item in output:
             model_dump = getattr(item, "model_dump", None)
             if callable(model_dump):
-                serialized_output.append(model_dump(mode="json"))
+                serialized_output.append(
+                    model_dump(mode="json", exclude_none=True)
+                )
             else:
                 serialized_output.append(copy.deepcopy(item))
 
