@@ -126,6 +126,22 @@ def _is_pausable_gateway(cmdline: str) -> bool:
     return looks_like_gateway_command_line(cmdline)
 
 
+def _is_pausable_update_managed_process(cmdline: str) -> bool:
+    """Return True only for a holder the native updater can pause and restore."""
+    if _is_pausable_gateway(cmdline):
+        return True
+    try:
+        from hermes_constants import get_process_hermes_home  # noqa: PLC0415
+        from hermes_cli.update_desktop_runtime import (  # noqa: PLC0415
+            is_update_managed_desktop_plugin_command_line,
+        )
+    except Exception:
+        return False
+    return is_update_managed_desktop_plugin_command_line(
+        cmdline, get_process_hermes_home()
+    )
+
+
 def main() -> None:
     """Entry point.  Prints one JSON doc to stdout.  Exits 0 for valid scan."""
     try:
@@ -147,16 +163,24 @@ def main() -> None:
             "cmdline": _redact_sensitive_cmdline(cmdline),
         }
         for pid, name, cmdline in matches
-        if not _is_pausable_gateway(cmdline)
+        if not _is_pausable_update_managed_process(cmdline)
     ]
-    exempted = sum(1 for _pid, _name, cmdline in matches if _is_pausable_gateway(cmdline))
+    exempted = sum(
+        1
+        for _pid, _name, cmdline in matches
+        if _is_pausable_update_managed_process(cmdline)
+    )
+    pausable_gateways = sum(
+        1 for _pid, _name, cmdline in matches if _is_pausable_gateway(cmdline)
+    )
     data = {
         "ok": True,
         "blocked": bool(processes),
         "processes": processes,
-        # Diagnostic only: gateway processes present but not counted as
-        # blockers because the downstream updater pauses them itself.
-        "pausable_gateways": exempted,
+        # Diagnostic only: update-managed holders are present but not counted
+        # as blockers because the downstream updater pauses them itself.
+        "pausable_gateways": pausable_gateways,
+        "pausable_desktop_plugins": exempted - pausable_gateways,
     }
     print(json.dumps(data))
     sys.exit(0)

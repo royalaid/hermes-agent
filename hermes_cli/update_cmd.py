@@ -3055,6 +3055,46 @@ def _leftover_pausable_gateway_pids(
     return pids
 
 
+def _pause_windows_desktop_plugins_for_update() -> dict | None:
+    """Stop only update-managed Desktop plugin launcher trees."""
+    if not _m()._is_windows():
+        return None
+    try:
+        import psutil
+        from gateway.status import terminate_pid
+        from hermes_constants import get_process_hermes_home
+        from hermes_cli.update_desktop_runtime import pause_desktop_plugins_for_update
+    except Exception as exc:
+        logger.debug("Could not load desktop-plugin update helpers: %s", exc)
+        return None
+    try:
+        return pause_desktop_plugins_for_update(
+            get_process_hermes_home(),
+            process_iter=lambda: psutil.process_iter(["pid", "ppid", "cmdline", "cwd"]),
+            terminate_tree=lambda pid: terminate_pid(pid, force=True),
+        )
+    except Exception as exc:
+        logger.warning("Could not pause managed desktop plugins for update: %s", exc)
+        return None
+
+
+def _resume_windows_desktop_plugins_after_update(token: dict | None) -> None:
+    """Restart only Desktop plugin launchers paused for this update."""
+    if not token or not _m()._is_windows():
+        return
+    try:
+        from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+        from hermes_cli.update_desktop_runtime import resume_desktop_plugins_after_update
+
+        restarted = resume_desktop_plugins_after_update(
+            token, popen_kwargs=windows_detach_popen_kwargs()
+        )
+        if restarted:
+            print(f"Restarting {restarted} managed desktop plugin service(s)")
+    except Exception as exc:
+        logger.warning("Could not restart managed desktop plugins after update: %s", exc)
+
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -3608,12 +3648,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
 
     _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
+    _windows_plugin_resume = _m()._pause_windows_desktop_plugins_for_update()
     if _windows_gateway_resume:
         import atexit as _atexit
 
         _atexit.register(
             _m()._resume_windows_gateways_after_update,
             _windows_gateway_resume,
+        )
+    if _windows_plugin_resume:
+        import atexit as _atexit
+
+        _atexit.register(
+            _m()._resume_windows_desktop_plugins_after_update,
+            _windows_plugin_resume,
         )
 
     # With gateways paused, anything still running from the venv interpreter
@@ -3655,6 +3703,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            _m()._resume_windows_desktop_plugins_after_update(_windows_plugin_resume)
             sys.exit(2)
 
     # Try git-based update first, fall back to ZIP download on Windows
