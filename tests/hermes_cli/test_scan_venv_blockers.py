@@ -18,6 +18,7 @@ import pytest
 import agent.redact as redact_module
 from hermes_cli._scan_venv_blockers import (
     _is_pausable_gateway,
+    _is_pausable_update_managed_process,
     _redact_sensitive_cmdline,
     main,
 )
@@ -151,6 +152,20 @@ def test_is_pausable_gateway_rejects_everything_else(cmdline: str) -> None:
     assert _is_pausable_gateway(cmdline) is False
 
 
+def test_is_pausable_update_managed_process_accepts_desktop_plugin(monkeypatch, tmp_path) -> None:
+    """A plugin launcher has downstream pause/resume support, so the Desktop
+    preflight must allow the native updater to drain it instead of blocking."""
+    plugin = tmp_path / "desktop-plugins" / "tracker" / "service.py"
+    plugin.parent.mkdir(parents=True)
+    plugin.write_text("placeholder")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    assert _is_pausable_update_managed_process(f'python.exe "{plugin}"') is True
+    assert _is_pausable_update_managed_process(
+        f'python.exe "{tmp_path / "external.py"}"'
+    ) is False
+
+
 def _run_main_with_detector(monkeypatch, capsys, matches):
     """Run main() with the process detector patched to return *matches*."""
     for name, mod in _psutil_fake().items():
@@ -212,3 +227,22 @@ def test_main_desktop_serve_backend_still_blocks(monkeypatch, capsys):
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [78]
     assert data["pausable_gateways"] == 0
+
+
+def test_main_exempts_managed_desktop_plugin_but_keeps_external_holder(
+    monkeypatch, capsys, tmp_path
+):
+    plugin = tmp_path / "desktop-plugins" / "tracker" / "service.py"
+    plugin.parent.mkdir(parents=True)
+    plugin.write_text("placeholder")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin_launcher = (18, "python.exe", f'python.exe "{plugin}"')
+    external = (19, "python.exe", f'python.exe "{tmp_path / "external.py"}"')
+
+    code, data = _run_main_with_detector(
+        monkeypatch, capsys, [plugin_launcher, external]
+    )
+
+    assert code == 0
+    assert data["blocked"] is True
+    assert [p["pid"] for p in data["processes"]] == [19]
