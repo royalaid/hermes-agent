@@ -277,7 +277,7 @@ export function enumOptionsFor(
   // backends declared in config.yaml are selectable, not just the built-ins.
   // The `includes` guard keeps the list duplicate-free should the display list
   // ever carry a name we also enumerate.
-  if (!dynamicOptions && opts && (key === 'tts.provider' || key === 'stt.provider')) {
+  if (opts && (key === 'tts.provider' || key === 'stt.provider')) {
     const section = key.slice(0, 3) as 'tts' | 'stt'
     const custom = commandProviderNames(config, section).filter(name => !opts!.includes(name))
 
@@ -288,7 +288,7 @@ export function enumOptionsFor(
 
   // Narrow OpenAI voice suggestions to what the selected model actually
   // accepts — offering `marin` against tts-1 would 400 at the API.
-  if (!dynamicOptions && opts && key === 'tts.openai.voice') {
+  if (opts && key === 'tts.openai.voice') {
     const model = asText(getNested(config, 'tts.openai.model'))
 
     if (model === 'tts-1' || model === 'tts-1-hd') {
@@ -303,6 +303,21 @@ export function enumOptionsFor(
   const current = asText(value)
 
   return current && !opts.includes(current) ? [...opts, current] : opts
+}
+
+export function enumOptionsForField(
+  key: string,
+  value: unknown,
+  config: HermesConfigRecord,
+  field: Pick<ConfigFieldSchema, 'options'>,
+  elevenLabsVoiceOptions?: string[]
+): string[] | undefined {
+  const schemaOptions = field.options?.map(String)
+
+  const dynamicOptions =
+    key === 'tts.elevenlabs.voice_id' ? (elevenLabsVoiceOptions ?? schemaOptions) : schemaOptions
+
+  return enumOptionsFor(key, value, config, dynamicOptions)
 }
 
 // Built-in memory (MEMORY.md/USER.md) is controlled by memory_enabled, not
