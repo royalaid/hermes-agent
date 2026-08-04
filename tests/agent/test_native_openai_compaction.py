@@ -679,6 +679,49 @@ def test_cut_keeps_multiple_tool_calls_and_results_atomic():
     assert messages[cut.message_count]["role"] == "assistant"
 
 
+def test_cut_caps_default_tail_floor_so_large_parallel_tool_turn_is_compacted():
+    from agent.native_openai_compaction import select_native_compaction_cut
+    from agent.transports.codex import ResponsesApiTransport
+
+    first_calls = [
+        {"id": f"first_{i}", "function": {"name": "terminal", "arguments": "{}"}}
+        for i in range(20)
+    ]
+    second_calls = [
+        {"id": f"second_{i}", "function": {"name": "terminal", "arguments": "{}"}}
+        for i in range(10)
+    ]
+    messages = [
+        {"role": "user", "content": "run twenty tools"},
+        {"role": "assistant", "content": "", "tool_calls": first_calls},
+        *[
+            {"role": "tool", "tool_call_id": f"first_{i}", "content": "x" * 13_000}
+            for i in range(20)
+        ],
+        {"role": "assistant", "content": "first batch done"},
+        {"role": "user", "content": "run ten more"},
+        {"role": "assistant", "content": "", "tool_calls": second_calls},
+        *[
+            {"role": "tool", "tool_call_id": f"second_{i}", "content": "y" * 15_000}
+            for i in range(10)
+        ],
+        {"role": "assistant", "content": "second batch done"},
+    ]
+    transport = ResponsesApiTransport()
+
+    cut = select_native_compaction_cut(
+        messages,
+        protect_last_n=20,
+        serialize_input=lambda rows: transport.build_input_items(
+            rows, is_codex_backend=True
+        ),
+    )
+
+    assert cut is not None
+    assert cut.message_count == 23
+    assert cut.source_input_item_count > 1
+
+
 def test_cut_refuses_malformed_detached_tool_history_when_no_safe_prefix_exists():
     from agent.native_openai_compaction import select_native_compaction_cut
 

@@ -23,6 +23,11 @@ from hermes_cli.route_identity import normalize_route_base_url
 MAX_NATIVE_COMPACTION_OUTPUT_ITEMS = 512
 MAX_NATIVE_COMPACTION_OUTPUT_DEPTH = 64
 MAX_NATIVE_COMPACTION_OUTPUT_JSON_BYTES = 4 * 1024 * 1024
+# Match ContextCompressor's bounded recent-message floor. A raw default of 20
+# can land inside one large parallel tool-result group; atomic-boundary repair
+# then retreats to the opening user message and commits a projection that saves
+# effectively no context.
+MAX_NATIVE_PROTECTED_TAIL_MESSAGES = 8
 
 
 def _validate_json_value(
@@ -473,7 +478,13 @@ def select_native_compaction_cut(
             for index in range(len(messages) - 1, -1, -1)
             if _is_real_user_message(messages[index])
         )
-        max_cut = min(len(messages) - protect_last_n, newest_real_user_index)
+        effective_protect_last_n = min(
+            protect_last_n, MAX_NATIVE_PROTECTED_TAIL_MESSAGES
+        )
+        max_cut = min(
+            len(messages) - effective_protect_last_n,
+            newest_real_user_index,
+        )
         if max_cut <= 0:
             return None
 
