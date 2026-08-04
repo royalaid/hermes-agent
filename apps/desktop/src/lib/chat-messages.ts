@@ -70,6 +70,7 @@ export type GatewayEventPayload = {
   model?: string
   provider?: string
   reasoning_effort?: string
+  reasoning_id?: string
   service_tier?: string
   fast?: boolean
   approval_mode?: string
@@ -166,8 +167,16 @@ export function textPart(text: string, timestamp?: number): ChatMessagePart {
   return { type: 'text', text, ...(timestamp !== undefined ? { timestamp } : {}) }
 }
 
-export function reasoningPart(text: string, timestamp?: number): ChatMessagePart {
-  return { type: 'reasoning', text, ...(timestamp !== undefined ? { timestamp } : {}) }
+export function reasoningPart(text: string, timestampOrSourceId?: number | string, sourceId?: string): ChatMessagePart {
+  const timestamp = typeof timestampOrSourceId === 'number' ? timestampOrSourceId : undefined
+  const resolvedSourceId = typeof timestampOrSourceId === 'string' ? timestampOrSourceId : sourceId
+
+  return {
+    type: 'reasoning',
+    text,
+    ...(timestamp !== undefined ? { timestamp } : {}),
+    ...(resolvedSourceId ? { sourceId: resolvedSourceId } : {})
+  } as ChatMessagePart
 }
 
 const MEDIA_LINE_RE = /(^|\n)[\t ]*[`"']?MEDIA:\s*(?<line>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?[\t ]*(\n|$)/g
@@ -561,7 +570,43 @@ export function appendTextPart(parts: ChatMessagePart[], delta: string, timestam
   return appendStreamPart(parts, 'text', delta, timestamp).parts
 }
 
-export function appendReasoningPart(parts: ChatMessagePart[], delta: string, timestamp?: number): ChatMessagePart[] {
+export function appendReasoningPart(
+  parts: ChatMessagePart[],
+  delta: string,
+  timestampOrSourceId?: number | string,
+  sourceId?: string
+): ChatMessagePart[] {
+  const timestamp = typeof timestampOrSourceId === 'number' ? timestampOrSourceId : undefined
+  const resolvedSourceId = typeof timestampOrSourceId === 'string' ? timestampOrSourceId : sourceId
+
+  if (resolvedSourceId) {
+    const next = [...parts]
+
+    const index = next.findLastIndex(
+      part => part.type === 'reasoning' && (part as { sourceId?: string }).sourceId === resolvedSourceId
+    )
+
+    if (index >= 0) {
+      const part = next[index] as { text: string }
+      next[index] = { ...part, text: `${part.text}${delta}` } as ChatMessagePart
+
+      return next
+    }
+
+    const tailIndex = next.length - 1
+    const tail = next[tailIndex]
+
+    if (
+      timestamp !== undefined &&
+      (tail?.type === 'text' || tail?.type === 'reasoning') &&
+      tail.completedAt === undefined
+    ) {
+      next[tailIndex] = { ...tail, completedAt: timestamp } as ChatMessagePart
+    }
+
+    return [...next, reasoningPart(delta, timestamp, resolvedSourceId)]
+  }
+
   return appendStreamPart(parts, 'reasoning', delta, timestamp).parts
 }
 
