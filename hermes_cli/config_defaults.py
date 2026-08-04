@@ -1616,12 +1616,20 @@ DEFAULT_CONFIG = {
     
     # Context engine -- controls how the context window is managed when
     # approaching the model's token limit.
-    # "compressor" = built-in lossy summarization (default).
-    # Set to a plugin name to activate an alternative engine (e.g. "lcm"
-    # for Lossless Context Management).  The engine must be installed as
-    # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
+    # "compressor" = built-in textual summarization (default).
+    # "openai-native" = provider-native Responses compaction on supported
+    # first-party OpenAI routes, with the textual compressor as fail-open fallback.
+    # Set to a plugin name to activate another engine (e.g. "lcm" for Lossless
+    # Context Management). The plugin must be installed under
+    # plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        "openai_native": {
+            # Token-budgeted verbatim tail. Hermes chooses the nearest safe
+            # whole-message/tool-atomic boundary and keeps the newest actionable
+            # user turn anchored; it does not synthesize missing tool results.
+            "keep_recent_tokens": 20_000,
+        },
         # Return freed glibc allocator pages after long-running agent/TUI
         # cleanup boundaries. Unsupported platforms are safe no-ops.
         "memory_trim": {
