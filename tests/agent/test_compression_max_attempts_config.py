@@ -151,8 +151,12 @@ def test_invalid_native_openai_compaction_values_normalize_false_without_mutatio
 
 
 def test_agent_init_loads_native_compaction_config_and_current_route(monkeypatch, tmp_path):
+    from agent.openai_native_context_engine import OpenAINativeContextEngine
+
     agent = _make_agent(monkeypatch, tmp_path, openai_native=True)
 
+    assert type(agent.context_compressor) is OpenAINativeContextEngine
+    assert agent.context_compressor.native_keep_recent_tokens == 20_000
     assert agent.native_compaction_policy.feature_enabled is True
     assert agent.native_compaction_policy.is_eligible(
         client=agent.client,
@@ -160,6 +164,29 @@ def test_agent_init_loads_native_compaction_config_and_current_route(monkeypatch
         api_mode=agent.api_mode,
         base_url=agent.base_url,
     )
+
+
+def test_legacy_native_openai_compaction_loads_and_validates_custom_token_budget(
+    monkeypatch, tmp_path
+):
+    agent = _make_agent(
+        monkeypatch,
+        tmp_path,
+        openai_native=True,
+        native_keep_recent_tokens=32_000,
+    )
+
+    assert agent.context_compressor.native_keep_recent_tokens == 32_000
+
+    with pytest.raises(
+        ValueError, match="native_keep_recent_tokens must be a positive integer"
+    ):
+        _make_agent(
+            monkeypatch,
+            tmp_path,
+            openai_native=True,
+            native_keep_recent_tokens="invalid",
+        )
 
 
 def test_agent_init_caches_bound_session_native_checkpoint_once(monkeypatch, tmp_path):
@@ -268,6 +295,7 @@ def test_agent_init_marks_custom_context_engine_ineligible(monkeypatch, tmp_path
         context_engine="task4-custom",
     )
 
+    assert agent.context_compressor.name == "task4-custom"
     assert not agent.native_compaction_policy.built_in_compressor
     assert not agent.native_compaction_policy.is_eligible(
         client=agent.client,

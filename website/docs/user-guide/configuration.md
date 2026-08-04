@@ -835,8 +835,9 @@ the full route identity still match. Rewinds, edits, provider/model changes, and
 fallback activation therefore use readable history instead of stale opaque
 state. Eligible native failures fall back to Hermes text compression in the same
 attempt while the compression lease remains valid; cancellation and lease loss
-abort without launching fallback. To roll back, run
-`hermes config set context.engine compressor`. This local integration has
+abort without launching fallback. To roll back, set `context.engine` to
+`compressor` and clear the legacy flag with
+`hermes config set compression.openai_native false`. This local integration has
 no upstream support or compatibility guarantee.
 
 `hygiene_hard_message_limit` is a gateway-only **pre-compression safety valve**. It exists to break a death spiral: when API calls keep disconnecting on an oversized session, the gateway never receives token-usage data, so the token-based threshold can't fire, so the transcript keeps growing and disconnects get worse. This count-based floor fires on message count alone (always known, regardless of API failures) to force compression and recover the session. Default `5000` — far above any normal session, including large-context (1M+) models doing thousands of short turns, which compress on the token threshold long before this. Raise it further for unusual platforms, lower it to force more aggressive compression. Editing this value on a running gateway takes effect on the next message (see below).

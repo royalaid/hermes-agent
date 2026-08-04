@@ -2395,6 +2395,20 @@ def init_agent(
     _native_keep_recent_tokens = _native_engine_cfg.get(
         "keep_recent_tokens", 20_000
     )
+    from hermes_cli.config import openai_native_compaction_enabled
+
+    _legacy_native_enabled = openai_native_compaction_enabled(_agent_cfg)
+    _native_engine_requested = (
+        _engine_name == "openai-native" or _legacy_native_enabled
+    )
+    if _native_engine_requested:
+        from agent.openai_native_context_engine import (
+            validate_native_keep_recent_tokens,
+        )
+
+        _native_keep_recent_tokens = validate_native_keep_recent_tokens(
+            _native_keep_recent_tokens
+        )
 
     if _engine_name not in {"compressor", "openai-native"}:
         # Try loading from plugins/context_engine/<name>/
@@ -2502,7 +2516,7 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
         )
-        if _engine_name == "openai-native":
+        if _native_engine_requested:
             from agent.openai_native_context_engine import OpenAINativeContextEngine
 
             agent.context_compressor = OpenAINativeContextEngine(
@@ -2524,13 +2538,9 @@ def init_agent(
     # policy retains no client or route credentials; future call sites must
     # provide the then-current client/provider/api_mode/base_url to eligibility.
     from agent.native_openai_compaction import NativeCompactionPolicy
-    from hermes_cli.config import openai_native_compaction_enabled
 
     agent.native_compaction_policy = NativeCompactionPolicy.from_runtime(
-        feature_enabled=(
-            _engine_name == "openai-native"
-            or openai_native_compaction_enabled(_agent_cfg)
-        ),
+        feature_enabled=_native_engine_requested,
         context_compressor=agent.context_compressor,
         session_db=session_db,
         session_id=agent.session_id,

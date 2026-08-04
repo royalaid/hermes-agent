@@ -13,6 +13,12 @@ from agent.context_compressor import ContextCompressor
 DEFAULT_OPENAI_NATIVE_KEEP_RECENT_TOKENS = 20_000
 
 
+def validate_native_keep_recent_tokens(value: object) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError("native_keep_recent_tokens must be a positive integer")
+    return value
+
+
 class OpenAINativeContextEngine(ContextCompressor):
     """Native-first OpenAI compaction with inherited textual fallback."""
 
@@ -22,11 +28,9 @@ class OpenAINativeContextEngine(ContextCompressor):
         native_keep_recent_tokens: int = DEFAULT_OPENAI_NATIVE_KEEP_RECENT_TOKENS,
         **kwargs,
     ) -> None:
-        if (
-            type(native_keep_recent_tokens) is not int
-            or native_keep_recent_tokens <= 0
-        ):
-            raise ValueError("native_keep_recent_tokens must be a positive integer")
+        native_keep_recent_tokens = validate_native_keep_recent_tokens(
+            native_keep_recent_tokens
+        )
         super().__init__(*args, **kwargs)
         self.native_keep_recent_tokens = native_keep_recent_tokens
 
