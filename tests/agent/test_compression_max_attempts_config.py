@@ -18,12 +18,20 @@ import contextlib
 import io
 from pathlib import Path
 
+import pytest
+
 from agent.context_engine import ContextEngine
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
-def _config(max_attempts=None, *, openai_native=None, context_engine=None) -> dict:
+def _config(
+    max_attempts=None,
+    *,
+    openai_native=None,
+    context_engine=None,
+    native_keep_recent_tokens=None,
+) -> dict:
     compression = {
         "enabled": True,
         "threshold": 0.50,
@@ -38,6 +46,10 @@ def _config(max_attempts=None, *, openai_native=None, context_engine=None) -> di
     context = {}
     if context_engine is not None:
         context["engine"] = context_engine
+    if native_keep_recent_tokens is not None:
+        context["openai_native"] = {
+            "keep_recent_tokens": native_keep_recent_tokens
+        }
     return {
         "compression": compression,
         "context": context,
@@ -54,6 +66,7 @@ def _make_agent(
     max_attempts=None,
     openai_native=None,
     context_engine=None,
+    native_keep_recent_tokens=None,
     session_db=True,
 ):
     from hermes_cli import config as config_mod
@@ -63,6 +76,7 @@ def _make_agent(
             max_attempts=max_attempts,
             openai_native=openai_native,
             context_engine=context_engine,
+            native_keep_recent_tokens=native_keep_recent_tokens,
         )
 
     monkeypatch.setattr(config_mod, "load_config", config)
@@ -261,6 +275,60 @@ def test_agent_init_marks_custom_context_engine_ineligible(monkeypatch, tmp_path
         api_mode=agent.api_mode,
         base_url=agent.base_url,
     )
+
+
+def test_openai_native_context_engine_enables_native_policy_without_legacy_flag(
+    monkeypatch, tmp_path
+):
+    from agent.openai_native_context_engine import OpenAINativeContextEngine
+
+    agent = _make_agent(
+        monkeypatch,
+        tmp_path,
+        openai_native=False,
+        context_engine="openai-native",
+    )
+
+    assert type(agent.context_compressor) is OpenAINativeContextEngine
+    assert agent.context_compressor.name == "openai-native"
+    assert agent.context_compressor.native_keep_recent_tokens == 20_000
+    assert agent.native_compaction_policy.feature_enabled is True
+    assert agent.native_compaction_policy.is_eligible(
+        client=agent.client,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+        base_url=agent.base_url,
+    )
+
+
+def test_openai_native_context_engine_loads_token_budget_from_context_settings(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["context"]["openai_native"]["keep_recent_tokens"] == 20_000
+
+    agent = _make_agent(
+        monkeypatch,
+        tmp_path,
+        context_engine="openai-native",
+        native_keep_recent_tokens=32_000,
+    )
+
+    assert agent.context_compressor.native_keep_recent_tokens == 32_000
+
+
+@pytest.mark.parametrize("invalid_budget", [0, -1, True, 1.5, "20000", "invalid"])
+def test_openai_native_context_engine_rejects_invalid_token_budget(
+    monkeypatch, tmp_path, invalid_budget
+):
+    with pytest.raises(ValueError, match="native_keep_recent_tokens must be a positive integer"):
+        _make_agent(
+            monkeypatch,
+            tmp_path,
+            context_engine="openai-native",
+            native_keep_recent_tokens=invalid_budget,
+        )
 
 
 class TestCompressionMaxAttemptsConfig:

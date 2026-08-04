@@ -13,8 +13,9 @@ Context management is built on the `ContextEngine` ABC (`agent/context_engine.py
 
 ```yaml
 context:
-  engine: "compressor"    # default — built-in lossy summarization
-  engine: "lcm"           # example — plugin providing lossless context
+  engine: "compressor"     # default — built-in textual summarization
+  engine: "openai-native"  # OpenAI Responses native compaction + text fallback
+  engine: "lcm"            # example — plugin providing lossless context
 ```
 
 The engine is responsible for:
@@ -24,11 +25,13 @@ The engine is responsible for:
 - Tracking token usage from API responses
 
 Selection is config-driven via `context.engine` in `config.yaml`. The resolution order:
-1. Check `plugins/context_engine/<name>/` directory
-2. Check general plugin system (`register_context_engine()`)
-3. Fall back to built-in `ContextCompressor`
+1. Resolve built-ins (`compressor`, `openai-native`)
+2. Check `plugins/context_engine/<name>/` directory
+3. Check general plugin system (`register_context_engine()`)
+4. Fall back to built-in `ContextCompressor`
 
-Plugin engines are **never auto-activated** — the user must explicitly set `context.engine` to the plugin's name. The default `"compressor"` always uses the built-in.
+Plugin engines are **never auto-activated**. The default `"compressor"` remains
+textual compression; `"openai-native"` is a separate built-in engine.
 
 Configure via `hermes plugins` → Provider Plugins → Context Engine, or edit `config.yaml` directly.
 
@@ -81,7 +84,7 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  openai_native: false       # Opt in to direct OpenAI Responses native compaction
+  openai_native: false       # Legacy compatibility opt-in; prefer context.engine
   threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
   # model_thresholds:        # Per-model threshold overrides (substring match,
   #   "glm-5.2": 0.40        # longest key wins). See "Per-model threshold
@@ -102,11 +105,22 @@ auxiliary:
     base_url: null           # Custom OpenAI-compatible endpoint
 ```
 
-### Native OpenAI Responses projection (local fork, opt-in)
+### Native OpenAI Responses engine (local fork, opt-in)
 
-`compression.openai_native` defaults to `false`. When explicitly enabled, the
-built-in compressor first tries OpenAI's native Responses compaction on exactly
-these first-party routes using `api_mode: codex_responses`:
+Select the native-first engine and its token-budgeted retained tail with:
+
+```yaml
+context:
+  engine: "openai-native"
+  openai_native:
+    keep_recent_tokens: 20000
+```
+
+The engine uses the normal textual compressor as its fail-open fallback. The
+legacy `compression.openai_native: true` switch remains supported for existing
+profiles, but `context.engine` is the preferred selection surface. Native
+dispatch is restricted to exactly these first-party routes using
+`api_mode: codex_responses`:
 
 - OpenAI API key: `provider: openai` with `https://api.openai.com/v1`;
 - ChatGPT Codex OAuth: `provider: openai-codex` with
@@ -139,7 +153,7 @@ text compression invalidates the old native projection. Disable the feature to
 roll back (a running gateway applies the change on its next message):
 
 ```bash
-hermes config set compression.openai_native false
+hermes config set context.engine compressor
 ```
 
 This integration is maintained in this local fork and has no upstream support

@@ -1218,8 +1218,13 @@ def _discover_context_engines() -> list[tuple[str, str]]:
     plugins via ``ctx.register_context_engine``). Repo-shipped descriptions
     win when a plugin-registered engine collides on name.
     """
-    engines: list[tuple[str, str]] = []
-    seen: set[str] = set()
+    engines: list[tuple[str, str]] = [
+        (
+            "openai-native",
+            "OpenAI Responses native compaction with textual fallback",
+        )
+    ]
+    seen: set[str] = {"openai-native"}
 
     try:
         from plugins.context_engine import discover_context_engines

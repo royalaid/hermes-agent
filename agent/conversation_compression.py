@@ -2496,6 +2496,9 @@ def _try_native_openai_compaction(
         cut = select_native_compaction_cut(
             messages,
             protect_last_n=getattr(agent.context_compressor, "protect_last_n", 0),
+            keep_recent_tokens=getattr(
+                agent.context_compressor, "native_keep_recent_tokens", None
+            ),
             serialize_input=_serialize,
             previous_source_input_item_count=(
                 prior.source_input_item_count if prior is not None else 0
