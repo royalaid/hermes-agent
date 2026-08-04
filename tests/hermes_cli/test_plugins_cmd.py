@@ -504,13 +504,18 @@ class TestProviderDiscovery:
         assert content["context"]["engine"] == "lcm"
 
 
-    def test_discover_context_engines_empty(self):
-        """Discovery returns empty list when import fails."""
+    def test_discover_context_engines_includes_builtin_openai_native(self):
+        """Built-in native Responses compaction remains available without plugins."""
         with patch("plugins.context_engine.discover_context_engines",
-                    side_effect=ImportError("no module")):
+                   side_effect=ImportError("no module")):
             from hermes_cli.plugins_cmd import _discover_context_engines
             result = _discover_context_engines()
-            assert result == []
+            assert result == [
+                (
+                    "openai-native",
+                    "OpenAI Responses native compaction with textual fallback",
+                )
+            ]
 
 
 # ── Auto-activation fix ──────────────────────────────────────────────────
