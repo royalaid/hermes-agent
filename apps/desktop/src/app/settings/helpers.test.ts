@@ -6,6 +6,7 @@ import { FIELD_DESCRIPTIONS, FIELD_LABELS, SECTIONS } from './constants'
 import { defineFieldCopy, fieldCopyForSchemaKey, schemaKeyToFieldCopyKey } from './field-copy'
 import {
   enumOptionsFor,
+  enumOptionsForField,
   getNested,
   isExternalMemoryProvider,
   providerGroup,
@@ -192,6 +193,35 @@ describe('settings helpers', () => {
         'default',
         'custom'
       ])
+    })
+
+    it('uses authoritative backend schema options for a rendered field', () => {
+      expect(
+        enumOptionsForField('context.engine', 'compressor', config, {
+          options: ['backend-native']
+        })
+      ).toEqual(['backend-native', 'compressor'])
+      expect(
+        enumOptionsForField('tts.elevenlabs.voice_id', 'voice-1', config, {
+          options: ['schema-voice']
+        })
+      ).toEqual(['schema-voice', 'voice-1'])
+      expect(
+        enumOptionsForField(
+          'tts.provider',
+          'edge',
+          { tts: { providers: { localSpeech: { command: 'speak' } } } },
+          { options: ['edge'] }
+        )
+      ).toEqual(['edge', 'localSpeech'])
+      expect(
+        enumOptionsForField(
+          'tts.openai.voice',
+          'alloy',
+          { tts: { openai: { model: 'tts-1' } } },
+          { options: ['alloy', 'marin'] }
+        )
+      ).toEqual(['alloy'])
     })
 
     it('renders a dropdown for the TTS provider including xAI (Grok)', () => {
