@@ -54,6 +54,7 @@ export type GatewayEventPayload = {
   model?: string
   provider?: string
   reasoning_effort?: string
+  reasoning_id?: string
   service_tier?: string
   fast?: boolean
   approval_mode?: string
@@ -129,8 +130,8 @@ export function textPart(text: string): ChatMessagePart {
   return { type: 'text', text }
 }
 
-export function reasoningPart(text: string): ChatMessagePart {
-  return { type: 'reasoning', text }
+export function reasoningPart(text: string, sourceId?: string): ChatMessagePart {
+  return { type: 'reasoning', text, ...(sourceId && { sourceId }) } as ChatMessagePart
 }
 
 const MEDIA_LINE_RE = /(^|\n)[\t ]*[`"']?MEDIA:\s*(?<line>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?[\t ]*(\n|$)/g
@@ -439,7 +440,24 @@ export function appendTextPart(parts: ChatMessagePart[], delta: string): ChatMes
   return appendStreamPart(parts, 'text', delta).parts
 }
 
-export function appendReasoningPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
+export function appendReasoningPart(parts: ChatMessagePart[], delta: string, sourceId?: string): ChatMessagePart[] {
+  if (sourceId) {
+    const next = [...parts]
+
+    const index = next.findLastIndex(
+      part => part.type === 'reasoning' && (part as { sourceId?: string }).sourceId === sourceId
+    )
+
+    if (index >= 0) {
+      const part = next[index] as { text: string }
+      next[index] = { ...part, text: `${part.text}${delta}` } as ChatMessagePart
+
+      return next
+    }
+
+    return [...next, reasoningPart(delta, sourceId)]
+  }
+
   return appendStreamPart(parts, 'reasoning', delta).parts
 }
 
