@@ -596,6 +596,85 @@ class TestReasoningDeltasFiredFlag(unittest.TestCase):
 
         self.assertEqual(captured, ["Let me merge the PR."])
 
+    def test_native_codex_summary_entries_keep_separate_reasoning_ids(self):
+        """Each Responses summary entry is a separate visible reasoning item."""
+        agent = self._make_agent()
+        generic = []
+        structured = []
+        agent.reasoning_callback = None
+        agent.reasoning_event_callback = lambda phase, item_id, text="": structured.append(
+            (phase, item_id, text)
+        )
+
+        msg = SimpleNamespace(
+            content="Done.",
+            tool_calls=None,
+            reasoning_content="Inspecting the source\nChecking the package\n\nVerifying the artifact",
+            reasoning=None,
+            reasoning_details=None,
+            codex_reasoning_items=[
+                {
+                    "type": "reasoning",
+                    "id": "rs_live",
+                    "summary": [
+                        {"type": "summary_text", "text": "Inspecting the source"},
+                        {"type": "summary_text", "text": "Checking the package"},
+                    ],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_verify",
+                    "summary": [{"type": "summary_text", "text": "Verifying the artifact"}],
+                },
+            ],
+        )
+
+        agent._build_assistant_message(msg, "stop")
+
+        self.assertEqual(generic, [])
+        self.assertEqual(
+            structured,
+            [
+                ("start", "rs_live:summary:0", ""),
+                ("delta", "rs_live:summary:0", "Inspecting the source"),
+                ("end", "rs_live:summary:0", ""),
+                ("start", "rs_live:summary:1", ""),
+                ("delta", "rs_live:summary:1", "Checking the package"),
+                ("end", "rs_live:summary:1", ""),
+                ("start", "rs_verify:summary:0", ""),
+                ("delta", "rs_verify:summary:0", "Verifying the artifact"),
+                ("end", "rs_verify:summary:0", ""),
+            ],
+        )
+
+    def test_native_codex_summary_entries_do_not_hide_unmatched_reasoning(self):
+        agent = self._make_agent()
+        generic = []
+        structured = []
+        agent.reasoning_callback = generic.append
+        agent.reasoning_event_callback = lambda phase, item_id, text="": structured.append(
+            (phase, item_id, text)
+        )
+        msg = SimpleNamespace(
+            content="Done.",
+            tool_calls=None,
+            reasoning_content="Commentary not represented by the summary",
+            reasoning=None,
+            reasoning_details=None,
+            codex_reasoning_items=[
+                {
+                    "type": "reasoning",
+                    "id": "rs_live",
+                    "summary": [{"type": "summary_text", "text": "Different summary"}],
+                }
+            ],
+        )
+
+        agent._build_assistant_message(msg, "stop")
+
+        self.assertEqual(generic, ["Commentary not represented by the summary"])
+        self.assertEqual(structured, [])
+
 
 class TestReasoningShownThisTurnFlag(unittest.TestCase):
     """Post-response reasoning display should be suppressed when reasoning
