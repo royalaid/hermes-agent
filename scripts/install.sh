@@ -43,8 +43,7 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+REPOSITORY="NousResearch/hermes-agent"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -114,6 +113,10 @@ while [[ $# -gt 0 ]]; do
             BRANCH="$2"
             shift 2
             ;;
+        --repository|-Repository)
+            REPOSITORY="$2"
+            shift 2
+            ;;
         --commit|-Commit)
             INSTALL_COMMIT="$2"
             shift 2
@@ -169,6 +172,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --repository OWNER/REPO  GitHub repository (default: NousResearch/hermes-agent)"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "                   (ignored when it would roll an existing install back)"
             echo "  --force-commit Apply --commit even if it rolls the install backwards"
@@ -203,6 +207,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ ! "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || [[ "$REPOSITORY" =~ (^|/)\.{1,2}($|/) ]]; then
+    echo "Invalid --repository '$REPOSITORY'; expected GitHub owner/repository" >&2
+    exit 2
+fi
+REPO_URL_SSH="git@github.com:${REPOSITORY}.git"
+REPO_URL_HTTPS="https://github.com/${REPOSITORY}.git"
 
 # ============================================================================
 # Helper functions
@@ -1272,6 +1284,7 @@ clone_repo() {
             # every ref, and this repo carries thousands of auto-generated
             # branches — on a non-single-branch checkout that turns each update
             # into a multi-minute download that can stall the installer.
+            git remote set-url origin "$REPO_URL_HTTPS"
             git remote set-branches origin "$BRANCH" 2>/dev/null || true
             git fetch origin "$BRANCH"
             git checkout "$BRANCH"
@@ -2566,9 +2579,10 @@ write_bootstrap_marker() {
 
     # Atomic publish: the macOS launcher predicate only checks existence, so a
     # torn write would arm the fast path against a half-written marker.
-    printf '{\n  "schemaVersion": 1,\n  "pinnedCommit": "%s",\n  "pinnedBranch": "%s",\n  "completedAt": "%s"\n}\n' \
+    printf '{\n  "schemaVersion": 1,\n  "pinnedCommit": "%s",\n  "pinnedBranch": "%s",\n  "pinnedRepository": "%s",\n  "completedAt": "%s"\n}\n' \
         "$pinned_commit" \
         "$BRANCH" \
+        "$REPOSITORY" \
         "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$tmp_path"
     mv -f "$tmp_path" "$marker_path"
 }
@@ -2833,6 +2847,13 @@ EOF
 _desktop_pack() {
     local desktop_dir="$1"
     local mirror="${2:-}"
+    # Preserve the requested provenance tuple even when a commit pin leaves the
+    # checkout detached. write-build-stamp consumes these CI-style values before
+    # probing git, so the nested Desktop package keeps the requested branch.
+    export GITHUB_REPOSITORY="$REPOSITORY"
+    export GITHUB_REF_NAME="$BRANCH"
+    GITHUB_SHA="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
+    export GITHUB_SHA
     if [ -n "$mirror" ]; then
         ( cd "$desktop_dir" && ELECTRON_MIRROR="$mirror" CSC_IDENTITY_AUTO_DISCOVERY=false npm run pack )
     else

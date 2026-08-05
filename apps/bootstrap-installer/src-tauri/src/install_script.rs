@@ -14,6 +14,7 @@
 //! to live OUTSIDE any repo checkout.
 
 use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
@@ -25,6 +26,8 @@ use crate::paths;
 pub struct ResolvedScript {
     pub path: PathBuf,
     pub source: ScriptSource,
+    /// GitHub owner/repository used for both script download and checkout.
+    pub repository: Option<String>,
     /// Commit pin (40-char SHA) if known. install.ps1's `-Commit` arg is
     /// what makes the repo stage clone the exact tested SHA.
     pub commit: Option<String>,
@@ -104,7 +107,9 @@ pub async fn resolve(
 ) -> Result<ResolvedScript> {
     // 1. Dev shortcut.
     if let Ok(repo_root) = std::env::var("HERMES_SETUP_DEV_REPO_ROOT") {
-        let candidate = PathBuf::from(repo_root).join("scripts").join(kind.filename());
+        let candidate = PathBuf::from(repo_root)
+            .join("scripts")
+            .join(kind.filename());
         if candidate.exists() {
             emit_log(&format!(
                 "[bootstrap] dev mode — using local {} at {}",
@@ -114,6 +119,7 @@ pub async fn resolve(
             return Ok(ResolvedScript {
                 path: candidate,
                 source: ScriptSource::DevCheckout,
+                repository: pin.repository.clone(),
                 commit: pin.commit.clone(),
                 branch: pin.branch.clone(),
             });
@@ -142,7 +148,11 @@ pub async fn resolve(
         }
     };
 
-    let cached = cached_path(kind, &commit_or_ref);
+    let repository = pin
+        .repository
+        .as_deref()
+        .unwrap_or("NousResearch/hermes-agent");
+    let cached = cached_path(kind, repository, &commit_or_ref)?;
     match cache_plan(immutable, cached.exists()) {
         CachePlan::Reuse => {
             emit_log(&format!(
@@ -157,6 +167,7 @@ pub async fn resolve(
             return Ok(ResolvedScript {
                 path: cached,
                 source: ScriptSource::Cached,
+                repository: pin.repository.clone(),
                 commit: pin.commit.clone(),
                 branch: pin.branch.clone(),
             });
@@ -165,20 +176,17 @@ pub async fn resolve(
             emit_log(&format!(
                 "[bootstrap] downloading {} for {} {} from GitHub",
                 kind.filename(),
-                if immutable {
-                    "commit"
-                } else {
-                    "mutable ref"
-                },
+                if immutable { "commit" } else { "mutable ref" },
                 truncate_ref(&commit_or_ref)
             ));
 
-            match download(kind, &commit_or_ref, &cached).await {
+            match download(kind, repository, &commit_or_ref, &cached).await {
                 Ok(()) => {
                     emit_log(&format!("[bootstrap] cached to {}", cached.display()));
                     Ok(ResolvedScript {
                         path: cached,
                         source: ScriptSource::Downloaded,
+                        repository: pin.repository.clone(),
                         commit: pin.commit.clone(),
                         branch: pin.branch.clone(),
                     })
@@ -195,6 +203,7 @@ pub async fn resolve(
                     Ok(ResolvedScript {
                         path: cached,
                         source: ScriptSource::Cached,
+                        repository: pin.repository.clone(),
                         commit: pin.commit.clone(),
                         branch: pin.branch.clone(),
                     })
@@ -207,31 +216,44 @@ pub async fn resolve(
 
 #[derive(Debug, Clone, Default)]
 pub struct Pin {
+    pub repository: Option<String>,
     pub commit: Option<String>,
     pub branch: Option<String>,
 }
 
-fn cached_path(kind: ScriptKind, commit_or_ref: &str) -> PathBuf {
-    let safe = sanitize_ref(commit_or_ref);
+fn cached_path(kind: ScriptKind, repository: &str, commit_or_ref: &str) -> Result<PathBuf> {
+    let (owner, name) = valid_repository_parts(repository)?;
+    let safe_ref = format!("{:x}", Sha256::digest(commit_or_ref.as_bytes()));
     let filename = match kind {
-        ScriptKind::Ps1 => format!("install-{safe}.ps1"),
-        ScriptKind::Sh => format!("install-{safe}.sh"),
+        ScriptKind::Ps1 => format!("install-{safe_ref}.ps1"),
+        ScriptKind::Sh => format!("install-{safe_ref}.sh"),
     };
-    paths::bootstrap_cache_dir().join(filename)
+    Ok(paths::bootstrap_cache_dir()
+        .join(owner)
+        .join(name)
+        .join(filename))
 }
 
-/// Replace anything that's not [A-Za-z0-9._-] with `_`. Branch refs can
-/// contain `/`, dots, etc.; we want a flat filename.
-fn sanitize_ref(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn valid_repository_parts(repository: &str) -> Result<(&str, &str)> {
+    let Some((owner, name)) = repository.split_once('/') else {
+        return Err(anyhow!(
+            "invalid GitHub repository `{repository}`; expected owner/repository"
+        ));
+    };
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    };
+    if !valid_part(owner) || !valid_part(name) || name.contains('/') {
+        return Err(anyhow!(
+            "invalid GitHub repository `{repository}`; expected owner/repository"
+        ));
+    }
+    Ok((owner, name))
 }
 
 fn truncate_ref(s: &str) -> &str {
@@ -322,17 +344,17 @@ fn upgrade_cached_script(kind: ScriptKind, cached: &Path, emit_log: &impl Fn(&st
 /// black-holed connection (captive portal, hung proxy, silently dropped
 /// packets) never errors — the whole bootstrap would hang here instead of
 /// falling back to the cached script.
-async fn download(kind: ScriptKind, commit_or_ref: &str, dest_path: &Path) -> Result<()> {
-    let url = format!(
-        "https://raw.githubusercontent.com/NousResearch/hermes-agent/{}/scripts/{}",
-        commit_or_ref,
-        kind.filename()
-    );
+async fn download(
+    kind: ScriptKind,
+    repository: &str,
+    commit_or_ref: &str,
+    dest_path: &Path,
+) -> Result<()> {
+    let url = raw_script_url(repository, commit_or_ref, kind);
 
     if let Some(parent) = dest_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating bootstrap-cache parent dir {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating bootstrap-cache parent dir {}", parent.display()))?;
     }
 
     let tmp_path = dest_path.with_extension({
@@ -380,20 +402,42 @@ async fn download(kind: ScriptKind, commit_or_ref: &str, dest_path: &Path) -> Re
 
     tokio::fs::rename(&tmp_path, dest_path)
         .await
-        .with_context(|| {
-            format!(
-                "renaming {} → {}",
-                tmp_path.display(),
-                dest_path.display()
-            )
-        })?;
+        .with_context(|| format!("renaming {} → {}", tmp_path.display(), dest_path.display()))?;
 
     Ok(())
+}
+
+fn raw_script_url(repository: &str, commit_or_ref: &str, kind: ScriptKind) -> String {
+    format!(
+        "https://raw.githubusercontent.com/{repository}/{commit_or_ref}/scripts/{}",
+        kind.filename()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_cache_paths_cannot_collide_at_owner_boundary() {
+        let left = cached_path(ScriptKind::Ps1, "a_b/c", "main").unwrap();
+        let right = cached_path(ScriptKind::Ps1, "a/b_c", "main").unwrap();
+        assert_ne!(left, right);
+        assert!(cached_path(ScriptKind::Ps1, "../escape", "main").is_err());
+        assert!(cached_path(ScriptKind::Ps1, "owner/repo/extra", "main").is_err());
+    }
+
+    #[test]
+    fn raw_script_url_uses_the_pinned_repository() {
+        assert_eq!(
+            raw_script_url(
+                "royalaid/hermes-agent",
+                "51962fc0fb0dc468b5c8ab66c43d9a6a0e3dce3a",
+                ScriptKind::Ps1,
+            ),
+            "https://raw.githubusercontent.com/royalaid/hermes-agent/51962fc0fb0dc468b5c8ab66c43d9a6a0e3dce3a/scripts/install.ps1"
+        );
+    }
 
     #[test]
     fn is_valid_commit_accepts_short_and_full_shas() {
@@ -405,16 +449,12 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_ref_replaces_slashes() {
-        assert_eq!(sanitize_ref("bb/gui"), "bb_gui");
-        assert_eq!(sanitize_ref("main"), "main");
-        assert_eq!(sanitize_ref("release/1.2.3"), "release_1.2.3");
-    }
-
-    #[test]
     fn prepare_cached_ps1_prefixes_utf8_bom() {
         let out = prepare_cached_script_bytes(ScriptKind::Ps1, b"Write-Host hi\n");
-        assert!(out.starts_with(UTF8_BOM), "cached .ps1 must start with UTF-8 BOM");
+        assert!(
+            out.starts_with(UTF8_BOM),
+            "cached .ps1 must start with UTF-8 BOM"
+        );
         assert_eq!(&out[UTF8_BOM.len()..], b"Write-Host hi\n");
     }
 
