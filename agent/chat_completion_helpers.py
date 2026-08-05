@@ -1424,6 +1424,54 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 
 
 
+def _emit_native_codex_reasoning_summaries(agent, assistant_message, reasoning_text: str) -> bool:
+    """Emit completed Responses summary entries without flattening identity.
+
+    The non-streaming native Responses path stores a lossless
+    ``codex_reasoning_items`` list, but ``reasoning_content`` is a joined string.
+    Prefer the structured list when the gateway installed an item-aware callback
+    so Desktop can materialize one reasoning part per provider summary entry.
+    Only take this path when those entries account for the full visible
+    reasoning payload; commentary from sibling response items must not vanish.
+    """
+    callback = getattr(agent, "reasoning_event_callback", None)
+    items = getattr(assistant_message, "codex_reasoning_items", None)
+    if callback is None or not isinstance(items, list):
+        return False
+
+    entries = []
+    text_groups = []
+    for item_index, item in enumerate(items):
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            item_id = f"native-reasoning:{item_index}"
+        summary = item.get("summary")
+        if not isinstance(summary, list):
+            continue
+        item_texts = []
+        for summary_index, part in enumerate(summary):
+            if not isinstance(part, dict) or part.get("type") != "summary_text":
+                continue
+            text = part.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            entries.append((f"{item_id}:summary:{summary_index}", text))
+            item_texts.append(text)
+        if item_texts:
+            text_groups.append("\n".join(item_texts))
+
+    if not entries or "\n\n".join(text_groups).strip() != reasoning_text.strip():
+        return False
+
+    for source_id, text in entries:
+        callback("start", source_id, "")
+        callback("delta", source_id, text)
+        callback("end", source_id, "")
+    return True
+
+
 def build_assistant_message(agent, assistant_message, finish_reason: str) -> dict:
     """Build a normalized assistant message dict from an API response message.
 
@@ -1447,18 +1495,24 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if reasoning_text and agent.verbose_logging:
         logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
 
-    if reasoning_text and agent.reasoning_callback:
+    reasoning_callback = getattr(agent, "reasoning_callback", None)
+    reasoning_event_callback = getattr(agent, "reasoning_event_callback", None)
+    if reasoning_text and (reasoning_callback or reasoning_event_callback):
         # Skip callback when streaming is active — reasoning was already
         # displayed during the stream via one of two paths:
         #   (a) _fire_reasoning_delta (structured reasoning_content deltas)
         #   (b) _stream_delta tag extraction (<think>/<REASONING_SCRATCHPAD>)
         # When streaming is NOT active, always fire so non-streaming modes
-        # (gateway, batch, quiet) still get reasoning.
+        # (gateway, batch, quiet) still get reasoning. Native Responses messages
+        # retain provider summary entries in ``codex_reasoning_items``; emit
+        # those with stable identities instead of flattening them into one
+        # Markdown paragraph when an item-aware gateway callback is available.
         # Any reasoning that wasn't shown during streaming is caught by the
         # CLI post-response display fallback (cli.py _reasoning_shown_this_turn).
         if not agent.stream_delta_callback and not agent._stream_callback:
             try:
-                agent.reasoning_callback(reasoning_text)
+                if not _emit_native_codex_reasoning_summaries(agent, assistant_message, reasoning_text) and reasoning_callback:
+                    reasoning_callback(reasoning_text)
             except Exception:
                 pass
 
