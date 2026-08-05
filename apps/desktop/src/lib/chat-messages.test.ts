@@ -44,6 +44,60 @@ describe('toChatMessages', () => {
     expect((toolPart as { args: { command?: string } }).args.command).toBe(longCommand)
   })
 
+  it('hydrates native Codex summary entries as separate reasoning parts', () => {
+    const [message] = toChatMessages([
+      {
+        role: 'assistant',
+        content: 'Done.',
+        reasoning: 'Inspecting the source\nChecking the package\n\nVerifying the artifact',
+        codex_reasoning_items: [
+          {
+            type: 'reasoning',
+            id: 'rs_saved',
+            summary: [
+              { type: 'summary_text', text: 'Inspecting the source' },
+              { type: 'summary_text', text: 'Checking the package' }
+            ]
+          },
+          {
+            type: 'reasoning',
+            id: 'rs_verify',
+            summary: [{ type: 'summary_text', text: 'Verifying the artifact' }]
+          }
+        ],
+        timestamp: 1
+      }
+    ])
+
+    expect(message.parts.filter(part => part.type === 'reasoning')).toEqual([
+      { type: 'reasoning', sourceId: 'rs_saved:summary:0', text: 'Inspecting the source', timestamp: 1 },
+      { type: 'reasoning', sourceId: 'rs_saved:summary:1', text: 'Checking the package', timestamp: 1 },
+      { type: 'reasoning', sourceId: 'rs_verify:summary:0', text: 'Verifying the artifact', timestamp: 1 }
+    ])
+  })
+
+  it('keeps the full hydrated reasoning fallback when structured summaries are incomplete', () => {
+    const [message] = toChatMessages([
+      {
+        role: 'assistant',
+        content: 'Done.',
+        reasoning: 'Commentary not represented by the summary',
+        codex_reasoning_items: [
+          {
+            type: 'reasoning',
+            id: 'rs_saved',
+            summary: [{ type: 'summary_text', text: 'Different summary' }]
+          }
+        ],
+        timestamp: 1
+      }
+    ])
+
+    expect(message.parts.filter(part => part.type === 'reasoning')).toEqual([
+      { type: 'reasoning', text: 'Commentary not represented by the summary', timestamp: 1 }
+    ])
+  })
+
   it('keeps a turn with interleaved tool-only rows in a single bubble', () => {
     const messages = toChatMessages([
       { role: 'assistant', content: 'Planning.', timestamp: 1 },
