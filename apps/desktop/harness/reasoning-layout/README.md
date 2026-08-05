@@ -1,6 +1,6 @@
 # Reasoning layout harness
 
-This fixture renders one completed assistant message with four consecutive reasoning parts. It isolates the assistant-ui grouping and CSS layout from the gateway and Electron shell.
+This fixture starts from the persisted native OpenAI Responses shape that exposed the bug: two Codex reasoning items containing four total `summary_text` records plus a lossy flattened `reasoning` fallback. It passes that record through production `toChatMessages`, then renders the resulting production assistant transcript. This proves hydration, item preservation, assistant-ui grouping, and CSS layout together while remaining isolated from the gateway and Electron shell.
 
 From `apps/desktop`:
 
