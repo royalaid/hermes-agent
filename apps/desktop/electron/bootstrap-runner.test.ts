@@ -15,11 +15,13 @@ import {
   isPinnedCommit,
   resolveInstallScript,
   resolveMarkerPinnedCommit,
-  runBootstrap
+  runBootstrap,
+  shouldIncludeRepositoryPin
 } from './bootstrap-runner'
 
 const SCRIPT_NAME = process.platform === 'win32' ? 'install.ps1' : 'install.sh'
 const ZERO_COMMIT = '0000000000000000000000000000000000000000'
+const REPOSITORY = 'royalaid/hermes-agent'
 
 function mkTmpHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-bootstrap-test-'))
@@ -81,24 +83,60 @@ test('existing checkout detection requires git metadata', () => {
   }
 })
 
-test('fresh bootstrap args include the packaged commit pin', () => {
-  const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
+test('repository-scoped bootstrap cache hashes refs without collisions', () => {
+  const home = mkTmpHome()
+  assert.notEqual(
+    cachedScriptPath(home, 'feature/a', 'owner/repo'),
+    cachedScriptPath(home, 'feature_a', 'owner/repo')
+  )
+  assert.notEqual(
+    cachedScriptPath(home, 'main', 'owner/repo-a'),
+    cachedScriptPath(home, 'main', 'owner-a/repo')
+  )
+  assert.throws(() => cachedScriptPath(home, 'main', '../escape'), /Invalid install-stamp repository/)
+})
 
-  assert.deepEqual(buildPinArgs(installStamp), ['-Commit', installStamp.commit, '-Branch', 'main'])
+test('fresh bootstrap args include repository and packaged commit pins', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'main', repository: REPOSITORY }
+
+  assert.deepEqual(buildPinArgs(installStamp), [
+    '-Repository',
+    REPOSITORY,
+    '-Commit',
+    installStamp.commit,
+    '-Branch',
+    'main'
+  ])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp,
       activeRoot: '/tmp/hermes-agent',
       hermesHome: '/tmp/hermes'
     }),
-    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main', '--commit', installStamp.commit]
+    [
+      '--dir',
+      '/tmp/hermes-agent',
+      '--hermes-home',
+      '/tmp/hermes',
+      '--repository',
+      REPOSITORY,
+      '--branch',
+      'main',
+      '--commit',
+      installStamp.commit
+    ]
   )
 })
 
-test('existing-checkout bootstrap args keep branch but skip the packaged commit pin', () => {
-  const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
+test('existing-checkout bootstrap args keep repository and branch but skip packaged commit', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'main', repository: REPOSITORY }
 
-  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: false }), ['-Branch', 'main'])
+  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: false }), [
+    '-Repository',
+    REPOSITORY,
+    '-Branch',
+    'main'
+  ])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp,
@@ -106,28 +144,127 @@ test('existing-checkout bootstrap args keep branch but skip the packaged commit 
       hermesHome: '/tmp/hermes',
       pinCommit: false
     }),
-    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main']
+    [
+      '--dir',
+      '/tmp/hermes-agent',
+      '--hermes-home',
+      '/tmp/hermes',
+      '--repository',
+      REPOSITORY,
+      '--branch',
+      'main'
+    ]
   )
 })
 
-test('fallback install stamps use an unpinned branch ref', () => {
-  const stamp = { commit: ZERO_COMMIT, branch: 'main' }
+test('fallback install stamps use repository with an unpinned branch ref', () => {
+  const stamp = { commit: ZERO_COMMIT, branch: 'main', repository: REPOSITORY }
 
   assert.equal(isPinnedCommit(ZERO_COMMIT), false)
   assert.deepEqual(installRefForStamp(stamp), {
     ref: 'main',
-    cacheKey: 'fallback-main',
+    cacheKey: 'branch:main',
     pinned: false
   })
   // Must NOT pass -Commit / --commit for the all-zero placeholder.
-  assert.deepEqual(buildPinArgs(stamp), ['-Branch', 'main'])
+  assert.deepEqual(buildPinArgs(stamp), ['-Repository', REPOSITORY, '-Branch', 'main'])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp: stamp,
       activeRoot: '/tmp/hermes',
       hermesHome: '/tmp/home'
     }),
-    ['--dir', '/tmp/hermes', '--hermes-home', '/tmp/home', '--branch', 'main']
+    [
+      '--dir',
+      '/tmp/hermes',
+      '--hermes-home',
+      '/tmp/home',
+      '--repository',
+      REPOSITORY,
+      '--branch',
+      'main'
+    ]
+  )
+})
+
+test('fallback install refs preserve slash-containing branch identity in the cache key', () => {
+  const slash = installRefForStamp({
+    commit: ZERO_COMMIT,
+    branch: 'feature/a',
+    repository: REPOSITORY
+  })
+
+  const underscore = installRefForStamp({
+    commit: ZERO_COMMIT,
+    branch: 'feature_a',
+    repository: REPOSITORY
+  })
+
+  assert.notEqual(slash.cacheKey, underscore.cacheKey)
+  assert.notEqual(
+    cachedScriptPath('/tmp/hermes', slash.cacheKey, REPOSITORY),
+    cachedScriptPath('/tmp/hermes', underscore.cacheKey, REPOSITORY)
+  )
+})
+
+test('legacy installers omit the repository argument but retain branch and commit pins', () => {
+  const stamp = { commit: 'a'.repeat(40), branch: 'main', repository: 'NousResearch/hermes-agent' }
+
+  assert.deepEqual(buildPinArgs(stamp, { includeRepository: false }), [
+    '-Commit',
+    stamp.commit,
+    '-Branch',
+    'main'
+  ])
+  assert.deepEqual(
+    buildPosixPinArgs({
+      installStamp: stamp,
+      activeRoot: '/tmp/hermes-agent',
+      hermesHome: '/tmp/hermes',
+      includeRepository: false
+    }),
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main', '--commit', stamp.commit]
+  )
+})
+
+test('legacy installer fallback verifies the existing checkout repository', () => {
+  const canonicalStamp = {
+    commit: 'a'.repeat(40),
+    branch: 'main',
+    repository: 'NousResearch/hermes-agent'
+  }
+
+  const legacyScript = { supportsRepositoryPin: false }
+
+  assert.equal(
+    shouldIncludeRepositoryPin(legacyScript, canonicalStamp, '/tmp/checkout', {
+      execGit: () => 'https://github.com/NousResearch/hermes-agent.git'
+    }),
+    false
+  )
+  assert.throws(
+    () =>
+      shouldIncludeRepositoryPin(legacyScript, canonicalStamp, '/tmp/checkout', {
+        execGit: () => 'https://github.com/royalaid/hermes-agent.git'
+      }),
+    /checkout repository royalaid\/hermes-agent does not match/
+  )
+  assert.throws(
+    () =>
+      shouldIncludeRepositoryPin(legacyScript, canonicalStamp, '/tmp/checkout', {
+        execGit: () => 'https://evil.example/github.com/NousResearch/hermes-agent.git'
+      }),
+    /repository could not be verified/
+  )
+  assert.throws(
+    () =>
+      shouldIncludeRepositoryPin(
+        legacyScript,
+        { ...canonicalStamp, repository: REPOSITORY },
+        '/tmp/checkout',
+        { execGit: () => 'https://github.com/NousResearch/hermes-agent.git' }
+      ),
+    /does not support repository pinning/
   )
 })
 
@@ -162,12 +299,12 @@ test('resolveInstallScript downloads fallback stamps by branch instead of zero c
     const refs = []
 
     const result = await resolveInstallScript({
-      installStamp: { commit: ZERO_COMMIT, branch: 'main' },
+      installStamp: { commit: ZERO_COMMIT, branch: 'main', repository: REPOSITORY },
       sourceRepoRoot: null,
       hermesHome: home,
       emit: ev => logs.push(ev),
-      _download: async (ref, destPath) => {
-        refs.push(ref)
+      _download: async (repository, ref, destPath) => {
+        refs.push([repository, ref])
         fs.mkdirSync(path.dirname(destPath), { recursive: true })
         fs.writeFileSync(destPath, '#!/bin/sh\necho fallback branch\n')
 
@@ -175,10 +312,10 @@ test('resolveInstallScript downloads fallback stamps by branch instead of zero c
       }
     })
 
-    assert.deepEqual(refs, ['main'])
+    assert.deepEqual(refs, [[REPOSITORY, 'main']])
     assert.equal(result.source, 'download')
     assert.equal(result.commit, null)
-    assert.equal(result.path, cachedScriptPath(home, 'fallback-main'))
+    assert.equal(result.path, cachedScriptPath(home, 'branch:main', REPOSITORY))
     assert.ok(
       logs.some(ev => /fallback, unpinned/.test(ev.line || '')),
       'emits an unpinned fallback log line'
@@ -238,9 +375,13 @@ test('resolveInstallScript falls back to the installed agent checkout on a 404',
     })
 
     assert.equal(result.source, 'installed-agent')
-    // It should have copied the installer into the bootstrap cache.
-    assert.equal(result.path, cachedScriptPath(home, commit))
-    assert.ok(fs.existsSync(result.path), 'fallback script copied into cache')
+    assert.equal(result.supportsRepositoryPin, false)
+    assert.equal(result.path, installed)
+    assert.equal(
+      fs.existsSync(cachedScriptPath(home, commit)),
+      false,
+      'legacy fallback must not poison the immutable commit cache'
+    )
     assert.ok(
       logs.some(ev => /falling back to installed agent/.test(ev.line || '')),
       'emits a fallback log line'

@@ -9,6 +9,8 @@
 //! flags of the executable that consumes it.
 
 mod bootstrap;
+#[cfg(test)]
+mod build_pin;
 mod events;
 mod install_script;
 mod powershell;

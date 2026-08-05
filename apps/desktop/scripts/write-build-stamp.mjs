@@ -9,6 +9,7 @@
  *     "schemaVersion": 1,
  *     "commit":        "<40-char SHA>",
  *     "branch":        "<branch name>",
+ *     "repository":    "<GitHub owner/repository>",
  *     "builtAt":       "<ISO 8601 UTC timestamp>",
  *     "dirty":         true|false,
  *     "source":        "ci" | "local" | "fallback"
@@ -37,6 +38,8 @@ const STAMP_SCHEMA_VERSION = 1
 /** All-zero placeholder used when no real commit can be resolved. */
 export const FALLBACK_COMMIT = "0000000000000000000000000000000000000000"
 export const FALLBACK_BRANCH = "main"
+export const FALLBACK_REPOSITORY = "NousResearch/hermes-agent"
+const REPOSITORY_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 
 const DESKTOP_ROOT = resolve(import.meta.dirname, "..")
 const REPO_ROOT = resolve(DESKTOP_ROOT, "..", "..")
@@ -51,13 +54,30 @@ function tryExec(cmd, opts) {
   }
 }
 
+function validateRepository(repository, source) {
+  if (
+    !REPOSITORY_RE.test(repository) ||
+    repository.split("/").some(part => part === "." || part === "..")
+  ) {
+    throw new Error(`Invalid ${source}: ${repository}`)
+  }
+  return repository
+}
+
 export function fromCI(env = process.env) {
   const sha = env.GITHUB_SHA
   if (!sha) return null
   const branch = env.GITHUB_REF_NAME || env.GITHUB_HEAD_REF || null
+  let repository = FALLBACK_REPOSITORY
+  if (env.HERMES_BUILD_PIN_REPOSITORY) {
+    repository = validateRepository(env.HERMES_BUILD_PIN_REPOSITORY, "HERMES_BUILD_PIN_REPOSITORY")
+  } else if (env.GITHUB_REPOSITORY) {
+    repository = validateRepository(env.GITHUB_REPOSITORY, "GITHUB_REPOSITORY")
+  }
   return {
     commit: sha,
     branch: branch,
+    repository,
     dirty: false, // CI builds from a checkout-of-ref by definition
     source: "ci"
   }
@@ -75,15 +95,21 @@ export function fromLocalGit(repoRoot = REPO_ROOT, execFn = tryExec) {
   // differs from the commit being pinned.
   const status = execFn("git status --porcelain -uno", { cwd: repoRoot })
   const dirty = status !== null && status.length > 0
+  const upstream = execFn("git rev-parse --abbrev-ref --symbolic-full-name @{upstream}", { cwd: repoRoot })
+  const upstreamRemote = typeof upstream === "string" ? upstream.trim().split("/", 1)[0] : null
+  const upstreamUrl = upstreamRemote ? execFn(`git remote get-url ${upstreamRemote}`, { cwd: repoRoot }) : null
+  const originUrl = execFn("git remote get-url origin", { cwd: repoRoot })
+  const repository = repositoryFromRemote(upstreamUrl) || repositoryFromRemote(originUrl)
   return {
     commit: sha,
     branch: branch === "HEAD" ? null : branch, // detached HEAD -> null
+    repository: repository || FALLBACK_REPOSITORY,
     dirty: dirty,
     source: "local"
   }
 }
 
-export function fromFallback(branch = FALLBACK_BRANCH) {
+export function fromFallback(branch = FALLBACK_BRANCH, repository = FALLBACK_REPOSITORY) {
   // Non-git builds (ZIP download, bootstrap installer without a resolvable
   // HEAD) cannot determine a real commit.  Use a placeholder so local /
   // personal builds can still complete.  The desktop bootstrap treats the
@@ -92,6 +118,7 @@ export function fromFallback(branch = FALLBACK_BRANCH) {
   return {
     commit: FALLBACK_COMMIT,
     branch: branch || FALLBACK_BRANCH,
+    repository: repository || FALLBACK_REPOSITORY,
     dirty: false,
     source: "fallback"
   }
@@ -107,7 +134,21 @@ export function resolveStamp({
   execFn = tryExec,
   fallbackBranch = FALLBACK_BRANCH
 } = {}) {
-  return fromCI(env) || fromLocalGit(repoRoot, execFn) || fromFallback(fallbackBranch)
+  const stamp = fromCI(env) || fromLocalGit(repoRoot, execFn) || fromFallback(fallbackBranch, FALLBACK_REPOSITORY)
+  const repository = env.HERMES_BUILD_PIN_REPOSITORY
+  return repository
+    ? { ...stamp, repository: validateRepository(repository, "HERMES_BUILD_PIN_REPOSITORY") }
+    : stamp
+}
+
+export function repositoryFromRemote(remote) {
+  if (typeof remote !== "string") return null
+  const match = remote
+    .trim()
+    .match(
+      /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/i
+    )
+  return match ? match[1] : null
 }
 
 export function isFallbackCommit(commit) {
@@ -153,6 +194,7 @@ function main() {
     schemaVersion: STAMP_SCHEMA_VERSION,
     commit: stamp.commit,
     branch: stamp.branch,
+    repository: stamp.repository,
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
     source: stamp.source

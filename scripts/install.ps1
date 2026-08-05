@@ -15,6 +15,7 @@
 param(
     [switch]$NoVenv,
     [switch]$SkipSetup,
+    [string]$Repository = "NousResearch/hermes-agent",
     [string]$Branch = "main",
     # -Commit and -Tag are higher-precedence variants of -Branch for users
     # who need reproducible installs (desktop installer pinning, CI, release
@@ -142,8 +143,11 @@ foreach ($tmpVar in @('TEMP', 'TMP')) {
 # Configuration
 # ============================================================================
 
-$RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
-$RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
+if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or $Repository -match '(^|/)\.{1,2}($|/)') {
+    throw "Invalid -Repository '$Repository'; expected GitHub owner/repository"
+}
+$RepoUrlSsh = "git@github.com:$Repository.git"
+$RepoUrlHttps = "https://github.com/$Repository.git"
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -1611,6 +1615,11 @@ function Install-Repository {
                 # users hit on update. Pin autocrlf=false so the dirt is never
                 # created in the first place.
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
+                # A prior managed install can still point origin at canonical
+                # upstream. Keep the remote aligned with the repository pin so
+                # fork-only branches and commits are fetched from their source.
+                git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
+                if ($LASTEXITCODE -ne 0) { throw "git remote set-url origin failed (exit $LASTEXITCODE)" }
                 Discard-LockfileChurn $InstallDir
                 # Preserve any real local changes before the checkout instead of
                 # discarding them with `reset --hard HEAD`. The old hard reset
@@ -1831,16 +1840,17 @@ function Install-Repository {
                 # for.  GitHub supports archive URLs for commits, tags, and
                 # branches; we honour Commit > Tag > Branch.
                 if ($Commit) {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/$Commit.zip"
+                    $zipUrl = "https://github.com/$Repository/archive/$Commit.zip"
                     $zipLabel = $Commit
                 } elseif ($Tag) {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/tags/$Tag.zip"
+                    $zipUrl = "https://github.com/$Repository/archive/refs/tags/$Tag.zip"
                     $zipLabel = $Tag
                 } else {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/$Branch.zip"
+                    $zipUrl = "https://github.com/$Repository/archive/refs/heads/$Branch.zip"
                     $zipLabel = $Branch
                 }
-                $zipPath = "$env:TEMP\hermes-agent-$zipLabel.zip"
+                $safeZipLabel = $zipLabel -replace '[^A-Za-z0-9._-]', '_'
+                $zipPath = "$env:TEMP\hermes-agent-$safeZipLabel.zip"
                 $extractPath = "$env:TEMP\hermes-agent-extract"
 
                 Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
@@ -2512,6 +2522,7 @@ function Write-BootstrapMarker {
         schemaVersion = 1
         pinnedCommit  = $pinnedCommit
         pinnedBranch  = $pinnedBranch
+        pinnedRepository = $Repository
         completedAt   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
         # desktopVersion field intentionally omitted -- only the desktop
         # app knows its own version, and the marker validator doesn't
@@ -3172,6 +3183,9 @@ function Install-Desktop {
     if (-not $env:GITHUB_REF_NAME) {
         $env:GITHUB_REF_NAME = if ($Branch) { $Branch } else { "main" }
     }
+    # Keep the nested Desktop package on the same provenance tuple as this
+    # installer. write-build-stamp prefers CI-style values over git probes.
+    $env:GITHUB_REPOSITORY = $Repository
     if ($env:GITHUB_SHA) {
         $shaPreview = if ($env:GITHUB_SHA.Length -ge 12) { $env:GITHUB_SHA.Substring(0, 12) } else { $env:GITHUB_SHA }
         Write-Info "Desktop build stamp: $shaPreview ($($env:GITHUB_REF_NAME))"
