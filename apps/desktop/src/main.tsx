@@ -22,12 +22,18 @@ import App from './app'
 import { RootErrorBoundary } from './components/error-boundary'
 import { HapticsProvider } from './components/haptics-provider'
 import { RootTooltipProvider } from './components/ui/tooltip'
+import { initDiagnosticsArming } from './diagnostics'
 import { I18nProvider } from './i18n'
 import { installClipboardShim } from './lib/clipboard'
 import { queryClient } from './lib/query-client'
 import { ThemeProvider } from './themes/context'
 
 installClipboardShim()
+
+// Hitch capture. Unlike the dev-only probes above this SHIPS — hitches happen
+// in the packaged app — but it registers no observers and does no per-delta
+// work until the capture controller in main pushes 'diagnostics:arm'.
+initDiagnosticsArming()
 
 // The perf probe ships in dev, and in a production build ONLY when explicitly
 // opted in (VITE_PERF_PROBE=1) — this lets the perf harness measure a real,
