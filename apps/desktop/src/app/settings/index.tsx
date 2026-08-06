@@ -9,6 +9,7 @@ import { getHermesConfigDefaults, getHermesConfigRecord, saveHermesConfig } from
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import {
+  Activity,
   Archive,
   BarChart3,
   Bell,
@@ -44,6 +45,7 @@ import { AppearanceSettings } from './appearance-settings'
 import { BillingSettings } from './billing'
 import { ConfigSettings } from './config-settings'
 import { SECTIONS } from './constants'
+import { DiagnosticsSettings } from './diagnostics-settings'
 import { GatewaySettings } from './gateway-settings'
 import { KeybindSettings } from './keybind-settings'
 import { KEYS_VIEWS, KeysSettings, type KeysView } from './keys-settings'
@@ -66,6 +68,7 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'billing',
   'plugins',
   'sessions',
+  'diagnostics',
   'about'
 ]
 
@@ -277,8 +280,15 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         onSelect: () => setActiveView('sessions')
       },
       {
-        active: activeView === 'about',
+        active: activeView === 'diagnostics',
         gapBefore: true,
+        icon: Activity,
+        id: 'diagnostics',
+        label: 'Diagnostics',
+        onSelect: () => setActiveView('diagnostics')
+      },
+      {
+        active: activeView === 'about',
         icon: Info,
         id: 'about',
         label: t.settings.nav.about,
@@ -404,6 +414,8 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
       <BillingSettings />
     ) : activeView === 'plugins' ? (
       <PluginsSettings />
+    ) : activeView === 'diagnostics' ? (
+      <DiagnosticsSettings />
     ) : (
       <SessionsSettings />
     )
