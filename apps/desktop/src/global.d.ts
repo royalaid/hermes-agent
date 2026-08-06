@@ -355,6 +355,14 @@ declare global {
       findInPage: (query: string, options?: { forward?: boolean; findNext?: boolean }) => Promise<{ count: number }>
       stopFindInPage: () => Promise<void>
       onFoundInPage: (callback: (result: { activeMatchOrdinal: number; count: number }) => void) => () => void
+      // Hitch-capture arming, pushed by the capture controller in main. Optional
+      // because the renderer must keep working against a preload that predates
+      // the diagnostics surface — no bridge simply means never armed, which is
+      // the zero-cost state. Wired by `initDiagnosticsArming` in src/diagnostics.
+      diagnostics?: {
+        onArm: (callback: (payload: { captureId: string; wallClockAnchorMs: number }) => void) => () => void
+        onDisarm: (callback: () => void) => () => void
+      }
     }
   }
 }
