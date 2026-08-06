@@ -304,6 +304,13 @@ Directional guidance: the capture controller lives in Electron main (it can reac
 
 ---
 
+## Closeout status (2026-08-06)
+
+- **Landed** on `local/openai-native-windows`: U1 (f22b305b8), U2 (4ff79eaa8), U3a (6791a4816), U3b (d48f09f7b), U4 (f5ecefb7d), U5 (471a3312f). All units independently re-verified by the orchestrator (test reruns + a second real harness run of the U5 acceptance gate: 5/5 cases).
+- **U6 parked (evidence-gated)** — gating condition: a captured bundle showing idle long-frame/GPU churn while the window is hidden or occluded. New supporting signal from U5: the idle *foreground* control capture already classifies renderer-bound (≥9 long_frame events ≥50ms in ~11s with zero injection, prod build). Foreground-idle churn is suggestive but does not by itself satisfy the hidden/occluded gate; capture one hidden-window bundle before executing U6.
+- **U7 parked (evidence-gated)** — gating condition: a captured gateway-bound bundle whose stall frame summaries name the blocking work. The capture path for this now exists (U3b frame summaries proven in U5's gateway cases).
+- **Pending user action (DoD items 1, 2, 6)**: the running desktop/serve processes still carry the inherited delegated-child marker and predate this build. Rebuilding/reinstalling the packaged app and restarting Hermes will (a) activate the U1 storm fix for live verification, (b) put the diagnostics capture into the daily-driver app, and (c) allow arming the soak window.
+
 ## Sources & Research
 
 - Recon dossier (verified findings, 2026-08-06): scratchpad `recon-dossier-hitching.md` — session logs, process measurements, upstream issue states, local fix presence. Load-bearing: it reversed the chat's fix-first framing.
