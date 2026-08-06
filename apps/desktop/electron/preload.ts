@@ -476,5 +476,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
       return () => ipcRenderer.removeListener('diagnostics:collect', listener)
     }
+  },
+  // Capture control for the Diagnostics settings section (U4). Separate from
+  // the `diagnostics` namespace above because that one is main-driven push and
+  // this one is renderer-driven request/response. `stop` also writes the
+  // sanitized bundle and answers with its path + classification — one action,
+  // no separate export step.
+  diagnosticsCapture: {
+    start: () => ipcRenderer.invoke('hermes:diagnostics:start'),
+    stop: () => ipcRenderer.invoke('hermes:diagnostics:stop'),
+    status: () => ipcRenderer.invoke('hermes:diagnostics:status')
   }
 })
