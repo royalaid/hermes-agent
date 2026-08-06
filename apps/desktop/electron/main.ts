@@ -133,6 +133,7 @@ import {
 } from './desktop-uninstall'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { COLLECT_RESULT_CHANNEL, createCaptureController } from './diagnostics-capture'
+import { electronProcessTree, exportDiagnosticsBundle } from './diagnostics-export'
 import { createGatewayDiagnosticsClient, gatewayDiagnosticsPath } from './diagnostics-gateway'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
@@ -14468,10 +14469,51 @@ app.on('browser-window-created', (_event, win) => diagnosticsCapture.attachWindo
 
 ipcMain.on(COLLECT_RESULT_CHANNEL, (_event, payload) => diagnosticsCapture.handleCollectResult(payload))
 
-// U4 builds the capture UI and the sanitized export on top of these; main only
-// owns arm/disarm and the gathered bundle.
+// Stop gathers the bundle AND writes it (U4): the Diagnostics settings section
+// is a one-action flow, so there is no separate "export" step for the user to
+// forget. The bundle goes to `<userData>/diagnostics/<captureId>/` and nothing
+// leaves the machine; the renderer gets back only the path plus the R3
+// classification, never any captured events.
 ipcMain.handle('hermes:diagnostics:start', () => diagnosticsCapture.start())
-ipcMain.handle('hermes:diagnostics:stop', () => diagnosticsCapture.stop())
+ipcMain.handle('hermes:diagnostics:stop', async () => {
+  const bundle = await diagnosticsCapture.stop()
+
+  if (!bundle) {
+    return null
+  }
+
+  let metrics = []
+
+  try {
+    metrics = app.getAppMetrics() as never
+  } catch {
+    // A process tree is nice to have, not a reason to lose the capture.
+  }
+
+  const result = await exportDiagnosticsBundle({
+    bundle,
+    userDataPath: app.getPath('userData'),
+    appVersion: app.getVersion(),
+    processes: electronProcessTree({
+      mainPid: process.pid,
+      mainPpid: process.ppid,
+      execPath: process.execPath,
+      metrics
+    })
+  })
+
+  return {
+    captureId: bundle.captureId,
+    directory: result.directory,
+    labels: result.classification.labels,
+    primary: result.classification.primary,
+    streams: result.manifest.streams.map(stream => ({
+      name: stream.name,
+      events: stream.events,
+      ...(stream.absent ? { absent: stream.absent } : {})
+    }))
+  }
+})
 ipcMain.handle('hermes:diagnostics:status', () => ({
   armed: diagnosticsCapture.isArmed(),
   captureId: diagnosticsCapture.captureId()
