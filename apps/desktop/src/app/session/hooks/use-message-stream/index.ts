@@ -1,6 +1,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import { isDiagnosticsArmed, recordStreamDeltaApplied } from '@/diagnostics'
 import { translateNow } from '@/i18n'
 import {
   appendAssistantTextPart,
@@ -66,6 +67,19 @@ interface QueuedStreamDelta {
 let streamMessageSeq = 0
 
 const nextStreamMessageId = (prefix: string) => `${prefix}-${Date.now()}-${++streamMessageSeq}`
+
+// Diagnostics only, and only while a capture is armed: how big the flush about
+// to run is, in sessions and characters. Sizes, never the delta text — the
+// capture ring buffer must never hold message content (see src/diagnostics).
+const queuedDeltaSizes = (queue: Map<string, QueuedStreamDelta[]>) => {
+  let queuedChars = 0
+
+  for (const queued of queue.values()) {
+    queuedChars += queued.reduce((total, delta) => total + delta.text.length, 0)
+  }
+
+  return { queuedChars, sessions: queue.size, sessionIds: [...queue.keys()] }
+}
 
 export function useMessageStream({
   activeGatewayProfile = 'default',
@@ -274,6 +288,9 @@ export function useMessageStream({
       flushHandleRef.current = null
       const startedAt = performance.now()
       lastFlushAtRef.current = startedAt
+      // Diagnostics reads the queue before it drains. Guarded on the armed flag
+      // so a normal build does one boolean test per flush and allocates nothing.
+      const pending = isDiagnosticsArmed() ? queuedDeltaSizes(queuedDeltasRef.current) : null
       flushQueuedDeltas()
       // The store write above is only the cheap half of a flush. While a
       // session streams, syncSessionStateToView defers the $messages publish
@@ -288,6 +305,22 @@ export function useMessageStream({
       // stays as the fallback.
       const writeCost = performance.now() - startedAt
       lastFlushCostRef.current = writeCost
+
+      // One capture event per flush, carrying the costs this path ALREADY
+      // measures. `commitMs`/`rafGapMs` are filled in place by the same
+      // measurement frame below — no second measurement pass, and a hidden
+      // renderer (no frame) still leaves the write-cost half on the record.
+      const sample = pending
+        ? recordStreamDeltaApplied({
+            historyMessages: pending.sessionIds.reduce(
+              (total, id) => total + (sessionStateByRuntimeIdRef.current.get(id)?.messages.length ?? 0),
+              0
+            ),
+            queuedChars: pending.queuedChars,
+            sessions: pending.sessions,
+            writeMs: writeCost
+          })
+        : null
 
       // At most one measurement rAF may be pending: only the newest flush's
       // measurement matters (the guard below discards stale frames), and a
@@ -306,7 +339,13 @@ export function useMessageStream({
           return
         }
 
-        lastFlushCostRef.current = writeCost + Math.max(0, performance.now() - frameStart)
+        const commitCost = Math.max(0, performance.now() - frameStart)
+        lastFlushCostRef.current = writeCost + commitCost
+
+        if (sample) {
+          sample.commitMs = Math.round(commitCost * 100) / 100
+          sample.rafGapMs = Math.round(Math.max(0, frameStart - startedAt) * 100) / 100
+        }
       })
     }
 
@@ -327,7 +366,7 @@ export function useMessageStream({
     // in the worst case (a delta arriving before the unthrottle lands) the
     // clamp only stretches one flush to ~1s in a window nobody can see.
     flushHandleRef.current = window.setTimeout(runFlush, Math.max(0, adaptiveFloor - sinceLast))
-  }, [flushQueuedDeltas])
+  }, [flushQueuedDeltas, sessionStateByRuntimeIdRef])
 
   const queueDelta = useCallback(
     (
