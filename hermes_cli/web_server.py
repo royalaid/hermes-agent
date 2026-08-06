@@ -13359,6 +13359,13 @@ async def diagnostics_collect(request: Request):
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+# The U5 proof harness has to cause a real gateway stall to prove the capture
+# attributes one to the gateway. Its hook is mounted here and ONLY when the
+# process was started with HERMES_DIAGNOSTICS_TEST_HOOKS=1 — a normally started
+# gateway never registers the route, so it answers 404.
+diagnostics_ring.install_test_routes(app)
+
+
 # ---------------------------------------------------------------------------
 # Credential pool endpoints — list / add / remove rotation keys.
 #
