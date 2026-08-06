@@ -1250,6 +1250,15 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
   }
 
   if (isFileEditTool(part.toolName)) {
+    // The inline diff is a compact review surface, not the file payload. A
+    // `write_file` call already carries the exact post-write file text in its
+    // raw arguments; handing that to another agent is the common Copy use
+    // case. Prefer it before the display-only diff so presentation does not
+    // silently change what reaches the clipboard.
+    if (part.toolName === 'write_file' && typeof args.content === 'string') {
+      return { label: copy.file, text: args.content }
+    }
+
     if (view.inlineDiff.trim()) {
       return { label: copy.file, text: view.inlineDiff }
     }
