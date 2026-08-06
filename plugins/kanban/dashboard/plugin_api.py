@@ -42,6 +42,39 @@ router = APIRouter()
 
 _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 
+# ---------------------------------------------------------------------------
+# Permanent (process-level) Kanban failures
+# ---------------------------------------------------------------------------
+
+# A ``PermissionError`` out of ``kanban_db`` comes from the delegate_task
+# delegated-child guard, which reads process-level state: it will fail
+# identically for every request until the process is restarted. Retrying is
+# pointless, so the WS closes with a terminal code and the client stops
+# reconnecting. 4004 is in the WebSocket private-use range (4000-4999) and is
+# deliberately NOT 1008 — the dashboard renders 1008 as "auth failed", which is
+# the wrong message and sends users hunting for a session-token problem.
+WS_KANBAN_UNAVAILABLE = 4004
+WS_KANBAN_UNAVAILABLE_REASON = "kanban-unavailable"
+
+# One warning per process, not one per reconnect: the storm this replaces put a
+# line in errors.log every few seconds for as long as a dashboard tab was open.
+_permanent_error_logged = False
+
+
+def _log_permanent_kanban_error(context: str, exc: BaseException) -> None:
+    """Log a permanent process-level Kanban failure exactly once per process."""
+    global _permanent_error_logged
+    if _permanent_error_logged:
+        return
+    _permanent_error_logged = True
+    log.warning(
+        "%s — permanent for this process, not retrying (restart Hermes to "
+        "recover): %s",
+        context,
+        exc,
+    )
+
+
 
 # --- Connection / board helpers ---------------------------------------------
 
@@ -85,6 +118,10 @@ def _conn(board: Optional[str] = None):
     idempotent; running it here lets a fresh install self-heal if POST /tasks arrives first."""
     try:
         kanban_db.init_db(board=board)
+    except PermissionError as exc:
+        # Delegated-child guard: permanent for this process. Logging it per
+        # request produced the same storm as the event stream did.
+        _log_permanent_kanban_error("kanban init_db unavailable", exc)
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
     return kbc.connect(board=board)
@@ -1696,6 +1733,22 @@ async def stream_events(ws: WebSocket):
         return
     except asyncio.CancelledError:
         return  # normal shutdown; CancelledError is a BaseException the handler below wouldn't quiet
+    except PermissionError as exc:
+        # Same shape as the CancelledError clause above — a specific exception
+        # class the generic handler would otherwise mistreat. This one is the
+        # delegate_task delegated-child guard: process-level and permanent, so
+        # the catch-all's plain close() (which the client retries with a
+        # backoff its own onopen resets) turned one failure into a reconnect
+        # storm. Log once, close terminally, let the client stop.
+        _log_permanent_kanban_error("Kanban event stream unavailable", exc)
+        try:
+            await ws.close(
+                code=WS_KANBAN_UNAVAILABLE,
+                reason=WS_KANBAN_UNAVAILABLE_REASON,
+            )
+        except Exception:
+            pass
+        return
     except Exception as exc:  # never crash the dashboard worker
         log.warning("Kanban event stream error: %s", exc)
         try:
