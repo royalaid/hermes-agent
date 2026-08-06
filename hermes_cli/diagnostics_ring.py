@@ -419,3 +419,70 @@ def install_rpc_methods(server) -> None:
     for key, names in _METHOD_ALIASES.items():
         for name in names:
             server._methods[name] = handlers[key]
+
+
+# ── Test-only loop block (U5) ────────────────────────────────────────
+#
+# The proof harness has to show that a *gateway* stall is attributed to the
+# gateway, which means it needs to cause one on demand. Nothing in normal
+# operation can be asked to block the loop, so this hook exists — and it is
+# dangerous by construction, so it is not reachable at all unless the process
+# was started with :data:`_TEST_HOOKS_ENV` set to ``1``. The guard is checked
+# once, at *registration* time: without the env var the route is never mounted,
+# so a normally started gateway answers 404 rather than "refused".
+
+_TEST_HOOKS_ENV = "HERMES_DIAGNOSTICS_TEST_HOOKS"
+
+# The harness blocks for ~1-6s; anything longer is a mistake, not a scenario.
+_MAX_TEST_BLOCK_S = 30.0
+
+_TEST_BLOCK_PATH = "/api/diagnostics/test/block-loop"
+
+
+def test_hooks_enabled() -> bool:
+    """True only when this process opted into the diagnostics test hooks."""
+    return os.environ.get(_TEST_HOOKS_ENV) == "1"
+
+
+def block_event_loop(seconds: Any) -> dict[str, Any]:
+    """Hold the calling thread for *seconds* — test hook only.
+
+    Called from an ``async def`` route it holds the *event loop*, which is
+    exactly the condition the CF-1 heartbeat measures as drift and the armed
+    ring records as a ``loop_drift`` event.
+    """
+    try:
+        duration = float(seconds)
+    except (TypeError, ValueError):
+        raise ValueError("seconds must be a number")
+    if not 0 < duration <= _MAX_TEST_BLOCK_S:
+        raise ValueError(f"seconds must be within (0, {_MAX_TEST_BLOCK_S}]")
+    started = time.monotonic()
+    time.sleep(duration)
+    return {"blocked_s": round(time.monotonic() - started, 6)}
+
+
+def install_test_routes(app) -> bool:
+    """Mount the guarded test hook on *app*. Returns whether it was mounted.
+
+    A no-op — and therefore an unmounted, unreachable path — unless
+    :func:`test_hooks_enabled`. The route sits under ``/api/`` like the rest of
+    the ring, so when it *is* mounted it still rides ``auth_middleware``.
+    """
+    if not test_hooks_enabled():
+        return False
+
+    # Imported here, not at module scope: this module is loaded by the TUI
+    # gateway too, and nothing outside this branch needs FastAPI. `seconds` is
+    # taken as an embedded body field rather than through a `Request` so the
+    # signature stays resolvable under `from __future__ import annotations`.
+    from fastapi import Body, HTTPException
+
+    @app.post(_TEST_BLOCK_PATH)
+    async def diagnostics_test_block_loop(seconds: float = Body(embed=True)):
+        try:
+            return block_event_loop(seconds)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    return True

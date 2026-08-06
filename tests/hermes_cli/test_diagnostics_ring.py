@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from types import SimpleNamespace
 
@@ -337,7 +338,15 @@ class TestAuthenticatedSurfaceOnly:
         from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
         paths = [getattr(r, "path", "") for r in web_server.app.routes]
-        mounted = [p for p in paths if "/diagnostics/" in p and "plugins" not in p]
+        mounted = [
+            p
+            for p in paths
+            if "/diagnostics/" in p
+            and "plugins" not in p
+            # The U5 test hook mounts only under an env opt-in and has its own
+            # coverage in TestLoopBlockHookIsGuarded.
+            and p != diagnostics_ring._TEST_BLOCK_PATH
+        ]
         assert sorted(mounted) == [
             "/api/diagnostics/arm",
             "/api/diagnostics/collect",
@@ -437,3 +446,91 @@ class TestAuthenticatedSurfaceOnly:
         assert got["result"]["dropped"] == 0
         assert got["result"]["events"][0]["kind"] == "loop_drift"
         assert server._methods["diagnostics/disarm"]("r3", {})["result"]["armed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Test-only loop-block hook (U5)
+# ---------------------------------------------------------------------------
+
+
+class TestLoopBlockHookIsGuarded:
+    """The hook that lets the U5 harness stall the gateway on purpose.
+
+    The whole safety property is *registration-time*: without the opt-in env
+    var the route does not exist, so there is no handler to reach, no flag to
+    misread, and no refusal path to get wrong.
+    """
+
+    @staticmethod
+    def _fresh_app():
+        from fastapi import FastAPI
+
+        return FastAPI()
+
+    def test_not_mounted_without_the_env_var(self, monkeypatch):
+        monkeypatch.delenv(diagnostics_ring._TEST_HOOKS_ENV, raising=False)
+        app = self._fresh_app()
+
+        assert diagnostics_ring.install_test_routes(app) is False
+        assert [getattr(r, "path", "") for r in app.routes if "block-loop" in getattr(r, "path", "")] == []
+
+    def test_a_normally_started_gateway_has_no_such_route(self):
+        """The real app, imported without the env var, never mounted it."""
+        if os.environ.get(diagnostics_ring._TEST_HOOKS_ENV) == "1":
+            pytest.skip("this test process itself opted into the hooks")
+        assert diagnostics_ring.test_hooks_enabled() is False
+        paths = [getattr(r, "path", "") for r in web_server.app.routes]
+        assert diagnostics_ring._TEST_BLOCK_PATH not in paths
+
+    def test_mounted_only_with_the_env_var_and_stays_behind_the_api_gate(self, monkeypatch):
+        from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+
+        monkeypatch.setenv(diagnostics_ring._TEST_HOOKS_ENV, "1")
+        app = self._fresh_app()
+
+        assert diagnostics_ring.install_test_routes(app) is True
+        paths = [getattr(r, "path", "") for r in app.routes]
+        assert diagnostics_ring._TEST_BLOCK_PATH in paths
+        # Same gate as the rest of the ring: under /api/ and not public.
+        assert diagnostics_ring._TEST_BLOCK_PATH.startswith("/api/")
+        assert diagnostics_ring._TEST_BLOCK_PATH not in PUBLIC_API_PATHS
+
+    def test_the_hook_blocks_for_the_requested_duration(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setenv(diagnostics_ring._TEST_HOOKS_ENV, "1")
+        app = self._fresh_app()
+        diagnostics_ring.install_test_routes(app)
+
+        started = time.monotonic()
+        with TestClient(app) as client:
+            resp = client.post(diagnostics_ring._TEST_BLOCK_PATH, json={"seconds": 0.4})
+        elapsed = time.monotonic() - started
+
+        assert resp.status_code == 200
+        assert resp.json()["blocked_s"] >= 0.4
+        assert elapsed >= 0.4
+
+    def test_a_block_lands_in_an_armed_ring_as_loop_drift(self, monkeypatch):
+        """What the harness asserts on: the block is what the ring records.
+
+        The heartbeat itself is the recorder, so this drives its two calls the
+        way ``_install_loop_heartbeat`` does — the block happens *between* two
+        ticks and the drift it caused is the event.
+        """
+        monkeypatch.setenv(diagnostics_ring._TEST_HOOKS_ENV, "1")
+        diagnostics_ring.arm("cap-block")
+
+        started = time.monotonic()
+        diagnostics_ring.block_event_loop(0.4)
+        drift = time.monotonic() - started
+        diagnostics_ring.record_loop_drift(drift)
+
+        events = diagnostics_ring.collect("cap-block")["events"]
+        assert [e["kind"] for e in events] == ["loop_drift"]
+        assert events[0]["drift_s"] >= 0.4
+
+    @pytest.mark.parametrize("seconds", [None, "soon", 0, -1, 31.0])
+    def test_a_nonsense_duration_is_refused(self, seconds):
+        with pytest.raises(ValueError):
+            diagnostics_ring.block_event_loop(seconds)
