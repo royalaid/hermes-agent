@@ -2,7 +2,7 @@
 // the packaged app and costs nothing until main arms it. See `capture.ts` for
 // the cost/sanitization contract and `arming-bridge.ts` for the IPC surface.
 
-export { type DiagnosticsArmPayload, initDiagnosticsArming } from './arming-bridge'
+export { type DiagnosticsArmPayload, initDiagnosticsArming, initDiagnosticsSnapshots } from './arming-bridge'
 export {
   activeCaptureId,
   armDiagnostics,
