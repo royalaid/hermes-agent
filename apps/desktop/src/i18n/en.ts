@@ -3052,6 +3052,8 @@ export const en: Translations = {
       copyResults: 'Copy results',
       copyQuery: 'Copy query',
       copyFile: 'Copy file',
+      copyDiff: 'Copy diff',
+      copyFullFile: 'Copy full file',
       copyPath: 'Copy path',
       outputAlt: 'Tool output',
       rawResponse: 'Raw response',
