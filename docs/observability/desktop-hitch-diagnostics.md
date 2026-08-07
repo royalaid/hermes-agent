@@ -27,7 +27,7 @@ clock and aligned at export against a shared wall-clock anchor.
 
 | Stream | Source | Records |
 | --- | --- | --- |
-| `renderer-<windowId>` | each chat window | long animation frames (with attribution), heap samples, stream-delta flush costs, costly gateway-event dispatches |
+| `renderer-<windowId>` | each chat window | long animation frames (with attribution), heap samples, stream-delta flush costs, costly gateway-event dispatches, in-flight journal writes (`journal_write`) |
 | `main` | Electron main | window responsive/unresponsive edges, per-process CPU + working set, backend transport failures |
 | `gateway` | the Hermes backend | event-loop heartbeat drift with sampled stacks, slow WS writes |
 
@@ -113,6 +113,38 @@ threshold heuristics over the streams. Multiple labels are normal and useful —
 Each fired label carries a `reason` in plain terms and the `evidence` numbers it
 was computed from, so a threshold that looks wrong can be argued with against
 the raw JSONL sitting beside it.
+
+## The in-flight turn journal
+
+The 2026-08-06 hitching investigation traced sustained 250–400ms renderer
+stalls to the crash-recovery journal (`src/lib/inflight-turn-journal.ts`): its
+v1 layout kept **every** session's full turn tail — tool bodies included — in
+one aggregate localStorage key, and re-read, re-cloned, re-stringified and
+synchronously rewrote the whole multi-megabyte blob every 400ms per busy
+session.
+
+The v2 layout removes that class of stall:
+
+- one key per session (`hermes.desktop.inflightTurnJournal.v2.<sessionId>`),
+  written blind (no read-before-write, no aggregate cache);
+- a bounded recovery projection built before any clone — full user prompt,
+  capped assistant text/reasoning, tool-call identity with ~2KB previews —
+  with a ~256KB serialized fail-safe per entry;
+- the legacy v1 blob is migrated through the same projection once at boot and
+  then deleted, whatever state it is in;
+- expiry and the 24-entry global cap are enforced by a startup sweep, not on
+  the hot path.
+
+Each write records a `journal_write` event into the renderer stream:
+`durationMs`, `bytes`, `outcome` (`ok` / `quota` / `error` / `skipped`) and
+`busySessions`. A capture showing `quota` outcomes means the entry exceeded
+the origin's storage quota and crash recovery is degraded — previously that
+failure was silent.
+
+Kill switch for A/B diagnosis: set localStorage key
+`hermes.desktop.inflightTurnJournal.disabled` to `'1'` (DevTools console:
+`localStorage.setItem('hermes.desktop.inflightTurnJournal.disabled','1')`) and
+reload; journaling is skipped entirely until the key is cleared.
 
 ## `hermes debug diagnose`
 
