@@ -85,6 +85,20 @@ export interface GatewayEventAppliedEvent extends DiagnosticsEventBase {
   busySessions: number
 }
 
+export interface JournalWriteEvent extends DiagnosticsEventBase {
+  type: 'journal_write'
+  /** Projection + stringify + setItem, end to end. */
+  durationMs: number
+  /** Serialized entry length (UTF-16 code units) — a size, never the text. */
+  bytes: number
+  /** `quota`/`error` mean the synchronous cost was paid but recovery is
+   *  degraded — exactly the failure mode that stays invisible in logs. */
+  outcome: 'error' | 'ok' | 'quota' | 'skipped'
+  /** Sessions with a journal write in flight at record time (see
+   *  StreamDeltaAppliedEvent.busySessions). */
+  busySessions: number
+}
+
 export interface MemorySampleEvent extends DiagnosticsEventBase {
   type: 'memory_sample'
   usedMb: number
@@ -92,7 +106,12 @@ export interface MemorySampleEvent extends DiagnosticsEventBase {
   limitMb: number
 }
 
-export type DiagnosticsEvent = GatewayEventAppliedEvent | LongFrameEvent | MemorySampleEvent | StreamDeltaAppliedEvent
+export type DiagnosticsEvent =
+  | GatewayEventAppliedEvent
+  | JournalWriteEvent
+  | LongFrameEvent
+  | MemorySampleEvent
+  | StreamDeltaAppliedEvent
 
 export interface DiagnosticsCaptureSnapshot {
   captureId: string
@@ -275,5 +294,29 @@ export function recordGatewayEventApplied(sample: GatewayEventSample): void {
     eventType: sample.eventType,
     t: performance.now(),
     type: 'gateway_event_applied'
+  })
+}
+
+export interface JournalWriteSample {
+  durationMs: number
+  bytes: number
+  outcome: JournalWriteEvent['outcome']
+  busySessions: number
+}
+
+/** Record one in-flight-journal write (throttled to ≥400ms apart per session
+ *  by the journal itself, so no extra thresholding is needed here). */
+export function recordJournalWrite(sample: JournalWriteSample): void {
+  if (!armed) {
+    return
+  }
+
+  armed.buffer.push({
+    busySessions: Math.round(sample.busySessions),
+    bytes: Math.round(sample.bytes),
+    durationMs: Math.round(sample.durationMs * 100) / 100,
+    outcome: sample.outcome,
+    t: performance.now(),
+    type: 'journal_write'
   })
 }
