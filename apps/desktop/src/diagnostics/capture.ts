@@ -60,6 +60,29 @@ export interface StreamDeltaAppliedEvent extends DiagnosticsEventBase {
   /** Flush start → the measurement frame's start: how long the commit waited
    *  for a frame. Stays 0 when no frame arrives. */
   rafGapMs: number
+  /** Which flush drained the queue: the batched timer flush, or an eager
+   *  drain forced by an ordering-sensitive event (tool rows, interim seals,
+   *  turn completion). Eager drains skip the commit-measurement frame, so
+   *  their `commitMs`/`rafGapMs` stay 0 by construction. */
+  path: 'eager' | 'timer'
+  /** Sessions with a turn in flight at record time — concurrent threads, not
+   *  just the ones with text queued in THIS flush (`sessions` above). This is
+   *  the multi-chat attribution signal: a second thread doing tool-call work
+   *  contributes render load without ever entering the delta queue. */
+  busySessions: number
+}
+
+export interface GatewayEventAppliedEvent extends DiagnosticsEventBase {
+  type: 'gateway_event_applied'
+  /** The gateway event's type tag (`tool.complete`, `subagent.progress`, …) —
+   *  an identifier, never payload content. */
+  eventType: string
+  /** Synchronous main-thread cost of dispatching the event: store writes,
+   *  eager flushes, tool-row upserts — everything the handler did in place. */
+  durationMs: number
+  /** Sessions with a turn in flight at record time (see
+   *  StreamDeltaAppliedEvent.busySessions). */
+  busySessions: number
 }
 
 export interface MemorySampleEvent extends DiagnosticsEventBase {
@@ -69,7 +92,7 @@ export interface MemorySampleEvent extends DiagnosticsEventBase {
   limitMb: number
 }
 
-export type DiagnosticsEvent = LongFrameEvent | MemorySampleEvent | StreamDeltaAppliedEvent
+export type DiagnosticsEvent = GatewayEventAppliedEvent | LongFrameEvent | MemorySampleEvent | StreamDeltaAppliedEvent
 
 export interface DiagnosticsCaptureSnapshot {
   captureId: string
@@ -204,6 +227,8 @@ export interface StreamDeltaSample {
   queuedChars: number
   historyMessages: number
   writeMs: number
+  path: 'eager' | 'timer'
+  busySessions: number
 }
 
 /** Record one applied stream-delta flush. Returns the stored event so the
@@ -216,8 +241,10 @@ export function recordStreamDeltaApplied(sample: StreamDeltaSample): StreamDelta
   }
 
   return armed.buffer.push({
+    busySessions: Math.round(sample.busySessions),
     commitMs: 0,
     historyMessages: Math.round(sample.historyMessages),
+    path: sample.path,
     queuedChars: Math.round(sample.queuedChars),
     rafGapMs: 0,
     sessions: Math.round(sample.sessions),
@@ -225,4 +252,28 @@ export function recordStreamDeltaApplied(sample: StreamDeltaSample): StreamDelta
     type: 'stream_delta_applied',
     writeMs: Math.round(sample.writeMs * 100) / 100
   }) as StreamDeltaAppliedEvent
+}
+
+export interface GatewayEventSample {
+  eventType: string
+  durationMs: number
+  busySessions: number
+}
+
+/** Record one costly gateway-event dispatch. The caller thresholds on
+ *  duration BEFORE calling (a streaming turn emits dozens of sub-millisecond
+ *  events per second; recording them all would be ring churn for nothing), so
+ *  reaching this function already means "worth a row". */
+export function recordGatewayEventApplied(sample: GatewayEventSample): void {
+  if (!armed) {
+    return
+  }
+
+  armed.buffer.push({
+    busySessions: Math.round(sample.busySessions),
+    durationMs: Math.round(sample.durationMs * 100) / 100,
+    eventType: sample.eventType,
+    t: performance.now(),
+    type: 'gateway_event_applied'
+  })
 }
