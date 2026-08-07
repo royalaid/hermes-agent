@@ -4117,6 +4117,8 @@ export const zh = defineLocale({
       copyResults: '复制结果',
       copyQuery: '复制查询',
       copyFile: '复制文件',
+      copyDiff: '复制差异',
+      copyFullFile: '复制完整文件',
       copyPath: '复制路径',
       failedCalls: (count: number) => `${count} 次工具调用失败`,
       skillActivity: {

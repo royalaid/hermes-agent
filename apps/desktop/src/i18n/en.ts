@@ -3963,6 +3963,8 @@ export const en: Translations = {
       copyResults: 'Copy results',
       copyQuery: 'Copy query',
       copyFile: 'Copy file',
+      copyDiff: 'Copy diff',
+      copyFullFile: 'Copy full file',
       copyPath: 'Copy path',
       failedCalls: (count: number) => `${count} tool call${count === 1 ? '' : 's'} failed`,
       skillActivity: {
