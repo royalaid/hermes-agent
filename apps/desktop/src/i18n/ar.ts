@@ -2373,6 +2373,8 @@ export const ar = defineLocale({
       copyResults: 'نسخ النتائج',
       copyQuery: 'نسخ الاستعلام',
       copyFile: 'نسخ الملف',
+      copyDiff: 'نسخ الفرق',
+      copyFullFile: 'نسخ الملف كاملاً',
       copyPath: 'نسخ المسار',
       outputAlt: 'إخراج الأداة',
       rawResponse: 'الرد الخام',
