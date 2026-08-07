@@ -41,11 +41,13 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { ToolIcon } from '@/components/ui/tool-icon'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import { isDesktopFsRemoteMode, readDesktopFileText } from '@/lib/desktop-fs'
 import { PrettyLink, LinkifiedText as SharedLinkifiedText, urlSlugTitleLabel } from '@/lib/external-link'
-import { AlertCircle, CheckCircle2 } from '@/lib/icons'
+import { AlertCircle, CheckCircle2, FolderOpen } from '@/lib/icons'
 import { normalize } from '@/lib/text'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
+import { revealFile } from '@/store/file-actions'
 import { recordPreviewArtifact } from '@/store/preview-status'
 import { sessionApprovalRequest } from '@/store/prompts'
 import { $toolInlineDiff } from '@/store/tool-diffs'
@@ -58,11 +60,13 @@ import {
   clampForDisplay,
   cleanVisibleText,
   countDiffLineStats,
+  fileEditFilesystemPath,
   inlineDiffFromResult,
   isCardTool,
   isFileEditTool,
   isPreviewableTarget,
   looksRedundant,
+  parseMaybeObject,
   type SearchResultRow,
   selectMessageRunning,
   stripInlineDiffChrome,
@@ -325,6 +329,58 @@ function ToolTitle({
   )
 }
 
+interface FileEditActionsProps {
+  copyFullFile: string
+  path: string
+  revealInFileManager: string
+}
+
+/** File edits retain their inline review diff. These actions operate on the
+ * landed file itself, and are deliberately separate from the diff Copy button. */
+function FileEditActions({ copyFullFile, path, revealInFileManager }: FileEditActionsProps) {
+  const canReveal = !isDesktopFsRemoteMode()
+
+  return (
+    <div className="flex items-center gap-0.5">
+      <CopyButton
+        appearance="inline"
+        className="h-5 gap-0 rounded-md px-1 opacity-5 transition-opacity group-hover/tool-block:opacity-100 hover:opacity-100 focus-visible:opacity-100"
+        iconClassName="size-3"
+        label={copyFullFile}
+        showLabel={false}
+        side="left"
+        stopPropagation
+        text={async () => {
+          const result = await readDesktopFileText(path)
+
+          if (result.truncated) {
+            throw new Error('The complete file is too large to copy')
+          }
+
+          return result.text
+        }}
+      />
+      {canReveal && (
+        <Tip label={revealInFileManager} side="left">
+          <Button
+            aria-label={revealInFileManager}
+            className="size-5 rounded-md text-(--ui-text-tertiary) opacity-5 transition-opacity group-hover/tool-block:opacity-100 hover:text-(--ui-text-primary) hover:opacity-100 focus-visible:opacity-100"
+            onClick={event => {
+              event.stopPropagation()
+              void revealFile(path)
+            }}
+            size="icon-xs"
+            type="button"
+            variant="ghost"
+          >
+            <FolderOpen size="0.75rem" />
+          </Button>
+        </Tip>
+      )}
+    </div>
+  )
+}
+
 interface ToolEntryProps {
   part: ToolPart
 }
@@ -477,6 +533,12 @@ function ToolEntry({ part }: ToolEntryProps) {
   // copyAction reads the uncapped view.detail; clampForDisplay below only bounds
   // what's painted, so the row's Copy button still yields the full output.
   const copyAction = useMemo(() => toolCopyPayload(stablePart, view), [stablePart, view])
+  // File actions must use the landed absolute path, not a repo-relative display
+  // path. The backend provides `resolved_path` after a successful edit.
+  const filesystemPath = useMemo(
+    () => (isFileEdit && result !== undefined ? fileEditFilesystemPath(parseMaybeObject(args), parseMaybeObject(result)) : undefined),
+    [args, isFileEdit, result]
+  )
 
   const diffStats = useMemo(
     () => (isFileEdit && view.inlineDiff ? countDiffLineStats(view.inlineDiff) : null),
@@ -601,17 +663,28 @@ function ToolEntry({ part }: ToolEntryProps) {
       {isPending && <PendingToolApproval part={part} />}
       {open && (
         <div className="relative grid w-full min-w-0 max-w-full gap-1.5 overflow-hidden p-1.5">
-          {copyAction.text && (
-            <CopyButton
-              appearance="inline"
-              className="absolute right-4 top-1.5 z-10 h-5 gap-0 rounded-md px-1 opacity-5 transition-opacity group-hover/tool-block:opacity-100 hover:opacity-100 focus-visible:opacity-100"
-              iconClassName="size-3"
-              label={copyAction.label}
-              showLabel={false}
-              side="left"
-              stopPropagation
-              text={copyAction.text}
-            />
+          {(copyAction.text || filesystemPath) && (
+            <div className="absolute right-4 top-1.5 z-10 flex items-center gap-0.5">
+              {filesystemPath && (
+                <FileEditActions
+                  copyFullFile={copy.copyFullFile}
+                  path={filesystemPath}
+                  revealInFileManager={t.fileMenu.revealFileManager}
+                />
+              )}
+              {copyAction.text && (
+                <CopyButton
+                  appearance="inline"
+                  className="h-5 gap-0 rounded-md px-1 opacity-5 transition-opacity group-hover/tool-block:opacity-100 hover:opacity-100 focus-visible:opacity-100"
+                  iconClassName="size-3"
+                  label={isFileEdit && filesystemPath ? copy.copyDiff : copyAction.label}
+                  showLabel={false}
+                  side="left"
+                  stopPropagation
+                  text={copyAction.text}
+                />
+              )}
+            </div>
           )}
           {part.toolName === 'terminal' && toolViewMode !== 'technical' && (
             <TerminalTranscript command={view.terminalCommand} exitCode={view.terminalExitCode} />

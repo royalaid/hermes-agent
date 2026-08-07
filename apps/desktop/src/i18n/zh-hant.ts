@@ -2813,6 +2813,8 @@ export const zhHant = defineLocale({
       copyResults: '複製結果',
       copyQuery: '複製查詢',
       copyFile: '複製檔案',
+      copyDiff: '複製差異',
+      copyFullFile: '複製完整檔案',
       copyPath: '複製路徑',
       outputAlt: '工具輸出',
       rawResponse: '原始回應',
