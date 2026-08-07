@@ -27,7 +27,7 @@ clock and aligned at export against a shared wall-clock anchor.
 
 | Stream | Source | Records |
 | --- | --- | --- |
-| `renderer-<windowId>` | each chat window | long animation frames (with attribution), heap samples, stream-delta flush costs |
+| `renderer-<windowId>` | each chat window | long animation frames (with attribution), heap samples, stream-delta flush costs, costly gateway-event dispatches |
 | `main` | Electron main | window responsive/unresponsive edges, per-process CPU + working set, backend transport failures |
 | `gateway` | the Hermes backend | event-loop heartbeat drift with sampled stacks, slow WS writes |
 
@@ -50,6 +50,27 @@ asked, and the stream is marked absent with reason `remote-gateway`.
 Every event carries its original monotonic `t` (or `t_monotonic`) plus an added
 `wall_clock_ms`, so the three streams sort into one timeline without anyone
 having to trust a second machine's `Date.now()`.
+
+### Renderer events for multi-thread attribution
+
+Two renderer event details exist specifically to attribute hitches when more
+than one chat/thread runs at once:
+
+- `stream_delta_applied` rows carry `path` (`timer` for the batched flush,
+  `eager` for a drain forced by an ordering-sensitive event such as a tool row
+  or turn completion — under an agentic turn most applies run eagerly) and
+  `busySessions` (sessions with a turn in flight at record time, not just the
+  ones with text queued in that flush). Eager rows have `commitMs`/`rafGapMs`
+  fixed at 0 — they skip the commit-measurement frame.
+- `gateway_event_applied` records any single gateway-event dispatch whose
+  synchronous main-thread cost reached 4ms — tool-row upserts, subagent
+  progress, session.info patches, terminal chunks — with `eventType` (the type
+  tag only, never payload), `durationMs` and `busySessions`. Cheaper
+  dispatches are deliberately not recorded.
+
+Reading a multi-thread capture: correlate long_frame bursts with
+`busySessions > 1`, then look at which `gateway_event_applied.eventType` and
+`path: 'eager'` rows cluster inside the bursts.
 
 ## Sanitization contract
 

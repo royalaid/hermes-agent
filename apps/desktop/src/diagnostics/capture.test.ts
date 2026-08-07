@@ -6,6 +6,7 @@ import {
   isDiagnosticsArmed,
   type LongFrameEvent,
   readDiagnosticsCapture,
+  recordGatewayEventApplied,
   recordStreamDeltaApplied
 } from './capture'
 
@@ -83,7 +84,19 @@ describe('renderer diagnostics capture', () => {
 
     // The per-delta entry point on the stream flush path: a single boolean read
     // and out, with nowhere for the sample to land.
-    expect(recordStreamDeltaApplied({ historyMessages: 40, queuedChars: 12, sessions: 1, writeMs: 3 })).toBeNull()
+    expect(
+      recordStreamDeltaApplied({
+        busySessions: 1,
+        historyMessages: 40,
+        path: 'timer',
+        queuedChars: 12,
+        sessions: 1,
+        writeMs: 3
+      })
+    ).toBeNull()
+
+    // Same contract for the dispatch-cost entry point.
+    recordGatewayEventApplied({ busySessions: 1, durationMs: 12, eventType: 'tool.complete' })
 
     expect(FakePerformanceObserver.instances).toHaveLength(0)
     expect(readDiagnosticsCapture()).toBeNull()
@@ -141,12 +154,21 @@ describe('renderer diagnostics capture', () => {
   it('records stream-delta samples as counts and durations only', () => {
     armDiagnostics('capture-4', 1_700_000_000_000)
 
-    const event = recordStreamDeltaApplied({ historyMessages: 412, queuedChars: 87, sessions: 2, writeMs: 4.567 })
+    const event = recordStreamDeltaApplied({
+      busySessions: 3,
+      historyMessages: 412,
+      path: 'eager',
+      queuedChars: 87,
+      sessions: 2,
+      writeMs: 4.567
+    })
 
     expect(event).not.toBeNull()
     expect(event).toMatchObject({
+      busySessions: 3,
       commitMs: 0,
       historyMessages: 412,
+      path: 'eager',
       queuedChars: 87,
       rafGapMs: 0,
       sessions: 2,
@@ -160,9 +182,24 @@ describe('renderer diagnostics capture', () => {
     expect(readDiagnosticsCapture()?.events).toEqual([expect.objectContaining({ commitMs: 61.2 })])
   })
 
+  it('records gateway-event dispatch costs as type tags and durations only', () => {
+    armDiagnostics('capture-events', 1_700_000_000_000)
+
+    recordGatewayEventApplied({ busySessions: 2, durationMs: 17.456, eventType: 'subagent.progress' })
+
+    expect(readDiagnosticsCapture()?.events).toEqual([
+      expect.objectContaining({
+        busySessions: 2,
+        durationMs: 17.46,
+        eventType: 'subagent.progress',
+        type: 'gateway_event_applied'
+      })
+    ])
+  })
+
   it('re-arms with a fresh buffer under a new capture id without a reload', () => {
     armDiagnostics('capture-5', 1_700_000_000_000)
-    recordStreamDeltaApplied({ historyMessages: 1, queuedChars: 1, sessions: 1, writeMs: 1 })
+    recordStreamDeltaApplied({ busySessions: 1, historyMessages: 1, path: 'timer', queuedChars: 1, sessions: 1, writeMs: 1 })
     expect(readDiagnosticsCapture()?.events).toHaveLength(1)
 
     armDiagnostics('capture-6', 1_700_000_000_001)
