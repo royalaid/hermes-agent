@@ -92,8 +92,10 @@ export interface JournalWriteEvent extends DiagnosticsEventBase {
   /** Serialized entry length (UTF-16 code units) — a size, never the text. */
   bytes: number
   /** `quota`/`error` mean the synchronous cost was paid but recovery is
-   *  degraded — exactly the failure mode that stays invisible in logs. */
-  outcome: 'error' | 'ok' | 'quota' | 'skipped'
+   *  degraded — exactly the failure mode that stays invisible in logs.
+   *  `oversize` means the entry blew the hard ceiling even after tight
+   *  re-projection and the write was skipped to protect the main thread. */
+  outcome: 'error' | 'ok' | 'oversize' | 'quota' | 'skipped'
   /** Sessions with a journal write in flight at record time (see
    *  StreamDeltaAppliedEvent.busySessions). */
   busySessions: number
