@@ -9,7 +9,6 @@ import {
   inlineDiffFromResult,
   MAX_TOOL_RENDER_CHARS,
   prettyJson,
-  toolCopyPayload,
   type ToolPart
 } from './fallback-model'
 
@@ -178,33 +177,6 @@ describe('buildToolView file edit diffs', () => {
     expect(view.title).toBe('demo.ts')
     expect(view.subtitle).toBe('src/demo.ts')
     expect(view.detail).toBe('')
-  })
-})
-
-describe('toolCopyPayload file edits', () => {
-  it('copies raw write_file content rather than the inline review diff', () => {
-    const rawFile = '## Handoff plan\n\n1. Implement the copy behavior.\n'
-    const reviewDiff = '--- a/PLAN.md\n+++ b/PLAN.md\n@@ -0,0 +1,3 @@\n+## Handoff plan\n+\n+1. Implement the copy behavior.'
-    const tool = part({
-      args: { content: rawFile, path: 'PLAN.md' },
-      result: { resolved_path: 'C:/repo/PLAN.md', success: true },
-      toolName: 'write_file'
-    })
-    const view = buildToolView(tool, reviewDiff)
-
-    expect(toolCopyPayload(tool, view)).toMatchObject({ text: rawFile })
-  })
-
-  it('keeps a patch diff as the copy fallback when no full file payload exists', () => {
-    const reviewDiff = '--- a/src/demo.ts\n+++ b/src/demo.ts\n@@ -1 +1 @@\n-old\n+new'
-    const tool = part({
-      args: { mode: 'replace', new_string: 'new', old_string: 'old', path: 'src/demo.ts' },
-      result: { diff: reviewDiff, success: true },
-      toolName: 'patch'
-    })
-    const view = buildToolView(tool, reviewDiff)
-
-    expect(toolCopyPayload(tool, view)).toMatchObject({ text: reviewDiff })
   })
 })
 
