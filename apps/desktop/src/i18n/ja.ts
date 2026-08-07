@@ -2787,6 +2787,8 @@ export const ja = defineLocale({
       copyResults: '結果をコピー',
       copyQuery: 'クエリをコピー',
       copyFile: 'ファイルをコピー',
+      copyDiff: '差分をコピー',
+      copyFullFile: '完全なファイルをコピー',
       copyPath: 'パスをコピー',
       outputAlt: 'ツール出力',
       rawResponse: '生の応答',
