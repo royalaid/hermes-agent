@@ -195,6 +195,7 @@ import {
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
+import { resolveDefaultUpdateBranch } from './update-branch'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
@@ -2341,9 +2342,9 @@ function readDesktopUpdateConfig() {
     const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CONFIG_PATH, 'utf8'))
     const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
 
-    return { branch: branch || DEFAULT_UPDATE_BRANCH }
+    return { branch }
   } catch {
-    return { branch: DEFAULT_UPDATE_BRANCH }
+    return { branch: '' }
   }
 }
 
@@ -2508,9 +2509,35 @@ async function resolveHealedBranch(updateRoot, branch) {
   return 'main'
 }
 
+// A source checkout without an explicit desktop update preference should follow
+// its checked-out branch when that branch is published by its update remote.
+// This keeps fork installs and their status badge on the same branch as the
+// staged updater. Detached/local-only work remains conservative on `main`.
+async function resolveDesktopUpdateBranch(updateRoot) {
+  const { branch: configuredBranch } = readDesktopUpdateConfig()
+
+  if (configuredBranch) {
+    return resolveHealedBranch(updateRoot, configuredBranch)
+  }
+
+  const current = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
+  const currentBranch = firstLine(current.stdout)
+  const originUrl = await getOriginUrl(updateRoot)
+  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
+  const published = currentBranch && currentBranch !== 'HEAD'
+    ? await runGit(['ls-remote', '--exit-code', '--heads', remote, currentBranch], { cwd: updateRoot })
+    : null
+
+  return resolveDefaultUpdateBranch({
+    configuredBranch,
+    currentBranch,
+    published: published?.code === 0
+  })
+}
+
 async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
-  let { branch } = readDesktopUpdateConfig()
+  let branch = await resolveDesktopUpdateBranch(updateRoot)
   const gitDir = path.join(updateRoot, '.git')
 
   if (!directoryExists(gitDir)) {
@@ -2951,8 +2978,7 @@ async function applyUpdates(opts = {}) {
     repairMacUpdaterHelper(updater)
 
     const updateRoot = resolveUpdateRoot()
-    const { branch: configuredBranch } = readDesktopUpdateConfig()
-    const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
+    const branch = await resolveDesktopUpdateBranch(updateRoot)
     const updaterArgs = ['--update', '--branch', branch]
     const targetApp = IS_MAC ? runningAppBundle() : null
 
@@ -3166,11 +3192,9 @@ async function handOffWindowsBootstrapRecovery(reason) {
   }
 
   const updateRoot = resolveUpdateRoot()
-  const { branch: configuredBranch } = readDesktopUpdateConfig()
-
   const branch = directoryExists(path.join(updateRoot, '.git'))
-    ? await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
-    : configuredBranch || DEFAULT_UPDATE_BRANCH
+    ? await resolveDesktopUpdateBranch(updateRoot)
+    : readDesktopUpdateConfig().branch || DEFAULT_UPDATE_BRANCH
 
   const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
   const venvHermes = path.join(venvBin, IS_WINDOWS ? 'hermes.exe' : 'hermes')
@@ -12074,7 +12098,7 @@ ipcMain.handle('hermes:terminal:dispose', (_event, id) => disposeTerminalSession
 ipcMain.handle('hermes:updates:check', async () =>
   checkUpdates().catch(error => ({
     supported: true,
-    branch: readDesktopUpdateConfig().branch,
+    branch: readDesktopUpdateConfig().branch || DEFAULT_UPDATE_BRANCH,
     error: 'check-failed',
     message: error?.message || String(error),
     fetchedAt: Date.now()
@@ -12089,7 +12113,14 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
   }))
 )
 
-ipcMain.handle('hermes:updates:branch:get', async () => readDesktopUpdateConfig())
+ipcMain.handle('hermes:updates:branch:get', async () => {
+  const updateRoot = resolveUpdateRoot()
+  const branch = directoryExists(path.join(updateRoot, '.git'))
+    ? await resolveDesktopUpdateBranch(updateRoot)
+    : readDesktopUpdateConfig().branch || DEFAULT_UPDATE_BRANCH
+
+  return { branch }
+})
 
 ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
   const branch = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
