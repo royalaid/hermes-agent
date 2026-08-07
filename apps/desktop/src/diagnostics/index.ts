@@ -11,10 +11,12 @@ export {
   disarmDiagnostics,
   type GatewayEventAppliedEvent,
   isDiagnosticsArmed,
+  type JournalWriteEvent,
   type LongFrameEvent,
   type MemorySampleEvent,
   readDiagnosticsCapture,
   recordGatewayEventApplied,
+  recordJournalWrite,
   recordStreamDeltaApplied,
   type StreamDeltaAppliedEvent
 } from './capture'
