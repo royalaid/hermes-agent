@@ -66,6 +66,16 @@ export function fileEditPath(args: Record<string, unknown>, result: Record<strin
   )
 }
 
+/** A path safe to hand to Desktop filesystem actions. Tool arguments are often
+ * repo-relative for display, while the backend result carries the resolved,
+ * absolute target after the operation lands. */
+export function fileEditFilesystemPath(args: Record<string, unknown>, result: Record<string, unknown>): string | undefined {
+  const resolved = firstStringField(result, ['resolved_path'])
+  const candidate = resolved || firstStringField(args, ['path', 'file', 'filepath'])
+
+  return candidate && /^(?:[a-zA-Z]:[\\/]|\/)/.test(candidate) ? candidate : undefined
+}
+
 export function fileEditBasename(path: string): string {
   const normalized = path.replace(/\\/g, '/').trim()
 
