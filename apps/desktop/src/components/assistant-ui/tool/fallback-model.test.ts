@@ -6,6 +6,7 @@ import {
   buildToolView,
   clampForDisplay,
   countDiffLineStats,
+  fileEditFilesystemPath,
   inlineDiffFromResult,
   MAX_TOOL_RENDER_CHARS,
   prettyJson,
@@ -445,6 +446,22 @@ describe('prettyJson caps serialized result size', () => {
 
     expect(out.length).toBeLessThanOrEqual(MAX_TOOL_RENDER_CHARS + 200)
     expect(out).toContain('truncated')
+  })
+})
+
+describe('fileEditFilesystemPath', () => {
+  it('prefers the backend-resolved absolute path over the display path', () => {
+    expect(fileEditFilesystemPath({ path: 'docs/plan.md' }, { resolved_path: 'C:/repo/docs/plan.md' })).toBe(
+      'C:/repo/docs/plan.md'
+    )
+  })
+
+  it('uses an absolute tool argument when no resolved path was returned', () => {
+    expect(fileEditFilesystemPath({ path: '/repo/docs/plan.md' }, {})).toBe('/repo/docs/plan.md')
+  })
+
+  it('does not expose a relative path to filesystem actions', () => {
+    expect(fileEditFilesystemPath({ path: 'docs/plan.md' }, {})).toBeUndefined()
   })
 })
 
