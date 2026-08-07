@@ -142,18 +142,48 @@ SERVER_ROLE_COMMANDS: frozenset[str] = frozenset({
 })
 
 
+# The only flags that may legitimately precede the subcommand: the CLI's own
+# global profile selector, pre-parsed before argparse by
+# ``hermes_cli.main._apply_profile_override`` (``--profile <name>`` /
+# ``-p <name>`` / ``--profile=<name>``).  The desktop launcher really invokes
+# ``hermes --profile <name> serve ...`` (apps/desktop/electron/main.ts), so
+# these exact shapes must classify as server-role.  Their arity is fixed at
+# one value, which is what makes skipping them safe without a full parser.
+_GLOBAL_VALUE_FLAGS: frozenset[str] = frozenset({"--profile", "-p"})
+
+
 def is_server_role_argv(argv: Sequence[str]) -> bool:
     """Return True when *argv* starts a long-lived Hermes server process.
 
     *argv* is the argument list WITHOUT the program name (``sys.argv[1:]``).
-    Only the leading positional words matter, so flags anywhere are ignored.
+
+    Conservative by construction.  Only the leading tokens are inspected, and
+    the only flags skipped over are the CLI's global ``--profile``/``-p``
+    selectors, whose one-value arity is known.  Any other leading flag means
+    the command position can no longer be trusted without the full parser, so
+    the answer is False and the delegated-child marker is simply retained —
+    the safe direction (a server started that way keeps the guard; nothing is
+    declassified).  In particular an option VALUE is never mistaken for a
+    command: ``hermes -s desktop chat`` is not a server.
     """
-    positionals = [arg for arg in argv if not arg.startswith("-")]
-    if not positionals:
+    index = 0
+    total = len(argv)
+    while index < total:
+        arg = argv[index]
+        if arg in _GLOBAL_VALUE_FLAGS:
+            index += 2  # flag + its value
+            continue
+        if arg.startswith("--profile="):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            return False  # unknown leading flag: arity unknown, fail safe
+        break
+    if index >= total:
         return False
-    command = positionals[0]
+    command = argv[index]
     if command == "gateway":
-        return len(positionals) > 1 and positionals[1] == "run"
+        return index + 1 < total and argv[index + 1] == "run"
     return command in SERVER_ROLE_COMMANDS
 
 

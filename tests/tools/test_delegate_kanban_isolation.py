@@ -338,6 +338,22 @@ def _run_child_python(code: str, env_overrides: dict[str, str], tmp_path):
         (["chat"], False),
         ([], False),
         (["--version"], False),
+        # Option VALUES must never be read as commands — a delegated child
+        # running e.g. `hermes -s desktop chat` is agent work, not a server
+        # (the old positional filter skipped flags but not their values).
+        (["-s", "desktop", "chat"], False),
+        (["-m", "serve", "chat"], False),
+        (["--provider", "gui", "chat"], False),
+        # The CLI's global profile selector is the one flag family allowed to
+        # precede the command — the desktop launcher really invokes
+        # `hermes --profile <name> serve ...` (electron/main.ts).
+        (["--profile", "work", "serve", "--host", "127.0.0.1"], True),
+        (["--profile=work", "dashboard", "--no-open"], True),
+        (["-p", "work", "gateway", "run"], True),
+        # A profile flag that consumes the would-be command leaves no command.
+        (["--profile", "serve"], False),
+        # Any other leading flag has unknown arity: fail safe, keep the marker.
+        (["--verbose", "serve"], False),
     ],
 )
 def test_is_server_role_argv(argv, expected):
