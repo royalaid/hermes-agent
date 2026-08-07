@@ -2810,6 +2810,8 @@ export interface Translations {
       copyResults: string
       copyQuery: string
       copyFile: string
+      copyDiff: string
+      copyFullFile: string
       copyPath: string
       outputAlt: string
       rawResponse: string
