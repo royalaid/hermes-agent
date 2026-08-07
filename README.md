@@ -16,6 +16,25 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
 </p>
 
+## RoyalAid fork integration
+
+This repository is a maintained fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). The published integration branch is [`fork-integration`](https://github.com/royalaid/hermes-agent/tree/fork-integration). It is reconstructed from current upstream `main` plus the reviewable component set documented below; it is not a general-purpose development branch.
+
+### Included fork changes
+
+| Component | Changes carried by this fork |
+| --- | --- |
+| Windows desktop environment | Preserve the live Windows host `PATH` for desktop-launched backend processes. |
+| Native reasoning display | Preserve reasoning-item boundaries and streamed native reasoning summaries. |
+| Desktop hitch diagnostics | Capture and classify renderer/main-process stalls, expose diagnostics controls and sanitized exports, and provide `hermes debug diagnose`. |
+| Gateway responsiveness | Move gateway configuration I/O off the event loop and serialize config mutations. |
+| Desktop render instrumentation | Attribute multi-thread render cost and bound the in-flight turn journal. |
+| Delegation argv safety | Do not interpret option values as server-role commands. |
+
+### Updating this fork
+
+Use the blue **Hermes Setup** bootstrap/updater launcher, not a versioned MSI/NSIS wrapper. The launcher and Desktop update status follow the published integration branch; the status pill reports the exact number of commits available as `(+N)`. The daily integration job rebuilds the branch from the manifest, validates it, and publishes a prerelease launcher with a checksum and provenance record. The prior `local/openai-native-windows` branch remains a compatibility alias for existing installers while clients migrate to `fork-integration`.
+
 **The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenRouter, OpenAI, your own endpoint, and [many others](https://hermes-agent.nousresearch.com/docs/integrations/providers). Switch with `hermes model` — no code changes, no lock-in.
