@@ -1,3 +1,4 @@
+import { recordJournalWrite } from '@/diagnostics/capture'
 import { type ChatMessage, type ChatMessagePart, chatMessageText } from '@/lib/chat-messages'
 
 /**
@@ -23,12 +24,20 @@ import { type ChatMessage, type ChatMessagePart, chatMessageText } from '@/lib/c
  *  write O(own tail) regardless of how many other sessions are streaming. */
 const STORAGE_PREFIX = 'hermes.desktop.inflightTurnJournal.v2:'
 const LEGACY_STORAGE_KEY = 'hermes.desktop.inflightTurnJournal.v1'
+const KILL_SWITCH_KEY = 'hermes.desktop.inflightTurnJournal.disabled'
 const MAX_ENTRIES = 24
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 /** Streaming repaints arrive every ~33ms; localStorage writes are synchronous.
  *  Trailing-edge throttle keeps the journal off the hot path — a crash costs at
  *  most this much of the newest tail. */
 const PERSIST_THROTTLE_MS = 400
+const ASSISTANT_TEXT_CAP = 64 * 1024
+const ASSISTANT_TEXT_CAP_TIGHT = 8 * 1024
+const REASONING_CAP = 16 * 1024
+const TOOL_PREVIEW_CAP = 2 * 1024
+const ENTRY_BUDGET = 256 * 1024
+const ENTRY_HARD_CEILING = 2 * ENTRY_BUDGET
+const PREVIEW_MAX_DEPTH = 6
 
 export interface InFlightTurnSnapshot {
   messages: ChatMessage[]
@@ -70,6 +79,184 @@ function isExpired(entry: InFlightTurnSnapshot, now = Date.now()): boolean {
   return now - entry.updatedAt > MAX_AGE_MS
 }
 
+function truncated(text: string, cap: number): string {
+  return text.length > cap ? `${text.slice(0, cap)}…[truncated]` : text
+}
+
+function boundedJsonPreview(value: unknown, cap: number): string {
+  const out: string[] = []
+  let used = 0
+  let full = false
+
+  const emit = (text: string): void => {
+    if (full) {
+      return
+    }
+
+    if (used + text.length >= cap) {
+      out.push(`${text.slice(0, Math.max(0, cap - used))}…[truncated]`)
+      full = true
+
+      return
+    }
+
+    out.push(text)
+    used += text.length
+  }
+
+  const seen = new Set<object>()
+
+  const walk = (node: unknown, depth: number): void => {
+    if (full) {
+      return
+    }
+
+    if (node === null || node === undefined) {
+      emit('null')
+
+      return
+    }
+
+    if (typeof node === 'string') {
+      emit(JSON.stringify(node.length > cap ? node.slice(0, cap) : node))
+
+      return
+    }
+
+    if (typeof node === 'number' || typeof node === 'boolean' || typeof node === 'bigint') {
+      emit(String(node))
+
+      return
+    }
+
+    if (typeof node !== 'object') {
+      emit('null')
+
+      return
+    }
+
+    if (seen.has(node) || depth >= PREVIEW_MAX_DEPTH) {
+      emit(Array.isArray(node) ? '[…]' : '{…}')
+
+      return
+    }
+
+    seen.add(node)
+
+    if (Array.isArray(node)) {
+      emit('[')
+
+      for (let index = 0; index < node.length && !full; index += 1) {
+        if (index > 0) {
+          emit(',')
+        }
+
+        walk(node[index], depth + 1)
+      }
+
+      emit(']')
+
+      return
+    }
+
+    emit('{')
+    let first = true
+
+    for (const key in node) {
+      if (full) {
+        break
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(node, key)) {
+        continue
+      }
+
+      if (!first) {
+        emit(',')
+      }
+
+      first = false
+      emit(`${JSON.stringify(key)}:`)
+      walk((node as Record<string, unknown>)[key], depth + 1)
+    }
+
+    emit('}')
+  }
+
+  try {
+    walk(value, 0)
+  } catch {
+    // A throwing getter mid-walk: keep whatever was emitted so far.
+  }
+
+  return out.join('')
+}
+
+function previewOf(value: unknown, cap: number): null | string {
+  if (value === undefined || value === null) {
+    return null
+  }
+
+  return typeof value === 'string' ? truncated(value, cap) : boundedJsonPreview(value, cap)
+}
+
+function projectPart(part: ChatMessagePart, role: ChatMessage['role'], tight: boolean): ChatMessagePart | null {
+  if (part.type === 'text') {
+    const text = typeof part.text === 'string' ? part.text : ''
+
+    return {
+      type: 'text',
+      text: role === 'user' ? text : truncated(text, tight ? ASSISTANT_TEXT_CAP_TIGHT : ASSISTANT_TEXT_CAP)
+    }
+  }
+
+  if (part.type === 'reasoning') {
+    if (tight) {
+      return null
+    }
+
+    return { type: 'reasoning', text: truncated(typeof part.text === 'string' ? part.text : '', REASONING_CAP) }
+  }
+
+  if (part.type === 'tool-call') {
+    const argsPreview = tight ? null : previewOf(part.argsText ?? part.args, TOOL_PREVIEW_CAP)
+    const resultPreview = tight ? undefined : (previewOf(part.result, TOOL_PREVIEW_CAP) ?? undefined)
+
+    return {
+      args: {} as never,
+      argsText: argsPreview ?? '',
+      toolCallId: part.toolCallId,
+      toolName: part.toolName,
+      type: 'tool-call',
+      ...(resultPreview !== undefined && { result: resultPreview }),
+      ...('isError' in part && { isError: Boolean(part.isError) })
+    } as ChatMessagePart
+  }
+
+  return null
+}
+
+function projectMessage(message: ChatMessage, tight: boolean): ChatMessage {
+  const parts = message.parts
+    .map(part => projectPart(part, message.role, tight))
+    .filter((part): part is ChatMessagePart => part !== null)
+
+  return {
+    id: message.id,
+    parts,
+    role: message.role,
+    ...(message.timestamp !== undefined && { timestamp: message.timestamp }),
+    ...(message.pending !== undefined && { pending: message.pending }),
+    ...(message.error !== undefined && { error: message.error }),
+    ...(message.interim !== undefined && { interim: message.interim }),
+    ...(message.attachmentRefs !== undefined && { attachmentRefs: [...message.attachmentRefs] })
+  }
+}
+
+function projectTail(messages: ChatMessage[], tight: boolean): ChatMessage[] {
+  return messages.map(message => projectMessage(message, tight))
+}
+
 function loadEntry(storedSessionId: string): InFlightTurnSnapshot | null {
   const store = storage()
 
@@ -87,19 +274,11 @@ function loadEntry(storedSessionId: string): InFlightTurnSnapshot | null {
   }
 }
 
-function saveEntry(storedSessionId: string, entry: InFlightTurnSnapshot): void {
-  try {
-    storage()?.setItem(entryKey(storedSessionId), JSON.stringify(entry))
-  } catch {
-    // Quota/private-mode failures: the journal is a recovery aid, not truth.
-  }
-}
-
 function removeEntry(storedSessionId: string): void {
   try {
     storage()?.removeItem(entryKey(storedSessionId))
   } catch {
-    // Same best-effort stance as saveEntry.
+    // The journal is a recovery aid, not truth.
   }
 }
 
@@ -118,7 +297,23 @@ function migrateLegacyStore(store: Storage): void {
 
     if (parsed && typeof parsed.entries === 'object' && !Array.isArray(parsed.entries)) {
       for (const [id, entry] of Object.entries(parsed.entries as Record<string, InFlightTurnSnapshot>)) {
-        saveEntry(id, entry)
+        if (!entry || !Array.isArray(entry.messages) || typeof entry.updatedAt !== 'number' || isExpired(entry)) {
+          continue
+        }
+
+        let serialized = JSON.stringify({ ...entry, messages: projectTail(entry.messages, false) })
+
+        if (serialized.length > ENTRY_BUDGET) {
+          serialized = JSON.stringify({ ...entry, messages: projectTail(entry.messages, true) })
+        }
+
+        if (serialized.length <= ENTRY_HARD_CEILING) {
+          try {
+            store.setItem(entryKey(id), serialized)
+          } catch {
+            // One quota failure must not stop smaller legacy entries migrating.
+          }
+        }
       }
     }
   } catch {
@@ -132,26 +327,7 @@ function migrateLegacyStore(store: Storage): void {
   }
 }
 
-// One-time prune per renderer: drop expired/overflow entries. Startup-only on
-// purpose — entries clear on settle, so anything left over is crash residue,
-// and enumerating localStorage on the write path would defeat the point.
-let housekeepingDone = false
-
-function ensureHousekeeping(): void {
-  const store = storage()
-
-  if (!store) {
-    return
-  }
-
-  migrateLegacyStore(store)
-
-  if (housekeepingDone) {
-    return
-  }
-
-  housekeepingDone = true
-
+function sweepJournalKeys(store: Storage): void {
   try {
     const keys: string[] = []
 
@@ -188,6 +364,39 @@ function ensureHousekeeping(): void {
     }
   } catch {
     // Best-effort, like every other journal write.
+  }
+}
+
+let booted = false
+let journalDisabled = false
+
+function ensureBooted(): void {
+  if (booted) {
+    return
+  }
+
+  booted = true
+  const store = storage()
+
+  if (!store) {
+    return
+  }
+
+  try {
+    journalDisabled = store.getItem(KILL_SWITCH_KEY) === '1'
+  } catch {
+    // An unreadable kill switch leaves journaling enabled.
+  }
+
+  if (journalDisabled) {
+    return
+  }
+
+  try {
+    migrateLegacyStore(store)
+    sweepJournalKeys(store)
+  } catch {
+    // Boot housekeeping is best-effort; write paths guard themselves.
   }
 }
 
@@ -469,26 +678,117 @@ export function mergeInFlightMessages(
 
 const persistTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const persistLatest = new Map<string, JournalableSessionState>()
+const quotaWarned = new Set<string>()
+const oversizeWarned = new Set<string>()
+const sessionsWrittenSinceBoot = new Set<string>()
+
+export function resetInFlightTurnJournalForTests(): void {
+  booted = false
+  journalDisabled = false
+
+  for (const timer of persistTimers.values()) {
+    clearTimeout(timer)
+  }
+
+  persistTimers.clear()
+  persistLatest.clear()
+  quotaWarned.clear()
+  oversizeWarned.clear()
+  sessionsWrittenSinceBoot.clear()
+}
+
+function isQuotaError(error: unknown): boolean {
+  return (
+    error instanceof DOMException &&
+    (error.name === 'QuotaExceededError' || error.name === 'NS_ERROR_DOM_QUOTA_REACHED' || error.code === 22)
+  )
+}
 
 function writeSnapshot(storedSessionId: string, state: JournalableSessionState): void {
-  const tail = recoverableTail(state.messages, state.streamId)
+  const store = storage()
 
-  if (tail.length === 0) {
+  if (!store) {
     return
   }
 
-  ensureHousekeeping()
-  saveEntry(storedSessionId, {
-    messages: tail,
+  const started = performance.now()
+  const tail = recoverableTail(state.messages, state.streamId)
+  const busySessions = persistTimers.size + 1
+
+  if (tail.length === 0) {
+    recordJournalWrite({ busySessions, bytes: 0, durationMs: performance.now() - started, outcome: 'skipped' })
+
+    return
+  }
+
+  const entry: InFlightTurnSnapshot = {
+    messages: projectTail(tail, false),
     streamId: state.streamId,
     turnStartedAt: state.turnStartedAt,
     updatedAt: Date.now()
-  })
+  }
+  let serialized = JSON.stringify(entry)
+
+  if (serialized.length > ENTRY_BUDGET) {
+    serialized = JSON.stringify({ ...entry, messages: projectTail(tail, true) })
+
+    if (serialized.length > ENTRY_HARD_CEILING) {
+      if (!oversizeWarned.has(storedSessionId)) {
+        oversizeWarned.add(storedSessionId)
+        console.warn(
+          `[hermes] in-flight turn journal entry exceeds the hard size ceiling for session ${storedSessionId}; ` +
+            'skipping journal writes for this turn (crash recovery degraded).'
+        )
+      }
+
+      recordJournalWrite({
+        busySessions,
+        bytes: serialized.length,
+        durationMs: performance.now() - started,
+        outcome: 'oversize'
+      })
+
+      return
+    }
+  }
+
+  let outcome: 'error' | 'ok' | 'quota' = 'ok'
+
+  try {
+    store.setItem(entryKey(storedSessionId), serialized)
+
+    if (!sessionsWrittenSinceBoot.has(storedSessionId)) {
+      sessionsWrittenSinceBoot.add(storedSessionId)
+
+      if (sessionsWrittenSinceBoot.size > MAX_ENTRIES) {
+        sweepJournalKeys(store)
+      }
+    }
+  } catch (error) {
+    outcome = isQuotaError(error) ? 'quota' : 'error'
+
+    if (!quotaWarned.has(storedSessionId)) {
+      quotaWarned.add(storedSessionId)
+      console.warn(
+        `[hermes] in-flight turn journal write failed (${outcome}) for session ${storedSessionId}; ` +
+          'crash recovery for this turn is degraded.',
+        error
+      )
+    }
+  }
+
+  recordJournalWrite({ busySessions, bytes: serialized.length, durationMs: performance.now() - started, outcome })
 }
 
 /** Persist the running turn's visible tail (throttled), or clear the entry the
  *  moment the turn settles. Call on every session-state commit. */
 export function persistInFlightTurnState(state: JournalableSessionState): void {
+  ensureBooted()
+
+  if (journalDisabled) {
+    return
+  }
+
   const storedSessionId = state.storedSessionId
 
   if (!storedSessionId) {
@@ -523,11 +823,16 @@ export function persistInFlightTurnState(state: JournalableSessionState): void {
 }
 
 export function readInFlightTurnJournal(storedSessionId: null | string): InFlightTurnSnapshot | null {
+  ensureBooted()
+
+  if (journalDisabled) {
+    return null
+  }
+
   if (!storedSessionId) {
     return null
   }
 
-  ensureHousekeeping()
   const entry = loadEntry(storedSessionId)
 
   if (!entry) {
@@ -576,6 +881,12 @@ export function recoverInFlightTurnJournal(
 }
 
 export function clearInFlightTurnJournal(storedSessionId: null | string): void {
+  ensureBooted()
+
+  if (journalDisabled) {
+    return
+  }
+
   if (!storedSessionId) {
     return
   }
@@ -588,6 +899,5 @@ export function clearInFlightTurnJournal(storedSessionId: null | string): void {
   }
 
   persistLatest.delete(storedSessionId)
-  ensureHousekeeping()
   removeEntry(storedSessionId)
 }
