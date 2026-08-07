@@ -56,6 +56,13 @@ const TOOL_PREVIEW_CAP = 2 * 1024
 /** Fail-safe for one serialized entry. An entry can exceed it only when the
  *  user prompt alone does (kept in full — recovery matching needs it). */
 const ENTRY_BUDGET = 256 * 1024
+/** Hard ceiling after the tight re-projection. Above this the write is
+ *  SKIPPED: a pathological prompt's crash recovery is worth less than paying
+ *  a multi-megabyte synchronous setItem every tick — the exact stall this
+ *  file exists to prevent. */
+const ENTRY_HARD_CEILING = 2 * ENTRY_BUDGET
+/** Preview walker depth limit — deeper structure collapses to a placeholder. */
+const PREVIEW_MAX_DEPTH = 6
 
 export interface InFlightTurnSnapshot {
   messages: ChatMessage[]
@@ -109,6 +116,126 @@ function truncated(text: string, cap: number): string {
   return text.length > cap ? `${text.slice(0, cap)}…[truncated]` : text
 }
 
+/** JSON-ish preview of an arbitrary value that never does more work than the
+ *  cap allows: emission and traversal are the same loop, so a multi-megabyte
+ *  tool result costs ~cap code units of walking, not a full `JSON.stringify`
+ *  of the whole structure first. Output is display text, not guaranteed
+ *  parseable JSON — every `argsText` consumer already JSON.parses inside a
+ *  try/catch with an `{}` fallback, and the pre-existing `…[truncated]`
+ *  marker broke parseability anyway. */
+function boundedJsonPreview(value: unknown, cap: number): string {
+  const out: string[] = []
+  let used = 0
+  let full = false
+
+  const emit = (text: string): void => {
+    if (full) {
+      return
+    }
+
+    if (used + text.length >= cap) {
+      out.push(`${text.slice(0, Math.max(0, cap - used))}…[truncated]`)
+      full = true
+
+      return
+    }
+
+    out.push(text)
+    used += text.length
+  }
+
+  const seen = new Set<object>()
+
+  const walk = (node: unknown, depth: number): void => {
+    if (full) {
+      return
+    }
+
+    if (node === null || node === undefined) {
+      emit('null')
+
+      return
+    }
+
+    if (typeof node === 'string') {
+      // Slice BEFORE stringify so a giant string never gets fully escaped.
+      emit(JSON.stringify(node.length > cap ? node.slice(0, cap) : node))
+
+      return
+    }
+
+    if (typeof node === 'number' || typeof node === 'boolean' || typeof node === 'bigint') {
+      emit(String(node))
+
+      return
+    }
+
+    if (typeof node !== 'object') {
+      emit('null')
+
+      return
+    }
+
+    if (seen.has(node) || depth >= PREVIEW_MAX_DEPTH) {
+      emit(Array.isArray(node) ? '[…]' : '{…}')
+
+      return
+    }
+
+    seen.add(node)
+
+    if (Array.isArray(node)) {
+      emit('[')
+
+      for (let index = 0; index < node.length && !full; index += 1) {
+        if (index > 0) {
+          emit(',')
+        }
+
+        walk(node[index], depth + 1)
+      }
+
+      emit(']')
+
+      return
+    }
+
+    emit('{')
+
+    let first = true
+
+    // `for…in` walks keys lazily — `Object.keys` would allocate the full key
+    // array of a huge object even when the budget stops us after a few.
+    for (const key in node) {
+      if (full) {
+        break
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(node, key)) {
+        continue
+      }
+
+      if (!first) {
+        emit(',')
+      }
+
+      first = false
+      emit(`${JSON.stringify(key)}:`)
+      walk((node as Record<string, unknown>)[key], depth + 1)
+    }
+
+    emit('}')
+  }
+
+  try {
+    walk(value, 0)
+  } catch {
+    // A throwing getter mid-walk: keep whatever was emitted so far.
+  }
+
+  return out.join('')
+}
+
 function previewOf(value: unknown, cap: number): null | string {
   if (value === undefined || value === null) {
     return null
@@ -118,11 +245,7 @@ function previewOf(value: unknown, cap: number): null | string {
     return truncated(value, cap)
   }
 
-  try {
-    return truncated(JSON.stringify(value), cap)
-  } catch {
-    return null
-  }
+  return boundedJsonPreview(value, cap)
 }
 
 /** Project one part into its bounded journal form, or null to drop it.
@@ -627,6 +750,19 @@ function ensureBooted(): void {
 
   try {
     journalDisabled = store.getItem(KILL_SWITCH_KEY) === '1'
+  } catch {
+    // Unreadable kill switch: treat as enabled.
+  }
+
+  if (journalDisabled) {
+    // A/B isolation: when disabled, the journal subsystem does NOTHING —
+    // no migration (the legacy blob stays put for the revert case), no
+    // sweep, no writes. The kill-switch read above is the only storage
+    // access the whole subsystem performs.
+    return
+  }
+
+  try {
     migrateLegacyStore(store)
     sweepJournalKeys(store)
   } catch {
@@ -639,6 +775,11 @@ function ensureBooted(): void {
 const persistTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const persistLatest = new Map<string, JournalableSessionState>()
 const quotaWarned = new Set<string>()
+const oversizeWarned = new Set<string>()
+/** Distinct sessions this renderer has journaled since boot — when a NEW one
+ *  pushes the count past the global cap, the sweep runs once more so a
+ *  long-lived renderer cannot accumulate unbounded keys between reloads. */
+const sessionsWrittenSinceBoot = new Set<string>()
 
 /** Test hook: re-run boot (kill switch, migration, sweep) on next use and
  *  drop all pending timers/state. */
@@ -653,6 +794,8 @@ export function resetInFlightTurnJournalForTests(): void {
   persistTimers.clear()
   persistLatest.clear()
   quotaWarned.clear()
+  oversizeWarned.clear()
+  sessionsWrittenSinceBoot.clear()
 }
 
 function isQuotaError(error: unknown): boolean {
@@ -702,12 +845,45 @@ function writeSnapshot(storedSessionId: string, state: JournalableSessionState):
     // Structural reduction, never byte-slicing the JSON: re-project with the
     // tight caps (drops reasoning and tool previews, shrinks assistant text).
     serialized = JSON.stringify({ ...entry, messages: projectTail(tail, true) })
+
+    if (serialized.length > ENTRY_HARD_CEILING) {
+      // Still enormous after the tight pass — only an un-truncatable user
+      // prompt can do this. Skip the write outright: recovery for a
+      // pathological prompt is worth less than a multi-MB setItem per tick.
+      if (!oversizeWarned.has(storedSessionId)) {
+        oversizeWarned.add(storedSessionId)
+        console.warn(
+          `[hermes] in-flight turn journal entry exceeds the hard size ceiling for session ${storedSessionId}; ` +
+            'skipping journal writes for this turn (crash recovery degraded).'
+        )
+      }
+
+      recordJournalWrite({
+        busySessions,
+        bytes: serialized.length,
+        durationMs: performance.now() - started,
+        outcome: 'oversize'
+      })
+
+      return
+    }
   }
 
   let outcome: 'error' | 'ok' | 'quota' = 'ok'
 
   try {
     store.setItem(sessionKey(storedSessionId), serialized)
+
+    // Runtime enforcement of the global entry cap: only when a NEW session
+    // key appears while over the cap (rare, and each surviving entry is
+    // budget-bounded), so the hot path stays a single setItem.
+    if (!sessionsWrittenSinceBoot.has(storedSessionId)) {
+      sessionsWrittenSinceBoot.add(storedSessionId)
+
+      if (sessionsWrittenSinceBoot.size > MAX_ENTRIES) {
+        sweepJournalKeys(store)
+      }
+    }
   } catch (error) {
     outcome = isQuotaError(error) ? 'quota' : 'error'
 
@@ -785,7 +961,17 @@ export function readInFlightTurnJournal(storedSessionId: null | string): InFligh
   }
 
   const key = sessionKey(storedSessionId)
-  const entry = parseStoredEntry(store.getItem(key))
+  let raw: null | string = null
+
+  try {
+    raw = store.getItem(key)
+  } catch {
+    // A Web Storage read failure degrades to "no journal" — recovery is
+    // optional and must never break session resume.
+    return null
+  }
+
+  const entry = parseStoredEntry(raw)
 
   if (!entry) {
     return null

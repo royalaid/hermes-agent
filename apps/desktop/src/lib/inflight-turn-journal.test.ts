@@ -533,3 +533,164 @@ describe('mid-turn redirect corrections', () => {
     expect(journaled.map(message => message.id)).toEqual(['user-1', 'assistant-stream-1'])
   })
 })
+
+describe('external review hardening', () => {
+  it('previews object-valued tool results without traversing the full structure', () => {
+    let elementReads = 0
+    const bigArray = Array.from({ length: 200_000 }, (_, index) => `row-${index}-${'z'.repeat(24)}`)
+
+    const counted = new Proxy(bigArray, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+          elementReads += 1
+        }
+
+        return Reflect.get(target, prop, receiver)
+      }
+    })
+
+    persistInFlightTurnState(
+      journalState({
+        messages: [
+          user('u1', 'run it'),
+          {
+            id: 'assistant-stream-1',
+            role: 'assistant',
+            pending: true,
+            parts: [
+              {
+                type: 'tool-call',
+                toolCallId: 'tc-obj',
+                toolName: 'terminal',
+                args: {},
+                result: counted as unknown as string
+              },
+              { type: 'text', text: 'reading' }
+            ]
+          }
+        ]
+      })
+    )
+    vi.advanceTimersByTime(400)
+
+    const raw = window.localStorage.getItem(sessionKey('stored-1'))!
+    expect(raw.length).toBeLessThan(256 * 1024)
+    // The 2KB preview budget stops the walk after ~70 rows of ~30 chars; a
+    // full JSON.stringify of the object would have read all 200k elements.
+    expect(elementReads).toBeLessThan(1000)
+
+    const entry = readInFlightTurnJournal('stored-1')!
+    const tool = entry.messages.at(-1)!.parts[0] as { result?: string; toolCallId: string }
+    expect(tool.toolCallId).toBe('tc-obj')
+    expect((tool.result ?? '').length).toBeLessThanOrEqual(2 * 1024 + 20)
+  })
+
+  it('skips the write entirely when even the tight projection exceeds the hard ceiling', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    // Only an un-truncatable user prompt can defeat the tight caps.
+    const enormousPrompt = 'w'.repeat(600 * 1024)
+
+    try {
+      persistInFlightTurnState(
+        journalState({
+          messages: [user('u1', enormousPrompt), assistant('assistant-stream-1', 'ok', { pending: true })]
+        })
+      )
+      vi.advanceTimersByTime(400)
+
+      expect(window.localStorage.getItem(sessionKey('stored-1'))).toBeNull()
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(String(warn.mock.calls[0][0])).toContain('hard size ceiling')
+
+      // Once per session, not once per tick.
+      persistInFlightTurnState(
+        journalState({
+          messages: [user('u1', enormousPrompt), assistant('assistant-stream-1', 'ok then', { pending: true })]
+        })
+      )
+      vi.advanceTimersByTime(400)
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('degrades to no journal when a storage read fails during recovery', () => {
+    persistInFlightTurnState(journalState())
+    vi.advanceTimersByTime(400)
+    expect(readInFlightTurnJournal('stored-1')).not.toBeNull()
+
+    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new DOMException('denied', 'SecurityError')
+    })
+
+    try {
+      expect(() => readInFlightTurnJournal('stored-1')).not.toThrow()
+      expect(readInFlightTurnJournal('stored-1')).toBeNull()
+
+      const recovered = recoverInFlightTurnJournal('stored-1', [user('db-u1', 'do the thing')])
+      expect(recovered.applied).toBe(false)
+      expect(recovered.messages).toHaveLength(1)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('enforces the global entry cap at runtime, not only at boot', () => {
+    for (let index = 0; index < 25; index += 1) {
+      persistInFlightTurnState(journalState({ storedSessionId: `stored-cap-${index}` }))
+      // Each write lands at a distinct Date.now() so eviction order is stable.
+      vi.advanceTimersByTime(401)
+    }
+
+    const journalKeys = Object.keys(window.localStorage).filter(key => key.startsWith(KEY_PREFIX))
+    expect(journalKeys).toHaveLength(24)
+    // The oldest write was evicted by the sweep the 25th session triggered.
+    expect(window.localStorage.getItem(sessionKey('stored-cap-0'))).toBeNull()
+    expect(window.localStorage.getItem(sessionKey('stored-cap-24'))).not.toBeNull()
+
+    for (let index = 0; index < 25; index += 1) {
+      clearInFlightTurnJournal(`stored-cap-${index}`)
+    }
+  })
+
+  it('does nothing at boot when the kill switch is set — no migration, no sweep', () => {
+    const legacyBlob = JSON.stringify({
+      version: 1,
+      entries: {
+        'stored-legacy': {
+          messages: [user('u1', 'legacy'), assistant('a1', 'legacy partial')],
+          streamId: null,
+          turnStartedAt: 1,
+          updatedAt: Date.now()
+        }
+      }
+    })
+
+    window.localStorage.setItem(LEGACY_KEY, legacyBlob)
+    window.localStorage.setItem(KILL_SWITCH_KEY, '1')
+    resetInFlightTurnJournalForTests()
+
+    const getItem = vi.spyOn(Storage.prototype, 'getItem')
+    const setItem = vi.spyOn(Storage.prototype, 'setItem')
+    const removeItem = vi.spyOn(Storage.prototype, 'removeItem')
+
+    try {
+      persistInFlightTurnState(journalState())
+      vi.advanceTimersByTime(1000)
+
+      // The kill-switch probe is the subsystem's ONLY storage access.
+      expect(getItem).toHaveBeenCalledTimes(1)
+      expect(getItem).toHaveBeenCalledWith(KILL_SWITCH_KEY)
+      expect(setItem).not.toHaveBeenCalled()
+      expect(removeItem).not.toHaveBeenCalled()
+    } finally {
+      getItem.mockRestore()
+      setItem.mockRestore()
+      removeItem.mockRestore()
+    }
+
+    // The legacy blob is untouched, preserved for the revert case.
+    expect(window.localStorage.getItem(LEGACY_KEY)).toBe(legacyBlob)
+  })
+})
