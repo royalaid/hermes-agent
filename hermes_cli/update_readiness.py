@@ -211,7 +211,13 @@ def _assert_safe_git_configuration(
 def _resolve_update_target(
     git_cmd: list[str], cwd: Path, branch: str, *, env: dict[str, str] | None = None
 ) -> _UpdateTarget:
-    """Resolve the upstream updater's fixed origin branch contract."""
+    """Resolve a safe, explicit ref for the selected update branch.
+
+    ``main`` retains the upstream updater's fixed-origin contract.  Other
+    branches may belong to a separately configured fork remote; honoring that
+    tracking remote keeps a canonical fork-integration install on the branch
+    it was explicitly configured to follow.
+    """
     command_env = _sanitized_git_env() if env is None else env
     check = subprocess.run(
         git_cmd + ["check-ref-format", "--branch", branch],
@@ -225,6 +231,21 @@ def _resolve_update_target(
     if check.returncode != 0:
         raise ValueError(f"invalid update branch: {branch}")
     remote = "origin"
+    if branch != "main":
+        branch_remote = subprocess.run(
+            git_cmd + ["config", "--get", f"branch.{branch}.remote"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=command_env,
+        )
+        if branch_remote.returncode == 0:
+            configured_remote = branch_remote.stdout.strip()
+            if not _is_safe_remote_name(configured_remote):
+                raise ValueError(f"invalid update remote: {configured_remote}")
+            remote = configured_remote
     tracking_ref = f"refs/remotes/{remote}/{branch}"
     remote_probe = subprocess.run(
         git_cmd + ["remote", "get-url", "--", remote],

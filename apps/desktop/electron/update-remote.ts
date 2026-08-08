@@ -62,4 +62,34 @@ function isOfficialSshRemote(url) {
   return isSshRemote(url) && canonicalGitHubRemote(url) === OFFICIAL_REPO_CANONICAL
 }
 
-export { canonicalGitHubRemote, isOfficialSshRemote, isSshRemote, OFFICIAL_REPO_CANONICAL, OFFICIAL_REPO_HTTPS_URL }
+/**
+ * Pick the remote that owns the branch being updated.
+ *
+ * Fork checkouts may intentionally keep the official repository as `origin`
+ * while tracking their integration branch from a second remote such as
+ * `fork`. The branch remote is authoritative when it is available; the
+ * official SSH URL remains the anonymous passive-check path.
+ */
+function resolveUpdateRemote({ branchRemote, branchRemoteUrl, originUrl }) {
+  const configuredRemote = String(branchRemote || '').trim()
+  const configuredUrl = String(branchRemoteUrl || '').trim()
+
+  if (configuredRemote && configuredRemote !== '.' && configuredUrl) {
+    return { name: configuredRemote, url: configuredUrl }
+  }
+
+  if (isOfficialSshRemote(originUrl)) {
+    return { name: OFFICIAL_REPO_HTTPS_URL, url: OFFICIAL_REPO_HTTPS_URL }
+  }
+
+  return { name: 'origin', url: String(originUrl || '').trim() }
+}
+
+export {
+  canonicalGitHubRemote,
+  isOfficialSshRemote,
+  isSshRemote,
+  OFFICIAL_REPO_CANONICAL,
+  OFFICIAL_REPO_HTTPS_URL,
+  resolveUpdateRemote
+}
