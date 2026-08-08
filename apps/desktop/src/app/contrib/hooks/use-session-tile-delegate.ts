@@ -193,18 +193,20 @@ export function useSessionTileDelegate({
             ? { connectionId: owner.connectionId, profile: owner.targetProfile || owner.profile }
             : owner
 
-        const [prefetch, resumed] = await Promise.all([
-          getLatestSessionMessages(storedSessionId, restScope).catch(() => null),
-          singleFlightSessionResume(storedSessionId, () =>
-            requestForSessionProfile<SessionResumeResponse>(owner, requestGateway, 'session.resume', {
-              session_id: storedSessionId,
-              cols: 96,
-              omit_messages: true,
-              ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
-            })
-          )
-        ])
-
+        // Bind the runtime before reading the transcript. Both operations
+        // resolve compression lineage server-side; running them concurrently
+        // can observe different lineage tips when a session is re-homed. More
+        // importantly, a failed transcript read must not be hidden behind an
+        // `omit_messages` resume, or the tile gets a live runtime with an
+        // empty history and no retryable error state.
+        const resumed = await singleFlightSessionResume(storedSessionId, () =>
+          requestForSessionProfile<SessionResumeResponse>(owner, requestGateway, 'session.resume', {
+            session_id: storedSessionId,
+            cols: 96,
+            omit_messages: true,
+            ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
+          })
+        )
         const runtimeId = resumed?.session_id
 
         if (!runtimeId) {
@@ -212,6 +214,7 @@ export function useSessionTileDelegate({
         }
 
         const info = resumed?.info
+        const prefetch = await getLatestSessionMessages(storedSessionId, restScope)
 
         updateSessionState(
           runtimeId,
@@ -224,8 +227,7 @@ export function useSessionTileDelegate({
             ...(typeof info?.provider === 'string' ? { provider: info.provider } : {}),
             ...(typeof info?.reasoning_effort === 'string' ? { reasoningEffort: info.reasoning_effort } : {}),
             ...(typeof info?.fast === 'boolean' ? { fast: info.fast } : {}),
-            messages:
-              state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
+            messages: state.messages.length > 0 ? state.messages : toChatMessages(prefetch.messages)
           }),
           storedSessionId
         )
