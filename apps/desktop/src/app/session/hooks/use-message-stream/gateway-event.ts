@@ -1086,7 +1086,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           notifyWorkspaceChanged(toolChangedPath(payload))
         }
       } else if (SUBAGENT_EVENT_TYPES.has(event.type)) {
-        if (sessionId && payload && !sessionInterrupted(sessionId)) {
+        // A parent stop may race with a child unwinding. Keep live progress out
+        // of a stopped turn, but accept its terminal frame so a dead child does
+        // not remain a non-prunable running card across tabs or later turns.
+        const isTerminalSubagentEvent = event.type === 'subagent.complete'
+        if (sessionId && payload && (isTerminalSubagentEvent || !sessionInterrupted(sessionId))) {
           if (!nativeSubagentSessionsRef.current.has(sessionId)) {
             pruneDelegateFallbackSubagents(sessionId)
           }

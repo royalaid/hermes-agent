@@ -123,6 +123,32 @@ def test_live_child_session_gets_native_stream(server, emits):
     assert server._child_mirrors == {}
 
 
+def test_live_child_session_mirrors_a_terminal_failure_as_an_error(server, emits):
+    """A watch window must not render a dead child as a normal completed turn."""
+    server._sessions["live-1"] = {"session_key": "child-1", "agent": None}
+
+    _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
+    _relay(
+        server,
+        "subagent.complete",
+        child_session_id="child-1",
+        status="timeout",
+        summary="Operation interrupted: waiting for model response.",
+    )
+
+    child = [(event, payload) for event, sid, payload in emits if sid == "live-1"]
+
+    assert child[-1] == (
+        "message.complete",
+        {
+            "error": "Operation interrupted: waiting for model response.",
+            "status": "error",
+            "text": "Operation interrupted: waiting for model response.",
+        },
+    )
+    assert "child-1" not in server._active_child_runs
+
+
 def test_window_closed_midrun_drops_state_then_fresh_turn_on_reopen(server, emits):
     server._sessions["live-1"] = {"session_key": "child-1", "agent": None}
     _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
