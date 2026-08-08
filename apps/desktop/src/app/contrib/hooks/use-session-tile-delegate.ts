@@ -241,10 +241,8 @@ export function useSessionTileDelegate({
             ? { connectionId: owner.connectionId, profile: owner.targetProfile || owner.profile }
             : owner
 
-        const prefetchPromise = getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
-
         if (existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
-          const prefetch = await prefetchPromise
+          const prefetch = await getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
           const merged = mergeTileTranscript(cached.messages, prefetch?.messages)
 
           if (!chatMessageArraysEquivalent(cached.messages, merged)) {
@@ -276,7 +274,9 @@ export function useSessionTileDelegate({
             )
           },
           async () => {
-            const stored = (await prefetchPromise) ?? (await fetchStoredTranscriptAcrossBackends(storedSessionId))
+            const stored =
+              (await getLatestSessionMessages(storedSessionId, restScope).catch(() => null)) ??
+              (await fetchStoredTranscriptAcrossBackends(storedSessionId))
 
             if (!stored) {
               throw new Error('stored transcript unavailable on every reachable backend')
@@ -285,8 +285,6 @@ export function useSessionTileDelegate({
             return stored
           }
         )
-
-        const prefetch = await prefetchPromise
 
         if (outcome.mode === 'read-only') {
           const readOnlyId = readOnlyRuntimeIdFor(storedSessionId)
@@ -312,7 +310,6 @@ export function useSessionTileDelegate({
         }
 
         const resumed = outcome.resumed
-
         const runtimeId = resumed?.session_id
 
         if (!runtimeId) {
@@ -320,6 +317,7 @@ export function useSessionTileDelegate({
         }
 
         const info = resumed?.info
+        const prefetch = await getLatestSessionMessages(storedSessionId, restScope)
 
         updateSessionState(
           runtimeId,
@@ -332,8 +330,7 @@ export function useSessionTileDelegate({
             ...(typeof info?.provider === 'string' ? { provider: info.provider } : {}),
             ...(typeof info?.reasoning_effort === 'string' ? { reasoningEffort: info.reasoning_effort } : {}),
             ...(typeof info?.fast === 'boolean' ? { fast: info.fast } : {}),
-            messages:
-              state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
+            messages: state.messages.length > 0 ? state.messages : toChatMessages(prefetch.messages)
           }),
           storedSessionId
         )
