@@ -328,7 +328,7 @@ import {
   type UpdatePreflightOutcome,
   type UpdatePreflightPurpose
 } from './update-preflight'
-import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
+import { isOfficialSshRemote, resolveUpdateRemote } from './update-remote'
 import {
   observeUpdaterHandoff,
   captureSpawnedUpdaterCreatedAt,
@@ -2904,6 +2904,23 @@ async function getOriginUrl(updateRoot) {
   return origin.code === 0 ? origin.stdout.trim() : ''
 }
 
+async function getUpdateRemote(updateRoot, branch) {
+  const configured = await runGit(['config', '--get', `branch.${branch}.remote`], { cwd: updateRoot })
+  const branchRemote = firstLine(configured.stdout)
+  let branchRemoteUrl = ''
+
+  if (branchRemote && branchRemote !== '.') {
+    const remoteUrl = await runGit(['remote', 'get-url', branchRemote], { cwd: updateRoot })
+    branchRemoteUrl = firstLine(remoteUrl.stdout)
+  }
+
+  return resolveUpdateRemote({
+    branchRemote,
+    branchRemoteUrl,
+    originUrl: await getOriginUrl(updateRoot)
+  })
+}
+
 function emitUpdateProgress(payload) {
   const merged = { stage: 'idle', message: '', percent: null, error: null, ...payload, at: Date.now() }
   rememberLog(`[updates] ${merged.stage}: ${merged.message || merged.error || ''}`)
@@ -2924,15 +2941,14 @@ async function resolveHealedBranch(updateRoot, branch) {
     return branch || 'main'
   }
 
-  const originUrl = await getOriginUrl(updateRoot)
-  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
-  const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
+  const remote = await getUpdateRemote(updateRoot, branch)
+  const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote.name, branch], { cwd: updateRoot })
 
   if (probe.code !== 2) {
     return branch
   }
 
-  rememberLog(`[updates] origin/${branch} is gone (merged?); falling back to main`)
+  rememberLog(`[updates] ${remote.name}/${branch} is gone (merged?); falling back to main`)
   const config = readDesktopUpdateConfig()
 
   if (config.branch !== 'main') {
@@ -2955,10 +2971,9 @@ async function resolveDesktopUpdateBranch(updateRoot) {
 
   const current = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
   const currentBranch = firstLine(current.stdout)
-  const originUrl = await getOriginUrl(updateRoot)
-  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
+  const remote = await getUpdateRemote(updateRoot, currentBranch)
   const published = currentBranch && currentBranch !== 'HEAD'
-    ? await runGit(['ls-remote', '--exit-code', '--heads', remote, currentBranch], { cwd: updateRoot })
+    ? await runGit(['ls-remote', '--exit-code', '--heads', remote.name, currentBranch], { cwd: updateRoot })
     : null
 
   return resolveDefaultUpdateBranch({
@@ -2984,14 +2999,14 @@ async function checkUpdates() {
   }
 
   branch = await resolveHealedBranch(updateRoot, branch)
-  const originUrl = await getOriginUrl(updateRoot)
+  const remote = await getUpdateRemote(updateRoot, branch)
 
-  if (isOfficialSshRemote(originUrl)) {
+  if (isOfficialSshRemote(remote.url)) {
     const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
     const [currentSha, target, dirtyStr, currentBranch] = await Promise.all([
       git(['rev-parse', 'HEAD']),
-      runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${branch}`], { cwd: updateRoot }),
+      runGit(['ls-remote', remote.name, `refs/heads/${branch}`], { cwd: updateRoot }),
       git(['status', '--porcelain']),
       git(['rev-parse', '--abbrev-ref', 'HEAD'])
     ])
@@ -3045,7 +3060,7 @@ async function checkUpdates() {
   // check reports 'fetch-failed' forever — git never removes these itself.
   await clearStaleGitLocks(updateRoot)
 
-  const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+  const fetched = await runGit(['fetch', '--quiet', remote.name, branch], { cwd: updateRoot })
 
   if (fetched.code !== 0) {
     return {
@@ -3059,10 +3074,11 @@ async function checkUpdates() {
   }
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+  const remoteBranch = `${remote.name}/${branch}`
 
   const [currentSha, targetSha, dirtyStr, currentBranch, shallowStr] = await Promise.all([
     git(['rev-parse', 'HEAD']),
-    git(['rev-parse', `origin/${branch}`]),
+    git(['rev-parse', remoteBranch]),
     git(['status', '--porcelain']),
     git(['rev-parse', '--abbrev-ref', 'HEAD']),
     git(['rev-parse', '--is-shallow-repository'])
@@ -3072,14 +3088,16 @@ async function checkUpdates() {
 
   // A shallow graph cannot provide a trustworthy exact count, even when it has
   // a visible merge-base. Skip the ancestry walk and use the SHA fallback.
-  const countStr = shouldCountCommits({ isShallow }) ? await git(['rev-list', `HEAD..origin/${branch}`, '--count']) : ''
+  const countStr = shouldCountCommits({ isShallow })
+    ? await git(['rev-list', `HEAD..${remoteBranch}`, '--count'])
+    : ''
 
   // A positive directional ancestry result remains trustworthy in a shallow
   // graph and prevents a local commit on top of origin from looking outdated.
   const targetIsAncestorOfHead =
     isShallow &&
     currentSha !== targetSha &&
-    (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+    (await runGit(['merge-base', '--is-ancestor', remoteBranch, 'HEAD'], { cwd: updateRoot })).code === 0
 
   let behind = resolveBehindCount({
     countStr,
@@ -3094,14 +3112,14 @@ async function checkUpdates() {
   // offline, rate-limited, or non-GitHub origins keep the honest null
   // ("update available", no fabricated number).
   if (behind === null) {
-    behind = await fetchCompareBehindCount({ currentSha, originUrl, targetSha })
+    behind = await fetchCompareBehindCount({ currentSha, originUrl: remote.url, targetSha })
   }
 
   // behind === null means "update available, exact count unknown" (shallow
   // clone): still list what origin offers — resolveCommitLogSelection keeps
   // the shallow log to the fetched tip so the range walk can't enumerate the
   // contaminated ancestry — so "See what's new" stays useful and honest.
-  const commits = behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow) : []
+  const commits = behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow, remote.name) : []
 
   return {
     supported: true,
@@ -3172,10 +3190,10 @@ async function fetchCompareBehindCount({ currentSha, originUrl, targetSha }) {
   }
 }
 
-async function readCommitLog(cwd, branch, isShallow) {
+async function readCommitLog(cwd, branch, isShallow, remote = 'origin') {
   const SEP = '\x1f'
   const REC = '\x1e'
-  const { limit, revision } = resolveCommitLogSelection({ branch, isShallow })
+  const { limit, revision } = resolveCommitLogSelection({ branch, isShallow, remote })
 
   const { stdout } = await runGit(
     ['log', revision, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', String(limit)],

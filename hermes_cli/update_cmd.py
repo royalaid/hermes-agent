@@ -2971,7 +2971,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         except ValueError as exc:
             print(f"✗ {exc}")
             sys.exit(1)
-        print("→ Fetching from origin...")
+        print(f"→ Fetching from {target.remote}...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch"] + depth_args + ["--", target.remote, target.refspec],
             cwd=_m().PROJECT_ROOT,
@@ -5800,8 +5800,13 @@ def _cmd_update_impl(
     # the stash/branch logic rather than autostashing the entire tree.
     _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
-    # The apply path retains the upstream updater's fixed origin policy.
-    update_remote_url = _get_origin_url(git_cmd, _m().PROJECT_ROOT)
+    # The selected target is an explicit, validated ref.  For a non-main
+    # integration branch its configured remote, not origin, owns the update.
+    update_remote_url = (
+        _get_remote_url(git_cmd, _m().PROJECT_ROOT, update_target.remote)
+        if update_target is not None
+        else _get_origin_url(git_cmd, _m().PROJECT_ROOT)
+    )
     is_fork = _is_fork(update_remote_url)
 
     if is_fork:
