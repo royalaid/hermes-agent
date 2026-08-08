@@ -9,6 +9,7 @@
 #
 # Or download and run with options:
 #   .\install.ps1 -NoVenv -SkipSetup
+#   .\install.ps1 -RepoUrl https://github.com/royalaid/hermes-agent.git -Branch fork-integration
 #
 # ============================================================================
 
@@ -17,6 +18,9 @@ param(
     [switch]$SkipSetup,
     [switch]$SkipComputerUse,
     [string]$Branch = "main",
+    # Override the repository for fork/integration installs. The selected URL
+    # becomes origin so later Hermes/Desktop updates stay on the same fork.
+    [string]$RepoUrl = "",
     # -Commit and -Tag are higher-precedence variants of -Branch for users
     # who need reproducible installs (desktop installer pinning, CI, release
     # bundles).  When set, the repository stage clones $Branch (faster than
@@ -385,6 +389,10 @@ $script:ResolvedPathReport = @{
 
 $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
+if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) {
+    $RepoUrlSsh = $RepoUrl.Trim()
+    $RepoUrlHttps = $RepoUrl.Trim()
+}
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -2169,6 +2177,11 @@ function Install-Repository {
                 # users hit on update. Pin autocrlf=false so the dirt is never
                 # created in the first place.
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
+                if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) {
+                    Write-Info "Using repository override: $RepoUrlHttps"
+                    git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
+                    if ($LASTEXITCODE -ne 0) { throw "Could not set origin to $RepoUrlHttps" }
+                }
                 Discard-LockfileChurn $InstallDir
                 # Preserve any real local changes before the checkout instead of
                 # discarding them with `reset --hard HEAD`. The old hard reset
@@ -2383,6 +2396,9 @@ function Install-Repository {
         # Fallback: download ZIP archive (bypasses git file I/O issues entirely)
         if (-not $cloneSuccess) {
             if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
+            if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) {
+                throw "ZIP fallback is unavailable with -RepoUrl. Fix git access to the custom repository and retry."
+            }
             Write-Warn "Git clone failed -- downloading ZIP archive instead..."
             try {
                 # Pick the ZIP URL for the most-specific ref the caller asked
