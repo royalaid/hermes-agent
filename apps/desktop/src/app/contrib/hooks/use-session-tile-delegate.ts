@@ -109,29 +109,32 @@ export function useSessionTileDelegate({
         // the same cross-profile bleed the recovery resumes had (#67603).
         const profile = await resolveSessionProfile(storedSessionId)
 
-        const [prefetch, resumed] = await Promise.all([
-          getLatestSessionMessages(storedSessionId, profile).catch(() => null),
-          requestGateway<SessionResumeResponse>('session.resume', {
-            session_id: storedSessionId,
-            cols: 96,
-            omit_messages: true,
-            ...(profile ? { profile } : {})
-          })
-        ])
-
+        // Bind the runtime before reading the transcript. Both operations
+        // resolve compression lineage server-side; running them concurrently
+        // can observe different lineage tips when a session is re-homed. More
+        // importantly, a failed transcript read must not be hidden behind an
+        // `omit_messages` resume, or the tile gets a live runtime with an
+        // empty history and no retryable error state.
+        const resumed = await requestGateway<SessionResumeResponse>('session.resume', {
+          session_id: storedSessionId,
+          cols: 96,
+          omit_messages: true,
+          ...(profile ? { profile } : {})
+        })
         const runtimeId = resumed?.session_id
 
         if (!runtimeId) {
           throw new Error('resume returned no session id')
         }
 
+        const prefetch = await getLatestSessionMessages(storedSessionId, profile)
+
         updateSessionState(
           runtimeId,
           state => ({
             ...state,
             busy: Boolean(resumed?.info?.running),
-            messages:
-              state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
+            messages: state.messages.length > 0 ? state.messages : toChatMessages(prefetch.messages)
           }),
           storedSessionId
         )
