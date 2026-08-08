@@ -62,4 +62,42 @@ function isOfficialSshRemote(url) {
   return isSshRemote(url) && canonicalGitHubRemote(url) === OFFICIAL_REPO_CANONICAL
 }
 
-export { canonicalGitHubRemote, isOfficialSshRemote, isSshRemote, OFFICIAL_REPO_CANONICAL, OFFICIAL_REPO_HTTPS_URL }
+/**
+ * Pick the remote that owns the branch being updated.
+ *
+ * Fork checkouts may intentionally keep the official repository as `origin`
+ * while tracking their integration branch from a second remote such as
+ * `fork`. A configured branch remote is authoritative even when broken; the
+ * official SSH URL remains the anonymous passive-check path.
+ */
+function resolveUpdateRemote({ branchRemote, branchRemoteUrl, originUrl }) {
+  const configuredRemote = String(branchRemote || '').trim()
+  const configuredUrl = String(branchRemoteUrl || '').trim()
+
+  if (configuredRemote && configuredRemote !== '.') {
+    if (isOfficialSshRemote(configuredUrl)) {
+      return { name: OFFICIAL_REPO_HTTPS_URL, url: OFFICIAL_REPO_HTTPS_URL }
+    }
+
+    // The branch's configured remote remains authoritative even when its URL
+    // cannot be read. Callers must probe/fetch that name and fail closed,
+    // rather than silently checking origin and potentially applying another
+    // repository's same-named branch.
+    return { name: configuredRemote, url: configuredUrl }
+  }
+
+  if (isOfficialSshRemote(originUrl)) {
+    return { name: OFFICIAL_REPO_HTTPS_URL, url: OFFICIAL_REPO_HTTPS_URL }
+  }
+
+  return { name: 'origin', url: String(originUrl || '').trim() }
+}
+
+export {
+  canonicalGitHubRemote,
+  isOfficialSshRemote,
+  isSshRemote,
+  OFFICIAL_REPO_CANONICAL,
+  OFFICIAL_REPO_HTTPS_URL,
+  resolveUpdateRemote
+}

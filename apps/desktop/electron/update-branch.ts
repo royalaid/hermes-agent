@@ -8,6 +8,10 @@
  */
 export type PublicationState = 'present' | 'missing' | 'unknown'
 
+export function branchPublicationProbeArgs(remote: string, branch: string): string[] {
+  return ['ls-remote', '--exit-code', '--heads', remote, `refs/heads/${branch}`]
+}
+
 export function publicationStateFromExitCode(code: number | null | undefined): PublicationState {
   if (code === 0) {
     return 'present'

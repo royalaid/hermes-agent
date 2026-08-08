@@ -24,7 +24,8 @@ import {
   isOfficialSshRemote,
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
-  OFFICIAL_REPO_HTTPS_URL
+  OFFICIAL_REPO_HTTPS_URL,
+  resolveUpdateRemote
 } from './update-remote'
 
 test('canonicalGitHubRemote normalizes SSH and HTTPS forms to the same value', () => {
@@ -76,4 +77,61 @@ test('isOfficialSshRemote does NOT match forks, other hosts, or HTTPS', () => {
 test('OFFICIAL_REPO_HTTPS_URL canonicalizes to OFFICIAL_REPO_CANONICAL', () => {
   // Invariant: the URL we substitute in must be the same repo we detect.
   assert.equal(canonicalGitHubRemote(OFFICIAL_REPO_HTTPS_URL), OFFICIAL_REPO_CANONICAL)
+})
+
+test('resolveUpdateRemote follows a configured fork remote for the branch', () => {
+  assert.deepEqual(
+    resolveUpdateRemote({
+      branchRemote: 'fork',
+      branchRemoteUrl: 'https://github.com/royalaid/hermes-agent.git',
+      originUrl: 'https://github.com/NousResearch/hermes-agent.git'
+    }),
+    { name: 'fork', url: 'https://github.com/royalaid/hermes-agent.git' }
+  )
+})
+
+test('resolveUpdateRemote fails closed on a configured remote whose URL is unavailable', () => {
+  assert.deepEqual(
+    resolveUpdateRemote({
+      branchRemote: 'fork',
+      branchRemoteUrl: '',
+      originUrl: 'https://github.com/NousResearch/hermes-agent.git'
+    }),
+    { name: 'fork', url: '' }
+  )
+})
+
+test('resolveUpdateRemote only falls back to origin for an absent or local branch remote', () => {
+  const originUrl = 'https://github.com/royalaid/hermes-agent.git'
+
+  assert.deepEqual(resolveUpdateRemote({ branchRemote: '', branchRemoteUrl: '', originUrl }), {
+    name: 'origin',
+    url: originUrl
+  })
+  assert.deepEqual(resolveUpdateRemote({ branchRemote: '.', branchRemoteUrl: '', originUrl }), {
+    name: 'origin',
+    url: originUrl
+  })
+})
+
+test('resolveUpdateRemote keeps official SSH checks on anonymous HTTPS', () => {
+  assert.deepEqual(
+    resolveUpdateRemote({
+      branchRemote: '',
+      branchRemoteUrl: '',
+      originUrl: 'git@github.com:NousResearch/hermes-agent.git'
+    }),
+    { name: OFFICIAL_REPO_HTTPS_URL, url: OFFICIAL_REPO_HTTPS_URL }
+  )
+})
+
+test('resolveUpdateRemote keeps an authoritative official SSH branch remote on anonymous HTTPS', () => {
+  assert.deepEqual(
+    resolveUpdateRemote({
+      branchRemote: 'upstream',
+      branchRemoteUrl: 'git@github.com:NousResearch/hermes-agent.git',
+      originUrl: 'https://github.com/royalaid/hermes-agent.git'
+    }),
+    { name: OFFICIAL_REPO_HTTPS_URL, url: OFFICIAL_REPO_HTTPS_URL }
+  )
 })

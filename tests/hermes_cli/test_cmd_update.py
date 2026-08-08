@@ -559,6 +559,7 @@ class TestCmdUpdateCheckBranchFlag:
         verify_ok: bool = True,
         commit_count: str = "0",
         upstream_fetch_ok: bool = True,
+        branch_remote: str = "",
     ):
         """Mock side-effect for the _cmd_update_check git pipeline.
 
@@ -573,6 +574,14 @@ class TestCmdUpdateCheckBranchFlag:
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+
+            if "config --get branch." in joined and joined.endswith(".remote"):
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0 if branch_remote else 1,
+                    stdout=f"{branch_remote}\n" if branch_remote else "",
+                    stderr="",
+                )
 
             if "fetch" in joined and "upstream" in joined:
                 rc = 0 if upstream_fetch_ok else 128
@@ -654,7 +663,10 @@ class TestCmdUpdateCheckBranchFlag:
     ):
         """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
         mock_run.side_effect = self._check_side_effect(
-            target_branch="main", verify_ok=True, commit_count="0"
+            target_branch="main",
+            verify_ok=True,
+            commit_count="0",
+            branch_remote="origin",
         )
         args = SimpleNamespace(check=True, branch=None)
 
@@ -666,6 +678,38 @@ class TestCmdUpdateCheckBranchFlag:
         # Compare ref is upstream/main (upstream fetch succeeded).
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
+    def test_check_main_tracking_non_origin_stays_on_that_remote(
+        self, mock_run, _mock_method, capsys
+    ):
+        """An explicit main remote is authoritative for both check and apply."""
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="main",
+            verify_ok=True,
+            commit_count="2",
+            branch_remote="fork",
+        )
+        args = SimpleNamespace(check=True, branch="main")
+
+        cmd_update(args)
+
+        commands = [[str(a) for a in c.args[0]] for c in mock_run.call_args_list]
+        assert any(cmd[-3:] == ["fetch", "fork", "main"] for cmd in commands)
+        assert any(
+            cmd[-4:] == ["rev-parse", "--verify", "--quiet", "fork/main"]
+            for cmd in commands
+        )
+        assert any(
+            cmd[-3:] == ["rev-list", "HEAD..fork/main", "--count"]
+            for cmd in commands
+        )
+        assert not any(
+            "upstream/main" in part or "origin/main" in part
+            for cmd in commands
+            for part in cmd
+        )
 
 
 class TestCmdUpdateZipBranchRefusal:
