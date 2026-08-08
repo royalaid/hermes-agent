@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $subagentsBySession } from '@/store/subagents'
 import { $draftingToolSessions } from '@/store/tool-drafting'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -63,12 +64,14 @@ describe('drafting-tool label lifecycle', () => {
     handleEvent = null
     sessionStates.clear()
     $draftingToolSessions.set({})
+    $subagentsBySession.set({})
   })
 
   afterEach(() => {
     cleanup()
     sessionStates.clear()
     $draftingToolSessions.set({})
+    $subagentsBySession.set({})
     vi.restoreAllMocks()
   })
 
@@ -120,5 +123,15 @@ describe('drafting-tool label lifecycle', () => {
     emit('tool.generating', { name: 'write_file' })
 
     expect(draftedTool()).toBeUndefined()
+  })
+
+  it('still records a subagent terminal event after its parent is interrupted', async () => {
+    await mountStream()
+
+    emit('subagent.start', { goal: 'inspect the failure', status: 'running', subagent_id: 'child-1', task_index: 0 })
+    sessionStates.set(SID, { ...createClientSessionState(), interrupted: true })
+    emit('subagent.complete', { goal: 'inspect the failure', status: 'timeout', subagent_id: 'child-1', task_index: 0 })
+
+    expect($subagentsBySession.get()[SID]?.[0]?.status).toBe('failed')
   })
 })
