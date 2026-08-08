@@ -40,7 +40,7 @@ upstream_repository: NousResearch/hermes-agent
 upstream_main_sha: b9aa9289a8083f2e9d248ad6837b2938f5ee92d7
 fork_main_sha: a8c50eb1d841563eff22bd707d80472e7f1e9c9f
 integration_base_sha: b9aa9289a8083f2e9d248ad6837b2938f5ee92d7
-integration_head_sha: 5463a31d09bf4aa9e2981dd15e7499c42dc26d58
+integration_head_sha: cdc416a765d4f4e40cd7609e889d36541ad631e7
 status: ready_for_publish
 ```
 
@@ -68,6 +68,24 @@ Closed PRs remain in-process for this fork and are not treated as disposable.
 An upstream PR being open or closed does not by itself authorize duplication or
 discarding. Use the PR head SHA, patch identity, and the readiness/exclusion
 record above.
+
+## Integrated local fix record
+
+The following fork-local fix was integrated from a clean worktree based on the
+published `fork-integration` tip:
+
+```yaml
+- component: desktop-session-history-pane
+  source_worktree: C:\Users\gwmai\AppData\Local\hermes\worktrees\fix-session-history-pane
+  source_branch: fix/desktop-session-history-pane
+  source_head_sha: bb1f7e38ee0c9357db7cfaf7e60d576d2347b849
+  integration_sha: cdc416a765d4f4e40cd7609e889d36541ad631e7
+  status: integrated
+  behavior: resume runtime first, then load the authoritative transcript; surface transcript failures for tile retry
+  tests:
+    - "apps/desktop focused Vitest: 4 passed"
+    - "apps/desktop typecheck: passed"
+```
 
 ## Readiness exclusions
 
