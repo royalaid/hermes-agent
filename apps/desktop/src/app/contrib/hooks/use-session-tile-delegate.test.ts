@@ -310,6 +310,64 @@ describe('useSessionTileDelegate resumeTile', () => {
     const runtimeId = await sessionTileDelegate()!.resumeTile('stored-c')
     expect(runtimeId).toBe('runtime-fresh')
   })
+
+  it('loads the authoritative transcript after binding the runtime', async () => {
+    setSessions([row({ id: 'stored-z', profile: 'default' })])
+
+    const order: string[] = []
+    vi.mocked(getLatestSessionMessages).mockImplementation(async () => {
+      order.push('history')
+      return { messages: [{ role: 'user', content: 'hello' }], session_id: 'stored-z' } as never
+    })
+    const requestGateway = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForProfile).mockImplementationOnce(async () => {
+      order.push('resume')
+      return { session_id: 'runtime-3' } as never
+    })
+    const updateSessionState = vi.fn()
+
+    renderHook(() =>
+      useSessionTileDelegate({
+        archiveSession: vi.fn(async () => undefined),
+        branchStoredSession: vi.fn(async () => undefined),
+        executeSlashCommand: vi.fn(async () => undefined) as never,
+        removeSession: vi.fn(async () => undefined),
+        requestGateway: requestGateway as never,
+        runtimeIdByStoredSessionIdRef: { current: new Map() },
+        sessionStateByRuntimeIdRef: { current: new Map() },
+        updateSessionState
+      })
+    )
+
+    await sessionTileDelegate()!.resumeTile('stored-z')
+
+    expect(order).toEqual(['resume', 'history'])
+    expect(updateSessionState).toHaveBeenCalledWith('runtime-3', expect.any(Function), 'stored-z')
+  })
+
+  it('surfaces transcript failures instead of binding an empty tile', async () => {
+    setSessions([row({ id: 'stored-error', profile: 'default' })])
+    vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('history unavailable'))
+    const requestGateway = vi.fn(async () => ({}) as never)
+    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce({ session_id: 'runtime-error' } as never)
+    const updateSessionState = vi.fn()
+
+    renderHook(() =>
+      useSessionTileDelegate({
+        archiveSession: vi.fn(async () => undefined),
+        branchStoredSession: vi.fn(async () => undefined),
+        executeSlashCommand: vi.fn(async () => undefined) as never,
+        removeSession: vi.fn(async () => undefined),
+        requestGateway: requestGateway as never,
+        runtimeIdByStoredSessionIdRef: { current: new Map() },
+        sessionStateByRuntimeIdRef: { current: new Map() },
+        updateSessionState
+      })
+    )
+
+    await expect(sessionTileDelegate()!.resumeTile('stored-error')).rejects.toThrow('history unavailable')
+    expect(updateSessionState).not.toHaveBeenCalled()
+  })
 })
 
 describe('useSessionTileDelegate retireBusyClaim', () => {
