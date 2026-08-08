@@ -72,6 +72,7 @@ RUN_SETUP=true
 SKIP_BROWSER=false
 NO_SKILLS=false
 BRANCH="main"
+REPO_URL_OVERRIDE=""
 INSTALL_COMMIT=""
 FORCE_COMMIT=false
 ENSURE_DEPS=""
@@ -112,6 +113,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --branch|-Branch)
             BRANCH="$2"
+            shift 2
+            ;;
+        --repo-url|-RepoUrl)
+            REPO_URL_OVERRIDE="$2"
             shift 2
             ;;
         --commit|-Commit)
@@ -169,6 +174,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --repo-url URL Repository URL for fork/integration installs"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "                   (ignored when it would roll an existing install back)"
             echo "  --force-commit Apply --commit even if it rolls the install backwards"
@@ -203,6 +209,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [ -n "$REPO_URL_OVERRIDE" ]; then
+    REPO_URL_SSH="$REPO_URL_OVERRIDE"
+    REPO_URL_HTTPS="$REPO_URL_OVERRIDE"
+fi
 
 # ============================================================================
 # Helper functions
@@ -1244,6 +1255,11 @@ clone_repo() {
         if [ -d "$INSTALL_DIR/.git" ]; then
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
+
+            if [ -n "$REPO_URL_OVERRIDE" ]; then
+                log_info "Using repository override: $REPO_URL_HTTPS"
+                git remote set-url origin "$REPO_URL_HTTPS"
+            fi
 
             local autostash_ref=""
             discard_update_lockfile_churn "$INSTALL_DIR"
