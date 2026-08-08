@@ -6125,7 +6125,12 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             if st["open_tool"]:
                 _emit("tool.complete", csid, st["open_tool"])
             summary = str(payload.get("summary") or payload.get("text") or "")
-            _emit("message.complete", csid, {"text": summary})
+            status = str(payload.get("status") or "completed").lower()
+            if status not in {"completed", "success"}:
+                error = summary or str(payload.get("error") or "Subagent stopped without a result.")
+                _emit("message.complete", csid, {"text": summary, "status": "error", "error": error})
+            else:
+                _emit("message.complete", csid, {"text": summary})
             _child_mirrors.pop(child_key, None)
 
 
