@@ -56,16 +56,23 @@ const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : u
 const strList = (v: unknown) => (Array.isArray(v) ? v.filter(isStr) : [])
 
 const asStatus = (v: unknown, terminalEvent = false): SubagentStatus => {
-  if (v === 'completed' || v === 'failed' || v === 'interrupted') {
-    return v
+  if (v === 'completed' || v === 'success') {
+    return 'completed'
   }
 
-  if (v === 'timeout' || v === 'error') {
-    return 'failed'
-  }
-
-  if (v === 'cancelled' || v === 'canceled') {
+  if (v === 'interrupted' || v === 'cancelled' || v === 'canceled') {
     return 'interrupted'
+  }
+
+  if (
+    v === 'failed' ||
+    v === 'error' ||
+    v === 'timeout' ||
+    v === 'timed_out' ||
+    v === 'stalled' ||
+    v === 'disconnected'
+  ) {
+    return 'failed'
   }
 
   // Fail closed on completion: a subagent.complete event is terminal by
