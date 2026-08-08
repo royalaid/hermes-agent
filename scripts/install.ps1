@@ -9,6 +9,7 @@
 #
 # Or download and run with options:
 #   .\install.ps1 -NoVenv -SkipSetup
+#   .\install.ps1 -RepoUrl https://github.com/royalaid/hermes-agent.git -Branch fork-integration
 #
 # ============================================================================
 
@@ -16,6 +17,9 @@ param(
     [switch]$NoVenv,
     [switch]$SkipSetup,
     [string]$Branch = "main",
+    # Override the repository for fork/integration installs. The selected URL
+    # becomes origin so later Hermes/Desktop updates stay on the same fork.
+    [string]$RepoUrl = "",
     # -Commit and -Tag are higher-precedence variants of -Branch for users
     # who need reproducible installs (desktop installer pinning, CI, release
     # bundles).  When set, the repository stage clones $Branch (faster than
@@ -375,6 +379,10 @@ $script:ResolvedPathReport = @{
 
 $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
+if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) {
+    $RepoUrlSsh = $RepoUrl.Trim()
+    $RepoUrlHttps = $RepoUrl.Trim()
+}
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -1839,6 +1847,8 @@ function Install-Repository {
     Write-Info "Installing to $InstallDir..."
 
     $didUpdate = $false
+    $overrideBranchSha = $null
+    $overrideCommitSha = $null
 
     if (Test-Path $InstallDir) {
         # Test-Path "$InstallDir\.git" returns True when .git is a file OR a
@@ -1898,8 +1908,94 @@ function Install-Repository {
                 # show as locally modified even though nobody touched them. A
                 # bare `git checkout` then aborts with "Your local changes would
                 # be overwritten by checkout", which is exactly the failure GUI
-                # users hit on update. Pin autocrlf=false so the dirt is never
-                # created in the first place.
+                # users hit on update. Pin autocrlf=false after the read-only
+                # override preflights below so a refusal leaves config exact.
+                if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) {
+                    # Validate the exact branch directly against the candidate
+                    # URL before changing origin. An unreachable URL, typo, or
+                    # same-named tag must not poison a healthy checkout's
+                    # remote/tracking configuration.
+                    Write-Info "Validating repository override: $RepoUrlHttps"
+                    git -c windows.appendAtomically=false fetch --no-tags $RepoUrlHttps "refs/heads/$Branch"
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Repository override does not provide branch $Branch`: $RepoUrlHttps"
+                    }
+                    $overrideBranchSha = (& git -c windows.appendAtomically=false rev-parse "FETCH_HEAD^{commit}" 2>$null)
+                    if (($LASTEXITCODE -ne 0) -or [string]::IsNullOrWhiteSpace(("$overrideBranchSha").Trim())) {
+                        throw "Could not resolve branch $Branch from repository override"
+                    }
+                    $overrideBranchSha = ("$overrideBranchSha").Trim()
+
+                    # Existing managed checkouts must already have origin.
+                    # Refuse before config/stash/checkout rather than moving
+                    # HEAD and discovering at publication time that remote
+                    # set-url has no target.
+                    $null = (& git -c windows.appendAtomically=false remote get-url origin 2>$null)
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Existing checkout has no origin remote; refusing repository override"
+                    }
+
+                    if ($Commit) {
+                        # The explicit repository is authoritative for pins
+                        # too. Validate in an isolated object database:
+                        # fetching a raw SHA in the existing checkout can
+                        # report success merely because that object already
+                        # exists locally, without the candidate repository
+                        # actually providing it.
+                        Write-Info "Validating commit $Commit from repository override..."
+                        $commitProbeDir = Join-Path ([IO.Path]::GetTempPath()) (
+                            "hermes-commit-probe-" + [Guid]::NewGuid().ToString("N")
+                        )
+                        try {
+                            New-Item -ItemType Directory -Path $commitProbeDir -ErrorAction Stop | Out-Null
+                            git -c windows.appendAtomically=false -C $commitProbeDir init --bare --quiet
+                            if ($LASTEXITCODE -ne 0) {
+                                throw "Could not create isolated commit validation repository"
+                            }
+                            git -c windows.appendAtomically=false -C $commitProbeDir fetch --no-tags $RepoUrlHttps $Commit
+                            if ($LASTEXITCODE -ne 0) {
+                                throw "Repository override does not provide commit $Commit"
+                            }
+                            $overrideCommitSha = (& git -c windows.appendAtomically=false -C $commitProbeDir rev-parse "FETCH_HEAD^{commit}" 2>$null)
+                            if (($LASTEXITCODE -ne 0) -or [string]::IsNullOrWhiteSpace(("$overrideCommitSha").Trim())) {
+                                throw "Could not resolve commit $Commit from repository override"
+                            }
+                            $overrideCommitSha = ("$overrideCommitSha").Trim()
+                            git -c windows.appendAtomically=false fetch --no-tags $commitProbeDir $overrideCommitSha
+                            if ($LASTEXITCODE -ne 0) {
+                                throw "Could not import validated commit $Commit"
+                            }
+                        } finally {
+                            Remove-Item -LiteralPath $commitProbeDir -Recurse -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+
+                    # Ref namespaces cannot contain both a ref and one of its
+                    # path prefixes (for example origin/release and
+                    # origin/release/topic). Detect that read-only before
+                    # checkout so a later update-ref failure cannot leave HEAD
+                    # on override code while origin still points at the prior
+                    # repository.
+                    $overrideTargetRef = "refs/remotes/origin/$Branch"
+                    $originRemoteRefs = @(
+                        git -c windows.appendAtomically=false for-each-ref --format='%(refname)' refs/remotes/origin 2>$null
+                    )
+                    if ($LASTEXITCODE -ne 0) { throw "Could not inspect origin remote-tracking refs" }
+                    foreach ($existingRefValue in $originRemoteRefs) {
+                        $existingRef = ("$existingRefValue").Trim()
+                        if (-not $existingRef -or $existingRef -eq $overrideTargetRef) { continue }
+                        if (
+                            $existingRef.StartsWith("$overrideTargetRef/", [StringComparison]::OrdinalIgnoreCase) `
+                            -or $overrideTargetRef.StartsWith("$existingRef/", [StringComparison]::OrdinalIgnoreCase)
+                        ) {
+                            throw "Remote-tracking ref namespace collision: $existingRef blocks $overrideTargetRef"
+                        }
+                    }
+
+                    # Do not publish the new authority yet. Checkout and pin
+                    # resolution consume the validated SHA directly; origin is
+                    # changed transactionally only after those operations finish.
+                }
                 git -c windows.appendAtomically=false config core.autocrlf false 2>$null
                 Discard-LockfileChurn $InstallDir
                 # Preserve any real local changes before the checkout instead of
@@ -1930,15 +2026,20 @@ function Install-Repository {
                     git -c windows.appendAtomically=false stash push --include-untracked -m "$stashName"
                     if ($LASTEXITCODE -eq 0) { $autostashRef = "stash@{0}" }
                 }
-                git -c windows.appendAtomically=false fetch origin $Branch
-                if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
+                if (-not $overrideBranchSha) {
+                    git -c windows.appendAtomically=false fetch origin $Branch
+                    if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
+                }
                 # Precedence: Commit > Tag > Branch.  Commit and Tag check
                 # out as detached HEAD intentionally -- they're meant to be
                 # reproducible pins, not branches the user pulls into.
                 if ($Commit) {
                     # Make sure we have the commit locally (a tag-less commit
                     # SHA isn't always reachable from any one branch fetch).
-                    git -c windows.appendAtomically=false fetch origin $Commit
+                    $commitTarget = if ($overrideCommitSha) { $overrideCommitSha } else { $Commit }
+                    if (-not $overrideCommitSha) {
+                        git -c windows.appendAtomically=false fetch origin $Commit
+                    }
                     # A commit pin must never move an existing install
                     # BACKWARDS. hermes-setup.exe bakes its build-time commit
                     # into the binary (BUILD_PIN_COMMIT) and passes it as
@@ -1952,9 +2053,9 @@ function Install-Repository {
                     # fresh clone has no such ancestry and pins normally.
                     $skipRollback = $false
                     if (-not $ForceCommit) {
-                        git -c windows.appendAtomically=false merge-base --is-ancestor $Commit HEAD 2>$null
+                        git -c windows.appendAtomically=false merge-base --is-ancestor $commitTarget HEAD 2>$null
                         $isAncestor = ($LASTEXITCODE -eq 0)
-                        $pinnedSha = (& git -c windows.appendAtomically=false rev-parse "$Commit^{commit}" 2>$null)
+                        $pinnedSha = (& git -c windows.appendAtomically=false rev-parse "$commitTarget^{commit}" 2>$null)
                         $headSha = (& git -c windows.appendAtomically=false rev-parse HEAD 2>$null)
                         $skipRollback = $isAncestor -and ($pinnedSha -ne $headSha)
                     }
@@ -1962,25 +2063,54 @@ function Install-Repository {
                         Write-Warn "Ignoring -Commit $Commit`: the checkout is already newer."
                         Write-Warn "Pinning to it would roll this install back. Pass -ForceCommit to override."
                     } else {
-                        git -c windows.appendAtomically=false checkout --detach $Commit
+                        git -c windows.appendAtomically=false checkout --detach $commitTarget
                         if ($LASTEXITCODE -ne 0) { throw "git checkout $Commit failed (exit $LASTEXITCODE)" }
                     }
                 } elseif ($Tag) {
-                    git -c windows.appendAtomically=false fetch origin "refs/tags/${Tag}:refs/tags/${Tag}"
-                    git -c windows.appendAtomically=false checkout --detach "refs/tags/$Tag"
+                    # Resolve the tag from the authoritative source into
+                    # FETCH_HEAD. Updating refs/tags/$Tag directly would let a
+                    # conflicting stale local tag win when fetch is rejected.
+                    $tagSource = if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) { $RepoUrlHttps } else { "origin" }
+                    git -c windows.appendAtomically=false fetch --no-tags $tagSource "refs/tags/$Tag"
+                    if ($LASTEXITCODE -ne 0) { throw "Repository does not provide tag $Tag`: $tagSource" }
+                    $tagSha = (& git -c windows.appendAtomically=false rev-parse "FETCH_HEAD^{commit}" 2>$null)
+                    if (($LASTEXITCODE -ne 0) -or [string]::IsNullOrWhiteSpace(("$tagSha").Trim())) {
+                        throw "Could not resolve tag $Tag from $tagSource"
+                    }
+                    git -c windows.appendAtomically=false checkout --detach ("$tagSha").Trim()
                     if ($LASTEXITCODE -ne 0) { throw "git checkout tag $Tag failed (exit $LASTEXITCODE)" }
                 } else {
-                    git -c windows.appendAtomically=false checkout $Branch
-                    if ($LASTEXITCODE -ne 0) { throw "git checkout $Branch failed (exit $LASTEXITCODE)" }
+                    if ($overrideBranchSha) {
+                        git -c windows.appendAtomically=false show-ref --verify --quiet "refs/heads/$Branch"
+                        $localBranchExists = ($LASTEXITCODE -eq 0)
+                    } else {
+                        $localBranchExists = $true
+                    }
+                    if ($localBranchExists) {
+                        git -c windows.appendAtomically=false checkout $Branch
+                        if ($LASTEXITCODE -ne 0) { throw "git checkout $Branch failed (exit $LASTEXITCODE)" }
+                    } else {
+                        git -c windows.appendAtomically=false checkout -b $Branch $overrideBranchSha
+                        if ($LASTEXITCODE -ne 0) { throw "git checkout -b $Branch failed (exit $LASTEXITCODE)" }
+                    }
                     # Managed installs should follow origin/$Branch exactly. If
                     # the checkout has diverged (or has local-only commits),
                     # ff-only pull cannot succeed -- mirror ``hermes update`` and
                     # reset to the fetched remote so bootstrap/install can recover.
-                    git -c windows.appendAtomically=false pull --ff-only origin $Branch
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
-                        git -c windows.appendAtomically=false reset --hard "origin/$Branch"
-                        if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
+                    if ($overrideBranchSha) {
+                        git -c windows.appendAtomically=false merge --ff-only $overrideBranchSha
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
+                            git -c windows.appendAtomically=false reset --hard $overrideBranchSha
+                            if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
+                        }
+                    } else {
+                        git -c windows.appendAtomically=false pull --ff-only origin $Branch
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
+                            git -c windows.appendAtomically=false reset --hard "origin/$Branch"
+                            if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
+                        }
                     }
                 }
 
@@ -2115,6 +2245,9 @@ function Install-Repository {
         # Fallback: download ZIP archive (bypasses git file I/O issues entirely)
         if (-not $cloneSuccess) {
             if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
+            if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) {
+                throw "ZIP fallback is unavailable with -RepoUrl. Fix git access to the custom repository and retry."
+            }
             Write-Warn "Git clone failed -- downloading ZIP archive instead..."
             try {
                 # Pick the ZIP URL for the most-specific ref the caller asked
@@ -2240,14 +2373,107 @@ function Install-Repository {
                 }
             } elseif ($Tag) {
                 Write-Info "Pinning to tag $Tag..."
-                git -c windows.appendAtomically=false fetch origin "refs/tags/${Tag}:refs/tags/${Tag}"
-                git -c windows.appendAtomically=false checkout --detach "refs/tags/$Tag"
+                $tagSource = if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) { $RepoUrlHttps } else { "origin" }
+                git -c windows.appendAtomically=false fetch --no-tags $tagSource "refs/tags/$Tag"
+                if ($LASTEXITCODE -ne 0) { throw "Repository does not provide tag $Tag`: $tagSource" }
+                $tagSha = (& git -c windows.appendAtomically=false rev-parse "FETCH_HEAD^{commit}" 2>$null)
+                if (($LASTEXITCODE -ne 0) -or [string]::IsNullOrWhiteSpace(("$tagSha").Trim())) {
+                    throw "Could not resolve tag $Tag from $tagSource"
+                }
+                git -c windows.appendAtomically=false checkout --detach ("$tagSha").Trim()
                 if ($LASTEXITCODE -ne 0) {
                     throw "git checkout tag $Tag failed (exit $LASTEXITCODE)"
                 }
             }
         } finally {
             $ErrorActionPreference = $prevEAP
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RepoUrl)) {
+        $attachedBranch = (& git -c windows.appendAtomically=false symbolic-ref --quiet --short HEAD 2>$null)
+        $isAttachedTargetBranch = ($LASTEXITCODE -eq 0) -and (("$attachedBranch").Trim() -eq $Branch)
+
+        if ($didUpdate) {
+            # Existing installs publish the validated fork authority as one
+            # transaction. A ref namespace collision or config failure must
+            # not leave a half-switched origin behind.
+            $previousEAP = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                $originUrlsBefore = @(git -c windows.appendAtomically=false config --local --get-all remote.origin.url 2>$null)
+                if ($LASTEXITCODE -gt 1) { throw "Could not snapshot origin URL before repository override" }
+                $originUrlsExisted = ($LASTEXITCODE -eq 0)
+                $originFetchBefore = @(git -c windows.appendAtomically=false config --local --get-all remote.origin.fetch 2>$null)
+                if ($LASTEXITCODE -gt 1) { throw "Could not snapshot origin fetch refspec before repository override" }
+                $originFetchExisted = ($LASTEXITCODE -eq 0)
+                $branchRemoteBefore = @(git -c windows.appendAtomically=false config --local --get-all "branch.$Branch.remote" 2>$null)
+                if ($LASTEXITCODE -gt 1) { throw "Could not snapshot branch remote before repository override" }
+                $branchRemoteExisted = ($LASTEXITCODE -eq 0)
+                $branchMergeBefore = @(git -c windows.appendAtomically=false config --local --get-all "branch.$Branch.merge" 2>$null)
+                if ($LASTEXITCODE -gt 1) { throw "Could not snapshot branch merge ref before repository override" }
+                $branchMergeExisted = ($LASTEXITCODE -eq 0)
+                $originBranchRef = "refs/remotes/origin/$Branch"
+                $originBranchRefBefore = (& git -c windows.appendAtomically=false for-each-ref --format='%(objectname)' $originBranchRef 2>$null)
+                if ($LASTEXITCODE -ne 0) { throw "Could not snapshot origin/$Branch before repository override" }
+                $originBranchRefExisted = -not [string]::IsNullOrWhiteSpace("$originBranchRefBefore")
+                if ($originBranchRefExisted) { $originBranchRefBefore = ("$originBranchRefBefore").Trim() }
+
+                $restoreConfigSnapshot = {
+                    param([string]$Key, [bool]$Existed, [object[]]$Values)
+                    $ok = $true
+                    git -c windows.appendAtomically=false config --local --unset-all $Key 2>$null
+                    if ($Existed) {
+                        foreach ($value in $Values) {
+                            git -c windows.appendAtomically=false config --local --add $Key "$value"
+                            if ($LASTEXITCODE -ne 0) { $ok = $false }
+                        }
+                    }
+                    return $ok
+                }
+
+                try {
+                    Write-Info "Using repository override: $RepoUrlHttps"
+                    git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
+                    if ($LASTEXITCODE -ne 0) { throw "Could not set origin to $RepoUrlHttps" }
+                    git -c windows.appendAtomically=false remote set-branches origin $Branch
+                    if ($LASTEXITCODE -ne 0) { throw "Could not configure origin to fetch $Branch" }
+                    git -c windows.appendAtomically=false update-ref $originBranchRef $overrideBranchSha
+                    if ($LASTEXITCODE -ne 0) { throw "Could not update origin/$Branch to validated commit" }
+                    if ($isAttachedTargetBranch) {
+                        git -c windows.appendAtomically=false branch --set-upstream-to="origin/$Branch" $Branch
+                        if ($LASTEXITCODE -ne 0) { throw "Could not set $Branch upstream to origin/$Branch" }
+                    }
+                } catch {
+                    $transactionError = $_
+                    $rollbackOk = $true
+                    if (-not (& $restoreConfigSnapshot -Key remote.origin.url -Existed $originUrlsExisted -Values $originUrlsBefore)) { $rollbackOk = $false }
+                    if (-not (& $restoreConfigSnapshot -Key remote.origin.fetch -Existed $originFetchExisted -Values $originFetchBefore)) { $rollbackOk = $false }
+                    if (-not (& $restoreConfigSnapshot -Key "branch.$Branch.remote" -Existed $branchRemoteExisted -Values $branchRemoteBefore)) { $rollbackOk = $false }
+                    if (-not (& $restoreConfigSnapshot -Key "branch.$Branch.merge" -Existed $branchMergeExisted -Values $branchMergeBefore)) { $rollbackOk = $false }
+                    if ($originBranchRefExisted) {
+                        git -c windows.appendAtomically=false update-ref $originBranchRef $originBranchRefBefore
+                        if ($LASTEXITCODE -ne 0) { $rollbackOk = $false }
+                    } else {
+                        $currentOriginBranchRef = (& git -c windows.appendAtomically=false for-each-ref --format='%(objectname)' $originBranchRef 2>$null)
+                        if (($LASTEXITCODE -eq 0) -and (-not [string]::IsNullOrWhiteSpace("$currentOriginBranchRef"))) {
+                            git -c windows.appendAtomically=false update-ref -d $originBranchRef
+                            if ($LASTEXITCODE -ne 0) { $rollbackOk = $false }
+                        }
+                    }
+                    if (-not $rollbackOk) {
+                        Write-Err "Repository override failed and prior Git authority could not be fully restored"
+                    }
+                    throw $transactionError
+                }
+            } finally {
+                $ErrorActionPreference = $previousEAP
+            }
+        } elseif ($isAttachedTargetBranch) {
+            # A fresh branch clone already has the requested origin and remote
+            # ref. Detached pins keep the clone's branch tracking untouched.
+            git -c windows.appendAtomically=false branch --set-upstream-to="origin/$Branch" $Branch
+            if ($LASTEXITCODE -ne 0) { throw "Could not set $Branch upstream to origin/$Branch" }
         }
     }
 

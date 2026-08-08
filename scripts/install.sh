@@ -72,6 +72,7 @@ RUN_SETUP=true
 SKIP_BROWSER=false
 NO_SKILLS=false
 BRANCH="main"
+REPO_URL_OVERRIDE=""
 INSTALL_COMMIT=""
 FORCE_COMMIT=false
 ENSURE_DEPS=""
@@ -112,6 +113,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --branch|-Branch)
             BRANCH="$2"
+            shift 2
+            ;;
+        --repo-url|-RepoUrl)
+            REPO_URL_OVERRIDE="$2"
             shift 2
             ;;
         --commit|-Commit)
@@ -169,6 +174,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --repo-url URL Repository URL for fork/integration installs"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "                   (ignored when it would roll an existing install back)"
             echo "  --force-commit Apply --commit even if it rolls the install backwards"
@@ -203,6 +209,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [ -n "$REPO_URL_OVERRIDE" ]; then
+    REPO_URL_SSH="$REPO_URL_OVERRIDE"
+    REPO_URL_HTTPS="$REPO_URL_OVERRIDE"
+fi
 
 # ============================================================================
 # Helper functions
@@ -1225,8 +1236,90 @@ show_manual_install_hint() {
 # Installation
 # ============================================================================
 
+snapshot_git_config_key() {
+    local key="$1"
+    local snapshot_file="$2"
+
+    local config_status=0
+    if git config --local --get-all "$key" > "$snapshot_file" 2>/dev/null; then
+        : > "${snapshot_file}.present"
+    else
+        config_status=$?
+        if [ "$config_status" -ne 1 ]; then
+            return "$config_status"
+        fi
+        : > "$snapshot_file"
+        rm -f "${snapshot_file}.present"
+    fi
+}
+
+restore_git_config_key() {
+    local key="$1"
+    local snapshot_file="$2"
+    local restore_ok=true
+
+    git config --local --unset-all "$key" >/dev/null 2>&1 || true
+    if [ -f "${snapshot_file}.present" ]; then
+        while IFS= read -r value || [ -n "$value" ]; do
+            if ! git config --local --add "$key" "$value"; then
+                restore_ok=false
+            fi
+        done < "$snapshot_file"
+    fi
+
+    [ "$restore_ok" = true ]
+}
+
+snapshot_repo_override_state() {
+    local snapshot_dir="$1"
+    local branch="$2"
+    local target_ref="refs/remotes/origin/$branch"
+
+    snapshot_git_config_key "remote.origin.url" "$snapshot_dir/origin-url" || return 1
+    snapshot_git_config_key "remote.origin.fetch" "$snapshot_dir/origin-fetch" || return 1
+    snapshot_git_config_key "branch.$branch.remote" "$snapshot_dir/branch-remote" || return 1
+    snapshot_git_config_key "branch.$branch.merge" "$snapshot_dir/branch-merge" || return 1
+    if ! git for-each-ref --format='%(objectname)' "$target_ref" > "$snapshot_dir/origin-ref"; then
+        return 1
+    fi
+    if [ -s "$snapshot_dir/origin-ref" ]; then
+        : > "$snapshot_dir/origin-ref.present"
+    else
+        : > "$snapshot_dir/origin-ref"
+        rm -f "$snapshot_dir/origin-ref.present"
+    fi
+}
+
+restore_repo_override_state() {
+    local snapshot_dir="$1"
+    local branch="$2"
+    local target_ref="refs/remotes/origin/$branch"
+    local restore_ok=true
+    local current_ref=""
+
+    restore_git_config_key "remote.origin.url" "$snapshot_dir/origin-url" || restore_ok=false
+    restore_git_config_key "remote.origin.fetch" "$snapshot_dir/origin-fetch" || restore_ok=false
+    restore_git_config_key "branch.$branch.remote" "$snapshot_dir/branch-remote" || restore_ok=false
+    restore_git_config_key "branch.$branch.merge" "$snapshot_dir/branch-merge" || restore_ok=false
+
+    if [ -f "$snapshot_dir/origin-ref.present" ]; then
+        if ! git update-ref "$target_ref" "$(cat "$snapshot_dir/origin-ref")"; then
+            restore_ok=false
+        fi
+    elif current_ref="$(git for-each-ref --format='%(objectname)' "$target_ref")" \
+         && [ -n "$current_ref" ]; then
+        if ! git update-ref -d "$target_ref"; then
+            restore_ok=false
+        fi
+    fi
+
+    [ "$restore_ok" = true ]
+}
+
 clone_repo() {
     log_info "Installing to $INSTALL_DIR..."
+    local override_branch_sha=""
+    local override_commit_sha=""
 
     # An interrupted previous clone leaves a .git with no initial commit, where
     # the update path's `git stash` / `git checkout` abort with "You do not
@@ -1244,6 +1337,98 @@ clone_repo() {
         if [ -d "$INSTALL_DIR/.git" ]; then
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
+
+            if [ -n "$REPO_URL_OVERRIDE" ]; then
+                # Treat an explicit override as a prepare/commit operation.
+                # Fetch the exact branch directly from the candidate URL
+                # before changing origin. A typo, an unreachable repository,
+                # or a URL that only has a same-named tag must leave the
+                # checkout's existing remote and tracking configuration intact.
+                log_info "Validating repository override: $REPO_URL_HTTPS"
+                if ! git fetch --no-tags "$REPO_URL_HTTPS" "refs/heads/$BRANCH"; then
+                    log_error "Repository override does not provide branch $BRANCH: $REPO_URL_HTTPS"
+                    return 1
+                fi
+                if ! override_branch_sha="$(git rev-parse "FETCH_HEAD^{commit}")" \
+                   || [ -z "$override_branch_sha" ]; then
+                    log_error "Could not resolve branch $BRANCH from repository override"
+                    return 1
+                fi
+
+                # Existing managed checkouts must already have origin. Refuse
+                # before stash/checkout rather than moving HEAD and discovering
+                # at publication time that remote set-url has no target.
+                if ! git remote get-url origin >/dev/null 2>&1; then
+                    log_error "Existing checkout has no origin remote; refusing repository override"
+                    return 1
+                fi
+
+                if [ -n "$INSTALL_COMMIT" ]; then
+                    # The explicit repository is authoritative for pins too.
+                    # Validate in an isolated object database: fetching a raw
+                    # SHA in the existing checkout can report success merely
+                    # because that object already exists locally, without the
+                    # candidate repository actually providing it.
+                    log_info "Validating commit $INSTALL_COMMIT from repository override..."
+                    local commit_probe_dir=""
+                    commit_probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/hermes-commit-probe.XXXXXX")" || {
+                        log_error "Could not create isolated commit validation repository"
+                        return 1
+                    }
+                    if ! git -C "$commit_probe_dir" init --bare --quiet \
+                       || ! git -C "$commit_probe_dir" fetch --no-tags "$REPO_URL_HTTPS" "$INSTALL_COMMIT"; then
+                        rm -rf "$commit_probe_dir"
+                        log_error "Repository override does not provide commit $INSTALL_COMMIT"
+                        return 1
+                    fi
+                    if ! override_commit_sha="$(git -C "$commit_probe_dir" rev-parse "FETCH_HEAD^{commit}")" \
+                       || [ -z "$override_commit_sha" ]; then
+                        rm -rf "$commit_probe_dir"
+                        log_error "Could not resolve commit $INSTALL_COMMIT from repository override"
+                        return 1
+                    fi
+                    if ! git fetch --no-tags "$commit_probe_dir" "$override_commit_sha"; then
+                        rm -rf "$commit_probe_dir"
+                        log_error "Could not import validated commit $INSTALL_COMMIT"
+                        return 1
+                    fi
+                    rm -rf "$commit_probe_dir"
+                fi
+
+                # Ref namespaces cannot contain both a ref and one of its
+                # path prefixes (for example origin/release and
+                # origin/release/topic). Detect that read-only before checkout
+                # so a later update-ref failure cannot leave HEAD on override
+                # code while origin still points at the previous repository.
+                local override_target_ref="refs/remotes/origin/$BRANCH"
+                local origin_remote_refs=""
+                if ! origin_remote_refs="$(git for-each-ref --format='%(refname)' refs/remotes/origin)"; then
+                    log_error "Could not inspect origin remote-tracking refs"
+                    return 1
+                fi
+                while IFS= read -r existing_ref; do
+                    [ -z "$existing_ref" ] && continue
+                    case "$existing_ref" in
+                        "$override_target_ref") ;;
+                        "$override_target_ref"/*)
+                            log_error "Remote-tracking ref namespace collision: $existing_ref blocks $override_target_ref"
+                            return 1
+                            ;;
+                        *)
+                            case "$override_target_ref" in
+                                "$existing_ref"/*)
+                                    log_error "Remote-tracking ref namespace collision: $existing_ref blocks $override_target_ref"
+                                    return 1
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                done <<< "$origin_remote_refs"
+
+                # Do not publish the new authority yet. Checkout and pin
+                # resolution consume the validated SHA directly; origin is
+                # changed transactionally only after those operations finish.
+            fi
 
             local autostash_ref=""
             discard_update_lockfile_churn "$INSTALL_DIR"
@@ -1272,18 +1457,45 @@ clone_repo() {
             # every ref, and this repo carries thousands of auto-generated
             # branches — on a non-single-branch checkout that turns each update
             # into a multi-minute download that can stall the installer.
-            git remote set-branches origin "$BRANCH" 2>/dev/null || true
-            git fetch origin "$BRANCH"
-            git checkout "$BRANCH"
+            if [ -z "$override_branch_sha" ]; then
+                git remote set-branches origin "$BRANCH" 2>/dev/null || true
+                if ! git fetch origin "$BRANCH"; then
+                    log_error "git fetch failed"
+                    return 1
+                fi
+            fi
+            if [ -n "$override_branch_sha" ] \
+               && ! git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+                if ! git checkout -b "$BRANCH" "$override_branch_sha"; then
+                    log_error "git checkout -b $BRANCH failed"
+                    return 1
+                fi
+            elif ! git checkout "$BRANCH"; then
+                log_error "git checkout $BRANCH failed"
+                return 1
+            fi
             # Managed installs should follow origin/$BRANCH exactly. If the
             # checkout has diverged (or has local-only commits), ff-only pull
             # cannot succeed — mirror ``hermes update`` and reset to the
             # fetched remote so bootstrap/install can recover.
-            if ! git pull --ff-only origin "$BRANCH"; then
-                log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
-                git reset --hard "origin/$BRANCH"
+            if [ -n "$override_branch_sha" ]; then
+                update_target="$override_branch_sha"
+                if ! git merge --ff-only "$update_target"; then
+                    log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
+                    if ! git reset --hard "$update_target"; then
+                        log_error "git reset --hard origin/$BRANCH failed"
+                        return 1
+                    fi
+                fi
+            else
+                if ! git pull --ff-only origin "$BRANCH"; then
+                    log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
+                    if ! git reset --hard "origin/$BRANCH"; then
+                        log_error "git reset --hard origin/$BRANCH failed"
+                        return 1
+                    fi
+                fi
             fi
-
             if [ -n "$autostash_ref" ]; then
                 local restore_now="yes"
                 if [ -t 0 ] && [ -t 1 ]; then
@@ -1375,22 +1587,91 @@ EOF
         # to its build commit, stranding the user on ancient code with a
         # current venv. Only pin when the target is not already an ancestor of
         # HEAD; a fresh clone has no such ancestry and pins normally.
-        if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
+        local install_commit_target="$INSTALL_COMMIT"
+        if [ -n "$override_commit_sha" ]; then
+            install_commit_target="$override_commit_sha"
+        elif ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
             git fetch origin "$INSTALL_COMMIT" || true
         fi
         if git rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
-           && git merge-base --is-ancestor "$INSTALL_COMMIT" HEAD 2>/dev/null \
-           && [ "$(git rev-parse "$INSTALL_COMMIT^{commit}" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
+           && git merge-base --is-ancestor "$install_commit_target" HEAD 2>/dev/null \
+           && [ "$(git rev-parse "${install_commit_target}^{commit}" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
             if [ "$FORCE_COMMIT" = true ]; then
                 log_warn "--force-commit: rolling this install back to $INSTALL_COMMIT."
-                git checkout --detach "$INSTALL_COMMIT"
+                if ! git checkout --detach "$install_commit_target"; then
+                    log_error "git checkout $INSTALL_COMMIT failed"
+                    return 1
+                fi
             else
                 log_warn "Ignoring --commit $INSTALL_COMMIT: the checkout is already newer."
                 log_warn "Pinning to it would roll this install back. Pass --force-commit to override."
             fi
         else
             log_info "Pinning checkout to commit $INSTALL_COMMIT..."
-            git checkout --detach "$INSTALL_COMMIT"
+            if ! git checkout --detach "$install_commit_target"; then
+                log_error "git checkout $INSTALL_COMMIT failed"
+                return 1
+            fi
+        fi
+    fi
+
+    if [ -n "$REPO_URL_OVERRIDE" ]; then
+        local attached_branch=""
+        attached_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+
+        if [ -n "$override_branch_sha" ]; then
+            # Existing installs publish the validated fork authority as one
+            # transaction. A ref namespace collision or config failure must
+            # not leave a half-switched origin behind.
+            local override_snapshot_dir=""
+            override_snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/hermes-repo-override.XXXXXX")" || {
+                log_error "Could not create repository override snapshot"
+                return 1
+            }
+            if ! snapshot_repo_override_state "$override_snapshot_dir" "$BRANCH"; then
+                log_error "Could not snapshot existing Git authority before repository override"
+                rm -rf "$override_snapshot_dir"
+                return 1
+            fi
+
+            local override_commit_ok=true
+            log_info "Using repository override: $REPO_URL_HTTPS"
+            if ! git remote set-url origin "$REPO_URL_HTTPS"; then
+                log_error "Could not set origin to $REPO_URL_HTTPS"
+                override_commit_ok=false
+            fi
+            if [ "$override_commit_ok" = true ] \
+               && ! git remote set-branches origin "$BRANCH"; then
+                log_error "Could not configure origin to fetch $BRANCH"
+                override_commit_ok=false
+            fi
+            if [ "$override_commit_ok" = true ] \
+               && ! git update-ref "refs/remotes/origin/$BRANCH" "$override_branch_sha"; then
+                log_error "Could not update origin/$BRANCH to validated commit"
+                override_commit_ok=false
+            fi
+            if [ "$override_commit_ok" = true ] \
+               && [ "$attached_branch" = "$BRANCH" ] \
+               && ! git branch --set-upstream-to="origin/$BRANCH" "$BRANCH"; then
+                log_error "Could not set $BRANCH upstream to origin/$BRANCH"
+                override_commit_ok=false
+            fi
+
+            if [ "$override_commit_ok" != true ]; then
+                if ! restore_repo_override_state "$override_snapshot_dir" "$BRANCH"; then
+                    log_error "Repository override failed and prior Git authority could not be fully restored"
+                fi
+                rm -rf "$override_snapshot_dir"
+                return 1
+            fi
+            rm -rf "$override_snapshot_dir"
+        elif [ "$attached_branch" = "$BRANCH" ]; then
+            # A fresh branch clone already has the requested origin and remote
+            # ref. Detached pins keep the clone's branch tracking untouched.
+            if ! git branch --set-upstream-to="origin/$BRANCH" "$BRANCH"; then
+                log_error "Could not set $BRANCH upstream to origin/$BRANCH"
+                return 1
+            fi
         fi
     fi
 
