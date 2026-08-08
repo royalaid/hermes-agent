@@ -27,6 +27,27 @@ describe('subagent store', () => {
     expect(item?.summary).toBe('done')
   })
 
+  it('turns a timeout completion into a terminal failed row in only its parent session', () => {
+    upsertSubagent('parent-a', { goal: 'inspect stream', status: 'running', subagent_id: 'child-a', task_index: 0 })
+
+    // The Python timeout relay uses status="timeout". It must stop this
+    // child rather than falling through the renderer's unknown-status default
+    // and leaving a spinner in the originating parent (or another tab).
+    upsertSubagent(
+      'parent-a',
+      { goal: 'inspect stream', status: 'timeout', subagent_id: 'child-a', summary: 'Timed out after 6.2s', task_index: 0 },
+      false,
+      'subagent.complete'
+    )
+
+    expect(listFor('parent-a')[0]).toMatchObject({
+      status: 'failed',
+      summary: 'Timed out after 6.2s'
+    })
+    expect(activeSubagentCount(listFor('parent-a'))).toBe(0)
+    expect(listFor('parent-b')).toEqual([])
+  })
+
   it('builds parent/child trees', () => {
     upsertSubagent('s1', { goal: 'parent', status: 'running', subagent_id: 'p', task_index: 0 })
     upsertSubagent('s1', { goal: 'child', parent_id: 'p', status: 'queued', subagent_id: 'c', task_index: 1 })

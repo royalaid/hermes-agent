@@ -55,8 +55,26 @@ const str = (v: unknown) => (isStr(v) ? v : '')
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
 const strList = (v: unknown) => (Array.isArray(v) ? v.filter(isStr) : [])
 
-const asStatus = (v: unknown): SubagentStatus =>
-  v === 'completed' || v === 'failed' || v === 'interrupted' || v === 'queued' ? v : 'running'
+/**
+ * Python execution has richer terminal labels than the renderer. Never let an
+ * unfamiliar terminal failure silently become a live row: that turns a dead
+ * child into a spinner which can survive session switches indefinitely.
+ */
+const asStatus = (v: unknown): SubagentStatus => {
+  if (v === 'completed' || v === 'success') {
+    return 'completed'
+  }
+
+  if (v === 'interrupted' || v === 'cancelled' || v === 'canceled') {
+    return 'interrupted'
+  }
+
+  if (v === 'failed' || v === 'error' || v === 'timeout' || v === 'timed_out' || v === 'stalled' || v === 'disconnected') {
+    return 'failed'
+  }
+
+  return v === 'queued' ? 'queued' : 'running'
+}
 
 const compact = (text: string, max = PREVIEW_MAX) => {
   const line = text.replace(/\s+/g, ' ').trim()
