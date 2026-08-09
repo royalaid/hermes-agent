@@ -424,6 +424,35 @@ class TestResponseCapture:
         assert all(item.get("type") != "compaction" for item in items)
 
 
+class TestCompactionCheckpointRetention:
+    def test_local_compaction_prunes_stale_reasoning_but_keeps_native_checkpoint(self):
+        """A server checkpoint replaces old context; old reasoning blobs must
+        not be replayed indefinitely after local compression."""
+        from agent.context_compressor import _prune_stale_reasoning_replay
+
+        checkpoint = {"type": "compaction", "encrypted_content": "checkpoint"}
+        stale_reasoning = {"type": "reasoning", "encrypted_content": "stale"}
+        active_reasoning = {"type": "reasoning", "encrypted_content": "active"}
+        messages = [
+            {"role": "user", "content": "old request"},
+            {
+                "role": "assistant",
+                "content": "old answer",
+                "codex_reasoning_items": [checkpoint, stale_reasoning],
+            },
+            {"role": "user", "content": "current request"},
+            {
+                "role": "assistant",
+                "content": "current answer",
+                "codex_reasoning_items": [active_reasoning],
+            },
+        ]
+
+        assert _prune_stale_reasoning_replay(messages) == 1
+        assert messages[1]["codex_reasoning_items"] == [checkpoint]
+        assert messages[3]["codex_reasoning_items"] == [active_reasoning]
+
+
 class TestAgentInitConfig:
     def test_defaults_off_and_automatic_threshold(self, monkeypatch):
         from run_agent import AIAgent
