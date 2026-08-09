@@ -462,7 +462,35 @@ def _chat_messages_to_responses_input(
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
 
-    for msg in messages:
+    # Stateless Responses chaining can discard history before the latest
+    # usable compaction item. That opaque checkpoint carries the prior window;
+    # retaining its prefix defeats the token/latency benefit. A foreign item
+    # is unusable at this endpoint, so it must never become a pruning boundary.
+    first_message_idx = 0
+    if replay_encrypted_reasoning:
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict):
+                continue
+            replay_items = msg.get("codex_reasoning_items")
+            if not isinstance(replay_items, list):
+                continue
+            has_usable_checkpoint = any(
+                isinstance(item, dict)
+                and item.get("type") == "compaction"
+                and item.get("encrypted_content")
+                and (
+                    current_issuer_kind is None
+                    or item.get("_issuer_kind") is None
+                    or item.get("_issuer_kind") == current_issuer_kind
+                )
+                for item in replay_items
+            )
+            if has_usable_checkpoint:
+                first_message_idx = idx
+                break
+
+    for msg in messages[first_message_idx:]:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")

@@ -61,6 +61,11 @@ class TestRouteGate:
             "https://chatgpt.com/backend-api/codex", is_codex_backend=True
         )
 
+    def test_codex_backend_flag_does_not_trust_custom_relays(self):
+        assert not is_direct_openai_route(
+            "https://relay.example/v1", is_codex_backend=True
+        )
+
     def test_everything_else_rejected(self):
         for url in (
             "https://openrouter.ai/api/v1",
@@ -333,6 +338,35 @@ class TestResponseCapture:
             current_issuer_kind="xai_responses",
         )
         assert all(item.get("type") != "compaction" for item in items)
+
+    def test_latest_valid_checkpoint_replaces_prior_stateless_history(self):
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        items = _chat_messages_to_responses_input(
+            [
+                {"role": "user", "content": "discarded old request"},
+                {"role": "assistant", "content": "discarded old answer"},
+                {"role": "user", "content": "request before checkpoint"},
+                {
+                    "role": "assistant",
+                    "content": "answer after compacted window",
+                    "codex_reasoning_items": [
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "latest-checkpoint",
+                            "_issuer_kind": "codex_backend",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "current request"},
+            ],
+            current_issuer_kind="codex_backend",
+        )
+
+        assert {"role": "user", "content": "discarded old request"} not in items
+        assert {"role": "assistant", "content": "discarded old answer"} not in items
+        assert items[0] == {"type": "compaction", "encrypted_content": "latest-checkpoint"}
+        assert items[-1] == {"role": "user", "content": "current request"}
 
 
 class TestCompactionCheckpointRetention:
