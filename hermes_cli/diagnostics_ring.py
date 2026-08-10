@@ -458,7 +458,15 @@ def block_event_loop(seconds: Any) -> dict[str, Any]:
     if not 0 < duration <= _MAX_TEST_BLOCK_S:
         raise ValueError(f"seconds must be within (0, {_MAX_TEST_BLOCK_S}]")
     started = time.monotonic()
-    time.sleep(duration)
+    deadline = started + duration
+    # Windows timer waits can return a few milliseconds early. Keep the
+    # requested-duration contract by sleeping in short bounded intervals until
+    # the monotonic deadline has actually passed.
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 0.01))
     return {"blocked_s": round(time.monotonic() - started, 6)}
 
 
