@@ -1269,6 +1269,18 @@ def _consume_codex_event_stream(
                 except Exception:
                     logger.debug("Codex stream on_reasoning_event raised", exc_info=True)
             if reasoning_text and on_reasoning_delta is not None:
+                # Unstructured callers still need the wire's summary_index
+                # boundary; without it adjacent markdown parts can join as
+                # ``****``. Structured consumers get their own stable part id
+                # above and must not receive this legacy separator.
+                if (
+                    summary_index is not None
+                    and active_summary_index is not None
+                    and summary_index != active_summary_index
+                ):
+                    reasoning_text = f"\n\n{reasoning_text}"
+                if summary_index is not None:
+                    active_summary_index = summary_index
                 try:
                     on_reasoning_delta(reasoning_text)
                 except Exception:
