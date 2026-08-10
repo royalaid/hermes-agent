@@ -43,8 +43,9 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+REPOSITORY="NousResearch/hermes-agent"
+REPO_URL_SSH=""
+REPO_URL_HTTPS=""
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -114,6 +115,10 @@ while [[ $# -gt 0 ]]; do
             BRANCH="$2"
             shift 2
             ;;
+        --repository|-Repository)
+            REPOSITORY="$2"
+            shift 2
+            ;;
         --commit|-Commit)
             INSTALL_COMMIT="$2"
             shift 2
@@ -169,6 +174,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --repository OWNER/REPO  GitHub repository to install (default: NousResearch/hermes-agent)"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
             echo "                   (ignored when it would roll an existing install back)"
             echo "  --force-commit Apply --commit even if it rolls the install backwards"
@@ -203,6 +209,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ ! "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "Invalid repository: $REPOSITORY" >&2
+    exit 2
+fi
+REPO_URL_SSH="git@github.com:${REPOSITORY}.git"
+REPO_URL_HTTPS="https://github.com/${REPOSITORY}.git"
 
 # ============================================================================
 # Helper functions

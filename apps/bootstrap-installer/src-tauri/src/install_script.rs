@@ -25,6 +25,8 @@ use crate::paths;
 pub struct ResolvedScript {
     pub path: PathBuf,
     pub source: ScriptSource,
+    /// GitHub `owner/repository` used to fetch the install script.
+    pub repository: Option<String>,
     /// Commit pin (40-char SHA) if known. install.ps1's `-Commit` arg is
     /// what makes the repo stage clone the exact tested SHA.
     pub commit: Option<String>,
@@ -114,6 +116,7 @@ pub async fn resolve(
             return Ok(ResolvedScript {
                 path: candidate,
                 source: ScriptSource::DevCheckout,
+                repository: pin.repository.clone(),
                 commit: pin.commit.clone(),
                 branch: pin.branch.clone(),
             });
@@ -142,7 +145,7 @@ pub async fn resolve(
         }
     };
 
-    let cached = cached_path(kind, &commit_or_ref);
+    let cached = cached_path(kind, pin.repository.as_deref(), &commit_or_ref);
     match cache_plan(immutable, cached.exists()) {
         CachePlan::Reuse => {
             emit_log(&format!(
@@ -157,6 +160,7 @@ pub async fn resolve(
             return Ok(ResolvedScript {
                 path: cached,
                 source: ScriptSource::Cached,
+                repository: pin.repository.clone(),
                 commit: pin.commit.clone(),
                 branch: pin.branch.clone(),
             });
@@ -173,12 +177,19 @@ pub async fn resolve(
                 truncate_ref(&commit_or_ref)
             ));
 
-            match download(kind, &commit_or_ref, &cached).await {
+            match download(
+                kind,
+                &commit_or_ref,
+                &cached,
+                pin.repository.as_deref(),
+            )
+            .await {
                 Ok(()) => {
                     emit_log(&format!("[bootstrap] cached to {}", cached.display()));
                     Ok(ResolvedScript {
                         path: cached,
                         source: ScriptSource::Downloaded,
+                        repository: pin.repository.clone(),
                         commit: pin.commit.clone(),
                         branch: pin.branch.clone(),
                     })
@@ -195,6 +206,7 @@ pub async fn resolve(
                     Ok(ResolvedScript {
                         path: cached,
                         source: ScriptSource::Cached,
+                        repository: pin.repository.clone(),
                         commit: pin.commit.clone(),
                         branch: pin.branch.clone(),
                     })
@@ -207,17 +219,34 @@ pub async fn resolve(
 
 #[derive(Debug, Clone, Default)]
 pub struct Pin {
+    /// GitHub `owner/repository` for the raw install script.
+    pub repository: Option<String>,
     pub commit: Option<String>,
     pub branch: Option<String>,
 }
 
-fn cached_path(kind: ScriptKind, commit_or_ref: &str) -> PathBuf {
-    let safe = sanitize_ref(commit_or_ref);
+fn cached_path(kind: ScriptKind, repository: Option<&str>, commit_or_ref: &str) -> PathBuf {
+    let repository_key = repository_cache_key(repository);
+    let safe_ref = sanitize_ref(commit_or_ref);
     let filename = match kind {
-        ScriptKind::Ps1 => format!("install-{safe}.ps1"),
-        ScriptKind::Sh => format!("install-{safe}.sh"),
+        ScriptKind::Ps1 => format!("install-{repository_key}-{safe_ref}.ps1"),
+        ScriptKind::Sh => format!("install-{repository_key}-{safe_ref}.sh"),
     };
     paths::bootstrap_cache_dir().join(filename)
+}
+
+/// Encode repository bytes rather than flattening `/` so distinct repositories
+/// cannot share a mutable branch cache by accident.
+fn repository_cache_key(repository: Option<&str>) -> String {
+    let repository = repository
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_REPOSITORY);
+    repository
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Replace anything that's not [A-Za-z0-9._-] with `_`. Branch refs can
@@ -313,6 +342,20 @@ fn upgrade_cached_script(kind: ScriptKind, cached: &Path, emit_log: &impl Fn(&st
     }
 }
 
+/// Repository used by ordinary upstream builds when no fork pin is supplied.
+const DEFAULT_REPOSITORY: &str = "NousResearch/hermes-agent";
+
+fn raw_script_url(repository: Option<&str>, commit_or_ref: &str, kind: ScriptKind) -> String {
+    let repository = repository
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_REPOSITORY);
+    format!(
+        "https://raw.githubusercontent.com/{repository}/{commit_or_ref}/scripts/{}",
+        kind.filename()
+    )
+}
+
 /// Downloads to `dest_path` via reqwest with rustls. Atomically renames
 /// `dest_path.tmp` → `dest_path` so partial writes don't poison the cache.
 ///
@@ -322,12 +365,13 @@ fn upgrade_cached_script(kind: ScriptKind, cached: &Path, emit_log: &impl Fn(&st
 /// black-holed connection (captive portal, hung proxy, silently dropped
 /// packets) never errors — the whole bootstrap would hang here instead of
 /// falling back to the cached script.
-async fn download(kind: ScriptKind, commit_or_ref: &str, dest_path: &Path) -> Result<()> {
-    let url = format!(
-        "https://raw.githubusercontent.com/NousResearch/hermes-agent/{}/scripts/{}",
-        commit_or_ref,
-        kind.filename()
-    );
+async fn download(
+    kind: ScriptKind,
+    commit_or_ref: &str,
+    dest_path: &Path,
+    repository: Option<&str>,
+) -> Result<()> {
+    let url = raw_script_url(repository, commit_or_ref, kind);
 
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -394,6 +438,42 @@ async fn download(kind: ScriptKind, commit_or_ref: &str, dest_path: &Path) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_script_url_uses_explicit_repository_pin() {
+        let pin = Pin {
+            repository: Some("royalaid/hermes-agent".to_string()),
+            commit: Some("f6e3c6081fbe82084ff42605b7d27ab8d0af31f7".to_string()),
+            branch: None,
+        };
+        assert_eq!(
+            raw_script_url(
+                pin.repository.as_deref(),
+                pin.commit.as_deref().unwrap(),
+                ScriptKind::Ps1
+            ),
+            "https://raw.githubusercontent.com/royalaid/hermes-agent/f6e3c6081fbe82084ff42605b7d27ab8d0af31f7/scripts/install.ps1"
+        );
+    }
+
+    #[test]
+    fn raw_script_url_defaults_to_upstream_repository() {
+        assert_eq!(
+            raw_script_url(None, "main", ScriptKind::Sh),
+            "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
+        );
+    }
+
+    #[test]
+    fn cached_script_path_namespaces_repository_identity() {
+        let upstream = cached_path(ScriptKind::Ps1, None, "main");
+        let fork = cached_path(
+            ScriptKind::Ps1,
+            Some("royalaid/hermes-agent"),
+            "main",
+        );
+        assert_ne!(upstream, fork, "repositories must not share branch caches");
+    }
 
     #[test]
     fn is_valid_commit_accepts_short_and_full_shas() {

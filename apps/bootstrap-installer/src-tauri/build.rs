@@ -33,7 +33,12 @@ fn main() {
 
     let commit = resolve_commit_pin();
     let branch = resolve_branch_pin();
+    let repository = resolve_repository_pin();
 
+    if let Some(r) = &repository {
+        println!("cargo:rustc-env=BUILD_PIN_REPOSITORY={r}");
+        println!("cargo:warning=hermes-bootstrap: pinning to repository {r}");
+    }
     if let Some(c) = &commit {
         println!("cargo:rustc-env=BUILD_PIN_COMMIT={c}");
         println!(
@@ -79,6 +84,7 @@ fn main() {
             }
         }
     }
+    println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_REPOSITORY");
     println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_COMMIT");
     println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_BRANCH");
 
@@ -163,6 +169,16 @@ fn resolve_branch_pin() -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+fn resolve_repository_pin() -> Option<String> {
+    let value = std::env::var("HERMES_BUILD_PIN_REPOSITORY").ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 
