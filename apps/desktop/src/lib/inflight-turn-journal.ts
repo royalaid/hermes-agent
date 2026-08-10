@@ -495,7 +495,10 @@ function recoverableTail(messages: ChatMessage[], streamId: null | string): Chat
     }
   }
 
-  return cloneMessages(visible.slice(start))
+  // Project the live objects directly so bounded tool previews can stop walking
+  // large results once their byte budget is full. Recovery clones only the
+  // already-bounded persisted tail below.
+  return visible.slice(start)
 }
 
 function normalizeRecoveredTail(tail: ChatMessage[], keepPending: boolean): ChatMessage[] {
