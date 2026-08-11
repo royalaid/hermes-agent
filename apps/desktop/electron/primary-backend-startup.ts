@@ -5,6 +5,7 @@ export interface PrimaryBackendStartupOptions<Backend, RuntimeBackend, Remote, C
   ensureLocalRuntime: (backend: Backend) => Promise<RuntimeBackend>
   prepareLocalBackend: () => Backend | Promise<Backend>
   resolveRemote: () => Promise<Remote | null>
+  startHandoffResultPoll: () => void
   waitForDecision: (backend: Backend) => Promise<FirstRunSetupDecision>
   waitForLocalStart: () => Promise<unknown>
 }
@@ -31,11 +32,16 @@ export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, 
   ensureLocalRuntime,
   prepareLocalBackend,
   resolveRemote,
+  startHandoffResultPoll,
   waitForDecision,
   waitForLocalStart
 }: PrimaryBackendStartupOptions<Backend, RuntimeBackend, Remote, Connection>): Promise<
   PrimaryBackendStartupResult<RuntimeBackend, Connection>
 > {
+  // A saved remote still needs to surface a detached updater receipt even
+  // though it bypasses every local startup step.
+  startHandoffResultPoll()
+
   const savedRemote = await resolveRemote()
 
   if (savedRemote) {
