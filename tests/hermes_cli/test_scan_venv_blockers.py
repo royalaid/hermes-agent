@@ -181,6 +181,72 @@ def test_strict_detector_excludes_exact_immediate_python_venv_trampoline(
     ) == []
 
 
+def test_strict_detector_excludes_exact_immediate_standalone_scanner_trampoline(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    argv = [
+        str(python),
+        "-m",
+        "hermes_cli._scan_venv_blockers",
+        "--root",
+        str(tmp_path),
+    ]
+    parent = types.SimpleNamespace(
+        pid=558,
+        exe=lambda: str(python),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(558, str(python), "python.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == []
+
+
+def test_strict_detector_keeps_standalone_scanner_for_a_different_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    argv = [
+        str(python),
+        "-m",
+        "hermes_cli._scan_venv_blockers",
+        "--root",
+        str(tmp_path / "other-install"),
+    ]
+    parent = types.SimpleNamespace(
+        pid=559,
+        exe=lambda: str(python),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(559, str(python), "python.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == [(559, "python.exe", " ".join(argv))]
+
+
 def test_strict_detector_keeps_immediate_python_venv_non_update_parent(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -920,6 +986,42 @@ def test_terminate_rereads_and_refuses_changed_live_argv(
 
     assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=101.0)
     assert process.kills == 0
+
+
+@pytest.mark.windows_only
+def test_native_scanner_cli_excludes_its_exact_venv_redirector() -> None:
+    """Match the standalone subprocess that Desktop launches on Windows."""
+    root = Path(scanner.__file__).resolve().parents[1]
+    target_root, venv = scanner._validated_root(root)
+    python = venv / "Scripts" / "python.exe"
+
+    process = subprocess.Popen(
+        [
+            str(python),
+            "-m",
+            "hermes_cli._scan_venv_blockers",
+            "--root",
+            str(target_root),
+        ],
+        cwd=target_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    stdout, stderr = process.communicate(timeout=30)
+
+    assert process.returncode == 0, stderr
+    payload = json.loads(stdout)
+    records = [
+        *payload["processes"],
+        *payload["mcp_bridges"],
+        *payload["pausable_gateway_processes"],
+    ]
+    assert all(record["pid"] != process.pid for record in records)
 
 
 @pytest.mark.windows_only
