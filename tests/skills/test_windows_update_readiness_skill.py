@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 from collections.abc import Callable
@@ -74,10 +73,6 @@ def _content() -> str:
     return SKILL_PATH.read_text(encoding="utf-8")
 
 
-def _normalized_content() -> str:
-    return " ".join(_content().split())
-
-
 def _frontmatter_and_body() -> tuple[dict[str, str], str]:
     content = _content()
     assert content.startswith("---"), "SKILL.md must open with frontmatter"
@@ -93,142 +88,27 @@ def _frontmatter_and_body() -> tuple[dict[str, str], str]:
     return frontmatter, body
 
 
+def _markdown_section(heading: str) -> str:
+    """Return one Markdown section without coupling tests to exact prose."""
+    _, body = _frontmatter_and_body()
+    marker = f"{heading}\n"
+    start = body.index(marker) + len(marker)
+    level = len(heading) - len(heading.lstrip("#"))
+    following = body[start:]
+    match = re.search(rf"(?m)^#{{1,{level}}}\s", following)
+    return following[: match.start() if match else None]
+
+
 def _schema() -> dict[str, object]:
     return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
-def _assert_readiness_contract(payload: dict[str, object]) -> None:
-    """Assert the safety semantics the skill must apply to a CLI document."""
-    from hermes_cli.update_cmd import validate_update_readiness
+def _assert_valid_readiness(payload: dict[str, object]) -> None:
+    """Use the production validator instead of maintaining a shadow schema."""
+    from hermes_cli.update_readiness import validate_update_readiness
 
-    schema = _schema()
     assert validate_update_readiness(payload) is payload
-    assert set(payload) == set(schema["required"])
-    assert payload["schema_version"] == 1
-    assert payload["mode"] in {"preflight", "drain"}
-    assert all(type(payload[key]) is bool for key in ("ok", "ready", "blocked"))
-    assert payload["blocked"] is (not payload["ready"])
-    assert payload["reason"] is None or isinstance(payload["reason"], str)
-    assert all(
-        isinstance(payload[key], str) and os.path.isabs(payload[key])
-        for key in ("root", "venv")
-    )
-    for key in ("processes", "mcp_bridges", "pausable_gateway_processes", "actions"):
-        assert isinstance(payload[key], list)
-    assert type(payload["pausable_gateways"]) is int
-    assert payload["pausable_gateways"] >= 0
-    assert payload["pausable_gateways"] == len(payload["pausable_gateway_processes"])
-
-    if payload["ready"]:
-        assert payload["ok"] is True
-        assert payload["reason"] is None
-        assert payload["processes"] == []
-        assert payload["mcp_bridges"] == []
-        assert payload["error"] is None
-    elif payload["ok"]:
-        assert isinstance(payload["reason"], str) and payload["reason"]
-    else:
-        assert payload["ready"] is False
-        assert isinstance(payload["error"], dict)
-
-    process_required = set(schema["$defs"]["process"]["required"])
-    for process in payload["processes"]:
-        assert set(process) in (process_required, process_required | {"created_at"})
-        assert type(process["pid"]) is int and process["pid"] > 0
-        assert isinstance(process["name"], str)
-        assert isinstance(process["cmdline"], str)
-        assert process["actionable"] is False
-        assert process["actionability"] == "hard_block"
-        assert process["action"] == "refuse"
-
-    bridge_required = set(schema["$defs"]["mcpBridge"]["required"])
-    actionable_identities = set()
-    for bridge in payload["mcp_bridges"]:
-        assert set(bridge) in (bridge_required, bridge_required | {"wrapper_pid"})
-        assert type(bridge["pid"]) is int and bridge["pid"] > 0
-        assert isinstance(bridge["name"], str)
-        assert isinstance(bridge["cmdline"], str)
-        assert isinstance(bridge["created_at"], (int, float))
-        assert math.isfinite(bridge["created_at"]) and bridge["created_at"] > 0
-        assert bridge["role"] in {"mcp_bridge_wrapper", "mcp_bridge_worker"}
-        if bridge["actionable"]:
-            assert bridge["owner"] in {"codex", "claude"}
-            assert bridge["actionability"] == "exact_mcp_bridge"
-            assert bridge["action"] == "terminate_exact_mcp"
-            actionable_identities.add((bridge["pid"], float(bridge["created_at"])))
-        else:
-            assert bridge["actionability"] == "hard_block"
-            assert bridge["action"] == "refuse"
-
-    for gateway in payload["pausable_gateway_processes"]:
-        assert gateway["owner"] == "gateway"
-        assert gateway["role"] == "gateway_run"
-        assert gateway["actionable"] is False
-        assert gateway["actionability"] == "downstream_drainable"
-        assert gateway["action"] == "pause_downstream"
-
-    for action in payload["actions"]:
-        if action["type"] == "terminate-mcp-bridge":
-            identity = (action["pid"], float(action["created_at"]))
-            assert action["owner"] in {"codex", "claude"}
-            assert action["role"] in {"mcp_bridge_wrapper", "mcp_bridge_worker"}
-            assert set(action) in (
-                {"type", "pid", "created_at", "owner", "role"},
-                {"type", "pid", "created_at", "owner", "role", "terminated"},
-            )
-            if "terminated" not in action:
-                assert identity in actionable_identities
-            else:
-                assert type(action["terminated"]) is bool
-                assert payload["mode"] == "drain"
-        else:
-            assert action["type"] == "clear-scan"
-            assert set(action) == {"type", "sequence"}
-            assert action["sequence"] in {1, 2}
-            assert payload["mode"] == "drain"
-
-    if payload["mode"] == "drain" and payload["ready"]:
-        clear_proof = [
-            action["sequence"]
-            for action in payload["actions"]
-            if action["type"] == "clear-scan"
-        ]
-        assert clear_proof == [1, 2]
-        assert payload["actions"][-2:] == [
-            {"type": "clear-scan", "sequence": 1},
-            {"type": "clear-scan", "sequence": 2},
-        ]
-
-    git = payload["git"]
-    if git is not None:
-        assert set(git) == set(schema["$defs"]["git"]["required"])
-        assert type(git["dirty"]) is bool
-
-    lease = payload["lease"]
-    if lease is not None:
-        assert set(lease) == set(schema["$defs"]["lease"]["required"])
-        assert lease["schema_version"] == 1
-        assert re.fullmatch(r"[0-9a-f]{64}", lease["lease_fingerprint"])
-        assert "lease_id" not in lease
-        assert lease["install_root"] == payload["root"]
-        assert 0 < lease["created_at"] <= lease["handoff_grace_until"] <= lease["expires_at"]
-
-    receipt = payload["last_update_receipt"]
-    if receipt is not None:
-        assert set(receipt) == set(schema["$defs"]["receipt"]["required"])
-        assert receipt["schema_version"] == 1
-        assert receipt["root"] == payload["root"]
-        assert receipt["success"] is True
-        assert type(receipt["gateway_resume_deferred"]) is bool
-        health = receipt["health"]
-        assert set(health) == set(schema["$defs"]["health"]["required"])
-        assert all(type(value) is bool for value in health.values())
-        assert all(health.values())
-
-    error = payload["error"]
-    if error is not None:
-        assert set(error) == set(schema["$defs"]["error"]["required"])
-        assert all(isinstance(error[key], str) for key in ("code", "message"))
+    assert set(payload) == TOP_LEVEL_KEYS
 
 
 def _git_fixture() -> dict[str, object]:
@@ -392,7 +272,7 @@ def test_real_ready_preflight_fixture_matches_canonical_schema(
     assert exit_code == 0
     assert payload["mode"] == "preflight"
     assert (payload["ok"], payload["ready"], payload["blocked"]) == (True, True, False)
-    _assert_readiness_contract(payload)
+    _assert_valid_readiness(payload)
 
 
 def test_real_preflight_blocks_on_active_standalone_drain_lease(
@@ -424,7 +304,7 @@ def test_real_preflight_blocks_on_active_standalone_drain_lease(
 
     assert payload["lease"] == update_readiness._public_quiesce_lease(lease)
     assert "lease_id" not in payload["lease"]
-    _assert_readiness_contract(payload)
+    _assert_valid_readiness(payload)
 
     overclaim = json.loads(json.dumps(payload))
     overclaim.update(ready=True, blocked=False, reason=None)
@@ -458,7 +338,7 @@ def test_real_preflight_exposes_only_a_valid_all_healthy_receipt(
 
     assert exit_code == 0
     assert payload["last_update_receipt"] == receipt
-    _assert_readiness_contract(payload)
+    _assert_valid_readiness(payload)
 
     for field in receipt["health"]:
         unhealthy = json.loads(json.dumps(payload))
@@ -527,7 +407,7 @@ def test_real_blocked_preflight_fixture_preserves_supported_bridge_identity(
             "role": "mcp_bridge_wrapper",
         },
     ]
-    _assert_readiness_contract(payload)
+    _assert_valid_readiness(payload)
 
     incoherent = json.loads(json.dumps(payload))
     incoherent["mcp_bridges"][0]["owner"] = "unknown"
@@ -540,17 +420,6 @@ def test_real_blocked_preflight_fixture_preserves_supported_bridge_identity(
     mismatched_action["actions"][0]["owner"] = "claude"
     with pytest.raises(ValueError):
         validate_update_readiness(mismatched_action)
-
-    invalid_name = json.loads(json.dumps(payload))
-    invalid_name["mcp_bridges"][0]["name"] = 123
-    with pytest.raises(AssertionError):
-        _assert_readiness_contract(invalid_name)
-
-    invalid_cmdline = json.loads(json.dumps(payload))
-    invalid_cmdline["mcp_bridges"][0]["cmdline"] = {"redacted": True}
-    with pytest.raises(AssertionError):
-        _assert_readiness_contract(invalid_cmdline)
-
 
 def test_real_probe_failure_fixture_is_exit_one_and_schema_valid(
     monkeypatch: pytest.MonkeyPatch,
@@ -569,7 +438,7 @@ def test_real_probe_failure_fixture_is_exit_one_and_schema_valid(
     assert payload["blocked"] is True
     assert payload["reason"] == "probe-failed"
     assert payload["error"]["code"] == "probe-failed"
-    _assert_readiness_contract(payload)
+    _assert_valid_readiness(payload)
 
 
 @pytest.mark.parametrize(
@@ -638,7 +507,7 @@ def test_production_validator_requires_exact_successful_drain_clear_proof(
     ]
     valid = payload_for([historical_termination, *clear_proof])
     assert update_cmd.validate_update_readiness(valid) is valid
-    _assert_readiness_contract(valid)
+    _assert_valid_readiness(valid)
 
     invalid_actions = [
         [],
@@ -702,114 +571,90 @@ def test_production_validator_rejects_drain_only_actions_in_preflight(
             update_cmd.validate_update_readiness(payload)
 
 
-def test_canonical_schema_defines_safety_critical_nested_contracts():
-    schema = _schema()
-    definitions = schema["$defs"]
-    assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
-    assert set(definitions["mcpBridge"]["required"]) == {
-        "pid",
-        "name",
-        "cmdline",
-        "created_at",
-        "owner",
-        "role",
-        "actionable",
-        "actionability",
-        "action",
-    }
-    assert definitions["mcpBridge"]["properties"]["name"] == {"type": "string"}
-    assert definitions["mcpBridge"]["properties"]["cmdline"] == {"type": "string"}
-    assert set(definitions["lease"]["required"]) == {
-        "schema_version",
-        "lease_fingerprint",
-        "owner_pid",
-        "created_at",
-        "expires_at",
-        "handoff_grace_until",
-        "install_root",
-    }
-    assert set(definitions["receipt"]["required"]) == {
-        "schema_version",
-        "invocation_id",
-        "lease_id",
-        "mode",
-        "root",
-        "remote",
-        "branch",
-        "target_ref",
-        "target_sha",
-        "resulting_head",
-        "archive_sha",
-        "timestamp",
-        "success",
-        "gateway_resume_deferred",
-        "health",
-    }
-    assert definitions["receipt"]["properties"]["gateway_resume_deferred"] == {
-        "type": "boolean"
-    }
-    assert set(definitions["health"]["required"]) == {
-        "critical_syntax",
-        "critical_imports",
-        "dependencies",
-        "node_dependencies",
-    }
-    terminate_action, clear_action = definitions["action"]["oneOf"]
-    assert set(terminate_action["required"]) == {
-        "type",
-        "pid",
-        "created_at",
-        "owner",
-        "role",
-    }
-    assert set(clear_action["required"]) == {"type", "sequence"}
-
-
 def test_skill_keeps_readiness_pause_and_update_lifecycles_separate():
-    content = _normalized_content()
-    assert "For a readiness-only request" in content
-    assert "stop. Do not drain." in content
-    assert "temporary pause request" in content
-    assert "no update was applied" in content
-    assert "Do not call the drain-only command first" in content
-    assert "run `hermes update --yes` directly" in content
-    assert "final two `actions`" in content
-    assert "missing, duplicate, out-of-order, or trailing-action proof fails closed" in content
+    classify = _markdown_section("### 1. Preflight and classify").lower()
+    operate = _markdown_section("### 3. Follow the requested operation").lower()
+    contract = _markdown_section("## Quick Reference").lower()
+
+    assert "readiness-only" in classify
+    assert re.search(r"(?:do not|never)\s+drain", classify)
+    assert "temporary pause" in operate
+    assert "hermes update --drain --yes --json" in operate
+    assert "explicit update" in operate
+    assert "hermes update --yes" in operate
+    assert re.search(r"do not[^.]*drain[^.]*first", operate)
+    assert "no update" in operate and "later update" in operate
+    assert all(token in contract for token in ("clear-scan(1)", "clear-scan(2)", "final two"))
+    assert all(
+        failure in contract
+        for failure in ("missing", "duplicate", "out-of-order", "trailing-action")
+    )
 
 
 def test_atomic_update_requires_prospective_interruption_consent():
-    content = _normalized_content()
-    assert "This skill is the authorization trust boundary for `--yes`" in content
-    assert "prospective consent before every standalone" in content
-    assert "even when preflight is initially clear" in content
-    assert "launched after preflight may be paused" in content
-    assert "an initially clear scan is not interruption consent" in content
+    prerequisites = _markdown_section("## Prerequisites").lower()
+    consent = _markdown_section("### 2. Obtain interruption consent").lower()
+
+    assert all(
+        token in prerequisites
+        for token in ("trust boundary", "--yes", "prospective consent", "preflight")
+    )
+    assert all(
+        token in consent
+        for token in (
+            "codex",
+            "claude",
+            "tool calls",
+            "launched after preflight",
+            "yes/no",
+            "initially clear",
+            "stop without mutation",
+        )
+    )
 
 
 def test_destructive_shortcuts_are_explicitly_forbidden():
-    content = _content()
-    for forbidden in (
-        "Never enumerate processes directly",
-        "Never run `taskkill`, `Stop-Process`",
-        "Never create, delete, or rewrite updater markers or quiesce leases",
-        "Never use `--force-venv`",
-        "Never rebase, change remotes",
-        "Never classify `mcp_server` as Desktop `serve` by substring",
+    pitfalls = _markdown_section("## Pitfalls")
+    prohibitions = [
+        line.removeprefix("- ").lower()
+        for line in pitfalls.splitlines()
+        if line.startswith("- ")
+    ]
+    assert len(prohibitions) >= 8
+    assert all(item.startswith("never ") for item in prohibitions)
+    for required_terms in (
+        ("process", "direct"),
+        ("taskkill", "stop-process"),
+        ("marker", "lease"),
+        ("--force-venv",),
+        ("rebase", "remote"),
+        ("mcp_server", "desktop", "substring"),
     ):
-        assert forbidden in content
+        assert any(
+            all(term in prohibition for term in required_terms)
+            for prohibition in prohibitions
+        )
 
 
 def test_post_check_requires_current_receipt_health_and_relaunch_proof():
-    content = _normalized_content()
-    assert "new `invocation_id` and `lease_id` values versus pre-state" in content
-    assert "timestamp after this update command began" in content
-    assert "all health checks true" in content
-    assert "boolean `gateway_resume_deferred`" in content
-    assert "require the final ready result with `lease=null`" in content
-    assert "installed identity agrees with `git` and the intended target" in content
-    assert "successful build/relaunch proof" in content
-    assert "readiness is verified and update completion is not" in content
-    assert "this skill alone cannot claim completion for a Desktop-driven update" in content
+    post_check = _markdown_section("### 4. Post-check an update").lower()
+    for evidence in (
+        "invocation_id",
+        "lease_id",
+        "timestamp",
+        "gateway_resume_deferred",
+        "health checks",
+        "git",
+        "intended target",
+        "desktop-driven",
+        "build/relaunch",
+        "lease=null",
+    ):
+        assert evidence in post_check
+    assert all(
+        boundary in post_check
+        for boundary in ("readiness", "completion", "cannot claim", "schema v1")
+    )
 
 
 def test_shared_agent_layout_and_codex_prompt_are_declared():

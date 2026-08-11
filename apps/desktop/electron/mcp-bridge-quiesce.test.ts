@@ -13,6 +13,7 @@ import {
   mcpBridgeQuiesceMarkerPath,
   pruneInactiveMcpBridgeQuiesceLease,
   readMcpBridgeQuiesceLease,
+  revokeMcpBridgeQuiesceLease,
   transferMcpBridgeQuiesceLease,
   waitForMcpBridgeQuiesceLeaseAdoption
 } from './mcp-bridge-quiesce'
@@ -662,6 +663,70 @@ describe('MCP bridge quiesce lease', () => {
     }
   })
 
+  it('revokes the same capability after a late updater transfer wins the timeout edge', () => {
+    const { home, root } = sandbox()
+
+    try {
+      const lease = acquireMcpBridgeQuiesceLease(home, root, {
+        now: () => 100_000,
+        ownerPid: 321,
+        randomId: () => 'lease-late-adoption-12345'
+      })
+
+      assert.ok(lease)
+      const handoff = markMcpBridgeQuiesceLeaseForHandoff(home, lease, {
+        isPidAlive: pid => pid === 321,
+        now: () => 100_010
+      })
+
+      assert.ok(handoff)
+      const adopted = transferMcpBridgeQuiesceLease(home, handoff, 555, {
+        isPidAlive: pid => pid === 555,
+        now: () => 100_020
+      })
+
+      assert.ok(adopted)
+      assert.equal(adopted.ownerPid, 555)
+
+      assert.equal(
+        revokeMcpBridgeQuiesceLease(home, handoff, { now: () => 100_030, ownerPid: 321 }),
+        'revoked'
+      )
+      assert.equal(readMcpBridgeQuiesceLease(home)?.leaseId, handoff.leaseId)
+      assert.equal(
+        transferMcpBridgeQuiesceLease(home, adopted, 556, {
+          isPidAlive: pid => pid === 556,
+          now: () => 100_021
+        }),
+        null
+      )
+      const revocationArtifacts = fs
+        .readdirSync(home)
+        .filter(name => name.startsWith('.hermes-venv-quiesce.cas-'))
+
+      assert.equal(revocationArtifacts.length, 1)
+      assert.match(revocationArtifacts[0], /^\.hermes-venv-quiesce\.cas-release-/)
+      assert.equal(
+        pruneInactiveMcpBridgeQuiesceLease(home, {
+          installRoot: root,
+          isPidAlive: () => true,
+          now: () => 100_120
+        }),
+        'active'
+      )
+      assert.equal(
+        pruneInactiveMcpBridgeQuiesceLease(home, {
+          installRoot: root,
+          isPidAlive: () => true,
+          now: () => 100_121
+        }),
+        'absent'
+      )
+    } finally {
+      cleanupSandbox(home)
+    }
+  })
+
   it('requires the exact staged updater PID when one is known', async () => {
     const { home, root } = sandbox()
 
@@ -1127,6 +1192,60 @@ describe('MCP bridge quiesce lease', () => {
         }),
         null
       )
+    } finally {
+      cleanupSandbox(home)
+    }
+  })
+
+  it('retires a dead-owner non-emergency artifact only after the 90-second grace', () => {
+    const { home, root } = sandbox()
+    const marker = mcpBridgeQuiesceMarkerPath(home)
+    const artifact = `${marker}.cas-shadow-555-testnonce`
+    const recovery: McpBridgeQuiesceLease = {
+      schemaVersion: 1,
+      leaseId: 'dead-owner-recovery-12345',
+      ownerPid: 555,
+      createdAt: 100_000,
+      expiresAt: 101_200,
+      handoffGraceUntil: 100_090,
+      installRoot: fs.realpathSync.native(root)
+    }
+
+    try {
+      fs.writeFileSync(artifact, leaseRecordBytes(recovery))
+
+      assert.equal(
+        acquireMcpBridgeQuiesceLease(home, root, {
+          isPidAlive: () => false,
+          now: () => 100_090,
+          ownerPid: 777,
+          randomId: () => 'replacement-lease-12345'
+        }),
+        null
+      )
+      assert.equal(fs.existsSync(artifact), true)
+
+      assert.equal(
+        acquireMcpBridgeQuiesceLease(home, root, {
+          isPidAlive: () => true,
+          now: () => 100_091,
+          ownerPid: 777,
+          randomId: () => 'replacement-lease-12345'
+        }),
+        null
+      )
+      assert.equal(fs.existsSync(artifact), true)
+
+      assert.equal(
+        acquireMcpBridgeQuiesceLease(home, root, {
+          isPidAlive: () => false,
+          now: () => 100_091,
+          ownerPid: 777,
+          randomId: () => 'replacement-lease-12345'
+        })?.leaseId,
+        'replacement-lease-12345'
+      )
+      assert.equal(fs.existsSync(artifact), false)
     } finally {
       cleanupSandbox(home)
     }

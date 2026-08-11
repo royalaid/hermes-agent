@@ -24,7 +24,7 @@
     "pausable_gateways": {"type": "integer", "minimum": 0},
     "pausable_gateway_processes": {
       "type": "array",
-      "items": {"$ref": "#/$defs/process"}
+      "items": {"$ref": "#/$defs/gatewayProcess"}
     },
     "git": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/git"}]},
     "last_update_receipt": {
@@ -38,8 +38,7 @@
     "owner": {"enum": ["codex", "claude", "desktop", "gateway", "unknown"]},
     "role": {
       "enum": [
-        "other", "desktop_backend", "gateway_run", "update_lock_holder",
-        "mcp_bridge_wrapper", "mcp_bridge_worker"
+        "other", "desktop_backend", "update_lock_holder"
       ]
     },
     "actionability": {
@@ -59,30 +58,29 @@
         "created_at": {"type": "number", "exclusiveMinimum": 0},
         "owner": {"$ref": "#/$defs/owner"},
         "role": {"$ref": "#/$defs/role"},
-        "actionable": {"type": "boolean"},
-        "actionability": {"$ref": "#/$defs/actionability"},
-        "action": {"enum": ["refuse", "pause_downstream"]}
-      },
-      "allOf": [
-        {
-          "if": {"properties": {"role": {"const": "gateway_run"}}, "required": ["role"]},
-          "then": {
-            "properties": {
-              "owner": {"const": "gateway"},
-              "actionable": {"const": false},
-              "actionability": {"const": "downstream_drainable"},
-              "action": {"const": "pause_downstream"}
-            }
-          },
-          "else": {
-            "properties": {
-              "actionable": {"const": false},
-              "actionability": {"const": "hard_block"},
-              "action": {"const": "refuse"}
-            }
-          }
-        }
-      ]
+        "actionable": {"const": false},
+        "actionability": {"const": "hard_block"},
+        "action": {"const": "refuse"}
+      }
+    },
+    "gatewayProcess": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid", "name", "cmdline", "owner", "role", "actionable",
+        "actionability", "action"
+      ],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "name": {"type": "string"},
+        "cmdline": {"type": "string"},
+        "created_at": {"type": "number", "exclusiveMinimum": 0},
+        "owner": {"const": "gateway"},
+        "role": {"const": "gateway_run"},
+        "actionable": {"const": false},
+        "actionability": {"const": "downstream_drainable"},
+        "action": {"const": "pause_downstream"}
+      }
     },
     "mcpBridge": {
       "type": "object",
@@ -191,8 +189,8 @@
         "remote": {"type": ["string", "null"]},
         "branch": {"type": "string"},
         "target_ref": {"type": ["string", "null"]},
-        "target_sha": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{7,64}$"},
-        "resulting_head": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{7,64}$"},
+        "target_sha": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
+        "resulting_head": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{40}$"},
         "archive_sha": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{64}$"},
         "timestamp": {"type": "integer", "minimum": 1},
         "success": {"const": true},
