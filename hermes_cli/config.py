@@ -5951,8 +5951,31 @@ def _inject_profile_env_vars() -> None:
         pass
 
 
+def _read_only_update_preflight_import_active() -> bool:
+    """Return whether the importing CLI already proved read-only preflight.
+
+    Provider discovery consults the enabled-plugin configuration.  Its normal
+    config loader creates the Hermes-home directory tree, which is forbidden
+    before ``update --preflight`` returns its read-only snapshot.  The CLI
+    computes this flag with its stdlib-only argv parser before importing this
+    module; inspect the already-loaded module instead of importing it back and
+    creating a cycle.  No environment switch is used, so inherited process
+    state cannot enable this production behavior.
+    """
+    for module_name in ("hermes_cli.main", "__main__"):
+        module = sys.modules.get(module_name)
+        if module is not None and bool(
+            getattr(module, "_READ_ONLY_UPDATE_PREFLIGHT_EARLY", False)
+        ):
+            return True
+    return False
+
+
 # Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
-_inject_profile_env_vars()
+# Read-only updater preflight does not consume provider setup metadata and must
+# not let plugin discovery materialize the configuration home as a side effect.
+if not _read_only_update_preflight_import_active():
+    _inject_profile_env_vars()
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────
