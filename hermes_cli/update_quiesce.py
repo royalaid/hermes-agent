@@ -23,8 +23,10 @@ from hermes_cli.update_transaction import _UpdateTransaction
 logger = logging.getLogger(__name__)
 
 _DRAIN_CLEAR_INTERVAL_SECONDS = 0.5
+_DRAIN_CLEAR_STABILITY_SECONDS = 1.5
 _DRAIN_COOPERATIVE_WAIT_SECONDS = 1.0
 _DEFAULT_DRAIN_TIMEOUT_SECONDS = 12.0
+_DEFAULT_ATOMIC_DRAIN_TIMEOUT_SECONDS = 30.0
 
 
 def _claim_update_quiesce_lease(
@@ -131,8 +133,9 @@ def _drain_under_update_lease(
     branch: str,
     timeout_seconds: float,
     allow_hard_processes: bool = False,
+    wait_for_hard_processes: bool = False,
 ) -> dict[str, object]:
-    """Drain only actionable MCP records and prove two bounded clear scans."""
+    """Drain actionable MCP records and prove a bounded stable-clear window."""
     from hermes_cli._scan_venv_blockers import (
         scan_venv_blockers,
         terminate_mcp_bridge,
@@ -143,8 +146,13 @@ def _drain_under_update_lease(
     if not math.isfinite(timeout) or not 0.1 <= timeout <= 120.0:
         raise ValueError("timeout_seconds must be between 0.1 and 120")
     deadline = _time.monotonic() + timeout
+    clear_stability_seconds = (
+        _DRAIN_CLEAR_STABILITY_SECONDS
+        if wait_for_hard_processes
+        else _DRAIN_CLEAR_INTERVAL_SECONDS
+    )
     actions: list[dict] = []
-    clear_scans = 0
+    clear_since: float | None = None
     cooperative_wait_done = False
     last_scan: dict[str, object] = {}
     try:
@@ -158,20 +166,24 @@ def _drain_under_update_lease(
             reason="probe-failed",
             error={"code": "probe-failed", "message": str(exc)},
         )
+
+    def _drain_timeout_payload() -> dict[str, object]:
+        return _readiness_payload(
+            mode="drain",
+            root=root,
+            scan=last_scan,
+            git=git_metadata,
+            receipt=receipt,
+            lease=lease,
+            actions=actions,
+            ok=True,
+            ready=False,
+            reason="drain-timeout",
+        )
+
     while True:
-        if _time.monotonic() > deadline:
-            return _readiness_payload(
-                mode="drain",
-                root=root,
-                scan=last_scan,
-                git=git_metadata,
-                receipt=receipt,
-                lease=lease,
-                actions=actions,
-                ok=True,
-                ready=False,
-                reason="drain-timeout",
-            )
+        if _time.monotonic() >= deadline:
+            return _drain_timeout_payload()
         try:
             last_scan = scan_venv_blockers(root)
         except Exception as exc:
@@ -183,12 +195,14 @@ def _drain_under_update_lease(
                 reason="probe-failed",
                 error={"code": "probe-failed", "message": str(exc)},
             )
+        scan_completed_at = _time.monotonic()
+        if scan_completed_at >= deadline:
+            return _drain_timeout_payload()
 
         bridges = list(last_scan.get("mcp_bridges", []))
         hard_processes = list(last_scan.get("processes", []))
         unactionable = [entry for entry in bridges if not bool(entry.get("actionable"))]
-        if (hard_processes or unactionable) and not allow_hard_processes:
-            reason = "venv-blocked" if hard_processes else "mcp-owner-unverified"
+        if unactionable and not allow_hard_processes:
             return _readiness_payload(
                 mode="drain",
                 root=root,
@@ -199,12 +213,39 @@ def _drain_under_update_lease(
                 actions=actions,
                 ok=True,
                 ready=False,
-                reason=reason,
+                reason="mcp-owner-unverified",
             )
+        if hard_processes and not allow_hard_processes:
+            if not wait_for_hard_processes:
+                return _readiness_payload(
+                    mode="drain",
+                    root=root,
+                    scan=last_scan,
+                    git=git_metadata,
+                    receipt=receipt,
+                    lease=lease,
+                    actions=actions,
+                    ok=True,
+                    ready=False,
+                    reason="venv-blocked",
+                )
+            # A scheduled status/presence helper can start after Desktop's
+            # outer preflight and briefly hold this venv. It is never safe to
+            # terminate or exempt: wait only for an observed natural exit,
+            # then restart the full stable-clear proof. The shared drain
+            # deadline keeps persistent or repeated holders fail-closed.
+            clear_since = None
+            actions = [
+                action for action in actions if action.get("type") != "clear-scan"
+            ]
+            remaining = deadline - _time.monotonic()
+            if remaining > 0:
+                _time.sleep(min(_DRAIN_CLEAR_INTERVAL_SECONDS, remaining))
+            continue
 
         actionable = [entry for entry in bridges if bool(entry.get("actionable"))]
         if actionable:
-            clear_scans = 0
+            clear_since = None
             actions = [
                 action for action in actions if action.get("type") != "clear-scan"
             ]
@@ -235,9 +276,12 @@ def _drain_under_update_lease(
             _time.sleep(min(0.1, max(0.0, deadline - _time.monotonic())))
             continue
 
-        clear_scans += 1
-        actions.append({"type": "clear-scan", "sequence": clear_scans})
-        if clear_scans >= 2:
+        clear_now = scan_completed_at
+        if clear_since is None:
+            clear_since = clear_now
+            actions.append({"type": "clear-scan", "sequence": 1})
+        elif clear_now - clear_since >= clear_stability_seconds:
+            actions.append({"type": "clear-scan", "sequence": 2})
             # Renew from success time so the caller has a full, bounded handoff
             # window. The token stays stable for explicit updater adoption.
             lease = write_quiesce_lease(
@@ -732,14 +776,28 @@ def _prepare_atomic_windows_update(
                 "⚠ --force-venv: unverified venv holders will not block mutation; "
                 "native extensions may remain locked and the install may be damaged."
             )
+        requested_timeout = float(
+            getattr(args, "timeout_seconds", _DEFAULT_DRAIN_TIMEOUT_SECONDS)
+        )
+        # --timeout-seconds is the public standalone-drain bound. argparse
+        # also materializes it on normal updates, where the atomic handoff
+        # needs enough time for the scheduled 20-second gateway-status helper
+        # plus stable-clear proof. Keep the standalone behavior unchanged and
+        # enforce a 30-second floor only on this atomic path. Preserve invalid
+        # programmatic values so the drain validator still rejects them.
+        atomic_timeout = (
+            max(requested_timeout, _DEFAULT_ATOMIC_DRAIN_TIMEOUT_SECONDS)
+            if math.isfinite(requested_timeout)
+            and 0.1 <= requested_timeout <= 120.0
+            else requested_timeout
+        )
         payload = _drain_under_update_lease(
             root,
             lease,
             branch=branch,
-            timeout_seconds=float(
-                getattr(args, "timeout_seconds", _DEFAULT_DRAIN_TIMEOUT_SECONDS)
-            ),
+            timeout_seconds=atomic_timeout,
             allow_hard_processes=force_venv,
+            wait_for_hard_processes=True,
         )
         if not payload.get("ok") or not payload.get("ready"):
             _print_update_readiness(payload, json_mode=False)
