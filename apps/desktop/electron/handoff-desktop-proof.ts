@@ -1,6 +1,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import {
+  canonicalPathIdentity,
+  hasExactKeys,
+  type Realpath,
+  resolveCanonicalAbsolutePath,
+  sameCanonicalPath
+} from './handoff-wire-validation'
+
 const BUILD_ID_PATTERN = /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/
 
 export interface HandoffDesktopIdentityInput {
@@ -26,33 +34,19 @@ export interface HandoffBuildProof {
 
 interface FileDeps {
   readFile?: (file: string) => string
-  realpath?: (file: string) => string
+  realpath?: Realpath
 }
 
-function exactKeys(value: unknown, expected: string[]): value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {return false}
-  const keys = Object.keys(value).sort()
-  const sorted = [...expected].sort()
+function comparablePath(value: string, realpath?: Realpath): string | null {
+  const resolved = resolveCanonicalAbsolutePath(value, realpath)
 
-  return keys.length === sorted.length && keys.every((key, index) => key === sorted[index])
-}
-
-function comparablePath(value: string, realpath: (file: string) => string): string | null {
-  if (typeof value !== 'string' || !path.isAbsolute(value)) {return null}
-
-  try {
-    const resolved = realpath(value)
-
-    return process.platform === 'win32' ? resolved.toLowerCase() : resolved
-  } catch {
-    return null
-  }
+  return resolved === null ? null : canonicalPathIdentity(resolved)
 }
 
 /** Prove this is the exact Desktop process requested by the updater. */
 export function validateHandoffDesktopIdentity(
   input: HandoffDesktopIdentityInput,
-  { realpath = fs.realpathSync.native }: FileDeps = {}
+  { realpath }: FileDeps = {}
 ): HandoffDesktopIdentity | null {
   if (!Number.isInteger(input.currentPid) || input.currentPid <= 0 || input.currentPid !== input.expectedPid) {return null}
 
@@ -77,11 +71,11 @@ export function validateHandoffDesktopIdentity(
   // the managed source install is under HERMES_HOME\hermes-agent. Root and
   // executable are independent correlated identities: require the exact
   // updater-requested executable, but do not invent a containment relation.
-  if (executable !== expectedExecutable) {return null}
+  if (!sameCanonicalPath(executable, expectedExecutable)) {return null}
 
   const expectedResources = comparablePath(path.join(path.dirname(executable), 'resources'), realpath)
 
-  if (!expectedResources || resources !== expectedResources) {return null}
+  if (!expectedResources || !sameCanonicalPath(resources, expectedResources)) {return null}
 
   return { executable, root }
 }
@@ -102,7 +96,7 @@ export function readCorrelatedInstallStamp(
     return null
   }
 
-  if (!exactKeys(parsed, ['schemaVersion', 'commit', 'branch', 'builtAt', 'dirty', 'source'])) {return null}
+  if (!hasExactKeys(parsed, ['schemaVersion', 'commit', 'branch', 'builtAt', 'dirty', 'source'])) {return null}
 
   if (
     parsed.schemaVersion !== 1 ||
