@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import venv_bin_dir, venv_python_path
+from hermes_constants import get_default_hermes_root, venv_bin_dir, venv_python_path
 from hermes_cli.update_deferred_gateway import (
     _cmd_update_resume_deferred_gateway,
     _validate_deferred_update_request,
@@ -4142,6 +4142,10 @@ _GATEWAY_STOP_ROLES = frozenset(
 )
 
 
+class _GatewayOutsideInstall(RuntimeError):
+    """A discovered gateway process is rooted outside the target install."""
+
+
 def _canonical_process_path(value: str | Path) -> str:
     return os.path.normcase(os.path.realpath(os.fspath(value)))
 
@@ -4203,8 +4207,12 @@ def _capture_gateway_stop_identity(
     )
     executable = _canonical_process_path(executable_raw)
     working_directory = _canonical_process_path(cwd_raw)
-    if not _process_path_is_within(working_directory, install_root):
-        raise RuntimeError(
+    global_home = _canonical_process_path(get_default_hermes_root())
+    if not any(
+        _process_path_is_within(working_directory, allowed_root)
+        for allowed_root in (install_root, global_home)
+    ):
+        raise _GatewayOutsideInstall(
             f"gateway process {numeric_pid} is not rooted in this install"
         )
     if role == "gateway_launcher":
@@ -4611,6 +4619,47 @@ def _pause_windows_gateways_for_update(
             ) from exc
         logger.debug("Could not discover Windows gateway PIDs before update: %s", exc)
         return None
+    profile_processes = {}
+    if running_pids:
+        try:
+            profile_processes = {
+                proc.pid: proc for proc in find_profile_gateway_processes()
+            }
+        except Exception as exc:
+            if require_structured_resume:
+                raise RuntimeError(
+                    "could not map the gateway fleet to verified profiles"
+                ) from exc
+            logger.debug("Could not map Windows gateway PIDs to profiles: %s", exc)
+
+    # Convert discovery PIDs into immutable, root-bound process identities
+    # before the first wait or stop. A PID that exits during the drain can be
+    # reused immediately; the numeric value and a post-wait argv read are not
+    # authority to tree-kill the replacement. Global process discovery can
+    # also see gateways from another Hermes checkout. Ignore one only when it
+    # is unmapped by this install and its live cwd proves the foreign root;
+    # target profile state that names the PID remains a hard refusal.
+    verified_by_pid: dict[int, _VerifiedProcessIdentity] = {}
+    for pid in running_pids:
+        proc = profile_processes.get(pid)
+        role = "gateway_worker" if proc is not None else "gateway_unmapped"
+        try:
+            identity = _capture_gateway_stop_identity(
+                int(pid), role=role, root=_m().PROJECT_ROOT
+            )
+        except _GatewayOutsideInstall:
+            if proc is not None:
+                raise
+            continue
+        if identity is None:
+            if require_structured_resume:
+                raise RuntimeError(
+                    f"gateway process {pid} exited before its fleet identity was frozen"
+                )
+            continue
+        verified_by_pid[int(pid)] = identity
+
+    running_pids = list(verified_by_pid)
     if not running_pids:
         # No gateway is running right now, but the user may have installed an
         # autostart entry (Scheduled Task or Startup-folder login item) — that
@@ -4652,41 +4701,6 @@ def _pause_windows_gateways_for_update(
             return token
         return None
 
-    profile_processes = {}
-    try:
-        profile_processes = {
-            proc.pid: proc for proc in find_profile_gateway_processes()
-        }
-    except Exception as exc:
-        if require_structured_resume:
-            raise RuntimeError(
-                "could not map the gateway fleet to verified profiles"
-            ) from exc
-        logger.debug("Could not map Windows gateway PIDs to profiles: %s", exc)
-
-    # Convert discovery PIDs into immutable, root-bound process identities
-    # before the first wait or stop. A PID that exits during the drain can be
-    # reused immediately; the numeric value and a post-wait argv read are not
-    # authority to tree-kill the replacement.
-    verified_by_pid: dict[int, _VerifiedProcessIdentity] = {}
-    for pid in running_pids:
-        proc = profile_processes.get(pid)
-        role = "gateway_worker" if proc is not None else "gateway_unmapped"
-        try:
-            identity = _capture_gateway_stop_identity(
-                int(pid), role=role, root=_m().PROJECT_ROOT
-            )
-        except RuntimeError:
-            raise
-        if identity is None:
-            if require_structured_resume:
-                raise RuntimeError(
-                    f"gateway process {pid} exited before its fleet identity was frozen"
-                )
-            continue
-        verified_by_pid[int(pid)] = identity
-
-    running_pids = list(verified_by_pid)
     profiles: dict[str, int] = {}
     profile_identities: dict[str, dict[str, float | int]] = {}
     mapped_pids: list[int] = []
