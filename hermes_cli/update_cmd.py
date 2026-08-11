@@ -3478,7 +3478,6 @@ def _detect_venv_python_processes(
 
         process_rows.append(
             {
-                "process": proc,
                 "pid": numeric_pid,
                 # Test doubles and some psutil versions may already provide a
                 # ppid. Real Windows process_iter does not because we omit the
@@ -3535,7 +3534,9 @@ def _detect_venv_python_processes(
         and Path(str(row["exe"])).name.casefold() in {"python.exe", "pythonw.exe"}
         and bool(row["argv"])
     }
-    rows_by_pid = {int(row["pid"]): row for row in process_rows}
+    if not target_venv_wrappers:
+        return matches
+
     wrapper_argv_tails = {
         tuple(str(value) for value in row["argv"])[1:]
         for row in target_venv_wrappers.values()
@@ -3549,6 +3550,10 @@ def _detect_venv_python_processes(
         and tuple(str(value) for value in row["argv"])[1:]
         in wrapper_argv_tails
     ]
+    if not external_wrapper_candidates:
+        return matches
+
+    rows_by_pid = {int(row["pid"]): row for row in process_rows}
     parent_by_pid = _parent_by_pid
     if parent_by_pid is None and any(
         row["ppid"] is None for row in external_wrapper_candidates
