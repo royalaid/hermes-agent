@@ -15,7 +15,7 @@ import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, NoReturn, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 from hermes_mcp_update_gate import MCP_MAIN_MODULE, is_exact_mcp_module_argv
 
@@ -368,7 +368,11 @@ def _is_pausable_gateway(argv: str | Sequence[str]) -> bool:
     )
 
 
-def _snapshot_for_pid(pid: int) -> _ProcessSnapshot | None:
+def _snapshot_for_pid(
+    pid: int,
+    *,
+    parent_by_pid: Mapping[int, int] | None = None,
+) -> _ProcessSnapshot | None:
     import psutil  # noqa: PLC0415
 
     try:
@@ -376,7 +380,11 @@ def _snapshot_for_pid(pid: int) -> _ProcessSnapshot | None:
         argv_value = process.cmdline()
         exe = process.exe()
         created_at = float(process.create_time())
-        ppid = int(process.ppid())
+        ppid = int(
+            process.ppid()
+            if parent_by_pid is None
+            else parent_by_pid.get(int(pid), 0)
+        )
         name = str(process.name() or Path(str(exe)).name)
     except psutil.NoSuchProcess:
         return None
@@ -432,8 +440,18 @@ def _mcp_record(
     *,
     role: str,
     wrapper_pid: int | None,
+    owner: str | None = None,
+    parent_by_pid: Mapping[int, int] | None = None,
 ) -> dict[str, Any]:
-    owner = _owner_from_ancestry(snapshot)
+    if owner is None:
+        owner = (
+            _owner_from_ancestry(snapshot)
+            if parent_by_pid is None
+            else _owner_from_ancestry(
+                snapshot,
+                parent_by_pid=parent_by_pid,
+            )
+        )
     actionable = owner in {"codex", "claude"}
     record: dict[str, Any] = {
         "pid": snapshot.pid,
@@ -451,12 +469,33 @@ def _mcp_record(
     return record
 
 
-def _owner_from_ancestry(snapshot: _ProcessSnapshot) -> str:
+def _owner_from_ancestry(
+    snapshot: _ProcessSnapshot,
+    *,
+    parent_by_pid: Mapping[int, int] | None = None,
+) -> str:
     """Attribute a bridge only when a live ancestor proves the owner."""
-    try:
-        parents = snapshot.process.parents()
-    except Exception:
-        return "unknown"
+    if parent_by_pid is None:
+        try:
+            parents = snapshot.process.parents()
+        except Exception:
+            return "unknown"
+    else:
+        import psutil  # noqa: PLC0415
+
+        parents = []
+        ancestor_pid = snapshot.ppid
+        seen: set[int] = set()
+        while ancestor_pid > 0 and ancestor_pid not in seen:
+            seen.add(ancestor_pid)
+            try:
+                parents.append(psutil.Process(ancestor_pid))
+            except Exception:
+                pass
+            try:
+                ancestor_pid = int(parent_by_pid.get(ancestor_pid, 0))
+            except (TypeError, ValueError):
+                break
     for parent in parents:
         try:
             name = str(parent.name() or "").lower()
@@ -515,12 +554,25 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
     """Return a strict, typed blocker snapshot for a validated target root."""
     target_root, venv = _validated_root(root)
     try:
-        import psutil  # noqa: F401, PLC0415
+        import psutil  # noqa: PLC0415
         from hermes_cli.update_cmd import (  # noqa: PLC0415
             _detect_venv_python_processes,
         )
 
-        matches = _detect_venv_python_processes(root=target_root, strict=True)
+        parent_by_pid: dict[int, int] | None = None
+        ppid_map_fn = getattr(psutil, "_ppid_map", None)
+        if callable(ppid_map_fn):
+            parent_by_pid = {
+                int(pid): int(ppid) for pid, ppid in ppid_map_fn().items()
+            }
+        detector_kwargs: dict[str, Any] = {}
+        if parent_by_pid is not None:
+            detector_kwargs["_parent_by_pid"] = parent_by_pid
+        matches = _detect_venv_python_processes(
+            root=target_root,
+            strict=True,
+            **detector_kwargs,
+        )
     except Exception as exc:
         raise RuntimeError(f"scan aborted: {exc}") from exc
 
@@ -531,7 +583,14 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
     unreadable: set[int] = set()
     for pid in by_pid:
         try:
-            snapshot = _snapshot_for_pid(pid)
+            snapshot = (
+                _snapshot_for_pid(pid)
+                if parent_by_pid is None
+                else _snapshot_for_pid(
+                    pid,
+                    parent_by_pid=parent_by_pid,
+                )
+            )
         except Exception:
             unreadable.add(pid)
             continue
@@ -547,6 +606,7 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
     mcp_bridges: list[dict[str, Any]] = []
     processes: list[dict[str, Any]] = []
     gateways: list[dict[str, Any]] = []
+    owner_by_parent_pid: dict[int, str] = {}
     for pid, (scanned_name, scanned_cmdline) in by_pid.items():
         snapshot = snapshots.get(pid)
         if snapshot is None and pid not in unreadable:
@@ -555,8 +615,30 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
             classified = _mcp_role(snapshot, target_root, wrappers, snapshots)
             if classified is not None:
                 role, wrapper_pid = classified
+                owner_anchor = (
+                    snapshots.get(wrapper_pid, snapshot)
+                    if wrapper_pid is not None
+                    else snapshot
+                )
+                owner = owner_by_parent_pid.get(owner_anchor.ppid)
+                if owner is None:
+                    owner = (
+                        _owner_from_ancestry(owner_anchor)
+                        if parent_by_pid is None
+                        else _owner_from_ancestry(
+                            owner_anchor,
+                            parent_by_pid=parent_by_pid,
+                        )
+                    )
+                    owner_by_parent_pid[owner_anchor.ppid] = owner
                 mcp_bridges.append(
-                    _mcp_record(snapshot, role=role, wrapper_pid=wrapper_pid)
+                    _mcp_record(
+                        snapshot,
+                        role=role,
+                        wrapper_pid=wrapper_pid,
+                        owner=owner,
+                        parent_by_pid=parent_by_pid,
+                    )
                 )
                 continue
             live_argv = snapshot.argv
