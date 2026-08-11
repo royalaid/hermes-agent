@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -47,6 +48,17 @@ _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
 # command; a module singleton lets the 7k-line updater record steps from
 # any depth without threading a handle through every helper.
 _current: Optional["UpdateReceipt"] = None
+
+
+# Handoff-receipt (``.hermes-update-receipt.json``) validation vocabulary.
+# Distinct from the fleet receipts above: a handoff receipt is the terminal
+# mutation proof consumed by the desktop/bootstrap updater, so its identity
+# fields are matched at exact widths (full 40-hex git SHAs, 64-hex archive
+# digests) rather than the loose short-SHA form accepted elsewhere.
+_UPDATE_RECEIPT_NAME = ".hermes-update-receipt.json"
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{16,128}$")
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_ARCHIVE_SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _utc_now_iso() -> str:
@@ -200,6 +212,123 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None) -> Optional
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not write update receipt: %s", exc)
         return None
+
+
+def _sanitize_update_receipt(value: object, root: Path) -> dict | None:
+    """Validate one handoff receipt, returning its canonical form or None.
+
+    Fails closed: every field must be present, exactly typed, and bound to
+    ``root``.  The git and archive modes are mutually exclusive in their
+    identity fields, so a receipt can never describe both.
+    """
+    if not isinstance(value, dict):
+        return None
+    expected_receipt_keys = {
+        "schema_version",
+        "invocation_id",
+        "lease_id",
+        "mode",
+        "root",
+        "remote",
+        "branch",
+        "target_ref",
+        "target_sha",
+        "resulting_head",
+        "archive_sha",
+        "timestamp",
+        "success",
+        "gateway_resume_deferred",
+        "health",
+    }
+    if set(value) != expected_receipt_keys:
+        return None
+    try:
+        timestamp = int(value["timestamp"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if value.get("schema_version") != 1 or value.get("success") is not True:
+        return None
+    if type(value.get("gateway_resume_deferred")) is not bool:
+        return None
+    if value.get("mode") not in {"git", "archive"} or timestamp <= 0:
+        return None
+    if os.path.normcase(os.path.realpath(str(value.get("root", "")))) != os.path.normcase(
+        os.path.realpath(root)
+    ):
+        return None
+    invocation_id = value.get("invocation_id")
+    lease_id = value.get("lease_id")
+    if not isinstance(invocation_id, str) or _IDENTIFIER_RE.fullmatch(invocation_id) is None:
+        return None
+    if not isinstance(lease_id, str) or _IDENTIFIER_RE.fullmatch(lease_id) is None:
+        return None
+    branch = value.get("branch")
+    if not isinstance(branch, str) or not branch:
+        return None
+    remote = value.get("remote")
+    target_ref = value.get("target_ref")
+    if remote is not None and not isinstance(remote, str):
+        return None
+    if target_ref is not None and not isinstance(target_ref, str):
+        return None
+    shas: dict[str, str | None] = {}
+    for field, pattern in (
+        ("target_sha", _SHA_RE),
+        ("resulting_head", _SHA_RE),
+        ("archive_sha", _ARCHIVE_SHA_RE),
+    ):
+        candidate = value.get(field)
+        if candidate is not None and (
+            not isinstance(candidate, str) or pattern.fullmatch(candidate) is None
+        ):
+            return None
+        shas[field] = candidate.lower() if candidate else None
+    if value["mode"] == "git":
+        if (
+            not remote
+            or not target_ref
+            or shas["target_sha"] is None
+            or shas["resulting_head"] is None
+            or shas["target_sha"] != shas["resulting_head"]
+            or shas["archive_sha"] is not None
+        ):
+            return None
+    elif (
+        remote is not None
+        or target_ref is not None
+        or shas["target_sha"] is not None
+        or shas["resulting_head"] is not None
+        or shas["archive_sha"] is None
+    ):
+        return None
+    health = value.get("health")
+    expected_health = {
+        "critical_syntax",
+        "critical_imports",
+        "dependencies",
+        "node_dependencies",
+    }
+    if not isinstance(health, dict) or set(health) != expected_health:
+        return None
+    if any(type(health[field]) is not bool for field in expected_health) or not all(
+        health[field] for field in expected_health
+    ):
+        return None
+    return {
+        "schema_version": 1,
+        "invocation_id": invocation_id,
+        "lease_id": lease_id,
+        "mode": value["mode"],
+        "root": os.path.normcase(os.path.realpath(root)),
+        "remote": remote,
+        "branch": branch,
+        "target_ref": target_ref,
+        **shas,
+        "timestamp": timestamp,
+        "success": True,
+        "gateway_resume_deferred": bool(value["gateway_resume_deferred"]),
+        "health": {field: bool(health[field]) for field in sorted(expected_health)},
+    }
 
 
 def _prune_old_receipts(directory: Path) -> None:
