@@ -2,6 +2,7 @@
 
 import hashlib
 import subprocess
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,6 +14,8 @@ from hermes_cli.main import cmd_update, PROJECT_ROOT
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 
+    installed_sha = "a" * 40
+
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
@@ -23,7 +26,14 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
         # git rev-parse --verify origin/{branch}  (check remote branch exists)
         if "rev-parse" in joined and "--verify" in joined:
             rc = 0 if verify_ok else 128
-            return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+            stdout = f"{installed_sha}\n" if verify_ok else ""
+            return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr="")
+
+        # Receipt proof resolves the installed HEAD after fork sync/update.
+        if "rev-parse" in joined and "HEAD" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{installed_sha}\n", stderr=""
+            )
 
         # git rev-list HEAD..origin/{branch} --count
         if "rev-list" in joined:
@@ -50,7 +60,7 @@ def mock_args():
 # ``shutil.which`` so the existing test setup keeps working without
 # per-test changes.
 @pytest.fixture(autouse=True)
-def _patch_managed_uv(request):
+def _patch_managed_uv(request, platform_neutral_update_lifecycle):
     """Make managed_uv helpers follow shutil.which mocking in tests."""
     import shutil
 
@@ -65,9 +75,30 @@ def _patch_managed_uv(request):
     def _fake_update_managed_uv(**_kwargs):
         return None  # never actually self-update in tests
 
+    generic_cmd_update_classes = {
+        "TestCmdUpdateBranchFallback",
+        "TestCmdUpdateMigrationPrompt",
+        "TestCmdUpdateProfileSkillSync",
+        "TestCmdUpdateBranchFlag",
+    }
+    patch_node = (
+        patch("hermes_cli.update_cmd._update_node_dependencies", return_value=[])
+        if request.cls and request.cls.__name__ in generic_cmd_update_classes
+        else nullcontext()
+    )
+    patch_node_health = (
+        patch(
+            "hermes_cli.update_cmd._node_dependencies_healthy_read_only",
+            return_value=True,
+        )
+        if request.cls and request.cls.__name__ in generic_cmd_update_classes
+        else nullcontext()
+    )
+
     with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
          patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
-         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv):
+         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv), \
+         patch_node, patch_node_health:
         yield
 
 
@@ -202,6 +233,123 @@ class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
 
+    def test_foreign_upstream_remote_refuses_before_fetch_or_merge(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A remote named upstream is not authority to merge foreign code."""
+        from hermes_cli import update_cmd
+
+        repo = tmp_path / "repo"
+        foreign = tmp_path / "foreign.git"
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+        subprocess.run(["git", "init", "--bare", "--quiet", str(foreign)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "add", "upstream", str(foreign)],
+            check=True,
+        )
+
+        real_run = subprocess.run
+        commands: list[list[str]] = []
+
+        def traced_run(command, **kwargs):
+            commands.append([str(value) for value in command])
+            return real_run(command, **kwargs)
+
+        monkeypatch.setattr(update_cmd.subprocess, "run", traced_run)
+
+        assert not update_cmd._has_upstream_remote(["git"], repo)
+        update_cmd._sync_with_upstream_if_needed(["git"], repo)
+
+        operative = [
+            command
+            for command in commands
+            if "fetch" in command or "merge" in command
+        ]
+        assert operative == []
+        assert "not the official Hermes repository" in capsys.readouterr().out
+
+    def test_local_instead_of_refuses_no_upstream_path_before_fetch_or_merge(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A literal official URL must not be redirected by repo config."""
+        from hermes_cli import update_cmd
+
+        repo = tmp_path / "repo"
+        foreign = tmp_path / "foreign.git"
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+        subprocess.run(["git", "init", "--bare", "--quiet", str(foreign)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "config",
+                "--local",
+                f"url.{foreign.as_uri()}.insteadOf",
+                update_cmd.OFFICIAL_REPO_URL,
+            ],
+            check=True,
+        )
+
+        real_run = subprocess.run
+        commands: list[list[str]] = []
+
+        def traced_run(command, **kwargs):
+            values = [str(value) for value in command]
+            commands.append(values)
+            if "fetch" in values:
+                # Never touch the network while reproducing the vulnerable
+                # command selection; observing the fetch is already failure.
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            return real_run(command, **kwargs)
+
+        monkeypatch.setattr(update_cmd.subprocess, "run", traced_run)
+
+        with patch("builtins.input", return_value="y"):
+            update_cmd._sync_with_upstream_if_needed(["git"], repo)
+
+        assert not any("fetch" in command or "merge" in command for command in commands)
+        assert "URL rewrite" in capsys.readouterr().out
+        assert real_run(
+            ["git", "-C", str(repo), "remote", "get-url", "upstream"],
+            capture_output=True,
+            text=True,
+        ).returncode != 0
+
+    def test_official_upstream_fetch_uses_immutable_url_and_exact_refspec(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import update_cmd
+
+        commands: list[list[str]] = []
+
+        def fake_run(command, **_kwargs):
+            commands.append([str(value) for value in command])
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            update_cmd,
+            "_get_remote_url",
+            lambda *_args: update_cmd.OFFICIAL_REPO_URL,
+        )
+        monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+        monkeypatch.setattr(update_cmd, "_count_commits_between", lambda *_args: 0)
+
+        assert update_cmd._has_upstream_remote(["git"], tmp_path)
+        update_cmd._sync_with_upstream_if_needed(["git"], tmp_path)
+
+        fetches = [command for command in commands if "fetch" in command]
+        assert fetches == [
+            [
+                "git",
+                "fetch",
+                update_cmd.OFFICIAL_REPO_URL,
+                "+refs/heads/main:refs/remotes/upstream/main",
+                "--quiet",
+            ]
+        ]
+
+
 
 
     @patch("shutil.which", return_value=None)
@@ -220,17 +368,18 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        with patch.object(
-            hm,
-            "_get_origin_url",
+        with patch(
+            "hermes_cli.update_cmd._get_remote_url",
             return_value="https://github.com/example/hermes-agent.git",
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
             cmd_update(mock_args)
 
-        expected_git_cmd = (
-            ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
+        from hermes_cli.update_cmd import _git_cmd
+
+        expected_git_cmd = _git_cmd()
+        sync_mock.assert_called_once_with(
+            expected_git_cmd, PROJECT_ROOT, fork_remote="origin"
         )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -540,6 +689,157 @@ class TestCmdUpdateBranchFlag:
         assert "does not exist locally or on origin" in out
         assert "nonexistent" in out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_no_update_refuses_receipt_when_original_branch_cannot_be_restored(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        base = self._branch_side_effect(
+            current_branch="work", target_branch="main", commit_count="0"
+        )
+
+        def side_effect(command, **kwargs):
+            joined = " ".join(str(value) for value in command)
+            if "checkout work" in joined:
+                return subprocess.CompletedProcess(
+                    command, 1, stdout="", stderr="injected checkout failure"
+                )
+            if "symbolic-ref --quiet --short HEAD" in joined:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="work\n", stderr=""
+                )
+            return base(command, **kwargs)
+
+        mock_run.side_effect = side_effect
+        args = SimpleNamespace(branch="main")
+
+        with patch.object(update_cmd, "_record_update_success") as record:
+            with pytest.raises(SystemExit) as exit_info:
+                cmd_update(args)
+
+        assert exit_info.value.code == 1
+        record.assert_not_called()
+        assert "could not be restored" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_no_update_refuses_receipt_when_symbolic_branch_proof_is_wrong(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        base = self._branch_side_effect(
+            current_branch="work", target_branch="main", commit_count="0"
+        )
+
+        def side_effect(command, **kwargs):
+            joined = " ".join(str(value) for value in command)
+            if "checkout work" in joined:
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            if "symbolic-ref --quiet --short HEAD" in joined:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="main\n", stderr=""
+                )
+            return base(command, **kwargs)
+
+        mock_run.side_effect = side_effect
+        args = SimpleNamespace(branch="main")
+
+        with patch.object(update_cmd, "_record_update_success") as record:
+            with pytest.raises(SystemExit) as exit_info:
+                cmd_update(args)
+
+        assert exit_info.value.code == 1
+        record.assert_not_called()
+        assert "could not be restored" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_no_update_refuses_receipt_when_stash_restore_is_not_clean(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="0"
+        )
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(hm, "_stash_local_changes_if_needed", return_value="stash-ref"),
+            patch.object(hm, "_restore_stashed_changes", return_value=False),
+            patch.object(update_cmd, "_record_update_success") as record,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cmd_update(args)
+
+        assert exit_info.value.code == 1
+        record.assert_not_called()
+        assert "no success receipt" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_fork_push_stale_tracking_ref_suppresses_success_receipt(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="0"
+        )
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(update_cmd, "_is_fork", return_value=True),
+            patch.object(hm, "_sync_with_upstream_if_needed"),
+            patch.object(update_cmd, "_capture_head_sha", return_value="a" * 40),
+            patch.object(
+                update_cmd, "_refresh_update_target_sha", return_value="b" * 40
+            ) as refresh,
+            patch.object(update_cmd, "_record_update_success") as record,
+        ):
+            cmd_update(args)
+
+        refresh.assert_called_once()
+        refreshed_target = refresh.call_args.args[2]
+        assert refreshed_target.remote == "origin"
+        assert refreshed_target.refspec == (
+            "+refs/heads/main:refs/remotes/origin/main"
+        )
+        record.assert_not_called()
+        assert "identity could not be proven" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_unsafe_local_git_driver_refuses_before_worktree_cleanup(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="0"
+        )
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(
+                update_cmd,
+                "_assert_safe_git_configuration",
+                side_effect=RuntimeError("executable filter driver"),
+            ),
+            patch.object(update_cmd, "_discard_lockfile_churn") as discard,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cmd_update(args)
+
+        assert exit_info.value.code == 1
+        discard.assert_not_called()
+        assert "Unsafe Git configuration" in capsys.readouterr().out
+
 
 class TestCmdUpdateCheckBranchFlag:
     """``hermes update --check --branch <name>`` honors the branch override.
@@ -649,10 +949,10 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_default_main_uses_configured_tracking_remote(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """No --branch uses the branch's configured tracking remote."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
@@ -661,11 +961,15 @@ class TestCmdUpdateCheckBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have tried upstream first.
-        assert any("fetch" in c and "upstream" in c for c in commands), commands
-        # Compare ref is upstream/main (upstream fetch succeeded).
+        # Fetch and compare must use the same configured origin tracking ref.
+        assert any(
+            "fetch" in c
+            and "origin" in c
+            and "+refs/heads/main:refs/remotes/origin/main" in c
+            for c in commands
+        ), commands
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+        assert any("refs/remotes/origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
 
 class TestCmdUpdateZipBranchRefusal:
@@ -751,13 +1055,13 @@ class TestNodeRuntimeNpmResolution:
 
 
 
+    @pytest.mark.linux_only
     def test_wsl_update_skips_windows_npm_build_paths(self, mock_args, monkeypatch):
         """A Windows-only npm on WSL must not reach web or desktop builds."""
         from hermes_cli import main as hm
         import hermes_constants
 
         windows_npm = "/mnt/c/Program Files/nodejs/npm"
-        monkeypatch.setattr(hm, "_is_windows", lambda: False)
         monkeypatch.setattr(hermes_constants, "is_wsl", lambda: True)
         monkeypatch.setattr(
             hermes_constants,
