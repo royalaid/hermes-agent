@@ -149,6 +149,67 @@ def test_strict_detector_excludes_exact_immediate_hermes_console_shim(
     ) == []
 
 
+def test_strict_detector_excludes_exact_immediate_python_venv_trampoline(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    argv = [
+        str(python),
+        "-m",
+        "hermes_cli.main",
+        "update",
+        "--preflight",
+        "--json",
+    ]
+    parent = types.SimpleNamespace(
+        pid=556,
+        exe=lambda: str(python),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(556, str(python), "python.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == []
+
+
+def test_strict_detector_keeps_immediate_python_venv_non_update_parent(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    argv = [str(python), "-m", "hermes_cli.main", "serve"]
+    parent = types.SimpleNamespace(
+        pid=557,
+        exe=lambda: str(python),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(557, str(python), "python.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == [(557, "python.exe", " ".join(argv))]
+
+
 @pytest.mark.parametrize(
     "global_args",
     [
