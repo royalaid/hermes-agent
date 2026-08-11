@@ -54,6 +54,7 @@ const blockedByBridges = (bridges = [bridge()]): ScanOutcome => ({
 function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> = {}) {
   const calls: string[] = []
   const queue = [...scans]
+  let currentTime = 0
 
   const deps: UpdatePreflightDeps = {
     releaseTrackedBackendTrees: async () => {
@@ -81,6 +82,7 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
     clearMcpBridgeLease: current => {
       calls.push(`clear-lease:${current.leaseId}`)
     },
+    now: () => currentTime,
     terminateMcpBridge: async current => {
       calls.push(`terminate:${current.pid}:${current.createdAt}`)
 
@@ -88,6 +90,7 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
     },
     wait: async delay => {
       calls.push(`wait:${delay}`)
+      currentTime += Math.max(0, delay)
     },
     ...overrides
   }
@@ -237,6 +240,167 @@ describe('MCP bridge drain', () => {
       'wait:1100',
       'scan'
     ])
+  })
+
+  it('waits for a late generic holder when every bridge exits cooperatively', async () => {
+    const transient = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
+
+    const genericOnly: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [transient] })
+    }
+
+    const { calls, deps } = makeDeps([blockedByBridges(), genericOnly, clear(), clear()])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 0,
+      genericHolderPollMs: 5,
+      genericHolderTimeoutMs: 10,
+      respawnIntervalMs: 0
+    })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.equal(calls.some(call => call.startsWith('terminate:')), false)
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'consent',
+      'lease',
+      'wait:0',
+      'scan',
+      'wait:5',
+      'scan',
+      'wait:0',
+      'scan'
+    ])
+  })
+
+  it('drains an exact bridge from a mixed late scan while a transient generic holder exits naturally', async () => {
+    const transient = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
+
+    const mixed: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [transient], mcpBridges: [bridge()] })
+    }
+
+    const genericOnly: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [transient] })
+    }
+
+    const { calls, deps } = makeDeps([blockedByBridges(), mixed, genericOnly, clear(), clear()])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 900,
+      genericHolderPollMs: 250,
+      genericHolderTimeoutMs: 2_000,
+      respawnIntervalMs: 1_100,
+      terminationSettleMs: 700
+    })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'consent',
+      'lease',
+      'wait:900',
+      'scan',
+      'terminate:101:123.5',
+      'wait:700',
+      'scan',
+      'wait:250',
+      'scan',
+      'wait:1100',
+      'scan'
+    ])
+  })
+
+  it('refuses a generic holder that persists through the bounded post-termination window', async () => {
+    const persistent = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
+
+    const mixed: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [persistent], mcpBridges: [bridge()] })
+    }
+
+    const genericOnly: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [persistent] })
+    }
+
+    const { calls, deps } = makeDeps([blockedByBridges(), mixed, genericOnly, genericOnly, genericOnly])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 0,
+      genericHolderPollMs: 5,
+      genericHolderTimeoutMs: 10,
+      terminationSettleMs: 0
+    })
+
+    assert.equal(outcome.kind, 'blocked')
+    assert.equal(outcome.reason, 'quiesce-incomplete')
+    assert.deepEqual(outcome.result?.processes, [persistent])
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'consent',
+      'lease',
+      'wait:0',
+      'scan',
+      'terminate:101:123.5',
+      'wait:0',
+      'scan',
+      'wait:5',
+      'scan',
+      'wait:5',
+      'scan',
+      `clear-lease:${lease.leaseId}`
+    ])
+  })
+
+  it('fails closed without terminating when any current MCP record is unproven', async () => {
+    const transient = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
+
+    const unproven = bridge({
+      pid: 103,
+      owner: 'unknown',
+      actionable: false,
+      actionability: 'hard_block',
+      action: 'refuse'
+    })
+
+    const mixed: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [transient], mcpBridges: [unproven] })
+    }
+
+    const { calls, deps } = makeDeps([blockedByBridges(), mixed])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, { cooperativeExitMs: 0 })
+
+    assert.equal(outcome.kind, 'blocked')
+    assert.equal(outcome.reason, 'quiesce-incomplete')
+    assert.equal(
+      calls.some(call => call.startsWith('terminate:')),
+      false
+    )
+    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
+  })
+
+  it('fails closed without terminating when the current exact bridge set exceeds the fallback cap', async () => {
+    const bridges = Array.from({ length: 33 }, (_, index) => bridge({ pid: 1_000 + index, createdAt: 2_000 + index }))
+    const { calls, deps } = makeDeps([blockedByBridges(), blockedByBridges(bridges)])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, { cooperativeExitMs: 0 })
+
+    assert.equal(outcome.kind, 'blocked')
+    assert.equal(outcome.reason, 'quiesce-incomplete')
+    assert.equal(
+      calls.some(call => call.startsWith('terminate:')),
+      false
+    )
+    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
   })
 
   it('awaits each worker-first termination before starting the next bridge', async () => {
