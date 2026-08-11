@@ -17,6 +17,7 @@ disk.
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import pytest
@@ -25,6 +26,8 @@ from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
     UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateLock,
+    _pid_matches_update_owner,
+    _restore_tombstone_without_overwrite,
     describe_holder,
     read_live_update,
     update_marker_path,
@@ -104,6 +107,16 @@ def test_release_leaves_a_marker_a_handoff_partner_now_owns(marker):
     assert marker.exists(), "the partner's marker is not ours to remove"
 
 
+def test_exact_claim_proof_rejects_marker_swap(marker):
+    lock = UpdateLock(path=marker)
+    assert lock.acquire()
+    assert lock.prove_claim()
+
+    marker.write_text(f"{os.getpid() + 1}\n{int(time.time())}\n", encoding="utf-8")
+
+    assert not lock.prove_claim()
+
+
 def test_dead_owner_is_reclaimed_not_honored(marker):
     marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
 
@@ -112,13 +125,41 @@ def test_dead_owner_is_reclaimed_not_honored(marker):
     assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
 
 
-def test_owner_past_the_age_ceiling_is_reclaimed(marker):
-    """A live-but-wedged updater must not hold the lock forever."""
+def test_live_owner_past_the_age_ceiling_remains_authoritative(marker, monkeypatch):
+    """Long dependency stages must not let a second updater steal the lock."""
     long_ago = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
     marker.write_text(f"{os.getpid()}\n{long_ago}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.update_lock._pid_matches_update_owner", lambda *_args: True
+    )
+
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is False
+    assert lock.holder is not None
+
+
+def test_reused_pid_does_not_revive_an_old_claim(marker, monkeypatch):
+    marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.update_lock._pid_matches_update_owner", lambda *_args: False
+    )
 
     lock = UpdateLock(path=marker)
     assert lock.acquire() is True
+
+
+def test_pid_created_one_second_after_marker_is_reused(monkeypatch):
+    import psutil
+
+    started_at = 1_000.0
+    monkeypatch.setattr("hermes_cli.update_lock._pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda _pid: type("Process", (), {"create_time": lambda self: 1_001.0})(),
+    )
+
+    assert not _pid_matches_update_owner(1234, started_at)
 
 
 @pytest.mark.parametrize(
@@ -165,17 +206,71 @@ def test_describe_holder_names_the_pid_and_elapsed_time(marker):
     assert "already running" in message
 
 
-def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
-    """Degrade to pre-lock behavior rather than refusing to update at all.
-
-    An unwritable marker path is a worse reason to block an update than the
-    race the lock prevents.
-    """
+def test_unwritable_marker_location_fails_closed(tmp_path):
+    """Never mutate without a provable, durable exclusive claim."""
     lock = UpdateLock(path=tmp_path / "nonexistent-file" / "marker")
     (tmp_path / "nonexistent-file").write_text("i am a file, not a dir", encoding="utf-8")
 
-    assert lock.acquire() is True
+    assert lock.acquire() is False
     assert lock.acquired is False, "nothing was written, so there is nothing to release"
+    assert lock.failure_reason == "marker-write-failed"
+
+
+@pytest.mark.parametrize("started_at", ["nan", "inf", "-inf"])
+def test_non_finite_marker_timestamp_is_never_live(marker, started_at):
+    marker.write_text(f"{os.getpid()}\n{started_at}\n", encoding="utf-8")
+
+    assert read_live_update(path=marker) is None
+
+
+def test_pid_probe_failure_is_treated_as_live(marker, monkeypatch):
+    marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+
+    def inaccessible(_pid):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr("hermes_mcp_update_gate._pid_alive", inaccessible)
+
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.pid == os.getpid()
+    assert marker.exists()
+
+
+def test_concurrent_claim_has_exactly_one_owner(marker):
+    barrier = threading.Barrier(2)
+    results = []
+    locks = [UpdateLock(path=marker), UpdateLock(path=marker)]
+
+    def claim(lock):
+        barrier.wait()
+        results.append(lock.acquire())
+
+    threads = [threading.Thread(target=claim, args=(lock,)) for lock in locks]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert sorted(results) == [False, True]
+    assert sum(lock.acquired for lock in locks) == 1
+    for lock in locks:
+        lock.release()
+
+
+def test_failed_tombstone_restore_blocks_subsequent_claim(marker, monkeypatch):
+    tombstone = marker.with_name(f"{marker.name}.release-test")
+    tombstone.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "link", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("no links")))
+        scoped.setattr(os, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk error")))
+        _restore_tombstone_without_overwrite(tombstone, marker)
+
+    assert tombstone.exists(), "failed recovery must retain the live-owner evidence"
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is False
+    assert lock.failure_reason == "marker-recovery-pending"
 
 
 class TestHandoffFromOrchestratingUpdater:
@@ -242,6 +337,9 @@ class TestAncestryHandoff:
     @pytest.fixture(autouse=True)
     def _liveness_pinned_true(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.update_lock._pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "hermes_cli.update_lock._pid_matches_update_owner", lambda *_args: True
+        )
 
     def test_marker_owned_by_our_parent_process_is_our_orchestrator(self, marker):
         marker.write_text(f"{os.getppid()}\n{int(time.time())}\n", encoding="utf-8")

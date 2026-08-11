@@ -158,7 +158,7 @@ def get_process_hermes_home() -> Path:
     return _hermes_home_from_env()
 
 
-def get_default_hermes_root() -> Path:
+def get_default_hermes_root(hermes_home: str | Path | None = None) -> Path:
     """Return the root Hermes directory for profile-level operations.
 
     In standard deployments this is the platform-native Hermes home
@@ -168,18 +168,26 @@ def get_default_hermes_root() -> Path:
     ``~/.hermes`` (e.g. ``/opt/data``), returns ``HERMES_HOME`` directly
     — that IS the root.
 
-    In profile mode where ``HERMES_HOME`` is ``<root>/profiles/<name>``,
+    In profile mode where the selected home is ``<root>/profiles/<name>``,
     returns ``<root>`` so that ``profile list`` can see all profiles.
     Works both for standard (``~/.hermes/profiles/coder``) and Docker
     (``/opt/data/profiles/coder``) layouts.
 
+    When *hermes_home* is supplied, resolve that path without consulting the
+    process environment or the context-local task override. This lets early
+    lifecycle gates and cross-process marker readers share the exact same
+    root normalization for implicit and explicit homes.
+
     Import-safe — no dependencies beyond stdlib.
     """
     native_home = _get_platform_default_hermes_home()
-    env_home = os.environ.get("HERMES_HOME", "")
-    if not env_home:
-        return native_home
-    env_path = Path(env_home)
+    if hermes_home is None:
+        env_home = os.environ.get("HERMES_HOME", "").strip()
+        if not env_home:
+            return native_home
+        env_path = get_process_hermes_home()
+    else:
+        env_path = Path(hermes_home)
     try:
         env_path.resolve().relative_to(native_home.resolve())
         # HERMES_HOME is under ~/.hermes (normal or profile mode)
@@ -191,7 +199,10 @@ def get_default_hermes_root() -> Path:
     # Check if this is a profile path: <root>/profiles/<name>
     # If the immediate parent dir is named "profiles", the root is
     # the grandparent — this covers Docker profiles correctly.
-    if env_path.parent.name == "profiles":
+    profile_segment = env_path.parent.name
+    if profile_segment == "profiles" or (
+        os.name == "nt" and profile_segment.casefold() == "profiles"
+    ):
         return env_path.parent.parent
 
     # Not a profile path — HERMES_HOME itself is the root
@@ -638,15 +649,23 @@ def find_node_executable_on_path(command: str) -> str | None:
         sep and sep in command_str for sep in (os.sep, os.altsep, "/", "\\")
     )
     if has_path_separator:
-        return command_str if Path(command_str).is_file() else None
+        try:
+            return command_str if Path(command_str).is_file() else None
+        except OSError:
+            return None
 
     for name in _candidate_node_command_names(command_str):
         for directory in os.environ.get("PATH", "").split(os.pathsep):
             if not directory:
                 continue
             candidate = Path(directory) / name
-            if candidate.is_file():
-                return str(candidate)
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                # PATH may include protected or transient directories. One
+                # unreadable entry must not crash update dependency probing.
+                continue
     return None
 
 

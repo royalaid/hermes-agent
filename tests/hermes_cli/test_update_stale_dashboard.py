@@ -91,6 +91,7 @@ class TestFindStaleDashboardPids:
 
 
 
+    @pytest.mark.linux_only
     def test_self_pid_excluded(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
@@ -114,7 +115,7 @@ class TestFindStaleDashboardPids:
 
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX kill semantics")
+@pytest.mark.linux_only
 class TestKillStaleDashboardPosix:
     """Kill path on Linux / macOS: SIGTERM then SIGKILL any survivors."""
 
@@ -289,6 +290,7 @@ class TestWindowsWmicEncoding:
         )
 
 
+@pytest.mark.linux_only
 class TestSupervisedBackendRestart:
     """After the kill, systemd-supervised PIDs get their owning unit
     restarted (#68934) — SIGTERM reads as a clean stop to systemd, so
@@ -333,6 +335,7 @@ class TestManualBackendRespawn:
         return sys.modules["hermes_cli.main"]
 
 
+    @pytest.mark.linux_only
     def test_argv_capture_failure_falls_back_to_hint(self, capsys):
         live = self._live()
 
@@ -392,6 +395,7 @@ class TestCmdlineCapture:
     def _live(self):
         return sys.modules["hermes_cli.main"]
 
+    @pytest.mark.linux_only
     def test_reads_proc_cmdline_when_available(self, tmp_path, monkeypatch):
         live = self._live()
         proc_file = tmp_path / "cmdline"
@@ -417,6 +421,7 @@ class TestCmdlineCapture:
 
         assert argv == ["/usr/bin/python3", "-m", "hermes_cli.main", "serve"]
 
+    @pytest.mark.macos_only
     def test_falls_back_to_ps_without_proc(self, monkeypatch):
         live = self._live()
 
