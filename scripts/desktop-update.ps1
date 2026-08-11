@@ -1468,6 +1468,9 @@ exit $LASTEXITCODE
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $powershellPath
         $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedWrapper"
+        # The managed interpreter must import this checkout even when the
+        # Desktop handoff was launched from another Hermes worktree.
+        $psi.WorkingDirectory = $InstallRoot
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
