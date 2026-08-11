@@ -164,6 +164,15 @@ public static class FakeHermes {
         var leaseId = Arg(args, "--bridge-lease-id");
         var invocationId = Arg(args, "--invocation-id");
         var mode = Environment.GetEnvironmentVariable("HERMES_TEST_UPDATE_MODE") ?? "normal";
+        if (args.Contains("--resume-deferred-gateway") && mode == "resume-trampoline" &&
+            Process.GetCurrentProcess().MainModule.FileName.IndexOf(
+                "\\venv\\Scripts\\", StringComparison.OrdinalIgnoreCase
+            ) >= 0) {
+            var redirectorCapture = Environment.GetEnvironmentVariable("HERMES_TEST_RESUME_REDIRECTOR_CAPTURE");
+            if (!String.IsNullOrEmpty(redirectorCapture))
+                File.WriteAllText(redirectorCapture, Process.GetCurrentProcess().MainModule.FileName);
+            return 77;
+        }
         if (args.Contains("--resume-deferred-gateway"))
             return Resume(args, leasePath, leaseId, invocationId, mode);
         if (args.Contains("desktop")) {
@@ -341,9 +350,18 @@ function New-TestInstall([string]$Tag, [string]$FakeHermes) {
     $testHome = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-desktop-update-test-{0}-{1}" -f $Tag, [Guid]::NewGuid().ToString('N'))
     $root = Join-Path $testHome 'hermes-agent'
     $shimDir = Join-Path $root 'venv\Scripts'
+    $baseDir = Join-Path $root 'base-python'
     New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $baseDir -Force | Out-Null
     Copy-Item -LiteralPath $FakeHermes -Destination (Join-Path $shimDir 'hermes.exe')
     Copy-Item -LiteralPath $FakeHermes -Destination (Join-Path $shimDir 'python.exe')
+    $basePython = Join-Path $baseDir 'python.exe'
+    Copy-Item -LiteralPath $FakeHermes -Destination $basePython
+    [System.IO.File]::WriteAllText(
+        (Join-Path $root 'venv\pyvenv.cfg'),
+        "home = $baseDir`nexecutable = $basePython`n",
+        (New-Object System.Text.UTF8Encoding($false))
+    )
     return [pscustomobject]@{
         Home = $testHome
         Root = $root
@@ -354,6 +372,7 @@ function New-TestInstall([string]$Tag, [string]$FakeHermes) {
         PreflightArgsCapture = Join-Path $testHome 'preflight-args.txt'
         TopologyCapture = Join-Path $testHome 'contained-process-topology.txt'
         ResumeCapture = Join-Path $testHome 'deferred-resume-args.txt'
+        ResumeRedirectorCapture = Join-Path $testHome 'deferred-resume-redirector.txt'
         BuildShaCapture = Join-Path $testHome 'desktop-build-sha.txt'
         UpdateMarker = Join-Path $testHome '.hermes-update-in-progress'
         Result = Join-Path $testHome '.hermes-update-result.json'
@@ -415,6 +434,7 @@ function Invoke-TestHandoff(
     $oldPreflightArgsCapture = $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE
     $oldTopologyCapture = $env:HERMES_TEST_TOPOLOGY_CAPTURE
     $oldResumeCapture = $env:HERMES_TEST_RESUME_CAPTURE
+    $oldResumeRedirectorCapture = $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE
     $oldBuildShaCapture = $env:HERMES_TEST_BUILD_SHA_CAPTURE
     $oldUpdateMode = $env:HERMES_TEST_UPDATE_MODE
     $oldTestMode = $env:HERMES_DESKTOP_UPDATE_TEST
@@ -430,6 +450,7 @@ function Invoke-TestHandoff(
         $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE = $Install.PreflightArgsCapture
         $env:HERMES_TEST_TOPOLOGY_CAPTURE = $Install.TopologyCapture
         $env:HERMES_TEST_RESUME_CAPTURE = $Install.ResumeCapture
+        $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE = $Install.ResumeRedirectorCapture
         $env:HERMES_TEST_BUILD_SHA_CAPTURE = $Install.BuildShaCapture
         $env:HERMES_TEST_UPDATE_MODE = $UpdateMode
         $env:HERMES_DESKTOP_UPDATE_TEST = '1'
@@ -457,6 +478,7 @@ function Invoke-TestHandoff(
         $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE = $oldPreflightArgsCapture
         $env:HERMES_TEST_TOPOLOGY_CAPTURE = $oldTopologyCapture
         $env:HERMES_TEST_RESUME_CAPTURE = $oldResumeCapture
+        $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE = $oldResumeRedirectorCapture
         $env:HERMES_TEST_BUILD_SHA_CAPTURE = $oldBuildShaCapture
         $env:HERMES_TEST_UPDATE_MODE = $oldUpdateMode
         $env:HERMES_DESKTOP_UPDATE_TEST = $oldTestMode
@@ -672,6 +694,26 @@ try {
         Assert-True ([System.IO.File]::ReadAllText($handoffLog) -notmatch [regex]::Escape($leaseId)) 'lease capability is absent from user-visible handoff diagnostics'
     }
 
+    $trampoline = New-TestInstall 'resume-trampoline' $fakeHermes
+    $trampolineDesktop = Join-Path $trampoline.Home 'fake-desktop.exe'
+    Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $trampolineDesktop
+    $trampolineLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $trampoline $trampolineLeaseId
+    $code = Invoke-TestHandoff $trampoline (New-PreflightJson $trampoline $true $true) 0 '' $trampolineLeaseId 'resume-trampoline' $trampolineDesktop
+    Assert-Equal 0 $code 'deferred resume bypasses the exact Windows venv redirector'
+    Assert-True (-not (Test-Path -LiteralPath $trampoline.ResumeRedirectorCapture)) 'deferred resume never starts the redirector process'
+    Assert-True (-not (Test-Path -LiteralPath $trampoline.Lease)) 'base-interpreter resume clears the exact adopted lease'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $trampoline.Home -Filter '.hermes-venv-quiesce.cas-*' -File -ErrorAction SilentlyContinue).Count) 'base-interpreter resume leaves no lease CAS artifacts'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $trampoline.Home -Filter '.hermes-gateway-resume-*.json' -File -ErrorAction SilentlyContinue).Count) 'base-interpreter resume consumes the exact pending plan'
+
+    $invalidVenv = New-TestInstall 'invalid-pyvenv' $fakeHermes
+    [System.IO.File]::AppendAllText((Join-Path $invalidVenv.Root 'venv\pyvenv.cfg'), "home = C:\foreign`n")
+    $invalidVenvLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $invalidVenv $invalidVenvLeaseId
+    $code = Invoke-TestHandoff $invalidVenv (New-PreflightJson $invalidVenv $true $true) 0 '' $invalidVenvLeaseId
+    Assert-Equal 13 $code 'malformed pyvenv base identity fails closed after update'
+    Assert-True (-not (Test-Path -LiteralPath $invalidVenv.ResumeCapture)) 'invalid pyvenv identity starts no recovery interpreter'
+
     $archive = New-TestInstall 'archive-build-identity' $fakeHermes
     $archiveLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $archive $archiveLeaseId
@@ -792,7 +834,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $foreign.Sentinel)) 'foreign lease is never followed by mutation'
     Assert-Equal $before ([System.IO.File]::ReadAllText($foreign.Lease)) 'foreign live lease is neither rewritten nor deleted'
 } finally {
-    foreach ($path in @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $leased.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $foreignRace.Home, $foreign.Home, $suiteRoot)) {
+    foreach ($path in @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $leased.Home, $trampoline.Home, $invalidVenv.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $foreignRace.Home, $foreign.Home, $suiteRoot)) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
         }
