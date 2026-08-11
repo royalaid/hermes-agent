@@ -34,16 +34,52 @@ if (-not (Test-Path -LiteralPath $seedPython -PathType Leaf)) {
     throw "Seed venv has no Windows interpreter: $seedPython"
 }
 $seedVenvConfig = Join-Path $SeedVenv 'pyvenv.cfg'
-$basePythonLine = Get-Content -LiteralPath $seedVenvConfig -ErrorAction Stop |
-    Where-Object { $_ -match '^\s*executable\s*=' } |
-    Select-Object -First 1
-if (-not $basePythonLine) { throw 'Seed venv does not identify its base interpreter.' }
-$basePython = ($basePythonLine -split '=', 2)[1].Trim()
+$seedVenvConfigLines = [System.IO.File]::ReadAllLines($seedVenvConfig, [System.Text.Encoding]::UTF8)
+$seedVenvConfigHash = (Get-FileHash -LiteralPath $seedVenvConfig -Algorithm SHA256).Hash
+$seedVenvValues = @{}
+$seedVenvMetadataLines = New-Object System.Collections.Generic.List[string]
+foreach ($line in $seedVenvConfigLines) {
+    $trimmed = $line.Trim()
+    if (-not $trimmed -or $trimmed.StartsWith('#')) {
+        $seedVenvMetadataLines.Add($line)
+        continue
+    }
+    $separator = $trimmed.IndexOf('=')
+    if ($separator -le 0) { throw 'Seed pyvenv.cfg contains a malformed entry.' }
+    $key = $trimmed.Substring(0, $separator).Trim().ToLowerInvariant()
+    if ($key -ne 'home' -and $key -ne 'executable') {
+        $seedVenvMetadataLines.Add($line)
+        continue
+    }
+    if ($seedVenvValues.ContainsKey($key)) { throw "Seed pyvenv.cfg repeats $key." }
+    $value = $trimmed.Substring($separator + 1).Trim()
+    if (-not $value -or -not [System.IO.Path]::IsPathRooted($value)) {
+        throw "Seed pyvenv.cfg has an invalid $key."
+    }
+    $seedVenvValues[$key] = $value
+}
+if (-not $seedVenvValues.ContainsKey('home')) {
+    throw 'Seed venv does not identify its base interpreter home.'
+}
+$baseHome = [System.IO.Path]::GetFullPath(
+    (Resolve-Path -LiteralPath $seedVenvValues['home'] -ErrorAction Stop).ProviderPath
+).TrimEnd([char[]]@('\', '/'))
+$basePythonPath = if ($seedVenvValues.ContainsKey('executable')) {
+    $seedVenvValues['executable']
+} else {
+    Join-Path $seedVenvValues['home'] 'python.exe'
+}
 $basePython = [System.IO.Path]::GetFullPath(
-    (Resolve-Path -LiteralPath $basePython -ErrorAction Stop).ProviderPath
+    (Resolve-Path -LiteralPath $basePythonPath -ErrorAction Stop).ProviderPath
 )
-if (-not [string]::Equals((Split-Path -Leaf $basePython), 'python.exe', [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Seed venv base interpreter is not python.exe: $basePython"
+if (-not (Test-Path -LiteralPath $basePython -PathType Leaf) -or
+    -not [string]::Equals((Split-Path -Leaf $basePython), 'python.exe', [StringComparison]::OrdinalIgnoreCase) -or
+    -not [string]::Equals(
+        (Split-Path -Parent $basePython).TrimEnd([char[]]@('\', '/')),
+        $baseHome,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+    throw "Seed venv base interpreter is not the exact python.exe under home: $basePython"
 }
 
 $uvSource = Join-Path $SeedVenv 'Scripts\uv.exe'
@@ -452,6 +488,16 @@ try {
     $global:LASTEXITCODE = 0
     $managedPython = Join-Path $venvRoot 'Scripts\python.exe'
     Assert-True (Test-Path -LiteralPath $managedPython -PathType Leaf) 'copied managed Python exists'
+    $managedVenvConfig = Join-Path $venvRoot 'pyvenv.cfg'
+    $homeOnlyConfigLines = @("home = $baseHome") + @($seedVenvMetadataLines)
+    Write-Utf8NoBom $managedVenvConfig (($homeOnlyConfigLines -join "`n") + "`n")
+    $managedVenvConfigLines = [System.IO.File]::ReadAllLines($managedVenvConfig, [System.Text.Encoding]::UTF8)
+    Assert-Equal 1 (@($managedVenvConfigLines | Where-Object { $_ -match '^\s*home\s*=' }).Count) `
+        'disposable pyvenv.cfg has exactly one home key'
+    Assert-Equal 0 (@($managedVenvConfigLines | Where-Object { $_ -match '^\s*executable\s*=' }).Count) `
+        'disposable pyvenv.cfg uses the uv home-only layout'
+    Assert-Equal $seedVenvConfigHash (Get-FileHash -LiteralPath $seedVenvConfig -Algorithm SHA256).Hash `
+        'seed pyvenv.cfg remains byte-for-byte unchanged'
 
     # Keep uv fully private.  A fresh stamp prevents an irrelevant network
     # self-update while the production updater still runs its runtime probe.
@@ -536,6 +582,9 @@ raise SystemExit(result.returncode)
     Write-Utf8NoBom $leasePath ($leaseFixture | ConvertTo-Json -Compress)
 
     $handoffScript = Join-Path $installRoot 'scripts\desktop-update.ps1'
+    $managedVenvConfigLines = [System.IO.File]::ReadAllLines($managedVenvConfig, [System.Text.Encoding]::UTF8)
+    Assert-Equal 0 (@($managedVenvConfigLines | Where-Object { $_ -match '^\s*executable\s*=' }).Count) `
+        'full transaction starts from a home-only disposable pyvenv.cfg'
     Write-Host 'Invoking the production Desktop updater transaction'
     & $powerShellExe -NoProfile -ExecutionPolicy Bypass -File $handoffScript `
         -InstallRoot $installRoot -Branch $branch -DesktopPid 0 `
