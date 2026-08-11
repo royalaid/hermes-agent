@@ -36,6 +36,22 @@ const bridge = (overrides: Partial<McpBridgeProcess> = {}): McpBridgeProcess => 
   ...overrides
 })
 
+function pairedBridgeGroups(count: number): McpBridgeProcess[] {
+  return Array.from({ length: count }, (_, index) => {
+    const wrapperPid = 1_000 + index
+
+    return [
+      bridge({
+        pid: 2_000 + index,
+        createdAt: 3_000 + index,
+        role: 'mcp_bridge_worker',
+        wrapperPid
+      }),
+      bridge({ pid: wrapperPid, createdAt: 4_000 + index })
+    ]
+  }).flat()
+}
+
 const result = (overrides: Partial<VenvBlockerScanResult> = {}): VenvBlockerScanResult => ({
   blocked: false,
   processes: [],
@@ -390,6 +406,46 @@ describe('MCP bridge drain', () => {
 
   it('fails closed without terminating when the current exact bridge set exceeds the fallback cap', async () => {
     const bridges = Array.from({ length: 33 }, (_, index) => bridge({ pid: 1_000 + index, createdAt: 2_000 + index }))
+    const { calls, deps } = makeDeps([blockedByBridges(), blockedByBridges(bridges)])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, { cooperativeExitMs: 0 })
+
+    assert.equal(outcome.kind, 'blocked')
+    assert.equal(outcome.reason, 'quiesce-incomplete')
+    assert.equal(
+      calls.some(call => call.startsWith('terminate:')),
+      false
+    )
+    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
+  })
+
+  it('counts 32 paired wrappers and workers as 32 logical fallback groups', async () => {
+    const bridges = pairedBridgeGroups(32)
+    const terminated: McpBridgeProcess[] = []
+
+    const { deps } = makeDeps([blockedByBridges(), blockedByBridges(bridges), clear(), clear()], {
+      terminateMcpBridge: async current => {
+        terminated.push(current)
+
+        return true
+      }
+    })
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 0,
+      respawnIntervalMs: 0,
+      terminationSettleMs: 0
+    })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.equal(terminated.length, 64)
+    assert.equal(terminated.slice(0, 32).every(current => current.role === 'mcp_bridge_worker'), true)
+    assert.equal(terminated.slice(32).every(current => current.role === 'mcp_bridge_wrapper'), true)
+    assert.equal(new Set(terminated.map(current => current.wrapperPid ?? current.pid)).size, 32)
+  })
+
+  it('refuses 33 paired wrapper and worker groups before terminating any record', async () => {
+    const bridges = pairedBridgeGroups(33)
     const { calls, deps } = makeDeps([blockedByBridges(), blockedByBridges(bridges)])
 
     const outcome = await runWindowsUpdatePreflight('normal-update', deps, { cooperativeExitMs: 0 })
