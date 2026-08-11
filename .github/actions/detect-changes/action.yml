@@ -39,6 +39,9 @@ outputs:
   installer:
     description: Run the PowerShell installer tests on a Windows runner.
     value: ${{ steps.classify.outputs.installer }}
+  windows_update:
+    description: Run the native Windows updater lifecycle contracts.
+    value: ${{ steps.classify.outputs.windows_update }}
   mcp_catalog:
     description: Require MCP catalog security review label.
     value: ${{ steps.classify.outputs.mcp_catalog }}

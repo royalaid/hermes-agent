@@ -48,6 +48,7 @@ jobs:
       deps: ${{ steps.classify.outputs.deps }}
       npm_lock: ${{ steps.classify.outputs.npm_lock }}
       installer: ${{ steps.classify.outputs.installer }}
+      windows_update: ${{ steps.classify.outputs.windows_update }}
       docker_meta: ${{ steps.classify.outputs.docker_meta }}
       mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
       ci_review: ${{ steps.classify.outputs.ci_review }}
@@ -103,6 +104,12 @@ jobs:
     # Windows-only, and only for PRs that touch install.ps1 or its tests.
     if: needs.detect.outputs.installer == 'true'
     uses: ./.github/workflows/installer-tests.yml
+
+  windows-update-tests:
+    name: Native Windows updater tests
+    needs: detect
+    if: needs.detect.outputs.windows_update == 'true'
+    uses: ./.github/workflows/windows-update-tests.yml
 
   e2e-desktop:
     name: Desktop E2E
@@ -189,8 +196,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. ``failure`` and ``cancelled``
+  # results cause it to fail; only ``success`` and ``skipped`` are accepted.
   #
   # Branch protection should require ONLY this check.
   #
@@ -206,6 +213,7 @@ jobs:
       - lint
       - js-tests
       - installer-tests
+      - windows-update-tests
       - e2e-desktop
       - docs-site
       - history-check
@@ -239,13 +247,16 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          failed = [
+              name for name, info in needs.items()
+              if info['result'] not in ('success', 'skipped')
+          ]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
               print(f'{icon} {name}: {result}')
           if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+              print(f'::error::{len(failed)} job(s) failed or were cancelled: {\", \".join(failed)}')
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "

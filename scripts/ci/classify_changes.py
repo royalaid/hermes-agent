@@ -20,6 +20,7 @@ Lanes:
 * ``deps``        — pyproject.toml dependency bounds check.
 * ``npm_lock``    — semantic package-lock.json diff PR comment.
 * ``installer``   — PowerShell installer tests (Windows runner).
+* ``windows_update`` — Native Windows updater lifecycle contracts.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
 
 Docker is not a lane — it builds on push-to-main and release only,
@@ -28,7 +29,8 @@ never per-PR.
 Contract — *fail open, never closed*. We may run a lane we didn't need, but
 must never skip one a change could break:
 
-* An empty diff, or any ``.github/`` change, runs everything.
+* An empty diff, any ``.github/`` change, or a change to this classifier runs
+  everything.
 * ``python`` is a denylist: skipped only when *every* file is provably prose
   or a frontend-only package; an unrecognized path keeps it on.
 * ``skills/`` (incl. ``SKILL.md``) is python-relevant — the skill-doc tests
@@ -56,8 +58,10 @@ _PY_SKIP = ("docs/", "website/") + _FRONTEND
 # unprivileged generate-patch runner (contents: read), never on the privileged
 # apply-patch job. The two-job split means a malicious package.json script
 # can't get push access — it runs on an ephemeral runner with zero write perms.
+_CLASSIFIER_FILE = "scripts/ci/classify_changes.py"
 _CI_REVIEW_FILES = {
     ".prettierrc",
+    _CLASSIFIER_FILE,
 }
 _CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/")
 
@@ -73,6 +77,56 @@ _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 # so they get their own lane rather than riding along with ``python``.
 _INSTALLER_PATHS = ("scripts/tests/",)
 _INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
+
+# Native Windows update lifecycle. Keep this deliberately narrower than the
+# whole Desktop/bootstrap trees: this lane installs both npm and Rust
+# dependencies, so it should run only when the process/lease/handoff contract
+# can change. The workflow itself is covered by the .github fail-open rule.
+_WINDOWS_UPDATE_FILES = {
+    "scripts/desktop-update.ps1",
+    "scripts/tests/fixtures/desktop-update-bridge-lease.json",
+    "apps/bootstrap-installer/src-tauri/Cargo.toml",
+    "apps/bootstrap-installer/src-tauri/Cargo.lock",
+    "apps/bootstrap-installer/src-tauri/src/lib.rs",
+    "apps/bootstrap-installer/src-tauri/src/update.rs",
+    "agent/__init__.py",
+    "hermes_constants.py",
+    "hermes_cli/main.py",
+    "hermes_cli/subcommands/update.py",
+    "hermes_cli/update_cmd.py",
+    "hermes_cli/update_transaction.py",
+    "hermes_cli/update_lock.py",
+    "hermes_cli/update_readiness.py",
+    "hermes_cli/update_readiness.schema.v1.json",
+    "hermes_cli/update_quiesce.py",
+    "hermes_cli/update_deferred_gateway.py",
+    "hermes_cli/update_receipt.py",
+    "hermes_cli/gateway.py",
+    "hermes_cli/gateway_windows.py",
+    "hermes_cli/_scan_venv_blockers.py",
+    "hermes_mcp_update_gate.py",
+    "agent/transports/hermes_tools_mcp_server.py",
+    "tests/test_hermes_mcp_update_gate.py",
+    "tests/agent/transports/test_hermes_tools_mcp_server.py",
+    "tests/hermes_cli/test_scan_venv_blockers.py",
+    "tests/hermes_cli/test_update_readiness.py",
+    "tests/cli/test_update_command.py",
+}
+_WINDOWS_UPDATE_SCRIPT_TEST_PREFIX = "scripts/tests/test-desktop-update-"
+_WINDOWS_UPDATE_PYTHON_TEST_PREFIX = "tests/hermes_cli/test_update"
+_WINDOWS_UPDATE_BOOTSTRAP_SOURCE_PREFIX = "apps/bootstrap-installer/src-tauri/src/"
+_WINDOWS_UPDATE_DESKTOP_FILES = {"main.ts"}
+_WINDOWS_UPDATE_DESKTOP_PREFIXES = (
+    "backend-child.",
+    "handoff-",
+    "mcp-bridge-quiesce.",
+    "pool-backend-lifecycle.",
+    "primary-backend-startup.",
+    "update-",
+    "updater-process.",
+    "venv-blocker-scan.",
+    "windows-process-identity.",
+)
 
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
@@ -108,6 +162,23 @@ def _is_installer(p: str) -> bool:
     return p.startswith(_INSTALLER_PATHS) or p in _INSTALLER_FILES
 
 
+def _is_windows_update(p: str) -> bool:
+    if (
+        p in _WINDOWS_UPDATE_FILES
+        or p.startswith(_WINDOWS_UPDATE_SCRIPT_TEST_PREFIX)
+        or p.startswith(_WINDOWS_UPDATE_PYTHON_TEST_PREFIX)
+        or p.startswith(_WINDOWS_UPDATE_BOOTSTRAP_SOURCE_PREFIX)
+    ):
+        return True
+    desktop_prefix = "apps/desktop/electron/"
+    if not p.startswith(desktop_prefix):
+        return False
+    name = p[len(desktop_prefix):]
+    return name in _WINDOWS_UPDATE_DESKTOP_FILES or any(
+        name.startswith(prefix) for prefix in _WINDOWS_UPDATE_DESKTOP_PREFIXES
+    )
+
+
 def _is_ci_review(p: str) -> bool:
     if p in _CI_REVIEW_FILES or p.startswith(_CI_REVIEW_PATHS):
         return True
@@ -134,22 +205,17 @@ def classify(files: list[str]) -> dict[str, bool]:
         "deps": any(f == "pyproject.toml" for f in files),
         "npm_lock": any(f.split("/")[-1] == "package-lock.json" for f in files),
         "installer": any(_is_installer(f) for f in files),
+        "windows_update": any(_is_windows_update(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
     }
-    if not files or any(f.startswith(".github/") for f in files):
-        ret["python"] = True
-        ret["python_prod"] = True
-        ret["docker_meta"] = True
-        ret["frontend"] = True
-        ret["site"] = True
-        ret["scan"] = True
-        ret["deps"] = True
-        ret["npm_lock"] = True
-        ret["installer"] = True
-        ret["ci_review"] = True
-
-        # explicitly skip mcp catalog here. it's not needed unless those files are modified.
+    if not files or any(
+        f.startswith(".github/") or f == _CLASSIFIER_FILE for f in files
+    ):
+        for lane in ret:
+            # MCP catalog review is only needed when its own files change.
+            if lane != "mcp_catalog":
+                ret[lane] = True
     return ret
 
 
