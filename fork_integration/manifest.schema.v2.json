@@ -1,0 +1,308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/royalaid/hermes-agent/blob/fork-integration/fork_integration/manifest.schema.v2.json",
+  "title": "Hermes fork integration manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "manifest_state",
+    "repositories",
+    "integration",
+    "required_categories",
+    "required_patch_ids",
+    "components"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "manifest_state": { "enum": ["ready", "review_required"] },
+    "repositories": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "additionalProperties": { "$ref": "#/$defs/repository" }
+    },
+    "integration": { "$ref": "#/$defs/integration" },
+    "required_categories": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/id" },
+      "uniqueItems": true
+    },
+    "required_patch_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+      "uniqueItems": true
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/component" }
+    },
+    "migration_notes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "pattern": "\\S" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["manifest_state"],
+        "properties": { "manifest_state": { "const": "ready" } }
+      },
+      "then": {
+        "properties": {
+          "repositories": {
+            "additionalProperties": {
+              "required": ["url"],
+              "properties": {
+                "url": { "$ref": "#/$defs/safeRepositoryUrl" }
+              }
+            }
+          },
+          "integration": {
+            "properties": {
+              "expected_base_commit": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "expected_head_commit": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              }
+            }
+          },
+          "components": {
+            "items": {
+              "not": { "required": ["intended_upstream_status"] },
+              "properties": {
+                "upstream_status": {
+                  "enum": ["required", "absorbed", "superseded"]
+                },
+                "source": {
+                  "properties": {
+                    "ref": { "$ref": "#/$defs/branchRef" }
+                  }
+                },
+                "patches": {
+                  "items": {
+                    "properties": {
+                      "disposition": {
+                        "enum": [
+                          "required",
+                          "absorbed_upstream",
+                          "superseded",
+                          "folded"
+                        ]
+                      },
+                      "source": {
+                        "properties": {
+                          "commit": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{40}$"
+                          },
+                          "stable_patch_id": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{40}$"
+                          }
+                        }
+                      },
+                      "integration": {
+                        "properties": {
+                          "state": { "enum": ["expected", "not_replayed"] }
+                        },
+                        "allOf": [
+                          {
+                            "if": {
+                              "required": ["state"],
+                              "properties": { "state": { "const": "expected" } }
+                            },
+                            "then": {
+                              "properties": {
+                                "commit": {
+                                  "type": "string",
+                                  "pattern": "^[0-9a-f]{40}$"
+                                },
+                                "stable_patch_id": {
+                                  "type": "string",
+                                  "pattern": "^[0-9a-f]{40}$"
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?$(?![\\s\\S])"
+    },
+    "shaOrNull": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "safeRepositoryUrl": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!\\s*$)(?![A-Za-z][A-Za-z0-9+.-]*://[^/?#]*@)(?!.*[?#]).+$"
+    },
+    "branchRef": {
+      "type": "string",
+      "pattern": "^refs/heads/(?!\\.)(?!.*\\/\\.)(?!.*\\.lock(?:\\/|$))(?!.*\\.\\.)(?!.*@\\{)(?!.*[ ~^:?*\\[\\\\\\u0000-\\u001F\\u007F])(?!.*\\/\\/)(?!.*[\\/.]$).+$"
+    },
+    "refOrNull": {
+      "oneOf": [
+        { "$ref": "#/$defs/branchRef" },
+        { "type": "null" }
+      ]
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url"],
+      "properties": {
+        "url": {
+          "oneOf": [
+            { "$ref": "#/$defs/safeRepositoryUrl" },
+            { "type": "null" }
+          ]
+        },
+        "legacy_remote": { "type": ["string", "null"] },
+        "legacy_repository": { "type": ["string", "null"] }
+      }
+    },
+    "integration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "ref",
+        "upstream_repository",
+        "upstream_ref",
+        "expected_base_commit",
+        "expected_head_commit"
+      ],
+      "properties": {
+        "repository": { "$ref": "#/$defs/id" },
+        "ref": { "$ref": "#/$defs/branchRef" },
+        "upstream_repository": { "$ref": "#/$defs/id" },
+        "upstream_ref": { "$ref": "#/$defs/branchRef" },
+        "expected_base_commit": { "$ref": "#/$defs/shaOrNull" },
+        "expected_head_commit": { "$ref": "#/$defs/shaOrNull" }
+      }
+    },
+    "componentSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "ref"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/id" },
+        "ref": { "$ref": "#/$defs/refOrNull" },
+        "legacy_ref": { "type": ["string", "null"] }
+      }
+    },
+    "patchSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "stable_patch_id"],
+      "properties": {
+        "commit": { "$ref": "#/$defs/shaOrNull" },
+        "stable_patch_id": { "$ref": "#/$defs/shaOrNull" }
+      }
+    },
+    "patchIntegration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "commit", "stable_patch_id"],
+      "properties": {
+        "state": { "enum": ["expected", "not_replayed", "pending"] },
+        "commit": { "$ref": "#/$defs/shaOrNull" },
+        "stable_patch_id": { "$ref": "#/$defs/shaOrNull" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "expected" } } },
+          "then": {
+            "properties": {
+              "stable_patch_id": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "enum": ["not_replayed", "pending"] } } },
+          "then": {
+            "properties": {
+              "commit": { "type": "null" },
+              "stable_patch_id": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "role", "disposition", "source", "integration"],
+      "properties": {
+        "subject": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "role": { "enum": ["implementation", "test", "documentation"] },
+        "disposition": {
+          "enum": [
+            "required",
+            "absorbed_upstream",
+            "superseded",
+            "review_required",
+            "folded"
+          ]
+        },
+        "related_to": { "$ref": "#/$defs/shaOrNull" },
+        "source": { "$ref": "#/$defs/patchSource" },
+        "integration": { "$ref": "#/$defs/patchIntegration" }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "upstream_status",
+        "source",
+        "tests",
+        "patches"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "category": { "$ref": "#/$defs/id" },
+        "upstream_status": {
+          "enum": ["required", "absorbed", "superseded", "review_required"]
+        },
+        "intended_upstream_status": {
+          "enum": ["required", "absorbed", "superseded"]
+        },
+        "source": { "$ref": "#/$defs/componentSource" },
+        "tests": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "uniqueItems": true
+        },
+        "review_notes": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "patches": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/patch" }
+        }
+      }
+    }
+  }
+}

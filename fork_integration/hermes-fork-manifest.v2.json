@@ -1,0 +1,555 @@
+{
+  "schema_version": 2,
+  "manifest_state": "review_required",
+  "repositories": {
+    "upstream": {
+      "url": "https://github.com/NousResearch/hermes-agent.git"
+    },
+    "fork": {
+      "url": "https://github.com/royalaid/hermes-agent.git"
+    }
+  },
+  "integration": {
+    "repository": "fork",
+    "ref": "refs/heads/fork-integration",
+    "upstream_repository": "upstream",
+    "upstream_ref": "refs/heads/main",
+    "expected_base_commit": "e5bc6b21868efad57414b1d28abbbb5ce26765c9",
+    "expected_head_commit": null
+  },
+  "required_categories": [
+    "updater"
+  ],
+  "required_patch_ids": [
+    "c8b43d1da72f518463132b4665b2da45c54ea612",
+    "6a3f83308b6267066261c809df9721a2909c2b53",
+    "364d4a976831227d6d3732f3b6f159425e921cb4",
+    "b998a4ce1bc857abd3c5cad0137055d543493216",
+    "848e8bdbaa6f555a9a2474bbea85d0152d5f8791",
+    "a6a828c29d5a792d5809b68554b763e67b2ad3ee",
+    "cd436cf6d70095daebbeae217bb2717514d1fe15",
+    "330f2003790b0b7e922eae882c52d2226c2c30ce",
+    "7d1058747ec25f42f784d7cad44e00baee2e62ff",
+    "c271c1fa18d7ff37b6c03c19a903ee688e3237da",
+    "c612111f63bc0c0eb6e003a56f2bfae4f574daf9",
+    "11a4f4cd7f621e1217f17672cb90cc482d9fb6ca",
+    "94032a920e6ede8dabe2d9b6646d5802fa73c932",
+    "d79c677c75d4c3515371e84f3f6818944f46c963",
+    "92da96924c9668c77b77011cc5403090c1a4cf82",
+    "d4134d0928f41504394aebdb6bc4e5cb4dca50f5",
+    "3fcef96a39916cb7d1f5ec1ba8740ba721d075d3",
+    "ce99e4b056fc824d773e637e56845cff19b3ba8b",
+    "28b927d6e9a09e78fffed15c7480b658be5d478a",
+    "478f889b8f7cd5cb723f8e9afa788ac883d44e13",
+    "f86cff4f611c5b5f016260557cdabb57f75180e0",
+    "24e72bb4f36d99211d8adeed737bc79564da9c71",
+    "0d1a3112d4228bbdf0421ba97a29f074e9d2f130",
+    "36eea134ff23b4cc3414d98efa6a4ed97e1767a0",
+    "7e226e7568e9f8cda10123d6ba331c19abcc360e"
+  ],
+  "components": [
+    {
+      "id": "windows-host-path",
+      "category": "desktop",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": {
+        "repository": "fork",
+        "ref": null,
+        "legacy_ref": "205e59a813586e1e5bb644b11ce9b1b410b09867"
+      },
+      "tests": [
+        "apps/desktop/electron/backend-command.test.ts"
+      ],
+      "review_notes": "Required fork behavior retained; restore the immutable source object and portable source ref before release.",
+      "patches": [
+        {
+          "subject": "fix(desktop): preserve live Windows host PATH",
+          "role": "implementation",
+          "disposition": "required",
+          "source": {
+            "commit": "205e59a813586e1e5bb644b11ce9b1b410b09867",
+            "stable_patch_id": "c8b43d1da72f518463132b4665b2da45c54ea612"
+          },
+          "integration": {
+            "state": "pending",
+            "commit": null,
+            "stable_patch_id": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "reasoning-item-boundaries",
+      "category": "model-protocol",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": {
+        "repository": "fork",
+        "ref": null,
+        "legacy_ref": "fork/fix/installed-reasoning-summary-rows"
+      },
+      "tests": [
+        "apps/desktop/src/lib/reasoning-blocks.test.ts",
+        "tests/agent/test_reasoning_summaries.py"
+      ],
+      "review_notes": "Required fork behavior retained; legacy source commits are absent from this object database.",
+      "patches": [
+        {
+          "subject": "fix(codex): preserve reasoning item boundaries",
+          "role": "implementation",
+          "disposition": "required",
+          "source": {
+            "commit": "eb723f2faa79e749ba7e05d81f1a08e664819634",
+            "stable_patch_id": "6a3f83308b6267066261c809df9721a2909c2b53"
+          },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "test(desktop): isolate reasoning item layout",
+          "role": "test",
+          "disposition": "required",
+          "related_to": "eb723f2faa79e749ba7e05d81f1a08e664819634",
+          "source": {
+            "commit": "891b596006f1fc1101e079f4ea73fb01ddbe1015",
+            "stable_patch_id": "364d4a976831227d6d3732f3b6f159425e921cb4"
+          },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "[verified] fix(desktop): preserve native reasoning summaries",
+          "role": "implementation",
+          "disposition": "required",
+          "related_to": "eb723f2faa79e749ba7e05d81f1a08e664819634",
+          "source": {
+            "commit": "51962fc0fb0dc468b5c8ab66c43d9a6a0e3dce3a",
+            "stable_patch_id": "b998a4ce1bc857abd3c5cad0137055d543493216"
+          },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(codex): preserve streamed reasoning summary rows",
+          "role": "implementation",
+          "disposition": "required",
+          "related_to": "eb723f2faa79e749ba7e05d81f1a08e664819634",
+          "source": {
+            "commit": "41f4621abec31afb7c82923a72a9f88a2075ea4b",
+            "stable_patch_id": "848e8bdbaa6f555a9a2474bbea85d0152d5f8791"
+          },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    },
+    {
+      "id": "desktop-hitch-diagnostics",
+      "category": "diagnostics",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": {
+        "repository": "fork",
+        "ref": null,
+        "legacy_ref": "fork/feat/desktop-hitch-diagnostics"
+      },
+      "tests": [
+        "apps/desktop/electron/renderer-diagnostics.test.ts",
+        "tests/hermes_cli/test_diagnostics_upload.py"
+      ],
+      "review_notes": "Required fork diagnostics retained; immutable source objects and final replay identities require review.",
+      "patches": [
+        {
+          "subject": "docs: plan for desktop hitching diagnostics and confirmed local fixes",
+          "role": "documentation",
+          "disposition": "required",
+          "source": { "commit": "94454bf542b7a673423dd59d9139e9db16848e2e", "stable_patch_id": "a6a828c29d5a792d5809b68554b763e67b2ad3ee" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "feat(desktop): renderer diagnostics capture module (U2)",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "4ff79eaa89dc1eba0565b937a9c3b707db7bc094", "stable_patch_id": "cd436cf6d70095daebbeae217bb2717514d1fe15" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(kanban): stop delegated-child permission-error reconnect storm (U1)",
+          "role": "implementation",
+          "disposition": "required",
+          "related_to": "4ff79eaa89dc1eba0565b937a9c3b707db7bc094",
+          "source": { "commit": "f22b305b8065c2243dbd9ffccbdc59f89c281b1d", "stable_patch_id": "330f2003790b0b7e922eae882c52d2226c2c30ce" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "feat(desktop): main-process diagnostics capture controller (U3a)",
+          "role": "implementation",
+          "disposition": "required",
+          "related_to": "4ff79eaa89dc1eba0565b937a9c3b707db7bc094",
+          "source": { "commit": "6791a4816be1e10aaf58b583b0403b6f4333d38b", "stable_patch_id": "7d1058747ec25f42f784d7cad44e00baee2e62ff" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "feat(gateway): armed diagnostics ring with sub-5s stall capture (U3b)",
+          "role": "implementation",
+          "disposition": "required",
+          "related_to": "4ff79eaa89dc1eba0565b937a9c3b707db7bc094",
+          "source": { "commit": "d48f09f7b80688f5ec004e67d7aca5e2d50c0f15", "stable_patch_id": "c271c1fa18d7ff37b6c03c19a903ee688e3237da" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "feat(desktop): capture UX, sanitized bundle export, hermes debug diagnose (U4)",
+          "role": "implementation",
+          "disposition": "required",
+          "related_to": "4ff79eaa89dc1eba0565b937a9c3b707db7bc094",
+          "source": { "commit": "f5ecefb7d7c65023f34119209f078e063cc30a81", "stable_patch_id": "c612111f63bc0c0eb6e003a56f2bfae4f574daf9" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "test(perf): hitch-classify proof scenario for diagnostics capture (U5)",
+          "role": "test",
+          "disposition": "required",
+          "related_to": "4ff79eaa89dc1eba0565b937a9c3b707db7bc094",
+          "source": { "commit": "471a3312f4412fc7d46dde78afba93e8d649bf0d", "stable_patch_id": "11a4f4cd7f621e1217f17672cb90cc482d9fb6ca" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "docs: record closeout status and U6/U7 parking evidence in hitching plan",
+          "role": "documentation",
+          "disposition": "required",
+          "related_to": "4ff79eaa89dc1eba0565b937a9c3b707db7bc094",
+          "source": { "commit": "543f47a6b3d989b1427546ed0a96945749293727", "stable_patch_id": "94032a920e6ede8dabe2d9b6646d5802fa73c932" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    },
+    {
+      "id": "gateway-config-offloop",
+      "category": "gateway",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null, "legacy_ref": "fork/feat/gateway-config-offloop" },
+      "tests": ["tests/gateway/test_config_offloop.py"],
+      "review_notes": "Required fork behavior retained; restore source objects and portable ref.",
+      "patches": [
+        {
+          "subject": "fix(gateway): move _profile_scope and config I/O off the event loop in async handlers",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "eb76ea16f022467c69f6e6e59d2d4688bd41e5e6", "stable_patch_id": "d79c677c75d4c3515371e84f3f6818944f46c963" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(gateway): serialize config mutations and finish the router off-loop sweep",
+          "role": "implementation",
+          "disposition": "required",
+          "related_to": "eb76ea16f022467c69f6e6e59d2d4688bd41e5e6",
+          "source": { "commit": "69103841736b72ed893e73fc8557b3cbc939a0b6", "stable_patch_id": "92da96924c9668c77b77011cc5403090c1a4cf82" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    },
+    {
+      "id": "thread-stream-instrumentation",
+      "category": "diagnostics",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null, "legacy_ref": "fork/feat/thread-stream-instrumentation" },
+      "tests": ["apps/desktop/src/components/assistant-ui/thread/streaming.test.tsx"],
+      "review_notes": "Required fork behavior retained; restore source object and portable ref.",
+      "patches": [
+        {
+          "subject": "feat(desktop): attribute multi-thread render cost in diagnostics captures",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "5b03940559c7fcacd2ec861a016500d244e7c78e", "stable_patch_id": "d4134d0928f41504394aebdb6bc4e5cb4dca50f5" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    },
+    {
+      "id": "inflight-journal-bounded",
+      "category": "desktop",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null, "legacy_ref": "fork/feat/inflight-journal-bounded" },
+      "tests": ["apps/desktop/src/lib/inflight-turn-journal.test.ts"],
+      "review_notes": "Required fork behavior retained; restore source objects and portable ref.",
+      "patches": [
+        {
+          "subject": "fix(desktop): bound the in-flight turn journal and stop rewriting it every 400ms",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "ccf33639c68abda01405f2a3cebda0d6ae0c81a2", "stable_patch_id": "3fcef96a39916cb7d1f5ec1ba8740ba721d075d3" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(desktop): harden journal bounds per external review",
+          "role": "implementation",
+          "disposition": "required",
+          "related_to": "ccf33639c68abda01405f2a3cebda0d6ae0c81a2",
+          "source": { "commit": "af7d7c5e089b568f85df256de95f2a59b63f3611", "stable_patch_id": "ce99e4b056fc824d773e637e56845cff19b3ba8b" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    },
+    {
+      "id": "delegation-argv-classifier",
+      "category": "agent",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null, "legacy_ref": "fork/feat/delegation-argv-classifier" },
+      "tests": ["tests/tools/test_delegate_tool.py"],
+      "review_notes": "Required fork behavior retained; restore source object and portable ref.",
+      "patches": [
+        {
+          "subject": "fix(agent): never read option values as commands in is_server_role_argv",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "68030d40077b235da84db0005cac20e6dddfafb3", "stable_patch_id": "28b927d6e9a09e78fffed15c7480b658be5d478a" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    },
+    {
+      "id": "fork-update-status",
+      "category": "updater",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null, "legacy_ref": "fork/fix/fork-update-status" },
+      "tests": ["apps/desktop/electron/update-remote.test.ts"],
+      "review_notes": "Required fork behavior retained; restore source object and portable ref.",
+      "patches": [
+        {
+          "subject": "fix(desktop): follow published fork branch for updates",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "271dedb85ed0285b0944640e2b775a09274daa56", "stable_patch_id": "478f889b8f7cd5cb723f8e9afa788ac883d44e13" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    },
+    {
+      "id": "native-compaction-upstream-core",
+      "category": "compression",
+      "upstream_status": "absorbed",
+      "source": { "repository": "upstream", "ref": "refs/heads/main" },
+      "tests": [
+        "tests/run_agent/test_native_compaction.py",
+        "tests/agent/test_turn_retry_state.py"
+      ],
+      "review_notes": "Technium's upstream core source is 5e1b5011. Fork cherry-pick prefix 9c12c494 is patch-equivalent through stable patch ID 5eb223de and is therefore absorbed/not replayed. The old e13fd integration attempt was never replayed wholesale.",
+      "patches": [
+        {
+          "subject": "feat(compression): native OpenAI Responses server-side compaction for gpt-5.6",
+          "role": "implementation",
+          "disposition": "absorbed_upstream",
+          "source": { "commit": "5e1b50115f01cda8f8749a347d6a75aeda03ff18", "stable_patch_id": "5eb223dec2ffeeeadbccaa143fd7e7e00dbc856e" },
+          "integration": { "state": "not_replayed", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    },
+    {
+      "id": "native-compaction-replay-safety",
+      "category": "compression",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null },
+      "tests": ["tests/run_agent/test_native_compaction.py"],
+      "review_notes": "The stale integration-branch source was intentionally removed. Restore a non-circular immutable source ref.",
+      "patches": [
+        {
+          "subject": "fix(compression): prune stale native replay safely",
+          "role": "test",
+          "disposition": "required",
+          "related_to": "9b82e111bf4531d6a82bce905a94cbdcab47e647",
+          "source": { "commit": "8786aeca47be65e767a279e93791d89253a41cb7", "stable_patch_id": "f86cff4f611c5b5f016260557cdabb57f75180e0" },
+          "integration": { "state": "expected", "commit": null, "stable_patch_id": "f86cff4f611c5b5f016260557cdabb57f75180e0" }
+        },
+        {
+          "subject": "fix(compression): bound stateless checkpoint replay",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "9b82e111bf4531d6a82bce905a94cbdcab47e647", "stable_patch_id": "24e72bb4f36d99211d8adeed737bc79564da9c71" },
+          "integration": { "state": "expected", "commit": null, "stable_patch_id": "24e72bb4f36d99211d8adeed737bc79564da9c71" }
+        }
+      ]
+    },
+    {
+      "id": "legacy-reasoning-summary-boundaries",
+      "category": "model-protocol",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null },
+      "tests": ["tests/agent/test_reasoning_summaries.py"],
+      "review_notes": "Split from native compaction; restore a non-circular immutable source ref.",
+      "patches": [
+        {
+          "subject": "fix(codex): preserve legacy reasoning summary boundaries",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "67541cb56afebee4fcbc1fa08dcfa2c1f9183b0c", "stable_patch_id": "0d1a3112d4228bbdf0421ba97a29f074e9d2f130" },
+          "integration": { "state": "expected", "commit": null, "stable_patch_id": "0d1a3112d4228bbdf0421ba97a29f074e9d2f130" }
+        }
+      ]
+    },
+    {
+      "id": "diagnostics-test-block-duration",
+      "category": "diagnostics",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null },
+      "tests": ["tests/hermes_cli/test_diagnostics_upload.py"],
+      "review_notes": "Diagnostics fix is independent of native compaction; restore its immutable source ref.",
+      "patches": [
+        {
+          "subject": "fix(diagnostics): honor requested test-block duration",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "f6e3c6081fbe82084ff42605b7d27ab8d0af31f7", "stable_patch_id": "36eea134ff23b4cc3414d98efa6a4ed97e1767a0" },
+          "integration": { "state": "expected", "commit": null, "stable_patch_id": "36eea134ff23b4cc3414d98efa6a4ed97e1767a0" }
+        }
+      ]
+    },
+    {
+      "id": "bootstrap-build-ref-pin",
+      "category": "bootstrap",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null },
+      "tests": [
+        "apps/desktop/electron/bootstrap-runner.test.ts",
+        "tests/test_install_sh_bootstrap_marker.py"
+      ],
+      "review_notes": "Bootstrap pin is independent of native compaction; restore its immutable source ref.",
+      "patches": [
+        {
+          "subject": "fix(bootstrap): pin installer repository with build ref",
+          "role": "implementation",
+          "disposition": "required",
+          "source": { "commit": "adafd77fa07f68dcaf58d9b28466c0bdd4cb115c", "stable_patch_id": "7e226e7568e9f8cda10123d6ba331c19abcc360e" },
+          "integration": { "state": "expected", "commit": null, "stable_patch_id": "7e226e7568e9f8cda10123d6ba331c19abcc360e" }
+        }
+      ]
+    },
+    {
+      "id": "native-windows-updater-mcp",
+      "category": "updater",
+      "upstream_status": "review_required",
+      "intended_upstream_status": "required",
+      "source": { "repository": "fork", "ref": null },
+      "tests": [
+        "apps/desktop/electron/mcp-bridge-quiesce.test.ts",
+        "apps/desktop/electron/update-preflight.test.ts",
+        "tests/agent/transports/test_hermes_tools_mcp_server.py",
+        "tests/hermes_cli/test_cmd_update.py",
+        "tests/hermes_cli/test_scan_venv_blockers.py",
+        "tests/hermes_cli/test_update_venv_health.py",
+        "tests/test_hermes_mcp_update_gate.py"
+      ],
+      "review_notes": "All 13 omitted repair-chain commits are retained as immutable provenance. The first ten remain review_required while the replacement implementation is uncommitted. The final three forced app.exit/handoff-exit commits are superseded and are not replayed.",
+      "patches": [
+        {
+          "subject": "fix(updater): quiesce Codex MCP bridges for Desktop updates",
+          "role": "implementation",
+          "disposition": "review_required",
+          "source": { "commit": "79035c62fa624a9be8ef6214891a41e644c41dcc", "stable_patch_id": "6db9757f0d97335a2d020a2dabf02d31c7620a98" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(updater): gate MCP bridges before venv imports",
+          "role": "implementation",
+          "disposition": "review_required",
+          "related_to": "79035c62fa624a9be8ef6214891a41e644c41dcc",
+          "source": { "commit": "b6d6a0838f05a5a2f9d7fc350f006f0998705794", "stable_patch_id": "50ee09f1e291897c88d2289c80b0f00383f0d4ac" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(updater): refresh target tracking ref",
+          "role": "implementation",
+          "disposition": "review_required",
+          "related_to": "79035c62fa624a9be8ef6214891a41e644c41dcc",
+          "source": { "commit": "43022558a040cf03e6f6f4761f5ac178eb737128", "stable_patch_id": "38fbf024b0be130d4645c5fdef2d9caf73c3ca7b" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(updater): gate legacy MCP launch before imports",
+          "role": "implementation",
+          "disposition": "review_required",
+          "related_to": "79035c62fa624a9be8ef6214891a41e644c41dcc",
+          "source": { "commit": "e950fbb0fc9c7a0bc96c55e763b709d7b48437cf", "stable_patch_id": "38899fefccebae7010af17aed85ff844dd0234de" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(desktop): refresh branch ref before update checks",
+          "role": "implementation",
+          "disposition": "review_required",
+          "related_to": "79035c62fa624a9be8ef6214891a41e644c41dcc",
+          "source": { "commit": "b028dd5d7f99a3a8e36b345a7796947f18bf77df", "stable_patch_id": "eb3397df7e2f07bdc649f2814a73c94cd58b27c1" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(updater): recognize managed MCP runtime child",
+          "role": "implementation",
+          "disposition": "review_required",
+          "related_to": "79035c62fa624a9be8ef6214891a41e644c41dcc",
+          "source": { "commit": "a68f85c46c1ebdc94fb4b95feb7de9685b34b0b3", "stable_patch_id": "e01de898a2208e61e79703c8067fe1fc94ef293f" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(updater): scan managed runtime Python holders",
+          "role": "implementation",
+          "disposition": "review_required",
+          "related_to": "79035c62fa624a9be8ef6214891a41e644c41dcc",
+          "source": { "commit": "e0573c650e8d995f9ad2527c276dfe0e2dddf7f5", "stable_patch_id": "0cc51d321b466467bea1ac2748dcb7f6696b8106" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "test(updater): cover MCP trampoline consent",
+          "role": "test",
+          "disposition": "review_required",
+          "related_to": "b6d6a0838f05a5a2f9d7fc350f006f0998705794",
+          "source": { "commit": "deedb3db7f0e962b4e79f4c27ab24eaa350bcf2c", "stable_patch_id": "443aee472da1a3fbf9689935db493fd135aa9d59" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(updater): reread gateway runtime argv",
+          "role": "implementation",
+          "disposition": "review_required",
+          "related_to": "e0573c650e8d995f9ad2527c276dfe0e2dddf7f5",
+          "source": { "commit": "126528a77bda687013c274d8deaf9bcf5e5b97a5", "stable_patch_id": "2f439b403ed30012bfda1395d42d620843f2683b" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "test(updater): preserve runtime holder refusal",
+          "role": "test",
+          "disposition": "review_required",
+          "related_to": "126528a77bda687013c274d8deaf9bcf5e5b97a5",
+          "source": { "commit": "fb3ead63b596d5cd48c3c53d03e16503794b99f9", "stable_patch_id": "bfa6138d92f63e83a80bf77e0d00cc0cf1351c98" },
+          "integration": { "state": "pending", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(desktop): force updater handoff exit",
+          "role": "implementation",
+          "disposition": "superseded",
+          "related_to": "79035c62fa624a9be8ef6214891a41e644c41dcc",
+          "source": { "commit": "48cf9e5266a68d6f46cd43969f538a43f39d2aba", "stable_patch_id": "718a7fb88308a5e74af5b0a3344036778962fbda" },
+          "integration": { "state": "not_replayed", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "fix(desktop): complete updater handoff exit",
+          "role": "implementation",
+          "disposition": "superseded",
+          "related_to": "48cf9e5266a68d6f46cd43969f538a43f39d2aba",
+          "source": { "commit": "79959e421703fbead19f43d7b7edf3f50470dbb6", "stable_patch_id": "ecf4c06c7c4799dc48f0a72045919f49dc0f5dde" },
+          "integration": { "state": "not_replayed", "commit": null, "stable_patch_id": null }
+        },
+        {
+          "subject": "chore(desktop): log forced updater handoff exits",
+          "role": "implementation",
+          "disposition": "superseded",
+          "related_to": "48cf9e5266a68d6f46cd43969f538a43f39d2aba",
+          "source": { "commit": "28e28682e056952920b94574e5413a981031ebf2", "stable_patch_id": "0f651f8c1330f7958b04fe3ece9fe99c5498c28d" },
+          "integration": { "state": "not_replayed", "commit": null, "stable_patch_id": null }
+        }
+      ]
+    }
+  ]
+}
