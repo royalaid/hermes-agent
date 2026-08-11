@@ -24,22 +24,2352 @@ loaded, so there is no import cycle).
 """
 
 import hashlib
+import hmac
+import functools
 import json
 import logging
+import math
 import os
+import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time as _time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, NoReturn, Optional
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import venv_python_path
+from hermes_constants import venv_bin_dir, venv_python_path
 
 logger = logging.getLogger(__name__)
+
+_UPDATE_RECEIPT_NAME = ".hermes-update-receipt.json"
+_DEFERRED_GATEWAY_PLAN_PREFIX = ".hermes-gateway-resume-"
+# Native wrappers bound source/dependency mutation at 60 minutes and the
+# outside-Job fleet-resume phase at 5 minutes. Keep one additional minute for
+# descendant-drain/clock scheduling while still bounding abandoned recovery.
+_DEFERRED_GATEWAY_PLAN_TTL_SECONDS = 66 * 60
+_READINESS_SCHEMA_VERSION = 1
+_DRAIN_CLEAR_INTERVAL_SECONDS = 0.5
+_DRAIN_COOPERATIVE_WAIT_SECONDS = 1.0
+_DEFAULT_DRAIN_TIMEOUT_SECONDS = 12.0
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{16,128}$")
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_EXECUTABLE_GIT_CONFIG_RE = (
+    r"^(filter\..*\.(clean|smudge|process)|merge\..*\.driver|"
+    r"core\.(sshcommand|gitproxy)|credential(\..*)?\.helper|"
+    r"url\..*\.(insteadof|pushinsteadof))$"
+)
+_READINESS_KEYS = {
+    "schema_version",
+    "mode",
+    "ok",
+    "ready",
+    "blocked",
+    "reason",
+    "root",
+    "venv",
+    "processes",
+    "mcp_bridges",
+    "pausable_gateways",
+    "pausable_gateway_processes",
+    "git",
+    "last_update_receipt",
+    "lease",
+    "actions",
+    "error",
+}
+
+
+@dataclass(frozen=True)
+class _UpdateTarget:
+    branch: str
+    remote: str
+    tracking_ref: str
+    refspec: str
+
+
+@dataclass(frozen=True)
+class _VerifiedProcessIdentity:
+    """One live process identity authorized for a narrowly scoped stop."""
+
+    pid: int
+    created_at: float
+    kind: str
+    argv: tuple[str, ...] = ()
+    executable: str = ""
+    install_root: str = ""
+    role: str = ""
+    working_directory: str = ""
+
+
+def _is_safe_remote_name(remote: str) -> bool:
+    return bool(
+        _REMOTE_NAME_RE.fullmatch(remote)
+        and ".." not in remote
+        and "//" not in remote
+        and "@{" not in remote
+        and not remote.endswith(("/", ".", ".lock"))
+    )
+
+
+def _git_cmd() -> list[str]:
+    # Every update Git subprocess shares this prefix.  Do not let repository
+    # configuration turn read/update operations into arbitrary process
+    # launches: hooks and fsmonitor are disabled and global/system attribute
+    # files are ignored.  Local filter/merge drivers need a separate explicit
+    # refusal because Git has no wildcard `-c filter.*=off` override.
+    command = [
+        "git",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-c",
+        "protocol.ext.allow=never",
+    ]
+    if sys.platform == "win32":
+        command.extend(["-c", "windows.appendAtomically=false"])
+    return command
+
+
+def _sanitized_git_env(*, read_only: bool = False) -> dict[str, str]:
+    """Return the ambient environment without inherited Git control knobs."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    # A privileged updater must not execute helpers or filters injected by a
+    # user's system/global Git configuration.  Repository-local remote and
+    # branch configuration remains available; executable local selectors are
+    # rejected by `_assert_safe_git_configuration` before status/mutation.
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
+        }
+    )
+    if read_only:
+        env.update(
+            {
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_NO_LAZY_FETCH": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+    return env
+
+
+class _GitRoutingEnvironmentGuard:
+    """Temporarily remove ambient variables that can redirect Git mutation."""
+
+    def __init__(self) -> None:
+        self._saved: dict[str, str] = {}
+
+    @staticmethod
+    def _is_routing_key(key: str) -> bool:
+        return key.upper().startswith("GIT_")
+
+    def __enter__(self) -> "_GitRoutingEnvironmentGuard":
+        self._saved = {
+            key: value
+            for key, value in os.environ.items()
+            if self._is_routing_key(key)
+        }
+        for key in self._saved:
+            os.environ.pop(key, None)
+        os.environ.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_ATTR_NOSYSTEM": "1",
+            }
+        )
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        # Remove any routing key introduced by update code, then restore the
+        # caller's exact environment. All direct and helper subprocess calls
+        # inside the decorated mutation pipeline inherit the safe view.
+        for key in list(os.environ):
+            if self._is_routing_key(key):
+                os.environ.pop(key, None)
+        os.environ.update(self._saved)
+
+
+def _with_sanitized_git_routing(function):
+    @functools.wraps(function)
+    def guarded(*args, **kwargs):
+        with _GitRoutingEnvironmentGuard():
+            return function(*args, **kwargs)
+
+    return guarded
+
+
+def _assert_safe_git_configuration(
+    git_cmd: list[str], cwd: Path, *, env: dict[str, str] | None = None
+) -> None:
+    """Refuse repository-local configuration that can execute a command.
+
+    Git's `status`, `stash`, `checkout`, `reset`, `restore`, and `merge` can
+    invoke filter/merge drivers without an obvious subprocess at this layer.
+    Fetch also honors repository-local ``url.*.insteadOf`` selectors, which
+    can redirect a literal official URL to an arbitrary transport/helper.
+    System/global config is excluded by the sanitized environment; inspect
+    the remaining local scope (including files it includes) before the first
+    worktree read or mutation.  Failure to inspect is itself a refusal.
+    """
+    command_env = _sanitized_git_env() if env is None else env
+    result = subprocess.run(
+        git_cmd
+        + [
+            "config",
+            "--includes",
+            "--show-origin",
+            "--show-scope",
+            "--name-only",
+            "--get-regexp",
+            _EXECUTABLE_GIT_CONFIG_RE,
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=command_env,
+    )
+    if result.returncode == 1 and not result.stdout.strip():
+        return
+    if result.returncode != 0:
+        raise RuntimeError("could not prove repository Git configuration is safe")
+    selectors = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if selectors:
+        raise RuntimeError(
+            "repository Git configuration contains executable filter/merge "
+            "drivers or URL rewrite selectors: "
+            + ", ".join(selectors)
+        )
+
+
+def _resolve_update_target(
+    git_cmd: list[str], cwd: Path, branch: str, *, env: dict[str, str] | None = None
+) -> _UpdateTarget:
+    """Resolve the upstream updater's fixed origin branch contract."""
+    command_env = _sanitized_git_env() if env is None else env
+    check = subprocess.run(
+        git_cmd + ["check-ref-format", "--branch", branch],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=command_env,
+    )
+    if check.returncode != 0:
+        raise ValueError(f"invalid update branch: {branch}")
+    remote = "origin"
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    remote_probe = subprocess.run(
+        git_cmd + ["remote", "get-url", "--", remote],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=command_env,
+    )
+    ref_probe = subprocess.run(
+        git_cmd + ["check-ref-format", tracking_ref],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=command_env,
+    )
+    if remote_probe.returncode != 0 or ref_probe.returncode != 0:
+        raise ValueError(f"invalid or missing update remote: {remote}")
+    return _UpdateTarget(
+        branch=branch,
+        remote=remote,
+        tracking_ref=tracking_ref,
+        refspec=f"+refs/heads/{branch}:{tracking_ref}",
+    )
+
+
+def _receipt_path(root: Path) -> Path:
+    del root
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / _UPDATE_RECEIPT_NAME
+
+
+def _deferred_gateway_plan_path(
+    root: Path, invocation_id: str, *, completed: bool = False
+) -> Path:
+    """Return the install-global private fleet-plan path."""
+    del root
+    from hermes_constants import get_default_hermes_root
+
+    suffix = ".completed" if completed else ".json"
+    return get_default_hermes_root() / (
+        f"{_DEFERRED_GATEWAY_PLAN_PREFIX}{invocation_id}{suffix}"
+    )
+
+
+def _write_private_exclusive(path: Path, raw: str) -> None:
+    """Publish fully-written private bytes without overwriting a claim."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".hermes-gateway-plan-{secrets.token_hex(16)}"
+    descriptor = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        encoded = raw.encode("utf-8")
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise OSError("short write while publishing gateway resume plan")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.link(temporary, path)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def _gateway_plan_auth(payload: dict, lease_id: str) -> str:
+    authenticated = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hmac.new(lease_id.encode("utf-8"), authenticated, hashlib.sha256).hexdigest()
+
+
+def _sanitize_deferred_gateway_plan(
+    value: object,
+    *,
+    root: Path,
+    invocation_id: str,
+    lease_id: str,
+    now: float | None = None,
+) -> dict | None:
+    """Validate a private no-argv gateway fleet plan and its capability MAC."""
+    if not isinstance(value, dict):
+        return None
+    expected = {
+        "schema_version",
+        "invocation_id",
+        "lease_fingerprint",
+        "install_root",
+        "created_at",
+        "expires_at",
+        "profiles",
+        "cold_start_if_installed",
+        "auth",
+    }
+    if (
+        set(value) != expected
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+    ):
+        return None
+    if value.get("invocation_id") != invocation_id:
+        return None
+    if not _IDENTIFIER_RE.fullmatch(invocation_id):
+        return None
+    if not _IDENTIFIER_RE.fullmatch(lease_id):
+        return None
+    expected_fingerprint = hashlib.sha256(lease_id.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(
+        str(value.get("lease_fingerprint", "")), expected_fingerprint
+    ):
+        return None
+    if os.path.normcase(os.path.realpath(str(value.get("install_root", "")))) != os.path.normcase(
+        os.path.realpath(root)
+    ):
+        return None
+    if type(value.get("created_at")) is not int or type(value.get("expires_at")) is not int:
+        return None
+    created_at = value["created_at"]
+    expires_at = value["expires_at"]
+    current = _time.time() if now is None else float(now)
+    if not math.isfinite(current) or not (
+        created_at > 0
+        and created_at <= expires_at
+        and expires_at - created_at <= _DEFERRED_GATEWAY_PLAN_TTL_SECONDS
+        and created_at <= current + 5
+        and current <= expires_at
+    ):
+        return None
+    if type(value.get("cold_start_if_installed")) is not bool:
+        return None
+    raw_profiles = value.get("profiles")
+    if not isinstance(raw_profiles, list):
+        return None
+    profiles: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw_profiles:
+        if not isinstance(entry, dict) or set(entry) != {
+            "name",
+            "old_pid",
+            "created_at",
+        }:
+            return None
+        name = entry.get("name")
+        if (
+            not isinstance(name, str)
+            or _PROFILE_NAME_RE.fullmatch(name) is None
+            or name in {".", ".."}
+            or name in seen
+        ):
+            return None
+        if type(entry.get("old_pid")) is not int or isinstance(
+            entry.get("created_at"), bool
+        ) or not isinstance(entry.get("created_at"), (int, float)):
+            return None
+        old_pid = entry["old_pid"]
+        process_created_at = float(entry["created_at"])
+        if (
+            isinstance(entry.get("old_pid"), bool)
+            or old_pid <= 0
+            or not math.isfinite(process_created_at)
+            or process_created_at <= 0
+        ):
+            return None
+        seen.add(name)
+        profiles.append(
+            {"name": name, "old_pid": old_pid, "created_at": process_created_at}
+        )
+    unsigned = {key: value[key] for key in expected if key != "auth"}
+    auth = value.get("auth")
+    if not isinstance(auth, str) or not hmac.compare_digest(
+        auth, _gateway_plan_auth(unsigned, lease_id)
+    ):
+        return None
+    return {
+        **unsigned,
+        "profiles": profiles,
+        "auth": auth,
+    }
+
+
+def _write_deferred_gateway_plan(args, root: Path) -> Path:
+    invocation_id = getattr(args, "_update_invocation_id", None)
+    lease = getattr(args, "_update_quiesce_lease", None)
+    token = getattr(args, "_windows_gateway_resume_plan", None) or {}
+    if not isinstance(invocation_id, str) or not isinstance(lease, dict):
+        raise RuntimeError("deferred gateway plan lacks update correlation")
+    lease_id = lease.get("lease_id")
+    if not isinstance(lease_id, str):
+        raise RuntimeError("deferred gateway plan lacks lease correlation")
+    existing_path = getattr(args, "_deferred_gateway_plan_written", None)
+    if isinstance(existing_path, Path):
+        try:
+            existing = json.loads(existing_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("deferred gateway plan became unreadable") from exc
+        if _sanitize_deferred_gateway_plan(
+            existing,
+            root=root,
+            invocation_id=invocation_id,
+            lease_id=lease_id,
+        ) is None:
+            raise RuntimeError("deferred gateway plan correlation changed")
+        return existing_path
+    if token.get("unmapped") or token.get("unmapped_pids"):
+        raise RuntimeError("unmapped gateways cannot be deferred safely")
+    identities = token.get("profile_identities") or {}
+    profiles = []
+    for name, old_pid in sorted((token.get("profiles") or {}).items()):
+        identity = identities.get(name)
+        if not isinstance(identity, dict):
+            raise RuntimeError(f"gateway profile {name!r} has no process identity")
+        if (
+            type(old_pid) is not int
+            or type(identity.get("pid")) is not int
+            or identity.get("pid") != old_pid
+        ):
+            raise RuntimeError(
+                f"gateway profile {name!r} process identity does not match its PID"
+            )
+        profiles.append(
+            {
+                "name": str(name),
+                "old_pid": int(old_pid),
+                "created_at": float(identity["created_at"]),
+            }
+        )
+    created_at = int(_time.time())
+    unsigned = {
+        "schema_version": 1,
+        "invocation_id": invocation_id,
+        "lease_fingerprint": hashlib.sha256(lease_id.encode("utf-8")).hexdigest(),
+        "install_root": os.path.normcase(os.path.realpath(root)),
+        "created_at": created_at,
+        "expires_at": created_at + _DEFERRED_GATEWAY_PLAN_TTL_SECONDS,
+        "profiles": profiles,
+        "cold_start_if_installed": bool(token.get("cold_start_if_installed")),
+    }
+    payload = {**unsigned, "auth": _gateway_plan_auth(unsigned, lease_id)}
+    sanitized = _sanitize_deferred_gateway_plan(
+        payload,
+        root=root,
+        invocation_id=invocation_id,
+        lease_id=lease_id,
+        now=created_at,
+    )
+    if sanitized is None:
+        raise RuntimeError("refusing invalid deferred gateway plan")
+    path = _deferred_gateway_plan_path(root, invocation_id)
+    _write_private_exclusive(
+        path, json.dumps(sanitized, sort_keys=True, separators=(",", ":"))
+    )
+    setattr(args, "_deferred_gateway_plan_written", path)
+    return path
+
+
+def _load_deferred_gateway_plan(
+    path: Path,
+    *,
+    root: Path,
+    invocation_id: str,
+    lease_id: str,
+) -> tuple[str, dict] | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        value = json.loads(raw)
+    except FileNotFoundError:
+        # A crash can occur after consume moves the pending name but before it
+        # publishes the completed record. Recover only authenticated,
+        # byte-identical consume tombstones; malformed or divergent evidence
+        # remains fail-closed for manual recovery.
+        candidates = sorted(path.parent.glob(f"{path.name}.consume-*"))
+        if not candidates:
+            return None
+        recovered_raw: str | None = None
+        recovered_value: dict | None = None
+        for candidate in candidates:
+            try:
+                candidate_raw = candidate.read_text(encoding="utf-8")
+                candidate_value = json.loads(candidate_raw)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "deferred gateway plan recovery is unreadable"
+                ) from exc
+            candidate_plan = _sanitize_deferred_gateway_plan(
+                candidate_value,
+                root=root,
+                invocation_id=invocation_id,
+                lease_id=lease_id,
+            )
+            if candidate_plan is None:
+                raise RuntimeError("deferred gateway plan recovery is invalid")
+            if recovered_raw is not None and candidate_raw != recovered_raw:
+                raise RuntimeError("deferred gateway plan recoveries diverged")
+            recovered_raw = candidate_raw
+            recovered_value = candidate_plan
+        assert recovered_raw is not None and recovered_value is not None
+        try:
+            os.link(candidates[0], path)
+        except FileExistsError:
+            try:
+                if path.read_text(encoding="utf-8") != recovered_raw:
+                    raise RuntimeError("deferred gateway plan changed during recovery")
+            except OSError as exc:
+                raise RuntimeError(
+                    "deferred gateway plan recovery could not be proven"
+                ) from exc
+        except OSError as exc:
+            raise RuntimeError("deferred gateway plan could not be restored") from exc
+        return recovered_raw, recovered_value
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("deferred gateway plan is unreadable") from exc
+    sanitized = _sanitize_deferred_gateway_plan(
+        value,
+        root=root,
+        invocation_id=invocation_id,
+        lease_id=lease_id,
+    )
+    if sanitized is None:
+        raise RuntimeError("deferred gateway plan is invalid or expired")
+    return raw, sanitized
+
+
+def _consume_deferred_gateway_plan(path: Path, expected_raw: str) -> bool:
+    """Consume exact pending bytes into an idempotent completed record."""
+    completed = path.with_suffix(".completed")
+    tombstone = path.with_name(
+        f"{path.name}.consume-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    try:
+        os.replace(path, tombstone)
+    except OSError:
+        return False
+    try:
+        moved_raw = tombstone.read_text(encoding="utf-8")
+    except OSError:
+        # The rename already consumed the only discoverable pending name.
+        # Restore the exact inode without overwriting anything so a transient
+        # read/sharing failure cannot strand a stopped fleet with no retry
+        # path. Retain the tombstone as fail-closed evidence if restoration
+        # itself cannot be proven.
+        try:
+            os.link(tombstone, path)
+        except OSError:
+            pass
+        return False
+    if moved_raw != expected_raw:
+        try:
+            os.link(tombstone, path)
+        except OSError:
+            pass
+        return False
+    try:
+        os.link(tombstone, completed)
+    except (FileExistsError, OSError):
+        try:
+            os.link(tombstone, path)
+        except OSError:
+            pass
+        return False
+    try:
+        tombstone.unlink()
+    except OSError:
+        # A completed record is terminal authority only after the pending
+        # tombstone is retired. Roll it back and restore the exact pending
+        # bytes so replay cannot skip lease cleanup after a partial consume.
+        try:
+            completed.unlink()
+        except OSError:
+            pass
+        try:
+            os.link(tombstone, path)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _validate_deferred_update_request(args) -> None:
+    invocation_id = getattr(args, "invocation_id", None)
+    lease_id = getattr(args, "bridge_lease_id", None)
+    if invocation_id is not None and (
+        not isinstance(invocation_id, str)
+        or _IDENTIFIER_RE.fullmatch(invocation_id) is None
+    ):
+        raise ValueError("invalid --invocation-id")
+    if lease_id is not None and (
+        not isinstance(lease_id, str)
+        or _IDENTIFIER_RE.fullmatch(lease_id) is None
+    ):
+        raise ValueError("invalid --bridge-lease-id")
+    if not bool(getattr(args, "defer_gateway_resume", False)):
+        return
+    incompatible = [
+        flag
+        for flag in ("check", "preflight", "drain", "resume_deferred_gateway")
+        if bool(getattr(args, flag, False))
+    ]
+    if incompatible:
+        raise ValueError(
+            "--defer-gateway-resume cannot be combined with --"
+            + incompatible[0].replace("_", "-")
+        )
+    if not bool(getattr(args, "gateway", False)):
+        raise ValueError("--defer-gateway-resume requires --gateway")
+    if invocation_id is None:
+        raise ValueError("--defer-gateway-resume requires a valid --invocation-id")
+    if lease_id is None:
+        raise ValueError("--defer-gateway-resume requires a valid --bridge-lease-id")
+
+
+def _profile_process_still_matches(old_pid: int, created_at: float) -> bool:
+    """Fail closed when the pre-update process identity cannot be disproved."""
+    try:
+        import psutil  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("psutil is required to verify gateway identity") from exc
+    try:
+        process = psutil.Process(int(old_pid))
+        live_created = float(process.create_time())
+    except psutil.NoSuchProcess:
+        return False
+    except Exception as exc:
+        raise RuntimeError("could not revalidate prior gateway process identity") from exc
+    if not math.isfinite(live_created):
+        raise RuntimeError("prior gateway process creation time is invalid")
+    return abs(live_created - float(created_at)) <= 0.001
+
+
+def _running_gateway_profiles() -> dict[str, int]:
+    from hermes_cli.gateway import find_profile_gateway_processes
+
+    return {
+        str(process.profile): int(process.pid)
+        for process in find_profile_gateway_processes()
+    }
+
+
+def _spawn_deferred_gateway_profile(profile: str) -> int:
+    """Start one derived Hermes profile without accepting caller argv."""
+    from hermes_constants import get_default_hermes_root
+    from hermes_cli import gateway_windows
+
+    default_root = get_default_hermes_root()
+    profile_home = default_root if profile == "default" else default_root / "profiles" / profile
+    if profile != "default" and not profile_home.is_dir():
+        raise RuntimeError(f"gateway profile {profile!r} no longer exists")
+    previous = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(profile_home)
+    try:
+        return int(gateway_windows._spawn_detached())
+    finally:
+        if previous is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous
+
+
+def _wait_for_deferred_gateway_profile(profile: str, *, timeout: float = 20.0) -> bool:
+    deadline = _time.monotonic() + max(0.1, float(timeout))
+    while _time.monotonic() < deadline:
+        try:
+            if profile in _running_gateway_profiles():
+                return True
+        except Exception:
+            pass
+        _time.sleep(0.2)
+    return False
+
+
+def _resume_deferred_gateway_fleet(plan: dict) -> None:
+    """Resume only the authenticated structured fleet, idempotently."""
+    running = _running_gateway_profiles()
+    for entry in plan["profiles"]:
+        profile = str(entry["name"])
+        running_pid = running.get(profile)
+        if running_pid is not None:
+            if int(running_pid) == int(entry["old_pid"]) and _profile_process_still_matches(
+                int(entry["old_pid"]), float(entry["created_at"])
+            ):
+                raise RuntimeError(
+                    f"prior gateway profile {profile!r} is still running"
+                )
+            # A different verified profile PID (or a recycled numeric PID
+            # whose creation identity does not match) is a prior successful
+            # partial-resume result. Do not start a duplicate.
+            continue
+        if _profile_process_still_matches(
+            int(entry["old_pid"]), float(entry["created_at"])
+        ):
+            raise RuntimeError(
+                f"prior gateway profile {profile!r} is still running"
+            )
+        if _spawn_deferred_gateway_profile(profile) <= 0:
+            raise RuntimeError(f"gateway profile {profile!r} did not start")
+        if not _wait_for_deferred_gateway_profile(profile):
+            raise RuntimeError(f"gateway profile {profile!r} did not become ready")
+        running = _running_gateway_profiles()
+
+    if plan["cold_start_if_installed"] and not plan["profiles"]:
+        if "default" not in running:
+            from hermes_cli import gateway_windows
+
+            if gateway_windows.is_installed():
+                if _spawn_deferred_gateway_profile("default") <= 0:
+                    raise RuntimeError("default gateway did not start")
+                if not _wait_for_deferred_gateway_profile("default"):
+                    raise RuntimeError("default gateway did not become ready")
+
+
+def _cmd_update_resume_deferred_gateway(args, *, root: Path) -> NoReturn:
+    """Consume one authenticated deferred fleet plan outside mutation Jobs."""
+    invocation_id = getattr(args, "invocation_id", None)
+    lease_id = getattr(args, "bridge_lease_id", None)
+    requested_root = getattr(args, "resume_root", None)
+    if (
+        not isinstance(invocation_id, str)
+        or _IDENTIFIER_RE.fullmatch(invocation_id) is None
+        or not isinstance(lease_id, str)
+        or _IDENTIFIER_RE.fullmatch(lease_id) is None
+        or not isinstance(requested_root, str)
+        or os.path.normcase(os.path.realpath(requested_root))
+        != os.path.normcase(os.path.realpath(root))
+    ):
+        print("✗ Invalid deferred gateway resume request.")
+        raise SystemExit(1)
+
+    pending_path = _deferred_gateway_plan_path(root, invocation_id)
+    completed_path = _deferred_gateway_plan_path(root, invocation_id, completed=True)
+    completed = _load_deferred_gateway_plan(
+        completed_path,
+        root=root,
+        invocation_id=invocation_id,
+        lease_id=lease_id,
+    )
+
+    from hermes_cli.update_lock import UpdateLock
+    from hermes_mcp_update_gate import marker_path, read_quiesce_lease
+
+    if completed is not None and read_quiesce_lease(marker_path()) is None:
+        print("✓ Deferred gateway fleet was already resumed.")
+        raise SystemExit(0)
+
+    update_lock = UpdateLock()
+    lease: dict | None = None
+    prior_owner_pid: int | None = None
+    success = False
+    try:
+        if not update_lock.acquire() or not update_lock.prove_claim():
+            raise RuntimeError("update handoff lock is not owned by this transaction")
+        prior = read_quiesce_lease(marker_path())
+        if not (
+            isinstance(prior, dict)
+            and prior.get("schema_version") == 1
+            and prior.get("lease_id") == lease_id
+        ):
+            raise RuntimeError("deferred gateway lease is missing or changed")
+        prior_owner_pid = int(prior.get("owner_pid", 0))
+        lease = _claim_update_quiesce_lease(root, expected_lease_id=lease_id)
+        # The native parent must prove that its exact spawned child held the
+        # capability even when a fast no-op resume adopts and clears the lease
+        # between marker polls.  Emit no capability bytes: this frame is only
+        # an identity-bound observation, and terminal success still requires
+        # the correlated receipt/plan plus exact lease cleanup.
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "event": "deferred-gateway-lease-adopted",
+                    "invocation_id": invocation_id,
+                    "owner_pid": os.getpid(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        receipt = _load_update_receipt(root)
+        if receipt is not None and receipt.get("invocation_id") == invocation_id:
+            if not (
+                receipt.get("lease_id") == lease_id
+                and receipt.get("gateway_resume_deferred") is True
+            ):
+                raise RuntimeError("deferred gateway receipt correlation failed")
+        if completed is None:
+            loaded = _load_deferred_gateway_plan(
+                pending_path,
+                root=root,
+                invocation_id=invocation_id,
+                lease_id=lease_id,
+            )
+            if loaded is None:
+                raise RuntimeError("deferred gateway plan is missing")
+            raw, plan = loaded
+            _resume_deferred_gateway_fleet(plan)
+            if not _consume_deferred_gateway_plan(pending_path, raw):
+                raise RuntimeError("deferred gateway plan changed before consume")
+        success = True
+    except Exception as exc:
+        print(f"✗ Deferred gateway resume failed: {exc}")
+    finally:
+        try:
+            if lease is not None:
+                if success:
+                    try:
+                        released = _release_update_quiesce_lease(root, lease)
+                    except Exception:
+                        released = False
+                    if not released:
+                        success = False
+                        print("✗ Deferred gateway lease cleanup could not be proven.")
+                if not success and prior_owner_pid is not None and prior_owner_pid > 0:
+                    try:
+                        _transfer_update_quiesce_lease(
+                            root, lease, new_owner_pid=prior_owner_pid
+                        )
+                    except Exception:
+                        # Retain the child-owned/foreign marker as fail-closed
+                        # evidence. The native parent will reject terminal
+                        # success and can run its bounded recovery flow.
+                        pass
+        finally:
+            update_lock.release()
+    if success:
+        print(
+            "✓ Deferred gateway fleet was already resumed."
+            if completed is not None
+            else "✓ Deferred gateway fleet resumed."
+        )
+    raise SystemExit(0 if success else 1)
+
+
+def _sanitize_update_receipt(value: object, root: Path) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    expected_receipt_keys = {
+        "schema_version",
+        "invocation_id",
+        "lease_id",
+        "mode",
+        "root",
+        "remote",
+        "branch",
+        "target_ref",
+        "target_sha",
+        "resulting_head",
+        "archive_sha",
+        "timestamp",
+        "success",
+        "gateway_resume_deferred",
+        "health",
+    }
+    if set(value) != expected_receipt_keys:
+        return None
+    try:
+        timestamp = int(value["timestamp"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if value.get("schema_version") != 1 or value.get("success") is not True:
+        return None
+    if type(value.get("gateway_resume_deferred")) is not bool:
+        return None
+    if value.get("mode") not in {"git", "archive"} or timestamp <= 0:
+        return None
+    if os.path.normcase(os.path.realpath(str(value.get("root", "")))) != os.path.normcase(
+        os.path.realpath(root)
+    ):
+        return None
+    invocation_id = value.get("invocation_id")
+    lease_id = value.get("lease_id")
+    if not isinstance(invocation_id, str) or _IDENTIFIER_RE.fullmatch(invocation_id) is None:
+        return None
+    if not isinstance(lease_id, str) or _IDENTIFIER_RE.fullmatch(lease_id) is None:
+        return None
+    branch = value.get("branch")
+    if not isinstance(branch, str) or not branch:
+        return None
+    remote = value.get("remote")
+    target_ref = value.get("target_ref")
+    if remote is not None and not isinstance(remote, str):
+        return None
+    if target_ref is not None and not isinstance(target_ref, str):
+        return None
+    shas: dict[str, str | None] = {}
+    for field in ("target_sha", "resulting_head", "archive_sha"):
+        candidate = value.get(field)
+        if candidate is not None and (
+            not isinstance(candidate, str) or _SHA_RE.fullmatch(candidate) is None
+        ):
+            return None
+        shas[field] = candidate.lower() if candidate else None
+    if value["mode"] == "git":
+        if (
+            not remote
+            or not target_ref
+            or shas["target_sha"] is None
+            or shas["resulting_head"] is None
+            or shas["target_sha"] != shas["resulting_head"]
+            or shas["archive_sha"] is not None
+        ):
+            return None
+    elif (
+        remote is not None
+        or target_ref is not None
+        or shas["target_sha"] is not None
+        or shas["resulting_head"] is not None
+        or shas["archive_sha"] is None
+        or len(shas["archive_sha"]) != 64
+    ):
+        return None
+    health = value.get("health")
+    expected_health = {
+        "critical_syntax",
+        "critical_imports",
+        "dependencies",
+        "node_dependencies",
+    }
+    if not isinstance(health, dict) or set(health) != expected_health:
+        return None
+    if any(type(health[field]) is not bool for field in expected_health) or not all(
+        health[field] for field in expected_health
+    ):
+        return None
+    return {
+        "schema_version": 1,
+        "invocation_id": invocation_id,
+        "lease_id": lease_id,
+        "mode": value["mode"],
+        "root": os.path.normcase(os.path.realpath(root)),
+        "remote": remote,
+        "branch": branch,
+        "target_ref": target_ref,
+        **shas,
+        "timestamp": timestamp,
+        "success": True,
+        "gateway_resume_deferred": bool(value["gateway_resume_deferred"]),
+        "health": {field: bool(health[field]) for field in sorted(expected_health)},
+    }
+
+
+def _load_update_receipt(root: Path) -> dict | None:
+    try:
+        value = json.loads(_receipt_path(root).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    return _sanitize_update_receipt(value, root)
+
+
+def _write_update_receipt(
+    root: Path,
+    *,
+    invocation_id: str,
+    lease_id: str,
+    mode: str,
+    branch: str,
+    remote: str | None,
+    target_ref: str | None,
+    target_sha: str | None,
+    resulting_head: str | None,
+    archive_sha: str | None,
+    gateway_resume_deferred: bool,
+    health: dict[str, bool],
+) -> dict:
+    value = {
+        "schema_version": 1,
+        "invocation_id": invocation_id,
+        "lease_id": lease_id,
+        "mode": mode,
+        "root": os.path.normcase(os.path.realpath(root)),
+        "remote": remote,
+        "branch": branch,
+        "target_ref": target_ref,
+        "target_sha": target_sha,
+        "resulting_head": resulting_head,
+        "archive_sha": archive_sha,
+        "timestamp": int(_time.time()),
+        "success": True,
+        "gateway_resume_deferred": bool(gateway_resume_deferred),
+        "health": health,
+    }
+    sanitized = _sanitize_update_receipt(value, root)
+    if sanitized is None:
+        raise ValueError("refusing to write an invalid update receipt")
+    path = _receipt_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(sanitized, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+    return sanitized
+
+
+def _record_update_success(
+    args,
+    *,
+    mode: str,
+    branch: str,
+    remote: str | None,
+    target_ref: str | None,
+    target_sha: str | None,
+    resulting_head: str | None,
+    archive_sha: str | None,
+    health: dict[str, bool],
+) -> dict | None:
+    """Write a receipt only for an atomic invocation that owns a lease."""
+    invocation_id = getattr(args, "_update_invocation_id", None)
+    lease = getattr(args, "_update_quiesce_lease", None)
+    lease_id = lease.get("lease_id") if isinstance(lease, dict) else None
+    if not isinstance(invocation_id, str) or not isinstance(lease_id, str):
+        return None
+    expected_health = {
+        "critical_syntax",
+        "critical_imports",
+        "dependencies",
+        "node_dependencies",
+    }
+    if (
+        set(health) != expected_health
+        or any(type(health[key]) is not bool for key in expected_health)
+        or not all(health.values())
+    ):
+        raise RuntimeError("refusing success receipt without complete health proof")
+
+    # The cached lease object is not authority: a heartbeat may have lost the
+    # marker or another process may have replaced it during mutation.  Re-read
+    # the live capability immediately before the receipt becomes durable.
+    from hermes_mcp_update_gate import live_quiesce_lease, marker_path
+
+    root = Path(_m().PROJECT_ROOT)
+    live = live_quiesce_lease(marker_path(), install_root=root)
+    if not (
+        isinstance(live, dict)
+        and live.get("schema_version") == 1
+        and live.get("lease_id") == lease_id
+        and live.get("owner_pid") == os.getpid()
+    ):
+        raise RuntimeError("update quiesce lease ownership was lost before receipt")
+    deferred = bool(getattr(args, "defer_gateway_resume", False))
+    if deferred:
+        # Publish the authenticated, no-argv fleet state first.  The receipt
+        # is the terminal mutation proof and must never claim a resumable
+        # update when the private plan was not durably published.
+        _write_deferred_gateway_plan(args, root)
+    receipt = _write_update_receipt(
+        root,
+        invocation_id=invocation_id,
+        lease_id=lease_id,
+        mode=mode,
+        branch=branch,
+        remote=remote,
+        target_ref=target_ref,
+        target_sha=target_sha,
+        resulting_head=resulting_head,
+        archive_sha=archive_sha,
+        gateway_resume_deferred=deferred,
+        health=health,
+    )
+    setattr(args, "_update_receipt_written", True)
+    return receipt
+
+
+def _git_preflight_metadata(root: Path, branch: str) -> dict | None:
+    if not (root / ".git").exists():
+        return None
+    git_cmd = _git_cmd()
+    read_only_env = _sanitized_git_env(read_only=True)
+    target = _resolve_update_target(git_cmd, root, branch, env=read_only_env)
+    _assert_safe_git_configuration(git_cmd, root, env=read_only_env)
+
+    def _read(*args: str, required: bool = True) -> str | None:
+        result = subprocess.run(
+            git_cmd + list(args),
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=read_only_env,
+        )
+        if result.returncode != 0:
+            if required:
+                raise RuntimeError(f"git {' '.join(args)} failed")
+            return None
+        return result.stdout.strip()
+
+    head = _read("rev-parse", "HEAD")
+    current_branch = _read("symbolic-ref", "--quiet", "--short", "HEAD", required=False)
+    dirty = bool(_read("status", "--porcelain"))
+    target_sha = _read("rev-parse", "--verify", "--quiet", target.tracking_ref, required=False)
+    return {
+        "head": head,
+        "branch": current_branch or "HEAD",
+        "dirty": dirty,
+        "tracking_remote": target.remote,
+        "target_branch": target.branch,
+        "target_ref": target.tracking_ref,
+        "target_sha": target_sha,
+    }
+
+
+def _public_quiesce_lease(lease: dict | None) -> dict | None:
+    """Return readiness-safe lease metadata without its adoption capability."""
+    if lease is None:
+        return None
+    if "lease_fingerprint" in lease and "lease_id" not in lease:
+        return dict(lease)
+    lease_id = lease.get("lease_id")
+    if not isinstance(lease_id, str) or _IDENTIFIER_RE.fullmatch(lease_id) is None:
+        return None
+    return {
+        "schema_version": lease.get("schema_version"),
+        "lease_fingerprint": hashlib.sha256(lease_id.encode("utf-8")).hexdigest(),
+        "owner_pid": lease.get("owner_pid"),
+        "created_at": lease.get("created_at"),
+        "expires_at": lease.get("expires_at"),
+        "handoff_grace_until": lease.get("handoff_grace_until"),
+        "install_root": lease.get("install_root"),
+    }
+
+
+def _readiness_payload(
+    *,
+    mode: str,
+    root: Path,
+    scan: dict[str, object] | None = None,
+    git: dict | None = None,
+    receipt: dict | None = None,
+    lease: dict | None = None,
+    actions: list[dict] | None = None,
+    ok: bool = False,
+    ready: bool = False,
+    reason: str | None = None,
+    error: dict[str, str] | None = None,
+) -> dict[str, object]:
+    venv = root / "venv"
+    if not venv.exists() and (root / ".venv").exists():
+        venv = root / ".venv"
+    scan = scan or {}
+    return {
+        "schema_version": _READINESS_SCHEMA_VERSION,
+        "mode": mode,
+        "ok": bool(ok),
+        "ready": bool(ready),
+        "blocked": not bool(ready),
+        "reason": reason,
+        "root": os.path.normcase(os.path.realpath(root)),
+        "venv": os.path.normcase(os.path.realpath(venv)),
+        "processes": list(scan.get("processes", [])),
+        "mcp_bridges": list(scan.get("mcp_bridges", [])),
+        "pausable_gateways": int(scan.get("pausable_gateways", 0)),
+        "pausable_gateway_processes": list(
+            scan.get("pausable_gateway_processes", [])
+        ),
+        "git": git,
+        "last_update_receipt": receipt,
+        "lease": _public_quiesce_lease(lease),
+        "actions": list(actions or []),
+        "error": error,
+    }
+
+
+def validate_update_readiness(payload: object) -> dict[str, object]:
+    """Validate the cross-language v1 readiness contract and invariants.
+
+    The versioned JSON Schema is the structural public contract.  These
+    relational checks are deliberately in production code as well: JSON
+    Schema cannot prove that a terminate action identifies an actionable
+    bridge in the same document or that a lease belongs to this root.
+    """
+
+    def reject(message: str) -> NoReturn:
+        raise ValueError(f"invalid update readiness document: {message}")
+
+    if not isinstance(payload, dict) or set(payload) != _READINESS_KEYS:
+        reject("top-level keys do not match schema v1")
+    if payload["schema_version"] != 1 or payload["mode"] not in {
+        "preflight",
+        "drain",
+    }:
+        reject("unsupported schema version or mode")
+    for key in ("ok", "ready", "blocked"):
+        if type(payload[key]) is not bool:
+            reject(f"{key} must be boolean")
+    if payload["blocked"] is not (not payload["ready"]):
+        reject("blocked must be the inverse of ready")
+    if payload["ready"] and (
+        payload["reason"] is not None or payload["error"] is not None
+    ):
+        reject("ready output cannot have a reason or error")
+    if not payload["ready"] and not isinstance(payload["reason"], str):
+        reject("not-ready output requires a stable reason")
+    if payload["ok"] != (payload["error"] is None):
+        reject("ok and error are inconsistent")
+    if not isinstance(payload["root"], str) or not isinstance(payload["venv"], str):
+        reject("root and venv must be strings")
+    for key in (
+        "processes",
+        "mcp_bridges",
+        "pausable_gateway_processes",
+        "actions",
+    ):
+        if not isinstance(payload[key], list):
+            reject(f"{key} must be an array")
+    if type(payload["pausable_gateways"]) is not int or payload["pausable_gateways"] < 0:
+        reject("pausable_gateways must be a non-negative integer")
+    if payload["pausable_gateways"] != len(payload["pausable_gateway_processes"]):
+        reject("pausable gateway count does not match its process array")
+
+    allowed_owners = {"codex", "claude", "desktop", "gateway", "unknown"}
+    allowed_mcp_roles = {"mcp_bridge_wrapper", "mcp_bridge_worker"}
+    bridge_by_identity: dict[tuple[int, float], dict] = {}
+    for record in payload["mcp_bridges"]:
+        if not isinstance(record, dict):
+            reject("mcp bridge entries must be objects")
+        try:
+            pid = record["pid"]
+            created_at = float(record["created_at"])
+            owner = record["owner"]
+            role = record["role"]
+            actionable = record["actionable"]
+        except (KeyError, TypeError, ValueError):
+            reject("mcp bridge identity is incomplete")
+        if (
+            type(pid) is not int
+            or pid <= 0
+            or not math.isfinite(created_at)
+            or created_at <= 0
+            or owner not in allowed_owners
+            or role not in allowed_mcp_roles
+            or type(actionable) is not bool
+        ):
+            reject("mcp bridge identity is invalid")
+        if actionable:
+            if owner not in {"codex", "claude"} or (
+                record.get("actionability") != "exact_mcp_bridge"
+                or record.get("action") != "terminate_exact_mcp"
+            ):
+                reject("actionable bridge lacks exact owner/action contract")
+        elif record.get("actionability") != "hard_block" or record.get("action") != "refuse":
+            reject("unactionable bridge must be a hard refusal")
+        bridge_by_identity[(pid, created_at)] = record
+
+    for record in payload["processes"]:
+        if not isinstance(record, dict) or record.get("actionable") is not False:
+            reject("ordinary processes are never directly actionable")
+        if record.get("owner") not in allowed_owners:
+            reject("process owner is invalid")
+        if record.get("role") not in {
+            "other",
+            "desktop_backend",
+            "update_lock_holder",
+        }:
+            reject("process role is invalid")
+        if record.get("actionability") != "hard_block" or record.get("action") != "refuse":
+            reject("ordinary process must be a hard refusal")
+
+    for record in payload["pausable_gateway_processes"]:
+        if not isinstance(record, dict) or not (
+            record.get("owner") == "gateway"
+            and record.get("role") == "gateway_run"
+            and record.get("actionable") is False
+            and record.get("actionability") == "downstream_drainable"
+            and record.get("action") == "pause_downstream"
+        ):
+            reject("gateway record is incoherent")
+
+    lease = payload["lease"]
+    if lease is not None:
+        expected_lease_keys = {
+            "schema_version",
+            "lease_fingerprint",
+            "owner_pid",
+            "created_at",
+            "expires_at",
+            "handoff_grace_until",
+            "install_root",
+        }
+        if not isinstance(lease, dict) or set(lease) != expected_lease_keys:
+            reject("lease keys do not match schema v1")
+        times = [lease.get(key) for key in ("created_at", "expires_at", "handoff_grace_until")]
+        if (
+            lease.get("schema_version") != 1
+            or not isinstance(lease.get("lease_fingerprint"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", lease["lease_fingerprint"]) is None
+            or type(lease.get("owner_pid")) is not int
+            or lease["owner_pid"] <= 0
+            or any(type(value) is not int or value <= 0 for value in times)
+            or lease["created_at"] > lease["handoff_grace_until"]
+            or lease["handoff_grace_until"] > lease["expires_at"]
+            or os.path.normcase(os.path.realpath(str(lease.get("install_root", ""))))
+            != os.path.normcase(os.path.realpath(payload["root"]))
+        ):
+            reject("lease identity, ordering, or root is invalid")
+
+    receipt = payload["last_update_receipt"]
+    if receipt is not None:
+        sanitized_receipt = _sanitize_update_receipt(
+            receipt, Path(str(payload["root"]))
+        )
+        if sanitized_receipt is None or sanitized_receipt != receipt:
+            reject("last update receipt is invalid or lacks health proof")
+
+    for action in payload["actions"]:
+        if not isinstance(action, dict):
+            reject("actions must be objects")
+        if action.get("type") == "clear-scan":
+            if payload["mode"] != "drain":
+                reject("preflight cannot contain drain clear-scan actions")
+            if type(action.get("sequence")) is not int or action["sequence"] not in {1, 2}:
+                reject("clear-scan sequence is invalid")
+            continue
+        if action.get("type") != "terminate-mcp-bridge":
+            reject("unknown action type")
+        try:
+            identity = (action["pid"], float(action["created_at"]))
+        except (KeyError, TypeError, ValueError):
+            reject("terminate action identity is invalid")
+        if action.get("owner") not in {"codex", "claude"} or action.get(
+            "role"
+        ) not in allowed_mcp_roles:
+            reject("terminate action owner or role is invalid")
+        if payload["mode"] == "preflight" and "terminated" in action:
+            reject("preflight terminate action cannot claim an outcome")
+        if payload["mode"] == "drain" and type(action.get("terminated")) is not bool:
+            reject("drain terminate action requires its outcome")
+        bridge = bridge_by_identity.get(identity)
+        if bridge is not None and (
+            bridge.get("actionable") is not True
+            or bridge.get("owner") != action.get("owner")
+            or bridge.get("role") != action.get("role")
+        ):
+            reject("terminate action does not match an actionable bridge")
+        if bridge is None and type(action.get("terminated")) is not bool:
+            reject("historical terminate action requires its outcome")
+
+    if payload["ready"] and (
+        payload["processes"]
+        or payload["mcp_bridges"]
+        or (payload["mode"] == "preflight" and payload["lease"] is not None)
+    ):
+        reject("ready output still contains blockers")
+    if payload["mode"] == "drain" and payload["ready"]:
+        if payload["lease"] is None:
+            reject("successful drain requires a live handoff lease")
+        clear_proof = [
+            action.get("sequence")
+            for action in payload["actions"]
+            if action.get("type") == "clear-scan"
+        ]
+        if clear_proof != [1, 2]:
+            reject("successful drain requires two final clear scans")
+        if any(
+            action.get("type") != "clear-scan" for action in payload["actions"][-2:]
+        ):
+            reject("successful drain clear proof must be the final two actions")
+    return payload
+
+
+def _read_update_holder_read_only() -> object | None:
+    """Read the shared update marker without stale-marker cleanup mutation."""
+    from hermes_cli.update_lock import (
+        UpdateHolder,
+        _pid_matches_update_owner,
+        update_marker_path,
+    )
+
+    path = update_marker_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(f"update marker is unreadable: {exc}") from exc
+    try:
+        lines = raw.splitlines()
+        pid = int(lines[0].strip())
+        started_at = float(lines[1].strip())
+    except (IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError("update marker is malformed") from exc
+    age = _time.time() - started_at
+    if not math.isfinite(age) or age < -5:
+        return None
+    if not _pid_matches_update_owner(pid, started_at):
+        return None
+    return UpdateHolder(pid=pid, age_seconds=age, started_at=started_at, raw=raw)
+
+
+def _build_update_preflight(
+    root: Path,
+    branch: str,
+    *,
+    expected_lease_id: str | None = None,
+) -> dict[str, object]:
+    """Build the exact 17-key readiness document without network or mutation."""
+    from hermes_cli._scan_venv_blockers import scan_venv_blockers
+    from hermes_mcp_update_gate import live_quiesce_lease, marker_path
+
+    canonical_root = Path(os.path.realpath(root))
+    receipt = _load_update_receipt(canonical_root)
+    try:
+        scan = scan_venv_blockers(canonical_root)
+        git = _git_preflight_metadata(canonical_root, branch)
+        lease = live_quiesce_lease(marker_path(), install_root=canonical_root)
+        if lease is not None and lease.get("schema_version") != 1:
+            lease = None
+        if (
+            receipt is not None
+            and lease is not None
+            and receipt.get("lease_id") == lease.get("lease_id")
+        ):
+            # A deferred receipt is historical only after the live capability
+            # is cleared.  While the same lease is active, returning its raw
+            # ID through public readiness JSON would disclose adoption power.
+            receipt = None
+        update_holder = _read_update_holder_read_only()
+    except Exception as exc:
+        return _readiness_payload(
+            mode="preflight",
+            root=canonical_root,
+            receipt=receipt,
+            reason="probe-failed",
+            error={"code": "probe-failed", "message": str(exc)},
+        )
+
+    processes = list(scan.get("processes", []))
+    foreign_update = False
+    if update_holder is not None:
+        from hermes_cli.update_lock import _handoff_pid, _is_ancestor_pid
+
+        holder_pid = int(update_holder.pid)
+        if holder_pid not in {os.getpid(), _handoff_pid()} and not _is_ancestor_pid(
+            holder_pid
+        ):
+            foreign_update = True
+            processes.append(
+                {
+                    "pid": holder_pid,
+                    "name": "hermes-update",
+                    "cmdline": "<redacted>",
+                    "owner": "unknown",
+                    "role": "update_lock_holder",
+                    "actionable": False,
+                    "actionability": "hard_block",
+                    "action": "refuse",
+                }
+            )
+            scan = {**scan, "processes": processes}
+    lease_authorized = False
+    lease_reason: str | None = None
+    if expected_lease_id is not None:
+        from hermes_cli.update_lock import _handoff_pid, _is_ancestor_pid
+
+        if _IDENTIFIER_RE.fullmatch(expected_lease_id) is None:
+            lease_reason = "lease-capability-invalid"
+        elif lease is None:
+            lease_reason = "lease-capability-missing"
+        elif lease.get("lease_id") != expected_lease_id:
+            lease_reason = "lease-capability-mismatch"
+        else:
+            owner_pid = int(lease.get("owner_pid", 0))
+            lease_authorized = owner_pid == os.getpid() or (
+                owner_pid > 0 and _is_ancestor_pid(owner_pid)
+            )
+            if not lease_authorized:
+                lease_reason = "lease-capability-owner-mismatch"
+    elif lease is not None:
+        lease_reason = "quiesce-lease-active"
+
+    bridges = list(scan.get("mcp_bridges", []))
+    ready = not processes and not bridges and lease_reason is None
+    if foreign_update:
+        reason = "update-running"
+    elif processes:
+        reason = "venv-blocked"
+    elif any(not bool(entry.get("actionable")) for entry in bridges):
+        reason = "mcp-owner-unverified"
+    elif bridges:
+        reason = "mcp-bridges-running"
+    elif lease_reason is not None:
+        reason = lease_reason
+    else:
+        reason = None
+    actions = [
+        {
+            "type": "terminate-mcp-bridge",
+            "pid": int(entry["pid"]),
+            "created_at": float(entry["created_at"]),
+            "owner": str(entry["owner"]),
+            "role": str(entry["role"]),
+        }
+        for entry in bridges
+        if bool(entry.get("actionable"))
+    ]
+    return _readiness_payload(
+        mode="preflight",
+        root=canonical_root,
+        scan=scan,
+        git=git,
+        receipt=receipt,
+        # A capability-authorized preflight is ready under the caller's
+        # already-owned lease, but the public document never returns that
+        # reusable capability (or even a non-null active lease on ready
+        # preflight). Unauthorized observations expose only a hash fingerprint.
+        lease=None if lease_authorized else lease,
+        actions=actions,
+        ok=True,
+        ready=ready,
+        reason=reason,
+    )
+
+
+def _claim_update_quiesce_lease(
+    root: Path,
+    *,
+    expected_lease_id: str | None = None,
+) -> dict:
+    """Create a lease or adopt the exact capability supplied by a handoff."""
+    from hermes_mcp_update_gate import (
+        adopt_quiesce_lease,
+        live_quiesce_lease,
+        marker_path,
+        write_quiesce_lease,
+    )
+
+    path = marker_path()
+    active = live_quiesce_lease(path, install_root=root)
+    if expected_lease_id is not None and _IDENTIFIER_RE.fullmatch(expected_lease_id) is None:
+        raise RuntimeError("invalid bridge lease capability")
+    if active is not None:
+        if active.get("schema_version") != 1:
+            raise RuntimeError("a legacy bridge lease is already active")
+        active_id = str(active.get("lease_id", ""))
+        if int(active.get("owner_pid", 0)) == os.getpid():
+            if expected_lease_id is not None and active_id != expected_lease_id:
+                raise RuntimeError("bridge lease capability does not match")
+            return write_quiesce_lease(
+                root,
+                marker=path,
+                lease_id=active_id,
+                owner_pid=os.getpid(),
+                handoff_grace_seconds=0,
+            )
+        if expected_lease_id is None or active_id != expected_lease_id:
+            raise RuntimeError("another updater owns the bridge quiesce lease")
+        from hermes_cli.update_lock import _is_ancestor_pid
+
+        owner_pid = int(active.get("owner_pid", 0))
+        if owner_pid != os.getpid() and not _is_ancestor_pid(owner_pid):
+            raise RuntimeError(
+                "bridge lease owner is not this process or its live ancestor"
+            )
+        adopted = adopt_quiesce_lease(
+            root,
+            marker=path,
+            lease_id=expected_lease_id,
+            owner_pid=os.getpid(),
+        )
+        if adopted is None:
+            raise RuntimeError("bridge quiesce lease adoption failed")
+        return adopted
+    if expected_lease_id is not None:
+        raise RuntimeError("expected bridge quiesce lease is missing or stale")
+
+    # Malformed, expired, or dead-owner state is bounded stale state. It does
+    # not authorize a kill, but it also must not wedge updates indefinitely;
+    # atomically replace it with this invocation's fresh capability.
+    return write_quiesce_lease(
+        root,
+        marker=path,
+        owner_pid=os.getpid(),
+        handoff_grace_seconds=0,
+    )
+
+
+def _release_update_quiesce_lease(root: Path, lease: dict | None) -> bool:
+    if not lease:
+        return False
+    from hermes_mcp_update_gate import clear_quiesce_lease, marker_path
+
+    return clear_quiesce_lease(
+        str(lease.get("lease_id", "")),
+        owner_pid=os.getpid(),
+        marker=marker_path(),
+        install_root=root,
+    )
+
+
+def _transfer_update_quiesce_lease(
+    root: Path, lease: dict, *, new_owner_pid: int
+) -> dict:
+    """Atomically return/adopt a lease across one verified parent handoff."""
+    from hermes_cli.update_lock import _is_ancestor_pid
+    from hermes_mcp_update_gate import marker_path, write_quiesce_lease
+
+    owner_pid = int(new_owner_pid)
+    if owner_pid <= 0 or not _is_ancestor_pid(owner_pid):
+        raise RuntimeError("bridge lease handoff owner is not a live ancestor")
+    return write_quiesce_lease(
+        root,
+        marker=marker_path(),
+        lease_id=str(lease.get("lease_id", "")),
+        owner_pid=owner_pid,
+        expected_owner_pid=os.getpid(),
+        lifetime_seconds=1200,
+        handoff_grace_seconds=90,
+    )
+
+
+def _drain_under_update_lease(
+    root: Path,
+    lease: dict,
+    *,
+    branch: str,
+    timeout_seconds: float,
+    allow_hard_processes: bool = False,
+) -> dict[str, object]:
+    """Drain only actionable MCP records and prove two bounded clear scans."""
+    from hermes_cli._scan_venv_blockers import (
+        scan_venv_blockers,
+        terminate_mcp_bridge,
+    )
+    from hermes_mcp_update_gate import marker_path, write_quiesce_lease
+
+    timeout = float(timeout_seconds)
+    if not math.isfinite(timeout) or not 0.1 <= timeout <= 120.0:
+        raise ValueError("timeout_seconds must be between 0.1 and 120")
+    deadline = _time.monotonic() + timeout
+    actions: list[dict] = []
+    clear_scans = 0
+    cooperative_wait_done = False
+    last_scan: dict[str, object] = {}
+    try:
+        git_metadata = _git_preflight_metadata(root, branch)
+        receipt = _load_update_receipt(root)
+    except Exception as exc:
+        return _readiness_payload(
+            mode="drain",
+            root=root,
+            lease=lease,
+            reason="probe-failed",
+            error={"code": "probe-failed", "message": str(exc)},
+        )
+    while True:
+        if _time.monotonic() > deadline:
+            return _readiness_payload(
+                mode="drain",
+                root=root,
+                scan=last_scan,
+                git=git_metadata,
+                receipt=receipt,
+                lease=lease,
+                actions=actions,
+                ok=True,
+                ready=False,
+                reason="drain-timeout",
+            )
+        try:
+            last_scan = scan_venv_blockers(root)
+        except Exception as exc:
+            return _readiness_payload(
+                mode="drain",
+                root=root,
+                lease=lease,
+                actions=actions,
+                reason="probe-failed",
+                error={"code": "probe-failed", "message": str(exc)},
+            )
+
+        bridges = list(last_scan.get("mcp_bridges", []))
+        hard_processes = list(last_scan.get("processes", []))
+        unactionable = [entry for entry in bridges if not bool(entry.get("actionable"))]
+        if (hard_processes or unactionable) and not allow_hard_processes:
+            reason = "venv-blocked" if hard_processes else "mcp-owner-unverified"
+            return _readiness_payload(
+                mode="drain",
+                root=root,
+                scan=last_scan,
+                git=git_metadata,
+                receipt=receipt,
+                lease=lease,
+                actions=actions,
+                ok=True,
+                ready=False,
+                reason=reason,
+            )
+
+        actionable = [entry for entry in bridges if bool(entry.get("actionable"))]
+        if actionable:
+            clear_scans = 0
+            actions = [
+                action for action in actions if action.get("type") != "clear-scan"
+            ]
+            if not cooperative_wait_done:
+                cooperative_wait_done = True
+                remaining = deadline - _time.monotonic()
+                if remaining > 0:
+                    _time.sleep(min(_DRAIN_COOPERATIVE_WAIT_SECONDS, remaining))
+                continue
+            # The scanner supplies worker-first ordering. Preserve it so an
+            # external base worker's live wrapper ancestry remains provable.
+            for entry in actionable:
+                terminated = terminate_mcp_bridge(
+                    root,
+                    pid=int(entry["pid"]),
+                    created_at=float(entry["created_at"]),
+                )
+                actions.append(
+                    {
+                        "type": "terminate-mcp-bridge",
+                        "pid": int(entry["pid"]),
+                        "created_at": float(entry["created_at"]),
+                        "owner": str(entry["owner"]),
+                        "role": str(entry["role"]),
+                        "terminated": bool(terminated),
+                    }
+                )
+            _time.sleep(min(0.1, max(0.0, deadline - _time.monotonic())))
+            continue
+
+        clear_scans += 1
+        actions.append({"type": "clear-scan", "sequence": clear_scans})
+        if clear_scans >= 2:
+            # Renew from success time so the caller has a full, bounded handoff
+            # window. The token stays stable for explicit updater adoption.
+            lease = write_quiesce_lease(
+                root,
+                marker=marker_path(),
+                lease_id=str(lease["lease_id"]),
+                owner_pid=os.getpid(),
+                lifetime_seconds=120,
+                handoff_grace_seconds=90,
+            )
+            return _readiness_payload(
+                mode="drain",
+                root=root,
+                scan=last_scan,
+                git=git_metadata,
+                receipt=receipt,
+                lease=lease,
+                actions=actions,
+                ok=True,
+                ready=True,
+            )
+        remaining = deadline - _time.monotonic()
+        if remaining > 0:
+            _time.sleep(min(_DRAIN_CLEAR_INTERVAL_SECONDS, remaining))
+
+
+def _print_update_readiness(payload: dict[str, object], *, json_mode: bool) -> None:
+    validate_update_readiness(payload)
+    if json_mode:
+        print(json.dumps(payload, separators=(",", ":")))
+        return
+    if not payload["ok"]:
+        print(f"✗ Update safety probe failed: {payload['reason']}")
+    elif payload["ready"]:
+        print("✓ This Hermes install is ready to update.")
+    else:
+        print(f"✗ This Hermes install is not ready to update: {payload['reason']}")
+        for process in list(payload.get("processes", [])) + list(
+            payload.get("mcp_bridges", [])
+        ):
+            print(
+                f"  PID {process.get('pid')}  {process.get('role')}  "
+                f"{process.get('cmdline')}"
+            )
+
+
+def _readiness_exit_code(payload: dict[str, object]) -> int:
+    if not bool(payload.get("ok")):
+        return 1
+    return 0 if bool(payload.get("ready")) else 2
+
+
+def _cmd_update_preflight(args, *, root: Path) -> NoReturn:
+    branch = (getattr(args, "branch", None) or "main").strip() or "main"
+    payload = _build_update_preflight(
+        root,
+        branch,
+        expected_lease_id=getattr(args, "bridge_lease_id", None),
+    )
+    _print_update_readiness(payload, json_mode=bool(getattr(args, "json", False)))
+    raise SystemExit(_readiness_exit_code(payload))
+
+
+def _cmd_update_drain(args, *, root: Path) -> NoReturn:
+    if not bool(getattr(args, "yes", False)):
+        payload = _readiness_payload(
+            mode="drain",
+            root=root,
+            reason="consent-required",
+            error=None,
+            ok=True,
+            ready=False,
+        )
+        _print_update_readiness(payload, json_mode=bool(getattr(args, "json", False)))
+        raise SystemExit(2)
+    from hermes_cli.update_lock import UpdateLock
+
+    update_lock = UpdateLock()
+    lease: dict | None = None
+    success = False
+    try:
+        claimed = update_lock.acquire()
+        if not claimed:
+            if update_lock.holder is not None:
+                payload = _readiness_payload(
+                    mode="drain",
+                    root=root,
+                    reason="update-running",
+                    ok=True,
+                    ready=False,
+                )
+            else:
+                payload = _readiness_payload(
+                    mode="drain",
+                    root=root,
+                    reason="lock-failed",
+                    error={
+                        "code": str(update_lock.failure_reason or "lock-failed"),
+                        "message": "could not acquire the update safety lock",
+                    },
+                )
+        else:
+            # An accepted parent handoff does not rewrite the parent's marker;
+            # prove it is still live before acquiring the bridge lease.
+            lock_proven = update_lock.prove_claim()
+            if not lock_proven:
+                payload = _readiness_payload(
+                    mode="drain",
+                    root=root,
+                    reason="lock-failed",
+                    error={
+                        "code": "lock-lost",
+                        "message": "update safety lock disappeared before drain",
+                    },
+                )
+            else:
+                lease = _claim_update_quiesce_lease(root)
+                branch = (getattr(args, "branch", None) or "main").strip() or "main"
+                payload = _drain_under_update_lease(
+                    root,
+                    lease,
+                    branch=branch,
+                    timeout_seconds=float(
+                        getattr(args, "timeout_seconds", _DEFAULT_DRAIN_TIMEOUT_SECONDS)
+                    ),
+                )
+                success = bool(payload.get("ok") and payload.get("ready"))
+    except Exception as exc:
+        payload = _readiness_payload(
+            mode="drain",
+            root=root,
+            lease=lease,
+            reason="lease-failed",
+            error={"code": "lease-failed", "message": str(exc)},
+        )
+    finally:
+        try:
+            if lease is not None and not success:
+                try:
+                    released = _release_update_quiesce_lease(root, lease)
+                except Exception as exc:
+                    released = False
+                    cleanup_message = str(exc)
+                else:
+                    cleanup_message = "bridge lease cleanup could not be proven"
+                if not released:
+                    payload = _readiness_payload(
+                        mode="drain",
+                        root=root,
+                        lease=lease,
+                        reason="lease-failed",
+                        error={
+                            "code": "lease-cleanup-failed",
+                            "message": cleanup_message,
+                        },
+                    )
+        finally:
+            update_lock.release()
+    _print_update_readiness(payload, json_mode=bool(getattr(args, "json", False)))
+    raise SystemExit(_readiness_exit_code(payload))
+
+
+class _UpdateLeaseHeartbeat:
+    """Renew an owner-bound mutation lease during a long dependency rebuild."""
+
+    def __init__(
+        self,
+        root: Path,
+        lease: dict,
+        interval_seconds: float = 30.0,
+        *,
+        fail_stop: Callable[[str], object] | None = None,
+    ):
+        self.root = root
+        self.lease = lease
+        self.interval_seconds = interval_seconds
+        self.lost = False
+        self.loss_reason: str | None = None
+        self._fail_stop = fail_stop or self._exit_process
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="hermes-update-lease-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            self._lose("update lease heartbeat did not stop cleanly")
+            raise RuntimeError("update lease heartbeat did not stop cleanly")
+
+    @staticmethod
+    def _exit_process(_reason: str) -> NoReturn:
+        # A cooperative exception in this daemon thread cannot interrupt a
+        # dependency/git subprocess running on the main thread.  Losing the
+        # bridge gate while source mutation continues is unsafe, so terminate
+        # the updater process immediately.  The emergency shadow below keeps
+        # bridges gated while any already-started child process unwinds.
+        os._exit(1)
+
+    def _lose(self, reason: str) -> None:
+        if self.lost:
+            return
+        self.lost = True
+        self.loss_reason = reason
+        try:
+            from hermes_mcp_update_gate import write_emergency_quiesce_shadow
+
+            write_emergency_quiesce_shadow(
+                self.root,
+                lease_id=str(self.lease.get("lease_id", "")),
+                owner_pid=os.getpid(),
+            )
+        except Exception as exc:
+            logger.critical(
+                "Update lease was lost and the emergency bridge gate failed: %s",
+                exc,
+            )
+        self._fail_stop(reason)
+
+    def _renew_once(self) -> bool:
+        from hermes_mcp_update_gate import (
+            marker_path,
+            read_quiesce_lease,
+            write_quiesce_lease,
+        )
+
+        try:
+            current = read_quiesce_lease(marker_path())
+        except Exception as exc:
+            self._lose(f"bridge quiesce lease probe failed: {exc}")
+            return False
+        if not isinstance(current, dict) or (
+            current.get("schema_version") != 1
+            or current.get("lease_id") != self.lease.get("lease_id")
+            or current.get("owner_pid") != os.getpid()
+            or os.path.normcase(os.path.realpath(str(current.get("install_root", ""))))
+            != os.path.normcase(os.path.realpath(self.root))
+        ):
+            self._lose("bridge quiesce lease identity changed")
+            return False
+        try:
+            self.lease = write_quiesce_lease(
+                self.root,
+                marker=marker_path(),
+                lease_id=str(self.lease["lease_id"]),
+                owner_pid=os.getpid(),
+                lifetime_seconds=1200,
+                handoff_grace_seconds=0,
+            )
+        except Exception as exc:
+            self._lose(f"bridge quiesce lease renewal failed: {exc}")
+            return False
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            if not self._renew_once():
+                return
+
+
+class _WindowsMutationJob:
+    """Contain this updater and every descendant in a kill-on-close job."""
+
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Windows mutation containment is Windows-only")
+        import ctypes
+        from ctypes import wintypes
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        class _BasicAccountingInformation(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_longlong),
+                ("TotalKernelTime", ctypes.c_longlong),
+                ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+                ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._ctypes = ctypes
+        self._info_type = _ExtendedLimitInformation
+        self._accounting_type = _BasicAccountingInformation
+        self._close_handle = kernel32.CloseHandle
+        self._close_handle.argtypes = [wintypes.HANDLE]
+        self._close_handle.restype = wintypes.BOOL
+        self._set_information = kernel32.SetInformationJobObject
+        self._set_information.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        self._set_information.restype = wintypes.BOOL
+        self._query_information = kernel32.QueryInformationJobObject
+        self._query_information.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self._query_information.restype = wintypes.BOOL
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        create_job.restype = wintypes.HANDLE
+        assign = kernel32.AssignProcessToJobObject
+        assign.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        assign.restype = wintypes.BOOL
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.argtypes = []
+        get_current_process.restype = wintypes.HANDLE
+
+        handle = create_job(None, None)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        self.handle = handle
+        try:
+            self._configure(kill_on_close=True)
+            if not assign(handle, get_current_process()):
+                raise OSError(
+                    ctypes.get_last_error(),
+                    "could not contain the updater in a Windows Job",
+                )
+        except BaseException:
+            self._close_handle(handle)
+            self.handle = None
+            raise
+
+    def _configure(
+        self, *, kill_on_close: bool, allow_breakaway: bool = False
+    ) -> None:
+        info = self._info_type()
+        flags = 0
+        if kill_on_close:
+            flags |= self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if allow_breakaway:
+            flags |= self._JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        info.BasicLimitInformation.LimitFlags = flags
+        if not self._set_information(
+            self.handle,
+            self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            self._ctypes.byref(info),
+            self._ctypes.sizeof(info),
+        ):
+            raise OSError(
+                self._ctypes.get_last_error(),
+                "SetInformationJobObject failed",
+            )
+
+    def abort(self, _reason: str) -> NoReturn:
+        """Atomically terminate the updater and its already-spawned mutators."""
+        handle, self.handle = self.handle, None
+        if handle:
+            self._close_handle(handle)
+        # Closing the last kill-on-close handle terminates this process too;
+        # retain a fail-stop fallback for an unexpected platform/API failure.
+        os._exit(1)
+
+    def _active_processes(self) -> int:
+        accounting = self._accounting_type()
+        returned = self._ctypes.c_ulong()
+        if not self._query_information(
+            self.handle,
+            1,  # JobObjectBasicAccountingInformation
+            self._ctypes.byref(accounting),
+            self._ctypes.sizeof(accounting),
+            self._ctypes.byref(returned),
+        ):
+            raise OSError(
+                self._ctypes.get_last_error(),
+                "QueryInformationJobObject failed",
+            )
+        return int(accounting.ActiveProcesses)
+
+    def disarm(self, *, timeout_seconds: float = 5.0) -> None:
+        """Release containment only after every update descendant has exited."""
+        if not self.handle:
+            return
+        deadline = _time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            try:
+                active = self._active_processes()
+            except OSError as exc:
+                self.abort(f"could not prove update descendants exited: {exc}")
+            if active <= 1:
+                break
+            if _time.monotonic() >= deadline:
+                self.abort(
+                    f"{active - 1} update descendant(s) survived mutation completion"
+                )
+            _time.sleep(0.05)
+        try:
+            # The updater remains associated with the Job until this handle is
+            # closed, so first remove KILL_ON_CLOSE after proving it is the
+            # only member. Never enable BREAKAWAY_OK: every mutator was born
+            # under a no-breakaway boundary, and persistent gateway resume is
+            # either after this Job is destroyed (direct CLI) or in the
+            # separate parent-owned resume child (Desktop/bootstrap).
+            self._configure(kill_on_close=False, allow_breakaway=False)
+        except OSError as exc:
+            self.abort(f"could not disarm update descendant containment: {exc}")
+        handle, self.handle = self.handle, None
+        self._close_handle(handle)
+
+
+def _prepare_atomic_windows_update(args, *, root: Path) -> tuple[dict, str]:
+    """Acquire consent+lease, then drain before any update mutation occurs."""
+    handoff_id = getattr(args, "bridge_lease_id", None)
+    handoff_owner_pid: int | None = None
+    if handoff_id:
+        from hermes_mcp_update_gate import marker_path, read_quiesce_lease
+
+        prior = read_quiesce_lease(marker_path())
+        if (
+            isinstance(prior, dict)
+            and prior.get("schema_version") == 1
+            and prior.get("lease_id") == handoff_id
+        ):
+            try:
+                handoff_owner_pid = int(prior.get("owner_pid", 0))
+            except (TypeError, ValueError):
+                handoff_owner_pid = None
+    assume_yes = bool(getattr(args, "yes", False))
+    if not assume_yes and not handoff_id:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print("✗ Safe Windows update requires explicit consent; re-run with --yes.")
+            raise SystemExit(2)
+        try:
+            response = input(
+                "This update may pause verified Codex or Claude Hermes MCP bridges. "
+                "Continue? [y/N]: "
+            )
+        except (EOFError, KeyboardInterrupt, UnicodeDecodeError):
+            response = ""
+        if response.strip().lower() not in {"y", "yes"}:
+            print("Update cancelled.")
+            raise SystemExit(2)
+
+    lease = _claim_update_quiesce_lease(root, expected_lease_id=handoff_id)
+
+    def _return_or_release_on_failure(current: dict) -> None:
+        if handoff_id and handoff_owner_pid is not None and handoff_owner_pid > 0:
+            try:
+                _transfer_update_quiesce_lease(
+                    root, current, new_owner_pid=handoff_owner_pid
+                )
+                return
+            except Exception as transfer_error:
+                # The adopting child must not disappear with a zero-grace
+                # capability if the parent handoff cannot be restored.
+                try:
+                    from hermes_mcp_update_gate import write_emergency_quiesce_shadow
+
+                    write_emergency_quiesce_shadow(
+                        root,
+                        lease_id=str(current.get("lease_id", "")),
+                        owner_pid=os.getpid(),
+                    )
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    "could not return the bridge lease to the update parent"
+                ) from transfer_error
+        _release_update_quiesce_lease(root, current)
+
+    try:
+        branch = (getattr(args, "branch", None) or "main").strip() or "main"
+        force_venv = bool(getattr(args, "force_venv", False))
+        if force_venv:
+            print(
+                "⚠ --force-venv: unverified venv holders will not block mutation; "
+                "native extensions may remain locked and the install may be damaged."
+            )
+        payload = _drain_under_update_lease(
+            root,
+            lease,
+            branch=branch,
+            timeout_seconds=float(
+                getattr(args, "timeout_seconds", _DEFAULT_DRAIN_TIMEOUT_SECONDS)
+            ),
+            allow_hard_processes=force_venv,
+        )
+        if not payload.get("ok") or not payload.get("ready"):
+            _print_update_readiness(payload, json_mode=False)
+            raise SystemExit(_readiness_exit_code(payload))
+
+        from hermes_mcp_update_gate import marker_path, write_quiesce_lease
+
+        lease = write_quiesce_lease(
+            root,
+            marker=marker_path(),
+            lease_id=str(lease["lease_id"]),
+            owner_pid=os.getpid(),
+            lifetime_seconds=1200,
+            handoff_grace_seconds=0,
+        )
+        requested_invocation = getattr(args, "invocation_id", None)
+        if requested_invocation is not None and (
+            not isinstance(requested_invocation, str)
+            or _IDENTIFIER_RE.fullmatch(requested_invocation) is None
+        ):
+            raise RuntimeError("invalid update invocation identity")
+        invocation_id = requested_invocation or secrets.token_urlsafe(24)
+        setattr(args, "_update_quiesce_lease", lease)
+        setattr(args, "_update_invocation_id", invocation_id)
+        setattr(args, "_update_handoff_owner_pid", handoff_owner_pid)
+        return lease, invocation_id
+    except BaseException:
+        _return_or_release_on_failure(lease)
+        raise
 
 
 def _m():
@@ -177,9 +2507,49 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             check=True,
+            env=_sanitized_git_env(),
         )
         return result.stdout.strip() or None
     except (subprocess.CalledProcessError, OSError):
+        return None
+
+
+def _refresh_update_target_sha(
+    git_cmd: list[str], cwd: Path, target: _UpdateTarget, *, env: dict[str, str]
+) -> str | None:
+    """Refresh and resolve the exact selected remote-tracking ref.
+
+    Fork synchronization may advance local HEAD and then fail to push.  A
+    receipt must describe the selected remote target, not merely whatever
+    commit is currently checked out, so fetch the same explicit refspec again
+    and resolve that same ref before success can be recorded.
+    """
+    try:
+        fetched = subprocess.run(
+            git_cmd + ["fetch", "--", target.remote, target.refspec],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        if fetched.returncode != 0:
+            return None
+        resolved = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", target.tracking_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        if resolved.returncode != 0:
+            return None
+        candidate = resolved.stdout.strip()
+        return candidate if _SHA_RE.fullmatch(candidate) else None
+    except OSError:
         return None
 
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
@@ -1075,9 +3445,15 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
 
     print("→ Downloading latest version...")
     tmp_dir = tempfile.mkdtemp(prefix="hermes-update-")
+    archive_sha: str | None = None
     try:
         zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
         urlretrieve(zip_url, zip_path)
+        archive_digest = hashlib.sha256()
+        with open(zip_path, "rb") as archive_file:
+            for chunk in iter(lambda: archive_file.read(1024 * 1024), b""):
+                archive_digest.update(chunk)
+        archive_sha = archive_digest.hexdigest()
 
         print("→ Extracting...")
         import stat as _stat
@@ -1218,6 +3594,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     # process holds a native extension the sync must rewrite.
     _m()._abort_dependency_sync_if_self_locked()
     print("→ Updating Python dependencies...")
+    dependencies_ok = False
 
     from hermes_cli.managed_uv import ensure_uv, update_managed_uv
 
@@ -1254,6 +3631,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
                 check=True,
             )
         _m()._install_python_dependencies_with_optional_fallback(pip_cmd)
+    dependencies_ok = True
 
     install_prefix = [uv_bin, "pip"] if uv_bin else pip_cmd
     install_env = uv_env if uv_bin else None
@@ -1277,6 +3655,16 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     # requirement isn't misreported as a partial copy. There is no SHA to roll
     # back to here, so surface it with a concrete recovery step rather than
     # reporting a successful update over a bricked install.
+    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
+        _m().PROJECT_ROOT
+    )
+    if not syntax_ok:
+        print()
+        print(f"✗ Updated checkout failed syntax validation: {failing_path}")
+        if syntax_error:
+            print(f"  {syntax_error}")
+        _m().sys.exit(1)
+
     import_ok, failing_module, import_error = _validate_critical_modules_import(
         _m().PROJECT_ROOT
     )
@@ -1405,6 +3793,22 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
         print("  Code and Python deps are updated, but the dashboard/TUI may")
         print("  be in a mixed state until the Node deps are rebuilt.")
     else:
+        _record_update_success(
+            args,
+            mode="archive",
+            branch=branch,
+            remote=None,
+            target_ref=None,
+            target_sha=None,
+            resulting_head=None,
+            archive_sha=archive_sha,
+            health={
+                "critical_syntax": syntax_ok,
+                "critical_imports": import_ok,
+                "dependencies": dependencies_ok,
+                "node_dependencies": not bool(node_failures),
+            },
+        )
         _print_update_completion(_update_complete_message(pre_update_version))
     try:
         _print_curator_first_run_notice()
@@ -1624,6 +4028,7 @@ def _restore_stashed_changes(
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
+    probe_failed = unmerged.returncode != 0
     has_conflicts = bool(unmerged.stdout.strip())
 
     if restore.returncode != 0 and not has_conflicts and (
@@ -1638,7 +4043,7 @@ def _restore_stashed_changes(
             "  ⚠ Some stashed untracked files already exist in the working "
             "tree and were kept as-is."
         )
-    elif restore.returncode != 0 or has_conflicts:
+    elif restore.returncode != 0 or has_conflicts or probe_failed:
         print("✗ Update pulled new code, but restoring local changes hit conflicts.")
         if restore.stdout.strip():
             print(restore.stdout.strip())
@@ -1658,12 +4063,35 @@ def _restore_stashed_changes(
         # Always reset to clean state — leaving conflict markers in source
         # files makes hermes completely unrunnable (SyntaxError on import).
         # The user's changes are safe in the stash for manual recovery.
-        subprocess.run(
+        reset = subprocess.run(
             git_cmd + ["reset", "--hard", "HEAD"],
             cwd=cwd,
             capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_sanitized_git_env(),
         )
-        print("Working tree reset to clean state.")
+        verify_unmerged = subprocess.run(
+            git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_sanitized_git_env(),
+        )
+        cleanup_ok = bool(
+            reset.returncode == 0
+            and verify_unmerged.returncode == 0
+            and not verify_unmerged.stdout.strip()
+        )
+        if cleanup_ok:
+            print("Working tree reset to clean state.")
+        else:
+            print("✗ Could not prove the conflicted working tree was cleaned.")
+            if reset.stderr.strip():
+                print(f"  {reset.stderr.strip().splitlines()[0]}")
         print(f"Restore your changes later with: git stash apply {stash_ref}")
         # Don't sys.exit — the code update itself succeeded, only the stash
         # restore had conflicts.  Let cmd_update continue with pip install,
@@ -1685,6 +4113,7 @@ def _restore_stashed_changes(
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
+            env=_sanitized_git_env(),
         )
         if drop.returncode != 0:
             print(
@@ -1761,14 +4190,19 @@ OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
-def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
-    """Get the URL of the origin remote, or None if not set."""
+def _get_remote_url(
+    git_cmd: list[str], cwd: Path, remote: str
+) -> Optional[str]:
+    """Get one configured remote URL, or ``None`` when unavailable."""
+    if not _is_safe_remote_name(remote):
+        return None
     try:
         result = subprocess.run(
-            git_cmd + ["remote", "get-url", "origin"],
+            git_cmd + ["remote", "get-url", "--", remote],
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
+            env=_sanitized_git_env(),
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -1776,34 +4210,47 @@ def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
         pass
     return None
 
+def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
+    """Backwards-compatible origin URL wrapper."""
+    return _get_remote_url(git_cmd, cwd, "origin")
+
+
+def _canonical_repo_url(value: str | None) -> str | None:
+    """Canonicalize the two supported GitHub URL forms for exact comparison."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().rstrip("/")
+    if not normalized or any(ch in normalized for ch in "\r\n\x00"):
+        return None
+    if normalized.casefold().endswith(".git"):
+        normalized = normalized[:-4].rstrip("/")
+    if re.fullmatch(
+        r"https://github\.com/[^/?#]+/[^/?#]+", normalized, re.IGNORECASE
+    ):
+        return normalized.casefold()
+    if re.fullmatch(
+        r"git@github\.com:[^/?#]+/[^/?#]+", normalized, re.IGNORECASE
+    ):
+        return normalized.casefold()
+    return None
+
+
+def _is_official_repo_url(value: str | None) -> bool:
+    canonical = _canonical_repo_url(value)
+    return canonical is not None and canonical in {
+        _canonical_repo_url(official) for official in OFFICIAL_REPO_URLS
+    }
+
+
 def _is_fork(origin_url: Optional[str]) -> bool:
     """Check if the origin remote points to a fork (not the official repo)."""
     if not origin_url:
         return False
-    # Normalize URL for comparison (strip trailing .git if present)
-    normalized = origin_url.rstrip("/")
-    if normalized.endswith(".git"):
-        normalized = normalized[:-4]
-    for official in OFFICIAL_REPO_URLS:
-        official_normalized = official.rstrip("/")
-        if official_normalized.endswith(".git"):
-            official_normalized = official_normalized[:-4]
-        if normalized == official_normalized:
-            return False
-    return True
+    return not _is_official_repo_url(origin_url)
 
 def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
-    """Check if an 'upstream' remote already exists."""
-    try:
-        result = subprocess.run(
-            git_cmd + ["remote", "get-url", "upstream"],
-            cwd=cwd,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    """Return true only for an upstream remote expanded to the official repo."""
+    return _is_official_repo_url(_get_remote_url(git_cmd, cwd, "upstream"))
 
 def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     """Add the official repo as the 'upstream' remote. Returns True on success."""
@@ -1813,6 +4260,7 @@ def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
+            env=_sanitized_git_env(),
         )
         return result.returncode == 0
     except Exception:
@@ -1848,14 +4296,16 @@ def _mark_skip_upstream_prompt():
     except Exception:
         pass
 
-def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
-    """Attempt to push updated main to origin (sync fork).
+def _sync_fork_with_upstream(
+    git_cmd: list[str], cwd: Path, fork_remote: str = "origin"
+) -> bool:
+    """Attempt to push updated main to the selected fork remote.
 
     Returns True if push succeeded, False otherwise.
     """
     try:
         result = subprocess.run(
-            git_cmd + ["push", "origin", "main", "--force-with-lease"],
+            git_cmd + ["push", fork_remote, "main", "--force-with-lease"],
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -1864,7 +4314,9 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     except Exception:
         return False
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
+def _sync_with_upstream_if_needed(
+    git_cmd: list[str], cwd: Path, fork_remote: str = "origin"
+) -> None:
     """Check if fork is behind upstream and sync if safe.
 
     This implements the fork upstream sync logic:
@@ -1873,7 +4325,20 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     - If origin/main is strictly behind upstream/main, pull from upstream
     - Try to sync fork back to origin if possible
     """
-    has_upstream = _has_upstream_remote(git_cmd, cwd)
+    try:
+        _assert_safe_git_configuration(git_cmd, cwd)
+    except RuntimeError as exc:
+        print()
+        print(f"✗ Refusing upstream sync: {exc}")
+        return
+
+    upstream_url = _get_remote_url(git_cmd, cwd, "upstream")
+    if upstream_url is not None and not _is_official_repo_url(upstream_url):
+        print()
+        print("✗ Refusing upstream sync: the 'upstream' remote is not the official Hermes repository.")
+        print(f"  Expected: {OFFICIAL_REPO_URL}")
+        return
+    has_upstream = upstream_url is not None
 
     if not has_upstream:
         # Check if user previously declined
@@ -1896,9 +4361,17 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         if response in {"", "y", "yes"}:
             print("→ Adding upstream remote...")
             if _add_upstream_remote(git_cmd, cwd):
-                print(
-                    "  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git"
-                )
+                # Re-read Git's expanded URL after the mutation. A local URL
+                # rewrite or a concurrent config change must not let the
+                # no-upstream prompt path turn into a redirected fetch.
+                upstream_url = _get_remote_url(git_cmd, cwd, "upstream")
+                if not _is_official_repo_url(upstream_url):
+                    print(
+                        "  ✗ The added upstream does not expand to the official "
+                        "Hermes repository. Refusing upstream sync."
+                    )
+                    return
+                print(f"  ✓ Added upstream: {OFFICIAL_REPO_URL}")
                 has_upstream = True
             else:
                 print("  ✗ Failed to add upstream remote. Skipping upstream sync.")
@@ -1910,14 +4383,29 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             _mark_skip_upstream_prompt()
             return
 
-    # Fetch upstream main only. This sync compares upstream/main with
-    # origin/main, so there's no reason to pull every upstream ref — and a bare
+    # Fetch upstream main from the immutable official URL into the exact ref
+    # this sync reads. Even if repository configuration changes the named
+    # remote after the check above, it cannot redirect this operation. A bare
     # fetch drags in thousands of auto-generated branches.
     print()
     print("→ Fetching upstream...")
     try:
+        # Re-prove immediately before transport selection. This closes the
+        # prompt/add window and protects direct helper callers as well as the
+        # ordinary updater's earlier repository-config check.
+        _assert_safe_git_configuration(git_cmd, cwd)
+    except RuntimeError as exc:
+        print(f"  ✗ Refusing upstream sync: {exc}")
+        return
+    try:
         subprocess.run(
-            git_cmd + ["fetch", "upstream", "main", "--quiet"],
+            git_cmd
+            + [
+                "fetch",
+                OFFICIAL_REPO_URL,
+                "+refs/heads/main:refs/remotes/upstream/main",
+                "--quiet",
+            ],
             cwd=cwd,
             capture_output=True,
             check=True,
@@ -1926,10 +4414,12 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
         return
 
-    # Compare origin/main with upstream/main
-    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
+    fork_ref = f"refs/remotes/{fork_remote}/main"
+    upstream_ref = "refs/remotes/upstream/main"
+    # Compare the selected fork target with upstream/main.
+    origin_ahead = _count_commits_between(git_cmd, cwd, upstream_ref, fork_ref)
     upstream_ahead = _count_commits_between(
-        git_cmd, cwd, "origin/main", "upstream/main"
+        git_cmd, cwd, fork_ref, upstream_ref
     )
 
     if origin_ahead < 0 or upstream_ahead < 0:
@@ -1957,7 +4447,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     try:
         subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
+            git_cmd + ["merge", "--ff-only", upstream_ref],
             cwd=cwd,
             check=True,
         )
@@ -1971,7 +4461,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     # Try to sync fork back to origin
     print("→ Syncing fork...")
-    if _sync_fork_with_upstream(git_cmd, cwd):
+    if _sync_fork_with_upstream(git_cmd, cwd, fork_remote=fork_remote):
         print("  ✓ Fork synced with upstream")
     else:
         print(
@@ -2484,6 +4974,18 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
     except OSError:
         return True
 
+
+def _node_dependencies_healthy_read_only() -> bool:
+    """Prove Node dependency state without installing or rewriting caches."""
+    if not (_m().PROJECT_ROOT / "package.json").is_file():
+        return True
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return not _npm_lockfile_changed(get_default_hermes_root())
+    except Exception:
+        return False
+
 def _record_npm_lockfile_hash(hermes_root: Path) -> None:
     digest = _npm_manifests_digest()
     if digest is None:
@@ -2679,6 +5181,7 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     _log_only_write(result.stdout or "")
     return result
 
+@_with_sanitized_git_routing
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -2714,9 +5217,8 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print("✗ Not a git repository — cannot check for updates.")
         sys.exit(1)
 
-    git_cmd = ["git"]
-    if sys.platform == "win32":
-        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    git_cmd = _git_cmd()
+    git_env = _sanitized_git_env()
 
     # A crashed/interrupted fetch can leave .git/shallow.lock (or another git
     # lock file) behind; every later fetch then fails with "File exists" and
@@ -2745,10 +5247,18 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
+            env=git_env,
         ).stdout.strip()
         == "true"
     )
     depth_args = ["--depth", "1"] if is_shallow else []
+    try:
+        _assert_safe_git_configuration(
+            git_cmd, _m().PROJECT_ROOT, env=git_env
+        )
+    except RuntimeError as exc:
+        print(f"✗ Unsafe Git configuration: {exc}")
+        sys.exit(1)
 
     if branch == "main":
         # Probe locally (~6 ms) whether an 'upstream' remote exists at all
@@ -2761,6 +5271,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
+                env=git_env,
             ).returncode
             == 0
         )
@@ -2772,6 +5283,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
+                env=git_env,
             )
         if fetch_result is not None and fetch_result.returncode == 0:
             upstream_exists = True
@@ -2784,6 +5296,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
+                env=git_env,
             )
             upstream_exists = False
             compare_branch = f"origin/{branch}"
@@ -2795,6 +5308,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
+            env=git_env,
         )
         upstream_exists = False
         compare_branch = f"origin/{branch}"
@@ -2820,6 +5334,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         cwd=_m().PROJECT_ROOT,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
+        env=git_env,
     )
     if verify_result.returncode != 0:
         print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
@@ -2833,10 +5348,12 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         head_sha = subprocess.run(
             git_cmd + ["rev-parse", "HEAD"],
             cwd=_m().PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=git_env,
         ).stdout.strip()
         target_sha = subprocess.run(
             git_cmd + ["rev-parse", compare_branch],
             cwd=_m().PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=git_env,
         ).stdout.strip()
         if head_sha and target_sha and head_sha == target_sha:
             print("✓ Already up to date.")
@@ -2863,6 +5380,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
         check=True,
+        env=git_env,
     )
     behind = int(rev_result.stdout.strip())
 
@@ -3354,8 +5872,88 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         return False, "; ".join(missing[:4])
     return True, ""
 
+_UPDATE_SHIM_FLAG_OPTIONS = frozenset(
+    {
+        "--accept-hooks",
+        "--cli",
+        "--dev",
+        "--ignore-rules",
+        "--ignore-user-config",
+        "--no-restore-cwd",
+        "--pass-session-id",
+        "--safe-mode",
+        "--tui",
+        "--worktree",
+        "--yolo",
+        "-w",
+    }
+)
+_UPDATE_SHIM_VALUE_OPTIONS = frozenset(
+    {
+        "--in",
+        "--model",
+        "--oneshot",
+        "--profile",
+        "--provider",
+        "--reasoning",
+        "--resume",
+        "--skills",
+        "--toolsets",
+        "--usage-file",
+        "-m",
+        "-p",
+        "-r",
+        "-s",
+        "-t",
+        "-z",
+    }
+)
+
+
+def _is_current_update_shim_argv(argv: list[str]) -> bool:
+    """Prove that a target-venv console shim is this update invocation.
+
+    Only recognized top-level options may precede the operative ``update``
+    token. Options with optional values (notably ``--continue``) are omitted
+    because their following ``update`` text is ambiguous by construction.
+    """
+    index = 1
+    while index < len(argv):
+        token = str(argv[index])
+        if token.casefold() == "update":
+            return True
+        if token == "--":
+            # argparse accepts one top-level end-of-options marker before the
+            # subcommand.  Keep this proof deliberately narrower than the
+            # parser: the very next token must be the operative update
+            # command, so ``-- -- update`` and ``-- value update`` cannot
+            # turn arbitrary shim ancestors into self exclusions.
+            return (
+                index + 1 < len(argv)
+                and str(argv[index + 1]).casefold() == "update"
+            )
+        if token in _UPDATE_SHIM_FLAG_OPTIONS:
+            index += 1
+            continue
+        if token in _UPDATE_SHIM_VALUE_OPTIONS:
+            if index + 1 >= len(argv):
+                return False
+            index += 2
+            continue
+        if token.startswith("--") and "=" in token:
+            option, value = token.split("=", 1)
+            if option in _UPDATE_SHIM_VALUE_OPTIONS and value:
+                index += 1
+                continue
+        return False
+    return False
+
+
 def _detect_venv_python_processes(
-    *, exclude_pids: set[int] | None = None
+    *,
+    exclude_pids: set[int] | None = None,
+    root: Path | str | None = None,
+    strict: bool = False,
 ) -> list[tuple[int, str, str]]:
     """Find live processes running from the project venv's interpreter.
 
@@ -3370,59 +5968,128 @@ def _detect_venv_python_processes(
     backend and respawns it within seconds — so the caller should refuse and
     tell the user to close the app instead. Returns ``(pid, name, cmdline)``
     tuples; empty off-Windows / without psutil / when nothing matches. The
-    calling process and its ancestors are always excluded (a CLI ``hermes
-    update`` itself runs from the venv python). Never raises.
+    The exact calling process is excluded (a CLI ``hermes update`` itself runs
+    from the venv python). Its ancestors are not: a venv launcher ancestor can
+    keep native modules mapped and must remain a hard blocker. Never raises in
+    compatibility mode; ``strict=True`` turns unprovable enumeration into a
+    probe failure.
     """
-    if not _m()._is_windows():
+    if not (os.name == "nt" if root is not None else _m()._is_windows()):
         return []
     try:
         import psutil
-    except Exception:
+        from hermes_mcp_update_gate import is_exact_mcp_module_argv
+    except Exception as exc:
+        if strict:
+            raise RuntimeError(f"psutil is not available: {exc}") from exc
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    target_root = Path(root) if root is not None else _m().PROJECT_ROOT
+    venv_dir = target_root / "venv"
+    if not venv_dir.exists() and (target_root / ".venv").exists():
+        venv_dir = target_root / ".venv"
     try:
         venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:
         venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
+    managed_dir = target_root / ".hermes-runtime" / "python"
     try:
-        root_prefix = str(_m().PROJECT_ROOT.resolve()).lower().rstrip(os.sep) + os.sep
+        managed_prefix = str(managed_dir.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:
-        root_prefix = str(_m().PROJECT_ROOT).lower().rstrip(os.sep) + os.sep
+        managed_prefix = str(managed_dir).lower().rstrip(os.sep) + os.sep
+    try:
+        root_prefix = str(target_root.resolve()).lower().rstrip(os.sep) + os.sep
+    except OSError:
+        root_prefix = str(target_root).lower().rstrip(os.sep) + os.sep
 
     skip: set[int] = set(exclude_pids or set())
     skip.add(os.getpid())
+    # A native console-script launch has one load-bearing venv shim directly
+    # above this updater process. Exclude only that exact current-invocation
+    # ``hermes.exe ... update`` parent. Higher venv ancestors may be agents or
+    # other native-module holders and remain fail-closed blockers.
     try:
-        for anc in psutil.Process().parents():
-            skip.add(int(anc.pid))
+        parent = psutil.Process(os.getpid()).parent()
+        expected_shim = venv_bin_dir(venv_dir, windows=True) / "hermes.exe"
+        parent_argv = [str(value) for value in (parent.cmdline() or [])]
+        parent_exe = str(parent.exe() or "")
+        same_exe = os.path.normcase(os.path.realpath(parent_exe)) == os.path.normcase(
+            os.path.realpath(expected_shim)
+        )
+        same_argv0 = bool(parent_argv) and os.path.normcase(
+            os.path.realpath(parent_argv[0])
+        ) == os.path.normcase(os.path.realpath(expected_shim))
+        if (
+            same_exe
+            and same_argv0
+            and _is_current_update_shim_argv(parent_argv)
+        ):
+            skip.add(int(parent.pid))
     except Exception:
         pass
 
     matches: list[tuple[int, str, str]] = []
     try:
         proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise RuntimeError(f"process enumeration failed: {exc}") from exc
         return []
     for proc in proc_iter:
         try:
             info = proc.info
-        except Exception:
+        except Exception as exc:
+            if strict:
+                raise RuntimeError("process identity enumeration was unreadable") from exc
             continue
         pid = info.get("pid")
         exe = info.get("exe")
-        if not exe or pid is None or int(pid) in skip:
+        if pid is None:
+            if strict:
+                raise RuntimeError("process enumeration returned no PID")
             continue
         try:
-            exe_norm = str(Path(exe).resolve()).lower()
-        except (OSError, ValueError):
-            exe_norm = str(exe).lower()
-        cmdline_raw = " ".join(info.get("cmdline") or [])
+            numeric_pid = int(pid)
+        except (TypeError, ValueError) as exc:
+            if strict:
+                raise RuntimeError("process enumeration returned an invalid PID") from exc
+            continue
+        if numeric_pid in skip:
+            continue
+        exe_norm = ""
+        if exe:
+            try:
+                exe_norm = str(Path(exe).resolve()).lower()
+            except (OSError, ValueError):
+                exe_norm = str(exe).lower()
+        cmdline_values = [str(value) for value in (info.get("cmdline") or [])]
+        cmdline_raw = " ".join(cmdline_values)
         cmdline_low = cmdline_raw.lower()
         cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
+        name_value = str(info.get("name") or "")
+
+        # ``psutil.process_iter(attrs=...)`` substitutes ``None`` for each
+        # AccessDenied attribute instead of raising.  With no exe/argv/cwd we
+        # cannot prove whether an elevated Python/Hermes process belongs to
+        # this target venv. A strict readiness probe must fail closed instead
+        # of silently dropping the potential native-module holder.
+        if (
+            strict
+            and exe is None
+            and info.get("cmdline") is None
+            and info.get("cwd") is None
+            and Path(name_value).name.casefold()
+            in {"python.exe", "pythonw.exe", "hermes.exe"}
+        ):
+            raise RuntimeError(
+                f"process {numeric_pid} ({name_value}) identity metadata was unreadable"
+            )
 
         # Primary match: the executable itself lives under this venv
         # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
-        is_holder = exe_norm.startswith(venv_prefix)
+        is_holder = exe_norm.startswith(venv_prefix) or exe_norm.startswith(
+            managed_prefix
+        )
         # Fallback: uv/base-interpreter trampolines run a python whose exe is
         # OUTSIDE the venv but which still imports from it and holds its .pyd
         # files. Catch those by what they're running: a cmdline that references
@@ -3433,16 +6100,25 @@ def _detect_venv_python_processes(
         if not is_holder and "hermes_cli.main" in cmdline_low:
             if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
                 is_holder = True
+        if (
+            not is_holder
+            and cwd_low.startswith(root_prefix)
+            and is_exact_mcp_module_argv(cmdline_values)
+        ):
+            # An AccessDenied/exe-less exact MCP launch rooted in this install
+            # is still a potential native-module holder. The strict scanner
+            # must report it as an unreadable hard blocker, never skip it.
+            is_holder = True
         if not is_holder:
             continue
-        name = info.get("name") or Path(exe).name
+        name = name_value or (Path(exe).name if exe else "unreadable-process")
         # Return the FULL cmdline: callers match against it (the Desktop
         # preflight's pausable-gateway exemption parses for `gateway run`).
         # Truncating here cut long managed-runtime interpreter paths before
         # the `-m hermes_cli.main gateway run` argv, so autostarted gateways
         # were misreported as blockers and the update dead-ended. Truncate
         # only at display time.
-        matches.append((int(pid), str(name), cmdline_raw))
+        matches.append((numeric_pid, str(name), cmdline_raw))
     return matches
 
 # Native-extension modules that pin files inside the venv once imported.  If
@@ -3614,12 +6290,20 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     lines = [
         "✗ Other Hermes processes are running from this install's venv:",
     ]
+    try:
+        from hermes_cli._scan_venv_blockers import (  # noqa: PLC0415
+            _hermes_cli_command,
+            _is_pausable_gateway,
+        )
+    except Exception:
+        _hermes_cli_command = lambda _cmdline: None
+        _is_pausable_gateway = lambda _cmdline: False
     for pid, name, cmdline in matches[:6]:
         hint = ""
-        low = cmdline.lower()
-        if "serve" in low or "dashboard" in low:
+        command = _hermes_cli_command(cmdline)
+        if command in {"serve", "dashboard"}:
             hint = "  ← Hermes Desktop backend (close the desktop app)"
-        elif "gateway" in low:
+        elif _is_pausable_gateway(cmdline):
             hint = "  ← gateway"
         lines.append(f"  PID {pid}  {name}  {cmdline[:120]}{hint}")
     if len(matches) > 6:
@@ -3638,8 +6322,135 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     lines.append("  (or use `hermes update --force-venv` to proceed anyway at your own risk)")
     return "\n".join(lines)
 
-def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
-    """Return venv-interpreter ancestors of *pids* that hold the install open.
+_GATEWAY_STOP_ROLES = frozenset(
+    {
+        "gateway_worker",
+        "gateway_unmapped",
+        "gateway_launcher",
+        "gateway_leftover",
+    }
+)
+
+
+def _canonical_process_path(value: str | Path) -> str:
+    return os.path.normcase(os.path.realpath(os.fspath(value)))
+
+
+def _process_path_is_within(value: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath([value, parent]) == parent
+    except (OSError, ValueError):
+        return False
+
+
+def _capture_gateway_stop_identity(
+    pid: int,
+    *,
+    role: str,
+    root: Path | str | None = None,
+) -> _VerifiedProcessIdentity | None:
+    """Capture one exact, root-bound gateway identity before any stop.
+
+    ``None`` means the PID definitively exited. Unreadable or weakly
+    classified state raises so callers refuse the update instead of turning a
+    discovery-time numeric PID into tree-kill authority.
+    """
+    if role not in _GATEWAY_STOP_ROLES:
+        raise RuntimeError(f"unsupported gateway stop role: {role}")
+    try:
+        import psutil  # type: ignore
+        from hermes_cli._scan_venv_blockers import _is_pausable_gateway
+    except Exception as exc:
+        raise RuntimeError("gateway process identity support is unavailable") from exc
+
+    numeric_pid = int(pid)
+    try:
+        process = psutil.Process(numeric_pid)
+        created_at = float(process.create_time())
+        argv = tuple(str(value) for value in (process.cmdline() or []))
+        executable_raw = str(process.exe() or "")
+        cwd_raw = str(process.cwd() or "")
+    except psutil.NoSuchProcess:
+        return None
+    except Exception as exc:
+        raise RuntimeError(
+            f"gateway process {numeric_pid} identity is unreadable"
+        ) from exc
+
+    if not math.isfinite(created_at) or created_at <= 0:
+        raise RuntimeError(f"gateway process {numeric_pid} creation time is invalid")
+    if not argv or not _is_pausable_gateway(list(argv)):
+        raise RuntimeError(
+            f"gateway process {numeric_pid} no longer has exact gateway argv"
+        )
+    if not executable_raw or not os.path.isabs(executable_raw) or not cwd_raw:
+        raise RuntimeError(
+            f"gateway process {numeric_pid} executable/root is unreadable"
+        )
+
+    install_root = _canonical_process_path(
+        Path(root) if root is not None else _m().PROJECT_ROOT
+    )
+    executable = _canonical_process_path(executable_raw)
+    working_directory = _canonical_process_path(cwd_raw)
+    if not _process_path_is_within(working_directory, install_root):
+        raise RuntimeError(
+            f"gateway process {numeric_pid} is not rooted in this install"
+        )
+    if role == "gateway_launcher":
+        launcher_roots = (
+            _canonical_process_path(Path(install_root) / "venv"),
+            _canonical_process_path(Path(install_root) / ".venv"),
+        )
+        if not any(
+            _process_path_is_within(executable, launcher_root)
+            for launcher_root in launcher_roots
+        ):
+            raise RuntimeError(
+                f"gateway launcher {numeric_pid} is outside this install's venv"
+            )
+
+    return _VerifiedProcessIdentity(
+        pid=numeric_pid,
+        created_at=created_at,
+        kind="pausable_gateway",
+        argv=argv,
+        executable=executable,
+        install_root=install_root,
+        role=role,
+        working_directory=working_directory,
+    )
+
+
+def _gateway_stop_identity_state(identity: _VerifiedProcessIdentity) -> str:
+    """Return ``match``, ``exited``, or fail-closed ``refuse``."""
+    if not (
+        isinstance(identity, _VerifiedProcessIdentity)
+        and identity.kind == "pausable_gateway"
+        and identity.role in _GATEWAY_STOP_ROLES
+        and identity.argv
+        and identity.executable
+        and identity.install_root
+        and identity.working_directory
+    ):
+        return "refuse"
+    try:
+        current = _capture_gateway_stop_identity(
+            identity.pid,
+            role=identity.role,
+            root=identity.install_root,
+        )
+    except Exception:
+        return "refuse"
+    if current is None:
+        return "exited"
+    return "match" if current == identity else "refuse"
+
+
+def _venv_launcher_ancestors(
+    workers: list[_VerifiedProcessIdentity],
+) -> list[_VerifiedProcessIdentity]:
+    """Return exact venv-launcher identities for mapped gateway workers.
 
     On Windows a gateway started through the venv shim is a **two-process
     chain**: ``venv\\Scripts\\python.exe`` (the launcher, which keeps native
@@ -3660,20 +6471,15 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     that live under the project venv closes the gap. Only the venv-side
     parent is returned — unrelated ancestors (the Scheduled Task's
     ``cmd.exe``, an operator's shell) are ignored so we never widen the
-    blast radius beyond the gateway's own launcher. Never raises.
+    blast radius beyond the gateway's own launcher. Unreadable or changed
+    target identities raise so the caller refuses before any force-stop.
     """
-    if not _m()._is_windows() or not pids:
+    if not _m()._is_windows() or not workers:
         return []
     try:
         import psutil
     except Exception:
         return []
-
-    venv_dir = _m().PROJECT_ROOT / "venv"
-    try:
-        venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
-    except OSError:
-        venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
 
     # Never return ourselves or our own ancestry: a CLI ``hermes update``
     # runs from the venv python and would otherwise nominate itself.
@@ -3684,29 +6490,62 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     except Exception:
         pass
 
-    found: list[int] = []
-    for pid in pids:
+    found: list[_VerifiedProcessIdentity] = []
+    found_pids: set[int] = set()
+    worker_pids = {int(identity.pid) for identity in workers}
+    for worker in workers:
+        if _gateway_stop_identity_state(worker) != "match":
+            raise RuntimeError(
+                f"gateway worker {worker.pid} changed before launcher capture"
+            )
         try:
-            parent = psutil.Process(int(pid)).parent()
-        except Exception:
+            parent = psutil.Process(int(worker.pid)).parent()
+        except psutil.NoSuchProcess:
             continue
+        except Exception as exc:
+            raise RuntimeError(
+                f"gateway worker {worker.pid} parent is unreadable"
+            ) from exc
         if parent is None:
             continue
         ppid = int(parent.pid)
-        if ppid in skip or ppid in found or ppid in set(pids):
+        if ppid in skip or ppid in found_pids or ppid in worker_pids:
             continue
         try:
-            exe = (parent.exe() or "").lower()
-        except Exception:
+            identity = _capture_gateway_stop_identity(
+                ppid,
+                role="gateway_launcher",
+                root=worker.install_root,
+            )
+        except RuntimeError as exc:
+            # An unrelated shell/cmd parent is not a launcher candidate. A
+            # target-venv executable whose remaining identity is unreadable is
+            # a hard refusal, not permission to kill it by PID.
+            try:
+                parent_exe = _canonical_process_path(parent.exe() or "")
+                venv_roots = (
+                    _canonical_process_path(Path(worker.install_root) / "venv"),
+                    _canonical_process_path(Path(worker.install_root) / ".venv"),
+                )
+            except Exception as probe_exc:
+                raise RuntimeError(
+                    f"gateway launcher candidate {ppid} is unreadable"
+                ) from probe_exc
+            if any(
+                _process_path_is_within(parent_exe, venv_root)
+                for venv_root in venv_roots
+            ):
+                raise exc
             continue
-        if exe.startswith(venv_prefix):
-            found.append(ppid)
+        if identity is not None:
+            found.append(identity)
+            found_pids.add(ppid)
     return found
 
 
 def _leftover_pausable_gateway_pids(
     matches: list[tuple[int, str, str]],
-) -> list[int] | None:
+) -> list[_VerifiedProcessIdentity] | None:
     """PIDs from *matches* when every remaining venv holder is a pausable gateway.
 
     ``_pause_windows_gateways_for_update()`` stops every gateway its discovery
@@ -3721,38 +6560,39 @@ def _leftover_pausable_gateway_pids(
     to exempt them (``_is_pausable_gateway``), so the preflight's exemption
     and this guard's tolerance cannot drift apart — matcher drift between
     two views of the same process table is what produced the launcher/worker
-    dead-end fixed above. The scan captures only a 120-char cmdline prefix,
-    so the live argv is re-read where psutil allows; an unreadable argv
-    falls back to the captured prefix.
+    dead-end fixed above. Authorization uses only a freshly read argv sequence
+    plus process creation time. Captured/flattened scan text is display data,
+    never authority for a force-stop.
 
     Returns ``None`` when any holder is not a pausable gateway — an operator
     REPL, a stray script, or the Desktop backend has no pause machinery
     downstream, and the guard must keep refusing exactly as before.
     """
-    from hermes_cli._scan_venv_blockers import _is_pausable_gateway
-
-    try:
-        import psutil  # type: ignore
-    except Exception:
-        psutil = None
-
-    pids: list[int] = []
-    for pid, _name, cmdline in matches:
-        argv = cmdline
-        if psutil is not None:
-            try:
-                argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
-            except Exception:
-                pass
-        if not _is_pausable_gateway(argv):
+    identities: list[_VerifiedProcessIdentity] = []
+    for pid, _name, _cmdline in matches:
+        try:
+            identity = _capture_gateway_stop_identity(
+                int(pid),
+                role="gateway_leftover",
+                root=_m().PROJECT_ROOT,
+            )
+        except Exception:
             return None
-        pids.append(int(pid))
-    return pids
+        if identity is not None:
+            identities.append(identity)
+    return identities
+
+
+def _revalidate_pausable_gateway_identity(
+    identity: _VerifiedProcessIdentity,
+) -> bool:
+    """Re-prove the exact frozen identity immediately before force-stop."""
+    return _gateway_stop_identity_state(identity) == "match"
 
 
 def _orphaned_desktop_backend_pids(
     matches: list[tuple[int, str, str]],
-) -> list[int] | None:
+) -> list[_VerifiedProcessIdentity] | None:
     """PIDs from *matches* when every remaining holder is an ORPHANED backend.
 
     The venv-holder guard refuses on the Desktop app's ``serve`` backend by
@@ -3794,30 +6634,31 @@ def _orphaned_desktop_backend_pids(
     except Exception:
         return None
 
-    def _is_backend(argv_low: str) -> bool:
-        return "hermes_cli.main" in argv_low and (
-            " serve" in argv_low or " dashboard" in argv_low
-        )
+    from hermes_cli._scan_venv_blockers import _hermes_cli_command
+
+    def _is_backend(argv: list[str]) -> bool:
+        return _hermes_cli_command(argv) in {"serve", "dashboard"}
 
     # Pass 1: find orphaned backend ROOTS among the holders.
-    roots: list[int] = []
-    remaining: list[tuple[int, str]] = []  # (pid, argv_low) still to justify
-    for pid, _name, cmdline in matches:
-        argv = cmdline
+    roots: list[_VerifiedProcessIdentity] = []
+    remaining: list[int] = []
+    for pid, _name, _cmdline in matches:
         try:
-            argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
+            proc = psutil.Process(int(pid))
+            argv = [str(value) for value in proc.cmdline()]
+            created_at = float(proc.create_time())
         except psutil.NoSuchProcess:
             # Holder exited between scan and classification — nothing to
             # reap, nothing blocking. Skip it.
             continue
         except Exception:
-            pass
-        low = argv.lower()
-        if not _is_backend(low):
-            remaining.append((int(pid), low))
+            return None
+        if not argv or not math.isfinite(created_at) or created_at <= 0:
+            return None
+        if not _is_backend(argv):
+            remaining.append(int(pid))
             continue
         try:
-            proc = psutil.Process(int(pid))
             ppid = proc.ppid()
             parent = psutil.Process(ppid) if ppid else None
             if parent is not None and parent.is_running():
@@ -3830,19 +6671,23 @@ def _orphaned_desktop_backend_pids(
                     # with the SAME backend argv, so the worker half of the
                     # two-process chain lands here. Defer to pass 2 instead
                     # of refusing outright.
-                    remaining.append((int(pid), low))
+                    remaining.append(int(pid))
                     continue
         except psutil.NoSuchProcess:
             pass  # parent gone → orphan
         except Exception:
             return None
-        roots.append(int(pid))
+        roots.append(
+            _VerifiedProcessIdentity(
+                pid=int(pid), created_at=created_at, kind="orphan_backend"
+            )
+        )
 
     # Pass 2: every non-backend holder must be a descendant of an accepted
     # orphan root — then it dies with the root's tree reap. Anything else
     # (operator REPL, stray script) keeps the refusal.
-    root_set = set(roots)
-    for pid, _low in remaining:
+    root_set = {identity.pid for identity in roots}
+    for pid in remaining:
         if not root_set:
             return None
         try:
@@ -3856,7 +6701,40 @@ def _orphaned_desktop_backend_pids(
     return roots
 
 
-def _stop_process_trees(pids: list[int]) -> None:
+def _revalidate_orphan_backend_identity(
+    identity: _VerifiedProcessIdentity,
+) -> bool:
+    """Re-prove one orphan backend and its creation time immediately before kill."""
+    if identity.kind != "orphan_backend":
+        return False
+    try:
+        import psutil  # type: ignore
+        from hermes_cli._scan_venv_blockers import _hermes_cli_command
+
+        process = psutil.Process(int(identity.pid))
+        created_at = float(process.create_time())
+        argv = [str(value) for value in process.cmdline()]
+        if (
+            not math.isfinite(created_at)
+            or abs(created_at - identity.created_at) > 0.001
+            or _hermes_cli_command(argv) not in {"serve", "dashboard"}
+        ):
+            return False
+        ppid = int(process.ppid())
+        if not ppid:
+            return True
+        try:
+            parent = psutil.Process(ppid)
+            if not parent.is_running():
+                return True
+            return float(parent.create_time()) > created_at
+        except psutil.NoSuchProcess:
+            return True
+    except Exception:
+        return False
+
+
+def _stop_process_trees(identities: list[_VerifiedProcessIdentity]) -> None:
     """Force-stop each PID with its full child tree (Windows).
 
     ``taskkill /T /F`` mirrors the Desktop's ``forceKillProcessTree`` and
@@ -3864,18 +6742,31 @@ def _stop_process_trees(pids: list[int]) -> None:
     ``.hermes-runtime`` interpreter child alive and holding the install open
     (#70026). Best effort; never raises.
     """
-    for pid in pids:
+    for identity in identities:
+        if not isinstance(identity, _VerifiedProcessIdentity):
+            logger.warning("Refusing bare-PID process-tree stop without identity proof")
+            continue
+        if not _revalidate_orphan_backend_identity(identity):
+            logger.warning(
+                "Refusing process-tree stop for PID %s after identity changed",
+                identity.pid,
+            )
+            continue
         try:
             subprocess.run(
-                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                ["taskkill", "/PID", str(int(identity.pid)), "/T", "/F"],
                 check=False,
                 capture_output=True,
             )
         except Exception as exc:
-            logger.debug("Could not stop process tree %s: %s", pid, exc)
+            logger.debug("Could not stop process tree %s: %s", identity.pid, exc)
 
 
-def _pause_windows_gateways_for_update() -> dict | None:
+def _pause_windows_gateways_for_update(
+    *,
+    require_structured_resume: bool = False,
+    before_stop: Callable[[dict], object] | None = None,
+) -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
     Windows scheduled/startup gateways run through pythonw.exe, so the generic
@@ -3889,18 +6780,25 @@ def _pause_windows_gateways_for_update() -> dict | None:
     try:
         from gateway.status import terminate_pid
         from hermes_cli.gateway import (
-            _capture_gateway_argv,
             _get_restart_drain_timeout,
             find_gateway_pids,
             find_profile_gateway_processes,
         )
     except Exception as exc:
+        if require_structured_resume:
+            raise RuntimeError(
+                "could not load verified gateway discovery for deferred resume"
+            ) from exc
         logger.debug("Could not prepare Windows gateway pause for update: %s", exc)
         return None
 
     try:
         running_pids = list(dict.fromkeys(find_gateway_pids(all_profiles=True)))
     except Exception as exc:
+        if require_structured_resume:
+            raise RuntimeError(
+                "could not discover the gateway fleet for deferred resume"
+            ) from exc
         logger.debug("Could not discover Windows gateway PIDs before update: %s", exc)
         return None
     if not running_pids:
@@ -3916,19 +6814,32 @@ def _pause_windows_gateways_for_update() -> dict | None:
         try:
             from hermes_cli import gateway_windows
 
-            if gateway_windows.is_installed():
-                return {
-                    "resume_needed": True,
-                    "profiles": {},
-                    "unmapped_pids": [],
-                    "unmapped": [],
-                    "cold_start_if_installed": True,
-                }
+            installed = bool(gateway_windows.is_installed())
         except Exception as exc:
+            if require_structured_resume:
+                raise RuntimeError(
+                    "could not prove gateway autostart state for deferred resume"
+                ) from exc
             logger.debug(
                 "Could not check Windows gateway autostart state before update: %s",
                 exc,
             )
+            installed = False
+        if installed or require_structured_resume:
+            token = {
+                "resume_needed": bool(installed),
+                "profiles": {},
+                "profile_identities": {},
+                "unmapped_pids": [],
+                "unmapped": [],
+                "cold_start_if_installed": bool(installed),
+            }
+            if before_stop is not None:
+                # Even an explicit empty fleet needs a durable authenticated
+                # recovery plan so a failed update can return and clear the
+                # continuously-held lease through the hidden resume seam.
+                before_stop(token)
+            return token
         return None
 
     profile_processes = {}
@@ -3937,16 +6848,73 @@ def _pause_windows_gateways_for_update() -> dict | None:
             proc.pid: proc for proc in find_profile_gateway_processes()
         }
     except Exception as exc:
+        if require_structured_resume:
+            raise RuntimeError(
+                "could not map the gateway fleet to verified profiles"
+            ) from exc
         logger.debug("Could not map Windows gateway PIDs to profiles: %s", exc)
 
+    # Convert discovery PIDs into immutable, root-bound process identities
+    # before the first wait or stop. A PID that exits during the drain can be
+    # reused immediately; the numeric value and a post-wait argv read are not
+    # authority to tree-kill the replacement.
+    verified_by_pid: dict[int, _VerifiedProcessIdentity] = {}
+    for pid in running_pids:
+        proc = profile_processes.get(pid)
+        role = "gateway_worker" if proc is not None else "gateway_unmapped"
+        try:
+            identity = _capture_gateway_stop_identity(
+                int(pid), role=role, root=_m().PROJECT_ROOT
+            )
+        except RuntimeError:
+            raise
+        if identity is None:
+            if require_structured_resume:
+                raise RuntimeError(
+                    f"gateway process {pid} exited before its fleet identity was frozen"
+                )
+            continue
+        verified_by_pid[int(pid)] = identity
+
+    running_pids = list(verified_by_pid)
     profiles: dict[str, int] = {}
-    mapped_pids = []
+    profile_identities: dict[str, dict[str, float | int]] = {}
+    mapped_pids: list[int] = []
     for pid in running_pids:
         proc = profile_processes.get(pid)
         if proc is None:
             continue
+        identity = verified_by_pid[pid]
         profiles[str(proc.profile)] = int(pid)
         mapped_pids.append(int(pid))
+        profile_identities[str(proc.profile)] = {
+            "pid": int(pid),
+            "created_at": identity.created_at,
+        }
+
+    unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
+    if require_structured_resume and unmapped_pids:
+        raise RuntimeError(
+            "deferred gateway resume requires every running gateway to map "
+            "to a verified Hermes profile"
+        )
+
+    resume_token = {
+        "resume_needed": True,
+        "profiles": profiles,
+        "profile_identities": profile_identities,
+        "unmapped_pids": unmapped_pids,
+        "unmapped": [],
+        "cold_start_if_installed": False,
+    }
+    if before_stop is not None:
+        # The authenticated recovery plan must be durable before the first
+        # gateway stop. A publication failure therefore leaves the entire
+        # prior fleet untouched and aborts before source mutation.
+        before_stop(resume_token)
+
+    for pid in mapped_pids:
+        proc = profile_processes[pid]
         _write_update_planned_stop_marker(Path(proc.path), int(pid))
 
     # Resolve each mapped worker's venv-side launcher BEFORE draining: the
@@ -3961,7 +6929,8 @@ def _pause_windows_gateways_for_update() -> dict | None:
     # mapped and is what ``_detect_venv_python_processes()`` reports
     # downstream. Left alive, it trips the venv-holder guard and aborts the
     # update even though the gateway itself is stopped.
-    launcher_pids = _m()._venv_launcher_ancestors(mapped_pids)
+    mapped_identities = [verified_by_pid[pid] for pid in mapped_pids]
+    launcher_identities = _m()._venv_launcher_ancestors(mapped_identities)
 
     print("→ Stopping Windows gateway process(es) before updating Hermes...")
     try:
@@ -3972,35 +6941,50 @@ def _pause_windows_gateways_for_update() -> dict | None:
         mapped_pids,
         timeout=drain_timeout,
     )
-    unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
+    # Resume argv comes from the same pre-wait immutable identity that
+    # authorizes the stop. Never re-read argv after a drain interval: at that
+    # point the numeric PID may belong to an unrelated process.
+    unmapped = [
+        {"pid": int(pid), "argv": list(verified_by_pid[pid].argv)}
+        for pid in unmapped_pids
+    ]
+    resume_token["unmapped"] = unmapped
 
-    # Snapshot each unmapped gateway's command line *before* we force-kill it,
-    # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
-    # its own argv. Unmapped gateways are ones with no profile→PID-file mapping
-    # — e.g. a Windows Scheduled Task running ``pythonw.exe -m hermes_cli.main
-    # gateway run``. Without this snapshot they were force-killed and never
-    # restarted (the "Restart manually after update" dead-end from #50090).
-    unmapped: list[dict] = []
-    for pid in unmapped_pids:
-        argv = None
-        try:
-            argv = _capture_gateway_argv(int(pid))
-        except Exception as exc:
-            logger.debug("Could not capture argv for unmapped gateway %s: %s", pid, exc)
-        unmapped.append({"pid": int(pid), "argv": argv})
+    # Select candidates by PID, but authorize each stop only with its frozen
+    # identity. Re-read PID/create-time/argv/exe/cwd/root immediately before
+    # the tree kill. A definite exit is harmless; every unreadable or changed
+    # identity aborts the update rather than widening the kill.
+    candidates = {
+        identity.pid: identity
+        for identity in launcher_identities
+    }
+    for pid in set(survivors).union(unmapped_pids):
+        identity = verified_by_pid.get(int(pid))
+        if identity is None:
+            raise RuntimeError(
+                f"gateway process {pid} has no frozen stop identity"
+            )
+        candidates[int(pid)] = identity
 
-    # Stop drain survivors, unmapped gateways, and the pre-drain launcher
-    # snapshot. ``terminate_pid(force=True)`` is a tree kill, so a launcher
-    # that outlived its worker takes any stragglers with it; a launcher that
-    # already exited with its drained worker raises ProcessLookupError below
-    # and is skipped.
-    force_killed = []
-    for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
+    force_killed: list[int] = []
+    for pid in sorted(candidates):
+        identity = candidates[pid]
+        state = _gateway_stop_identity_state(identity)
+        if state == "exited":
+            continue
+        if state != "match":
+            raise RuntimeError(
+                f"gateway process {pid} changed before force-stop; refusing update"
+            )
         try:
             terminate_pid(int(pid), force=True)
             force_killed.append(int(pid))
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        except ProcessLookupError:
+            continue
+        except (PermissionError, OSError) as exc:
+            raise RuntimeError(
+                f"gateway process {pid} could not be safely stopped"
+            ) from exc
 
     if profiles:
         print(f"  ✓ Paused gateway profile(s): {', '.join(sorted(profiles))}")
@@ -4008,21 +6992,11 @@ def _pause_windows_gateways_for_update() -> dict | None:
         print(f"  → Force-stopped {len(force_killed)} gateway process(es)")
 
     if unmapped_pids:
-        respawnable = sum(1 for u in unmapped if u.get("argv"))
         print(
             f"  → Stopped {len(unmapped_pids)} gateway process(es) without profile mapping"
         )
-        if respawnable < len(unmapped_pids):
-            # Some had no recoverable command line (psutil missing, access
-            # denied, already gone): those still need a manual restart.
-            print("    Restart manually after update: hermes gateway run")
 
-    return {
-        "resume_needed": True,
-        "profiles": profiles,
-        "unmapped_pids": unmapped_pids,
-        "unmapped": unmapped,
-    }
+    return resume_token
 
 def _cold_start_windows_gateway_after_update() -> None:
     """Start a fresh detached gateway after update when one is installed but down.
@@ -4524,7 +7498,6 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
-
 def _desktop_app_present(desktop_dir: Path) -> bool:
     """Return whether a packaged or source Desktop build exists."""
     return (
@@ -4601,6 +7574,7 @@ def _rebuild_desktop_after_update(
         print("  ✓ Desktop app up to date")
 
 
+@_with_sanitized_git_routing
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -4660,20 +7634,37 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(_format_concurrent_instances_message(concurrent, scripts_dir))
                 sys.exit(2)
 
+    deferred_gateway_resume = bool(
+        getattr(args, "defer_gateway_resume", False)
+    )
+    if deferred_gateway_resume:
+        # Prove the prior fleet is losslessly representable before the first
+        # backup/source mutation.  Unmapped argv is never persisted or passed
+        # across the privileged handoff boundary.
+        def _publish_resume_plan_before_stop(token: dict) -> None:
+            setattr(args, "_windows_gateway_resume_plan", token)
+            _write_deferred_gateway_plan(args, Path(_m().PROJECT_ROOT))
+
+        _windows_gateway_resume = _m()._pause_windows_gateways_for_update(
+            require_structured_resume=True,
+            before_stop=_publish_resume_plan_before_stop,
+        )
+    else:
+        _windows_gateway_resume = None
+    # The outer command owns Windows Job containment. It resumes this trusted
+    # gateway plan only after the Job proves every mutating descendant exited
+    # and disarms kill-on-close, while both update coordination markers remain
+    # held. Starting it here would make the gateway inherit the mutation Job.
+    setattr(args, "_windows_gateway_resume_plan", _windows_gateway_resume)
+
     # Pre-update backup — runs before any git/file mutation so users can
     # always roll back to the exact state they had before this update.
     # Returns the quick-snapshot id (or None when disabled/failed); the
     # post-update cron-jobs safety net uses it to detect job loss.
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
-
-    _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
-    if _windows_gateway_resume:
-        import atexit as _atexit
-
-        _atexit.register(
-            _m()._resume_windows_gateways_after_update,
-            _windows_gateway_resume,
-        )
+    if not deferred_gateway_resume:
+        _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
+        setattr(args, "_windows_gateway_resume_plan", _windows_gateway_resume)
 
     # With gateways paused, anything still running from the venv interpreter
     # (most commonly the Desktop app's `hermes serve` backend) will keep .pyd
@@ -4689,6 +7680,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
+            if _gateway_holders is not None and deferred_gateway_resume:
+                planned_pids = {
+                    int(pid)
+                    for pid in (
+                        (_windows_gateway_resume or {}).get("profiles") or {}
+                    ).values()
+                }
+                if any(
+                    int(identity.pid) not in planned_pids
+                    for identity in _gateway_holders
+                ):
+                    # The authenticated resume plan is frozen before any stop.
+                    # A later gateway is not represented in that plan, so
+                    # killing it would make the post-Job resume fleet lossy.
+                    # Leave it alive and let the ordinary hard-holder refusal
+                    # abort before source mutation.
+                    _gateway_holders = None
             if _gateway_holders is not None:
                 # Every remaining holder is a gateway the pause machinery
                 # already owns — respawned by its supervisor inside the
@@ -4702,13 +7710,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"  ⚠ {len(_gateway_holders)} gateway process(es) still "
                     "hold the venv after the pause; stopping them"
                 )
-                for _pid in _gateway_holders:
+                for _identity in _gateway_holders:
                     try:
-                        terminate_pid(int(_pid), force=True)
+                        if not _revalidate_pausable_gateway_identity(_identity):
+                            raise RuntimeError(
+                                f"gateway process {_identity.pid} changed before force-stop"
+                            )
+                        terminate_pid(int(_identity.pid), force=True)
+                    except ProcessLookupError:
+                        continue
                     except Exception as exc:
-                        logger.debug(
-                            "Could not stop leftover gateway %s: %s", _pid, exc
-                        )
+                        raise RuntimeError(
+                            f"leftover gateway {_identity.pid} could not be safely stopped"
+                        ) from exc
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
@@ -4733,7 +7747,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(2)
 
     # Self-lock deferral moved: the venv-holder sweep above excludes this
@@ -4772,23 +7785,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # due to filesystem atomicity issues. Set the recommended workaround.
     if sys.platform == "win32" and git_dir.exists():
         subprocess.run(
-            [
-                "git",
-                "-c",
-                "windows.appendAtomically=false",
-                "config",
-                "windows.appendAtomically",
-                "false",
-            ],
+            _git_cmd() + ["config", "windows.appendAtomically", "false"],
             cwd=_m().PROJECT_ROOT,
             check=False,
             capture_output=True,
+            env=_sanitized_git_env(),
         )
 
     # Build git command once — reused for fork detection and the update itself.
-    git_cmd = ["git"]
-    if sys.platform == "win32":
-        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    git_cmd = _git_cmd()
+    git_env = _sanitized_git_env()
+
+    branch = _m()._resolve_update_branch(args)
+    update_target = None
+    if not use_zip_update:
+        try:
+            update_target = _resolve_update_target(
+                git_cmd, _m().PROJECT_ROOT, branch, env=git_env
+            )
+            _assert_safe_git_configuration(
+                git_cmd, _m().PROJECT_ROOT, env=git_env
+            )
+        except ValueError as exc:
+            print(f"✗ {exc}")
+            sys.exit(1)
+        except RuntimeError as exc:
+            print(f"✗ Unsafe Git configuration: {exc}")
+            print("  Remove executable filter/merge drivers from this checkout before updating.")
+            sys.exit(1)
 
     # Discard npm lockfile churn before any stash/branch logic. npm rewrites
     # tracked package-lock.json files non-deterministically at install/build
@@ -4814,13 +7838,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
-        try:
-            _update_via_zip(
-                args,
-                had_desktop_app_before_update=had_desktop_app_before_update,
-            )
-        finally:
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        _update_via_zip(
+            args,
+            had_desktop_app_before_update=had_desktop_app_before_update,
+        )
         return
 
     # Fetch and pull
@@ -4831,7 +7852,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # thousands of auto-generated branches — an unscoped fetch can stall for
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
-        branch = _m()._resolve_update_branch(args)
+        assert update_target is not None
 
         # Self-heal abandoned git lock files (e.g. .git/shallow.lock left by a
         # crashed fetch) before the fetch — otherwise the update fails with
@@ -4845,10 +7866,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd
+            + ["fetch", "--", update_target.remote, update_target.refspec],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
+            env=git_env,
         )
         if fetch_result.returncode != 0:
             stderr = fetch_result.stderr.strip()
@@ -4867,6 +7890,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
 
+        target_sha_result = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", update_target.tracking_ref],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            env=git_env,
+        )
+        target_sha = target_sha_result.stdout.strip()
+
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -4874,6 +7909,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             check=True,
+            env=git_env,
         )
         current_branch = result.stdout.strip()
 
@@ -4930,6 +7966,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
+                env=git_env,
             )
             if checkout_result.returncode != 0:
                 # Local checkout doesn't have this branch yet. Try to set
@@ -4937,10 +7974,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # the common case when the requested branch exists upstream
                 # but was never checked out locally.
                 track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                    git_cmd
+                    + ["checkout", "-B", branch, update_target.tracking_ref],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
+                    env=git_env,
                 )
                 if track_result.returncode != 0:
                     # Restore the user's prior branch + stash before bailing
@@ -4973,11 +8012,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # 0), so keep it, but treat the shallow NUMBER as unknown and recover
         # the real one via the GitHub compare API when possible.
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd
+            + ["rev-list", f"HEAD..{update_target.tracking_ref}", "--count"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             check=True,
+            env=git_env,
         )
         commit_count = int(result.stdout.strip())
 
@@ -5010,36 +8051,88 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         if commit_count == 0:
             _invalidate_update_cache()
+            local_state_restored = True
 
-            # Even if origin is up to date, the fork may be behind upstream
+            # Even if origin is up to date, the fork may be behind upstream.
             if is_fork and branch == "main":
-                _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+                _m()._sync_with_upstream_if_needed(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    fork_remote=update_target.remote,
+                )
 
-            # Restore stash and switch back to original branch if we moved.
+            # Upstream fork synchronization can advance the checked-out
+            # target even when the selected fork ref had no new commits. Keep
+            # the installed target identity before restoring the caller's
+            # original branch; a receipt must never describe that other HEAD.
+            installed_target_head = _capture_head_sha(
+                git_cmd, _m().PROJECT_ROOT
+            )
+            if (
+                is_fork
+                and branch == "main"
+                and update_target.remote == "origin"
+            ):
+                # A failed fork push leaves local HEAD ahead of the selected
+                # remote target. Refresh the exact refspec and keep the two
+                # identities distinct so receipt validation fails closed.
+                target_sha = _refresh_update_target_sha(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    update_target,
+                    env=git_env,
+                )
+
+            # Switch back to the original branch if we moved, then restore the
+            # stash. Returning to the branch that owned the user's local
+            # changes before reapplying its stash avoids conflicts that do not
+            # exist on the original branch.
             # EXCEPTION: a parked feature branch we verified clean + fully
             # merged stays on the target — re-parking the checkout on the
             # stale branch is the 2026-08-17 incident all over again.
-            if auto_stash_ref is not None:
-                _m()._restore_stashed_changes(
-                    git_cmd,
-                    _m().PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
             if parked_branch_switched:
                 print(
                     f"  ✓ Checkout was parked on '{current_branch}' (fully "
                     f"merged) — switched back to {branch}."
                 )
             elif current_branch not in {branch, "HEAD"}:
-                subprocess.run(
+                checkout_original = subprocess.run(
                     git_cmd + ["checkout", current_branch],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                     check=False,
+                    env=git_env,
                 )
+                symbolic_original = subprocess.run(
+                    git_cmd + ["symbolic-ref", "--quiet", "--short", "HEAD"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    env=git_env,
+                )
+                if not (
+                    checkout_original.returncode == 0
+                    and symbolic_original.returncode == 0
+                    and symbolic_original.stdout.strip() == current_branch
+                ):
+                    print(
+                        f"✗ Update target was checked, but branch '{current_branch}' "
+                        "could not be restored."
+                    )
+                    print("  No success receipt was written.")
+                    sys.exit(1)
+            if auto_stash_ref is not None:
+                local_state_restored = bool(_m()._restore_stashed_changes(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=prompt_for_restore,
+                    input_fn=gw_input_fn,
+                ))
 
             # "No new commits" does not mean the managed interpreter is safe.
             # uv can retain the same CPython patch while python-build-standalone
@@ -5063,6 +8156,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # otherwise "Already up to date!" gaslights the user while their
             # install stays bricked.
             healthy, detail = _venv_core_imports_healthy()
+            dependencies_ok = healthy
+            completion_message: str | None = None
             if not healthy:
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
@@ -5118,13 +8213,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     )
                 _m()._clear_update_incomplete_marker()
                 healthy_after, detail_after = _venv_core_imports_healthy()
+                dependencies_ok = healthy_after
                 if healthy_after:
                     print("✓ Dependencies repaired!")
-                    _print_update_completion("✓ Update complete!")
+                    completion_message = "✓ Update complete!"
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
+                completion_message = "✓ Already up to date!"
                 _repair_node_deps_on_current_checkout(_print_update_completion)
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
@@ -5136,7 +8233,52 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "long-lived processes still use the previous runtime."
                 )
                 print("  Restart each of them to pick up the repaired runtime.")
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            if completion_message is not None:
+                if not local_state_restored:
+                    print(
+                        "⚠ Local changes were not restored cleanly; "
+                        "no success receipt was written."
+                    )
+                    sys.exit(1)
+                syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
+                    _m().PROJECT_ROOT
+                )
+                if not syntax_ok:
+                    print(f"✗ Current checkout failed syntax validation: {failing_path}")
+                    if syntax_error:
+                        print(f"  {syntax_error}")
+                    sys.exit(1)
+                node_dependencies_ok = _node_dependencies_healthy_read_only()
+                if not node_dependencies_ok:
+                    print(
+                        "⚠ Checkout is current, but Node dependency health could "
+                        "not be proven; no success receipt was written."
+                    )
+                    return
+                resulting_head = installed_target_head
+                if resulting_head is None or target_sha != resulting_head:
+                    print(
+                        "⚠ Installed Git identity could not be proven; "
+                        "no success receipt was written."
+                    )
+                else:
+                    _record_update_success(
+                        args,
+                        mode="git",
+                        branch=branch,
+                        remote=update_target.remote,
+                        target_ref=update_target.tracking_ref,
+                        target_sha=target_sha,
+                        resulting_head=resulting_head,
+                        archive_sha=None,
+                        health={
+                            "critical_syntax": syntax_ok,
+                            "critical_imports": dependencies_ok,
+                            "dependencies": dependencies_ok,
+                            "node_dependencies": node_dependencies_ok,
+                        },
+                    )
+                    _print_update_completion(completion_message)
             return
 
         if commit_count > 0:
@@ -5148,6 +8290,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print("→ Pulling updates...")
         update_succeeded = False
+        local_state_restored = True
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
         # orphan merge-conflict markers in hermes_cli/config.py bricked
@@ -5162,10 +8305,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
             pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                git_cmd + ["merge", "--ff-only", update_target.tracking_ref],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
+                env=git_env,
             )
             if pull_result.returncode != 0:
                 # ff-only failed — local and remote have diverged (e.g. upstream
@@ -5175,17 +8319,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", update_target.tracking_ref],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
+                    env=git_env,
                 )
                 if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
+                    print(f"✗ Failed to reset to {update_target.tracking_ref}.")
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  Try manually: git fetch {update_target.remote} "
+                        f"'{update_target.refspec}' && git reset --hard "
+                        f"{update_target.tracking_ref}"
                     )
                     sys.exit(1)
 
@@ -5215,6 +8362,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
+                        env=git_env,
                     )
                     if rollback_result.returncode == 0:
                         print("  ✓ Rollback complete — your install is unchanged.")
@@ -5250,13 +8398,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         auto_stash_ref,
                     )
                 else:
-                    _m()._restore_stashed_changes(
+                    local_state_restored = bool(_m()._restore_stashed_changes(
                         git_cmd,
                         _m().PROJECT_ROOT,
                         auto_stash_ref,
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
-                    )
+                    ))
+
+        if not local_state_restored:
+            print(
+                "✗ Local changes were not restored cleanly; refusing to "
+                "continue or write a success receipt."
+            )
+            sys.exit(1)
 
         _invalidate_update_cache()
 
@@ -5319,9 +8474,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._record_bytecode_fingerprint()
         _m()._refresh_bootstrap_cache_scripts(branch)
 
-        # Fork upstream sync logic (only for main branch on forks)
+        # Fork upstream sync logic (only for main branch on forks).
         if is_fork and branch == "main":
-            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+            _m()._sync_with_upstream_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                fork_remote=update_target.remote,
+            )
+            target_sha = _refresh_update_target_sha(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                update_target,
+                env=git_env,
+            )
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -5338,6 +8503,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # marker survives and the next ``hermes`` launch finishes the install
         # via ``_recover_from_interrupted_install``. Cleared after the core
         # ``.[all]`` install completes — lazy refresh uses a separate marker.
+        dependencies_ok = False
         _write_update_incomplete_marker()
         print("→ Updating Python dependencies...")
         from hermes_cli.managed_uv import ensure_uv, update_managed_uv
@@ -5391,6 +8557,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
                 _install_psutil_android_compat(pip_cmd)
             _m()._install_python_dependencies_with_optional_fallback(pip_cmd, group=install_group)
+        dependencies_ok = True
 
         install_prefix = [uv_bin, "pip"] if uv_bin else pip_cmd
         lazy_env = uv_env if uv_bin else None
@@ -5431,6 +8598,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if lazy_ok:
             _m()._clear_lazy_refresh_incomplete_marker()
         else:
+            dependencies_ok = False
             print(
                 "  ⚠ Lazy-refresh recovery incomplete — run `hermes` again "
                 "to finish import-based venv repair."
@@ -5853,8 +9021,38 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
+        elif not import_ok or not dependencies_ok:
+            print(
+                "⚠ Update did not pass the final runtime health proof; "
+                "no success receipt was written."
+            )
         else:
-            _print_update_completion(_update_complete_message(pre_update_version))
+            resulting_head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            if resulting_head is None or target_sha != resulting_head:
+                print(
+                    "⚠ Installed Git identity could not be proven; "
+                    "no success receipt was written."
+                )
+            else:
+                _record_update_success(
+                    args,
+                    mode="git",
+                    branch=branch,
+                    remote=update_target.remote,
+                    target_ref=update_target.tracking_ref,
+                    target_sha=target_sha,
+                    resulting_head=resulting_head,
+                    archive_sha=None,
+                    health={
+                        "critical_syntax": syntax_ok,
+                        "critical_imports": import_ok,
+                        "dependencies": dependencies_ok,
+                        "node_dependencies": not bool(node_failures),
+                    },
+                )
+                _print_update_completion(
+                    _update_complete_message(pre_update_version)
+                )
 
         # Search-index optimization notice (v23). Existing installs keep their
         # working search index untouched on update; the compact v23 layout —
@@ -6730,8 +9928,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _exit_code_path.write_text("1", encoding="utf-8")
                     except OSError:
                         pass
-
-        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
 
         # Warn if legacy Hermes gateway unit files are still installed.
         # When both hermes.service (from a pre-rename install) and the

@@ -63,7 +63,9 @@ def _proc(pid: int, exe: str, name: str, cmdline: list[str] | None = None, cwd: 
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
-def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
+def test_detect_venv_python_excludes_only_self_and_reports_venv_ancestor(
+    _winp, tmp_path
+):
     import os as _os
 
     venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
@@ -83,7 +85,33 @@ def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
     with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
         sys.modules, {"psutil": fake_psutil}
     ):
-        assert cli_main._detect_venv_python_processes() == []
+        assert cli_main._detect_venv_python_processes() == [
+            (555, "hermes.exe", "")
+        ]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_strict_keeps_target_candidate_with_unreadable_exe(_winp, tmp_path):
+    root_text = str(tmp_path)
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: iter(
+            [
+                _proc(
+                    777,
+                    None,
+                    "python.exe",
+                    ["python.exe", "-m", "hermes_cli.main", "serve"],
+                    cwd=root_text,
+                )
+            ]
+        )
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes(strict=True) == [
+            (777, "python.exe", "python.exe -m hermes_cli.main serve")
+        ]
 
 
 
