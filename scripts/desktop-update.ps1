@@ -314,14 +314,20 @@ function Resolve-ManagedVenvPythonLaunch([string]$VenvPython) {
             }
             $values[$key] = $value
         }
-        if (-not $values.ContainsKey('home') -or -not $values.ContainsKey('executable')) {
+        if (-not $values.ContainsKey('home')) {
             throw 'pyvenv.cfg does not identify the base interpreter'
         }
         $baseHome = (Resolve-Path -LiteralPath $values['home'] -ErrorAction Stop).ProviderPath
         $baseHome = [System.IO.Path]::GetFullPath($baseHome).TrimEnd([char[]]@('\', '/'))
-        $basePython = (Resolve-Path -LiteralPath $values['executable'] -ErrorAction Stop).ProviderPath
+        $basePythonPath = if ($values.ContainsKey('executable')) {
+            $values['executable']
+        } else {
+            Join-Path $values['home'] 'python.exe'
+        }
+        $basePython = (Resolve-Path -LiteralPath $basePythonPath -ErrorAction Stop).ProviderPath
         $basePython = [System.IO.Path]::GetFullPath($basePython)
-        if (-not [string]::Equals((Split-Path -Leaf $basePython), 'python.exe', [StringComparison]::OrdinalIgnoreCase) -or
+        if (-not (Test-Path -LiteralPath $basePython -PathType Leaf) -or
+            -not [string]::Equals((Split-Path -Leaf $basePython), 'python.exe', [StringComparison]::OrdinalIgnoreCase) -or
             -not [string]::Equals((Split-Path -Parent $basePython).TrimEnd([char[]]@('\', '/')), $baseHome, [StringComparison]::OrdinalIgnoreCase)) {
             throw 'pyvenv.cfg base interpreter is not the exact python.exe under home'
         }
