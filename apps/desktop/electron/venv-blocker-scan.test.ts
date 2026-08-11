@@ -272,6 +272,11 @@ describe('parseVenvBlockerScanOutput', () => {
     )
 
     assert.equal(outcome.kind, 'blocked')
+
+    if (outcome.kind === 'blocked') {
+      assert.equal(outcome.result.mcpBridges[0]?.wrapperPid, 42)
+      assert.equal(outcome.result.mcpBridges[1]?.wrapperPid, undefined)
+    }
   })
 
   it('does not count an exact pausable gateway as a blocker', () => {
