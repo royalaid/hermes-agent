@@ -2,65 +2,25 @@ import assert from 'node:assert/strict'
 import type { SpawnOptions } from 'node:child_process'
 import path from 'node:path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
-  MARKER_SELF_ADOPT_EPOCH_MS,
+  captureSpawnedUpdaterCreatedAt,
+  isSpawnedUpdaterGenerationActive,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
   spawnUpdaterProcess,
-  stagedUpdaterSupportsPrewrittenMarker,
+  STAGED_UPDATER_BRIDGE_LEASE_ENV,
+  stagedUpdaterEnvironment,
+  terminateSpawnedUpdaterIfExact,
   wrapHandoffForDetachedConsole
 } from './updater-process'
 
-const DAY_MS = 24 * 60 * 60 * 1000
-
-test('stagedUpdaterSupportsPrewrittenMarker rejects installers predating the self-adopt fix', () => {
-  // The real-world trap: an installer staged at first install months ago, never
-  // refreshed because copy_self_to_hermes_home no-ops during --update.
-  assert.equal(
-    stagedUpdaterSupportsPrewrittenMarker('C:\\Hermes\\hermes-setup.exe', {
-      stagedMtimeMs: () => MARKER_SELF_ADOPT_EPOCH_MS - 60 * DAY_MS
-    }),
-    false
-  )
-})
-
-test('stagedUpdaterSupportsPrewrittenMarker accepts installers from the fix onward', () => {
-  assert.equal(
-    stagedUpdaterSupportsPrewrittenMarker('C:\\Hermes\\hermes-setup.exe', {
-      stagedMtimeMs: () => MARKER_SELF_ADOPT_EPOCH_MS
-    }),
-    true
-  )
-  assert.equal(
-    stagedUpdaterSupportsPrewrittenMarker('C:\\Hermes\\hermes-setup.exe', {
-      stagedMtimeMs: () => MARKER_SELF_ADOPT_EPOCH_MS + 30 * DAY_MS
-    }),
-    true
-  )
-})
-
-test('stagedUpdaterSupportsPrewrittenMarker treats an unreadable mtime as unsupported', () => {
-  // Bias toward the path that can always make progress: a skipped pre-write
-  // loses anti-respawn hardening, a wedged updater can never update again.
-  assert.equal(
-    stagedUpdaterSupportsPrewrittenMarker('C:\\Hermes\\hermes-setup.exe', {
-      stagedMtimeMs: () => null
-    }),
-    false
-  )
-})
-
-test('resolveStagedUpdaterBinary still returns a stale staged updater on Windows', () => {
-  // Staleness gates only the marker PRE-WRITE, never the hand-off itself:
-  // the stale binary is the only updater these users have, and it works fine
-  // once it is allowed to write its own claim.
+test('resolveStagedUpdaterBinary returns the staged updater on Windows without guessing its generation', () => {
   assert.equal(
     resolveStagedUpdaterBinary('C:\\Hermes', {
       fileExists: () => true,
-      isWindows: true,
-      stagedMtimeMs: () => MARKER_SELF_ADOPT_EPOCH_MS - 60 * DAY_MS
+      isWindows: true
     }),
     path.join('C:\\Hermes', 'hermes-setup.exe')
   )
@@ -71,6 +31,7 @@ test('spawnUpdaterProcess hides the updater console and detaches the child on Wi
   let unrefCalls = 0
 
   const child = {
+    kill: () => true,
     pid: 4242,
     unref: () => {
       unrefCalls += 1
@@ -114,12 +75,135 @@ test('spawnUpdaterProcess preserves updater options off Windows', () => {
       spawnProcess: (_command, _args, options) => {
         capturedOptions = options
 
-        return { unref: () => {} }
+        return { kill: () => true, unref: () => {} }
       }
     }
   )
 
   assert.deepEqual(capturedOptions, { detached: true, stdio: 'ignore' })
+})
+
+test('staged bridge capability travels only through the private child environment', () => {
+  const token = 'unguessable-lease-id'
+  const base = { PATH: 'C:\\Windows' }
+  const env = stagedUpdaterEnvironment(base, token)
+
+  assert.deepEqual(base, { PATH: 'C:\\Windows' })
+  assert.equal(env[STAGED_UPDATER_BRIDGE_LEASE_ENV], token)
+  assert.equal(Object.values(base).includes(token), false)
+})
+
+test('captures and terminates only the exact spawned updater PID generation', async () => {
+  const terminated: number[] = []
+  const query = async () => 1_723_330_000
+
+  const child = {
+    pid: 42,
+    unref: () => {},
+    kill: () => {
+      terminated.push(42)
+
+      return true
+    }
+  }
+
+  assert.equal(await captureSpawnedUpdaterCreatedAt(42, { queryCreatedAt: query }), 1_723_330_000)
+  assert.equal(
+    await terminateSpawnedUpdaterIfExact(child, 1_723_330_000, { queryCreatedAt: query }),
+    true
+  )
+  assert.deepEqual(terminated, [42])
+})
+
+test('probes liveness through the retained updater handle', () => {
+  const signals: Array<NodeJS.Signals | number | undefined> = []
+
+  const child = {
+    pid: 42,
+    unref: () => {},
+    kill: (signal?: NodeJS.Signals | number) => {
+      signals.push(signal)
+
+      return true
+    }
+  }
+
+  assert.equal(isSpawnedUpdaterGenerationActive(child), true)
+  assert.deepEqual(signals, [0])
+})
+
+test('treats a false or throwing retained-handle liveness probe as inactive', () => {
+  assert.equal(
+    isSpawnedUpdaterGenerationActive({ pid: 42, unref: () => {}, kill: () => false }),
+    false
+  )
+  assert.equal(
+    isSpawnedUpdaterGenerationActive({
+      pid: 42,
+      unref: () => {},
+      kill: () => {
+        throw new Error('handle closed')
+      }
+    }),
+    false
+  )
+})
+
+test('never terminates after PID reuse or an unknown creation-time probe', async () => {
+  for (const observed of [1_723_330_001, null]) {
+    const kill = vi.fn(() => true)
+    assert.equal(
+      await terminateSpawnedUpdaterIfExact({ pid: 42, unref: () => {}, kill }, 1_723_330_000, {
+        queryCreatedAt: async () => observed
+      }),
+      false
+    )
+    assert.equal(kill.mock.calls.length, 0)
+  }
+})
+
+test('terminates through the retained child handle when the PID is reused after identity proof', async () => {
+  const expectedCreatedAt = 1_723_330_000
+  let currentGeneration = 'spawned-updater'
+  const reopenedGenerations: string[] = []
+  const exactHandleKills: string[] = []
+
+  const child = {
+    pid: 42,
+    unref: () => {},
+    kill: () => {
+      exactHandleKills.push('spawned-updater')
+
+      return true
+    }
+  }
+
+  const reopenPid = vi.spyOn(process, 'kill').mockImplementation(() => {
+    reopenedGenerations.push(currentGeneration)
+
+    return true
+  })
+
+  try {
+    assert.equal(
+      await terminateSpawnedUpdaterIfExact(child, expectedCreatedAt, {
+        queryCreatedAt: async () => {
+          const observedCreatedAt = expectedCreatedAt
+
+          // Model the updater exiting and its numeric PID being reused after
+          // the creation-time proof, but before termination is attempted.
+          currentGeneration = 'replacement-process'
+
+          return observedCreatedAt
+        }
+      }),
+      true
+    )
+    assert.deepEqual(exactHandleKills, ['spawned-updater'])
+    assert.deepEqual(reopenedGenerations, [])
+  } finally {
+    reopenPid.mockRestore()
+  }
 })
 
 test('resolveStagedUpdaterBinary hands Windows the staged installer it finds', () => {

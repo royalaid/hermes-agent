@@ -62,4 +62,16 @@ function isOfficialSshRemote(url) {
   return isSshRemote(url) && canonicalGitHubRemote(url) === OFFICIAL_REPO_CANONICAL
 }
 
-export { canonicalGitHubRemote, isOfficialSshRemote, isSshRemote, OFFICIAL_REPO_CANONICAL, OFFICIAL_REPO_HTTPS_URL }
+/** Refresh the exact tracking ref read by the subsequent update comparison. */
+function updateBranchFetchArgs(branch: string): string[] {
+  return ['fetch', '--quiet', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]
+}
+
+export {
+  canonicalGitHubRemote,
+  isOfficialSshRemote,
+  isSshRemote,
+  OFFICIAL_REPO_CANONICAL,
+  OFFICIAL_REPO_HTTPS_URL,
+  updateBranchFetchArgs
+}

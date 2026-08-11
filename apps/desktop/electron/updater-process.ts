@@ -3,9 +3,13 @@ import { statSync } from 'node:fs'
 import path from 'node:path'
 
 import { hiddenWindowsChildOptions } from './windows-child-options'
+import { queryWindowsProcessCreatedAt } from './windows-process-identity'
+
+export const STAGED_UPDATER_BRIDGE_LEASE_ENV = 'HERMES_UPDATE_BRIDGE_LEASE_ID'
 
 export interface UpdaterChild {
   pid?: number
+  kill: (signal?: NodeJS.Signals | number) => boolean
   unref: () => void
 }
 
@@ -97,33 +101,13 @@ export function wrapHandoffForDetachedConsole(
 export interface ResolveStagedUpdaterBinaryDeps {
   isWindows?: boolean
   fileExists?: (candidate: string) => boolean
-  stagedMtimeMs?: (candidate: string) => number | null
 }
-
-/**
- * Staged installers older than this have no self-PID exclusion in
- * `UpdateMarkerGuard::acquire` and will refuse an update whose marker was
- * pre-written on their behalf.
- *
- * The self-adopt fix landed in #74782 / 160586ff8 (2026-07-30 17:57 +0700).
- * We compare against the start of 2026-07-31 UTC so the boundary is
- * unambiguous for binaries staged that same day.
- */
-export const MARKER_SELF_ADOPT_EPOCH_MS = Date.UTC(2026, 6, 31)
 
 function stagedFileExists(candidate: string): boolean {
   try {
     return statSync(candidate).isFile()
   } catch {
     return false
-  }
-}
-
-function stagedFileMtimeMs(candidate: string): number | null {
-  try {
-    return statSync(candidate).mtimeMs
-  } catch {
-    return null
   }
 }
 
@@ -166,40 +150,17 @@ export function resolveStagedUpdaterBinary(
   return fileExists(candidate) ? candidate : null
 }
 
-/**
- * True when the staged installer is new enough to survive a pre-written marker.
- *
- * `copy_self_to_hermes_home` deliberately no-ops during `--update`
- * (apps/bootstrap-installer/src-tauri/src/paths.rs), so the binary staged by a
- * user's ORIGINAL install orchestrates every later update — forever. Installers
- * predating #74782 have no self-PID exclusion in `UpdateMarkerGuard::acquire`,
- * so when the desktop pre-writes the marker naming that very updater, the
- * updater reads its own claim as a foreign live owner and aborts with
- * "Another Hermes update is already running (PID <itself>, started 1s ago)" —
- * the observed infinite "Install didn't finish" loop. Skipping the pre-write
- * for those binaries lets them acquire cleanly and run `hermes update`, which
- * pulls the permanent fixes. See shouldPrewriteUpdateMarker.
- *
- * We cannot ask the binary its version without executing it, so use its mtime:
- * the installer is written to HERMES_HOME at install/repair time, making mtime
- * a faithful stamp of which installer generation produced it.
- *
- * Unreadable mtime counts as UNSUPPORTED — the pre-write is a best-effort
- * hardening, while a wedged updater is unrecoverable, so we bias toward the
- * path that can always make progress.
- */
-export function stagedUpdaterSupportsPrewrittenMarker(
-  candidate: string,
-  deps: ResolveStagedUpdaterBinaryDeps = {}
-): boolean {
-  const mtimeMs = (deps.stagedMtimeMs ?? stagedFileMtimeMs)(candidate)
-
-  return typeof mtimeMs === 'number' && Number.isFinite(mtimeMs) && mtimeMs >= MARKER_SELF_ADOPT_EPOCH_MS
-}
-
 export interface SpawnUpdaterProcessDeps {
   isWindows?: boolean
   spawnProcess?: (command: string, args: string[], options: SpawnOptions) => UpdaterChild
+}
+
+interface ExactUpdaterProcessDeps {
+  queryCreatedAt?: (pid: number) => Promise<number | null>
+}
+
+export function stagedUpdaterEnvironment(baseEnv: NodeJS.ProcessEnv, bridgeLeaseId: string): NodeJS.ProcessEnv {
+  return { ...baseEnv, [STAGED_UPDATER_BRIDGE_LEASE_ENV]: bridgeLeaseId }
 }
 
 /**
@@ -223,4 +184,64 @@ export function spawnUpdaterProcess(
   child.unref()
 
   return child
+}
+
+/** Capture the OS creation identity immediately after an updater spawn. */
+export async function captureSpawnedUpdaterCreatedAt(
+  pid: number,
+  { queryCreatedAt = queryWindowsProcessCreatedAt }: ExactUpdaterProcessDeps = {}
+): Promise<number | null> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {return null}
+  let createdAt: number | null
+
+  try {
+    createdAt = await queryCreatedAt(pid)
+  } catch {
+    return null
+  }
+
+  return Number.isSafeInteger(createdAt) && Number(createdAt) > 0 ? Number(createdAt) : null
+}
+
+/** Probe the retained spawned generation without reopening its numeric PID. */
+export function isSpawnedUpdaterGenerationActive(child: UpdaterChild): boolean {
+  try {
+    return child.kill(0)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Stop only the exact spawned updater generation. A missing, denied, exited,
+ * or PID-reused process is retained rather than risking an unrelated target.
+ */
+export async function terminateSpawnedUpdaterIfExact(
+  child: UpdaterChild,
+  expectedCreatedAt: number,
+  { queryCreatedAt = queryWindowsProcessCreatedAt }: ExactUpdaterProcessDeps = {}
+): Promise<boolean> {
+  const pid = child.pid
+
+  if (
+    !Number.isSafeInteger(pid) ||
+    Number(pid) <= 0 ||
+    !Number.isSafeInteger(expectedCreatedAt) ||
+    expectedCreatedAt <= 0
+  ) {
+    return false
+  }
+
+  const currentCreatedAt = await captureSpawnedUpdaterCreatedAt(Number(pid), { queryCreatedAt })
+
+  if (currentCreatedAt !== expectedCreatedAt) {return false}
+
+  try {
+    // ChildProcess.kill routes through libuv's retained process handle on
+    // Windows. Unlike process.kill(pid), it cannot reopen a replacement that
+    // reused the updater's numeric PID after the identity proof above.
+    return child.kill()
+  } catch {
+    return false
+  }
 }
