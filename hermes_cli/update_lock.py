@@ -23,10 +23,11 @@ unchanged and remain byte-compatible with the Rust and Electron readers:
 
     <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
 
-A marker only counts as a live update when its pid is alive AND it is younger
-than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
-crashed updater self-heals instead of wedging every future update. A stale
-marker is removed on read by whoever notices it first.
+A marker counts as live while its exact process identity remains live.  The
+timestamp bounds malformed/future claims and lets dead claims self-heal, but a
+legitimate long dependency rebuild is not stolen merely because it crosses a
+wall-clock ceiling.  PID create time prevents a reused numeric PID from
+reviving an old claim.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -51,7 +52,9 @@ Two mechanisms recognize the orchestrating parent, and either suffices:
 from __future__ import annotations
 
 import logging
+import math
 import os
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,9 +93,9 @@ def update_marker_path() -> Path:
     desktop pins that same value into the updater's env. A profile-scoped path
     here would put the lock somewhere the other two owners never look.
     """
-    from hermes_constants import get_process_hermes_home
+    from hermes_constants import get_default_hermes_root
 
-    return get_process_hermes_home() / MARKER_NAME
+    return get_default_hermes_root() / MARKER_NAME
 
 
 def _pid_alive(pid: int) -> bool:
@@ -105,20 +108,181 @@ def _pid_alive(pid: int) -> bool:
     process group (bpo-14484). A liveness check that killed the updater it was
     asking about would be a spectacular way to fix a concurrency bug.
 
-    Any pid we cannot evaluate counts as dead: a corrupt marker must not wedge
-    the lock forever.
+    Any positive pid we cannot evaluate counts as live.  Mutation must stop
+    when liveness is unprovable; malformed/non-positive pids are still stale.
     """
     if pid <= 0:
         return False
     try:
-        from gateway.status import _pid_exists
+        # Stdlib-only and, critically, treats Windows OpenProcess access denial
+        # as evidence that the PID exists. A protected updater must block a
+        # second mutation; "could not inspect" is not proof of death.
+        from hermes_mcp_update_gate import _pid_alive as probe_pid
 
-        return bool(_pid_exists(pid))
+        return bool(probe_pid(pid))
     except Exception as exc:
-        # Import failure or an unusable pid (e.g. larger than the platform's
-        # pid_t). Treat the marker as stale rather than blocking updates.
+        # A probe failure is not evidence that the owner died.  This lock
+        # protects source mutation, so an unprovable positive PID must fail
+        # closed instead of deleting a possibly-live updater's claim.
         logger.debug("Could not probe pid %s: %s", pid, exc)
+        return True
+
+
+def _pid_matches_update_owner(pid: int, started_at: float) -> bool:
+    """Prove the marker predates the same live process, failing closed.
+
+    A definitive missing process or a process created after the marker means
+    the numeric PID was reused.  Access denial, a missing optional probe, or
+    any other inspection failure is not proof that mutation stopped and must
+    continue to block.
+    """
+    if pid <= 0 or not math.isfinite(started_at) or started_at <= 0:
         return False
+    if not _pid_alive(pid):
+        return False
+    try:
+        import psutil
+
+        created_at = float(psutil.Process(pid).create_time())
+    except ImportError:
+        return True
+    except Exception as exc:
+        try:
+            import psutil
+
+            if isinstance(exc, psutil.NoSuchProcess):
+                return False
+            if isinstance(exc, psutil.AccessDenied):
+                return True
+        except Exception:
+            pass
+        logger.debug("Could not validate create time for pid %s: %s", pid, exc)
+        return True
+    if not math.isfinite(created_at) or created_at <= 0:
+        return True
+    # The marker uses whole epoch seconds, so the same owner can have a
+    # fractional creation time within that one serialized second. A process
+    # created one full second later is a reused PID, not clock skew.
+    return created_at < started_at + 1.0
+
+
+def _restore_tombstone_without_overwrite(tombstone: Path, marker: Path) -> None:
+    """Restore moved bytes only when no newer marker occupies the path."""
+    # A hard link is an atomic exclusive restore: it either publishes the
+    # exact tombstoned bytes or observes a newer claim.  It also avoids the
+    # partial-file window of open/write/fsync.  Some filesystems do not
+    # support links, so retain a fail-closed exclusive-copy fallback.
+    try:
+        os.link(tombstone, marker)
+    except FileExistsError:
+        try:
+            tombstone.unlink()
+        except OSError:
+            pass
+        return
+    except OSError:
+        pass
+    else:
+        try:
+            tombstone.unlink()
+        except OSError:
+            pass
+        return
+
+    try:
+        payload = tombstone.read_bytes()
+    except OSError:
+        return
+    descriptor = None
+    restored = False
+    superseded = False
+    try:
+        descriptor = os.open(
+            marker,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        restored = True
+    except FileExistsError:
+        superseded = True  # a newer claim is authoritative; never overwrite it
+    except OSError as exc:
+        # Preserve both the tombstone and any partial exclusive destination.
+        # Deleting either after a failed write could erase the only evidence
+        # of a live foreign owner; subsequent acquisition therefore fails
+        # closed until the condition can be inspected/recovered.
+        logger.warning("Could not restore update marker %s: %s", marker, exc)
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if restored or superseded:
+            try:
+                tombstone.unlink()
+            except OSError:
+                pass
+
+
+def _move_marker_if_unchanged(marker: Path, expected: str) -> Path | None:
+    """Move *marker* aside only if the moved bytes still match *expected*.
+
+    There is no portable compare-and-unlink primitive. Moving first and then
+    inspecting the exact inode prevents cleanup from deleting a foreign
+    replacement; a mismatch is restored with exclusive creation so it cannot
+    overwrite an even newer claim.
+    """
+    tombstone = marker.with_name(
+        f"{marker.name}.release-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    try:
+        os.replace(marker, tombstone)
+        moved = tombstone.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if moved != expected:
+        _restore_tombstone_without_overwrite(tombstone, marker)
+        return None
+    return tombstone
+
+
+def _has_pending_recovery(marker: Path) -> bool:
+    """Return whether a recent release tombstone requires fail-closed recovery."""
+    try:
+        candidates = list(marker.parent.glob(f"{marker.name}.release-*"))
+    except OSError:
+        return True
+    pending = False
+    now = time.time()
+    for candidate in candidates:
+        try:
+            age = now - candidate.stat().st_mtime
+        except OSError:
+            return True
+        if not math.isfinite(age) or age <= UPDATE_MARKER_MAX_AGE_SECONDS:
+            pending = True
+            continue
+        try:
+            raw = candidate.read_text(encoding="utf-8")
+            lines = raw.splitlines()
+            pid = int(lines[0].strip())
+            started_at = float(lines[1].strip())
+        except (OSError, IndexError, TypeError, ValueError):
+            pid = -1
+            started_at = float("-inf")
+        if _pid_matches_update_owner(pid, started_at):
+            pending = True
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            pending = True
+    return pending
 
 
 def _handoff_pid() -> int | None:
@@ -166,14 +330,16 @@ class UpdateHolder:
 
     pid: int
     age_seconds: float
+    started_at: float
+    raw: str
 
 
 def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
-    Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
-    unreadable, malformed, dead-pid, and past-the-ceiling all mean "no live
-    update", and a stale marker file is deleted so it can't strand future runs.
+    Absent, unreadable, malformed, definitively dead, and PID-reused claims
+    mean "no live update". A live process remains authoritative past the
+    ordinary age ceiling so a long dependency rebuild cannot be stolen.
     Never raises.
     """
     marker = path or update_marker_path()
@@ -193,14 +359,20 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
         started_at = float("-inf")
 
     age = time.time() - started_at
-    if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
-        try:
-            marker.unlink()
-        except OSError:
-            pass
+    if (
+        not math.isfinite(age)
+        or age < -5
+        or not _pid_matches_update_owner(pid, started_at)
+    ):
+        tombstone = _move_marker_if_unchanged(marker, raw)
+        if tombstone is not None:
+            try:
+                tombstone.unlink()
+            except OSError:
+                pass
         return None
 
-    return UpdateHolder(pid=pid, age_seconds=age)
+    return UpdateHolder(pid=pid, age_seconds=age, started_at=started_at, raw=raw)
 
 
 def describe_holder(holder: UpdateHolder) -> str:
@@ -231,6 +403,9 @@ class UpdateLock:
         self.path = path or update_marker_path()
         self.acquired = False
         self.holder: UpdateHolder | None = None
+        self.failure_reason: str | None = None
+        self._claim_raw: str | None = None
+        self._proof_raw: str | None = None
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -242,42 +417,97 @@ class UpdateLock:
         the parent's marker untouched. The ancestry path exists because staged
         updaters older than the HANDOFF_PID_ENV export never send the env var.
         """
+        if _has_pending_recovery(self.path):
+            self.failure_reason = "marker-recovery-pending"
+            return False
         existing = read_live_update(path=self.path)
         if existing is not None:
             if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+                self._proof_raw = existing.raw
                 return True
             self.holder = existing
+            self.failure_reason = "live-holder"
             return False
+        if _has_pending_recovery(self.path):
+            self.failure_reason = "marker-recovery-pending"
+            return False
+        started_at = int(time.time())
+        claim = f"{os.getpid()}\n{started_at}\n"
+        descriptor = None
+        open_attempted = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
+            open_attempted = True
+            descriptor = os.open(
+                self.path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0),
+                0o600,
             )
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                descriptor = None
+                stream.write(claim)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError:
+            if not open_attempted:
+                self.failure_reason = "marker-write-failed"
+                return False
+            self.holder = read_live_update(path=self.path)
+            self.failure_reason = (
+                "live-holder" if self.holder is not None else "unverifiable-marker"
+            )
+            return False
         except OSError as exc:
-            # Best-effort, exactly like the Rust guard: an unwritable marker
-            # must not block the update itself (that would be a worse failure
-            # than the race it prevents). Degrade to the pre-lock behavior.
             logger.debug("Could not write update marker %s: %s", self.path, exc)
-            return True
+            self.failure_reason = "marker-write-failed"
+            return False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
         self.acquired = True
+        self._claim_raw = claim
+        self._proof_raw = claim
         return True
+
+    def prove_claim(self) -> bool:
+        """Revalidate the exact own/inherited marker bytes and liveness."""
+        expected = self._proof_raw
+        if expected is None:
+            return False
+        try:
+            if self.path.read_text(encoding="utf-8") != expected:
+                return False
+        except OSError:
+            return False
+        holder = read_live_update(path=self.path)
+        if holder is None or holder.raw != expected:
+            return False
+        try:
+            return self.path.read_text(encoding="utf-8") == expected
+        except OSError:
+            return False
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""
         if not self.acquired:
+            self._proof_raw = None
             return
         self.acquired = False
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
-        except (OSError, IndexError, ValueError):
+        self._proof_raw = None
+        if self._claim_raw is None:
             return
-        if owner != os.getpid():
-            # A handoff partner took ownership (e.g. the Tauri updater wrote
-            # its own pid). Leave it alone — it's still a live update.
+        tombstone = _move_marker_if_unchanged(self.path, self._claim_raw)
+        self._claim_raw = None
+        if tombstone is None:
             return
         try:
-            self.path.unlink()
+            tombstone.unlink()
         except OSError:
             pass
 
