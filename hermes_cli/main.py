@@ -4998,6 +4998,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_refresh_bootstrap_cache_scripts",
         "_refresh_windows_gateway_launchers",
         "_release_update_quiesce_lease",
+        "_revalidate_pausable_gateway_identity",
         "_reload_updated_runtime_modules",
         "_resolve_pre_update_backup_mode",
         "_resolve_stash_selector",

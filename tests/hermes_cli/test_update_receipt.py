@@ -165,7 +165,7 @@ class TestCommandBoundaryFinalization:
         assert ur.read_latest_receipt() is None
 
     def test_cmd_update_boundary_finalizes_on_early_exit(
-        self, receipt_home, monkeypatch
+        self, receipt_home, monkeypatch, platform_neutral_update_lifecycle
     ):
         """End-to-end through the real cmd_update wrapper: an impl that begins
         a receipt then sys.exit(2)s (the concurrent-instance shape) must leave
@@ -193,11 +193,13 @@ class TestCommandBoundaryFinalization:
         monkeypatch.setattr(
             hermes_main, "_finalize_update_output", lambda state: None, raising=False
         )
-
         class _FakeLock:
             holder = None
 
             def acquire(self):
+                return True
+
+            def prove_claim(self):
                 return True
 
             def release(self):
@@ -208,7 +210,7 @@ class TestCommandBoundaryFinalization:
         monkeypatch.setattr(update_lock_mod, "UpdateLock", _FakeLock)
 
         args = SimpleNamespace(
-            check=False, gateway=False, branch=None, yes=False,
+            check=False, gateway=False, branch=None, yes=True,
             force=False, force_venv=False,
         )
         with pytest.raises(SystemExit) as exc_info:

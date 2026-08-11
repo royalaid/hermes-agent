@@ -27,7 +27,7 @@ test('idle relaunch watch caches process identity and does not repeatedly probe'
       assert.equal(identity.currentRoot, 'C:\\Users\\hermes\\hermes-agent')
       assert.equal(identity.currentProcessStartedAt, 1_725_000_000)
 
-      return 'idle'
+      return 'idle' as const
     },
     currentExecutable: 'C:\\Program Files\\Hermes\\Hermes.exe',
     currentPid: 4321,
