@@ -53,6 +53,7 @@ const DEFAULT_GENERIC_HOLDER_TIMEOUT_MS = 30_000
 const DEFAULT_RESPAWN_INTERVAL_MS = 1_500
 const DEFAULT_TERMINATION_SETTLE_MS = 750
 const MAX_FALLBACK_BRIDGE_GROUPS = 32
+const MAX_FALLBACK_BRIDGE_RECORDS = 64
 
 function wait(delayMs: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, delayMs))
@@ -63,9 +64,7 @@ function errorText(error: unknown): string {
 }
 
 function exactMcpOnly(result: VenvBlockerScanResult): boolean {
-  return (
-    result.processes.length === 0 && result.mcpBridges.length > 0 && result.mcpBridges.every(isExactActionableMcpBridge)
-  )
+  return result.processes.length === 0 && exactActionableMcpBridges(result)
 }
 
 function exactActionableMcpBridges(result: VenvBlockerScanResult): boolean {
@@ -304,7 +303,11 @@ export async function runWindowsUpdatePreflight(
       const exactCurrentBridges = exactActionableMcpBridges(firstClear.result)
       const logicalBridgeGroups = logicalMcpBridgeGroupCount(firstClear.result)
 
-      if (!exactCurrentBridges || logicalBridgeGroups > MAX_FALLBACK_BRIDGE_GROUPS) {
+      if (
+        !exactCurrentBridges ||
+        logicalBridgeGroups > MAX_FALLBACK_BRIDGE_GROUPS ||
+        firstClear.result.mcpBridges.length > MAX_FALLBACK_BRIDGE_RECORDS
+      ) {
         return {
           kind: 'blocked',
           reason: 'quiesce-incomplete',
@@ -369,22 +372,41 @@ export async function runWindowsUpdatePreflight(
       }
     }
 
-    await sleep(respawnIntervalMs)
-    const secondClear = await scanFailClosed()
+    while (true) {
+      await sleep(respawnIntervalMs)
+      let secondClear = await scanFailClosed()
 
-    if (secondClear.kind === 'probe-failure') {
-      return { kind: 'probe-failure', error: secondClear.error, message: formatProbeFailedMessage() }
-    }
-
-    if (secondClear.kind === 'blocked') {
-      return {
-        kind: 'blocked',
-        reason: 'quiesce-incomplete',
-        result: secondClear.result,
-        message: exactMcpOnly(secondClear.result)
-          ? quiesceIncompleteMessage(secondClear.result)
-          : formatBlockerMessage(secondClear.result)
+      if (secondClear.kind === 'probe-failure') {
+        return { kind: 'probe-failure', error: secondClear.error, message: formatProbeFailedMessage() }
       }
+
+      if (secondClear.kind === 'blocked' && genericHoldersOnly(secondClear.result)) {
+        genericHolderDeadline ??= now() + genericHolderTimeoutMs
+        secondClear = await pollGenericHoldersUntil(secondClear, genericHolderDeadline)
+
+        if (secondClear.kind === 'probe-failure') {
+          return { kind: 'probe-failure', error: secondClear.error, message: formatProbeFailedMessage() }
+        }
+
+        if (secondClear.kind === 'clear') {
+          // The holder exited, but the last clear observation has not yet
+          // survived a full stability interval.
+          continue
+        }
+      }
+
+      if (secondClear.kind === 'blocked') {
+        return {
+          kind: 'blocked',
+          reason: 'quiesce-incomplete',
+          result: secondClear.result,
+          message: exactMcpOnly(secondClear.result)
+            ? quiesceIncompleteMessage(secondClear.result)
+            : formatBlockerMessage(secondClear.result)
+        }
+      }
+
+      break
     }
 
     returnLease = true
