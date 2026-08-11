@@ -48,6 +48,7 @@ test('a first-run bootstrap-needed remote apply connects without ensuring or boo
     connectRemote,
     ensureLocalRuntime,
     prepareLocalBackend,
+    startHandoffResultPoll: vi.fn(),
     resolveRemote,
     waitForDecision: gate.wait,
     waitForLocalStart
