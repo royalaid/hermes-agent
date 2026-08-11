@@ -133,6 +133,63 @@ def canonical_repository_identity(url: str, *, base: Path) -> str:
 
 
 @dataclass(frozen=True)
+class RepositoryResolution:
+    """Canonical identity and local-remote binding for one declared URL."""
+
+    identity: str | None
+    is_bound: bool
+
+
+class RepositoryBinding:
+    """Compare declared repository URLs with configured remotes, fail closed."""
+
+    def __init__(
+        self,
+        repository: str | Path,
+        configured_remote_urls: Sequence[str],
+    ) -> None:
+        self.repository = Path(repository).resolve()
+        self._configured_identities = frozenset(
+            identity
+            for url in configured_remote_urls
+            if (identity := self._canonical_identity(url)) is not None
+        )
+        self._resolutions: dict[str, RepositoryResolution] = {}
+
+    def _canonical_identity(self, url: object) -> str | None:
+        if not isinstance(url, str) or not url.strip():
+            return None
+        try:
+            return canonical_repository_identity(url, base=self.repository)
+        except (OSError, ValueError):
+            return None
+
+    def resolve(self, url: object) -> RepositoryResolution:
+        """Resolve a declaration once so identity and binding cannot diverge."""
+
+        if not isinstance(url, str) or not url.strip():
+            return RepositoryResolution(identity=None, is_bound=False)
+        cached = self._resolutions.get(url)
+        if cached is not None:
+            return cached
+        identity = self._canonical_identity(url)
+        resolution = RepositoryResolution(
+            identity=identity,
+            is_bound=(
+                identity is not None and identity in self._configured_identities
+            ),
+        )
+        self._resolutions[url] = resolution
+        return resolution
+
+    def canonical_identity(self, url: object) -> str | None:
+        return self.resolve(url).identity
+
+    def is_bound(self, url: object) -> bool:
+        return self.resolve(url).is_bound
+
+
+@dataclass(frozen=True)
 class GitResult:
     returncode: int
     stdout: str
@@ -1005,35 +1062,12 @@ def audit_manifest(
     integration_ref = integration.get("ref")
     upstream_ref = integration.get("upstream_ref")
     manifest_ready = manifest.get("manifest_state") == "ready"
-    configured_remote_identities: set[str] = set()
-    for remote_url in git.remote_urls():
-        try:
-            configured_remote_identities.add(
-                canonical_repository_identity(remote_url, base=git.repository)
-            )
-        except (OSError, ValueError):
-            continue
-
-    def repository_is_bound(url: object) -> bool:
-        if not isinstance(url, str) or not url.strip():
-            return False
-        try:
-            identity = canonical_repository_identity(url, base=git.repository)
-        except (OSError, ValueError):
-            return False
-        return identity in configured_remote_identities
-
-    def repository_identity(url: object) -> str | None:
-        if not isinstance(url, str) or not url.strip():
-            return None
-        try:
-            return canonical_repository_identity(url, base=git.repository)
-        except (OSError, ValueError):
-            return None
-
-    integration_repository_bound = repository_is_bound(integration_url)
-    upstream_repository_bound = repository_is_bound(upstream_url)
-    integration_repository_identity = repository_identity(integration_url)
+    repository_binding = RepositoryBinding(git.repository, git.remote_urls())
+    integration_repository_resolution = repository_binding.resolve(integration_url)
+    upstream_repository_resolution = repository_binding.resolve(upstream_url)
+    integration_repository_bound = integration_repository_resolution.is_bound
+    upstream_repository_bound = upstream_repository_resolution.is_bound
+    integration_repository_identity = integration_repository_resolution.identity
 
     for label, ref in (
         ("integration.ref", integration_ref),
@@ -1060,11 +1094,11 @@ def audit_manifest(
                 "release_manifest_not_ready",
                 "strict release audit requires manifest_state=ready",
             )
-        for label, url in (
-            ("integration", integration_url),
-            ("upstream", upstream_url),
+        for label, resolution in (
+            ("integration", integration_repository_resolution),
+            ("upstream", upstream_repository_resolution),
         ):
-            if not repository_is_bound(url):
+            if not resolution.is_bound:
                 _add(
                     findings,
                     "release_repository_unbound",
@@ -1189,8 +1223,9 @@ def audit_manifest(
         source_ref = source.get("ref")
         source_ref_valid = isinstance(source_ref, str) and git.check_ref_format(source_ref)
         local_source_tip = git.resolve_commit(source_ref) if source_ref_valid else None
-        source_repository_bound = repository_is_bound(source_url)
-        source_repository_identity = repository_identity(source_url)
+        source_repository_resolution = repository_binding.resolve(source_url)
+        source_repository_bound = source_repository_resolution.is_bound
+        source_repository_identity = source_repository_resolution.identity
 
         if isinstance(source_ref, str) and not source_ref_valid:
             _add(

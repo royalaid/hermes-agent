@@ -16,6 +16,7 @@ import pytest
 from fork_integration.audit import (
     CANONICAL_MANIFEST_PATH,
     GitProbe,
+    RepositoryBinding,
     audit_manifest,
     audit_release_candidate,
     canonical_repository_identity,
@@ -512,6 +513,22 @@ def test_git_probe_sanitizes_routing_environment_and_disables_hooks_and_signing(
 def test_repository_identity_preserves_nondefault_port_and_remote_path_case(
     tmp_path: Path,
 ):
+    binding = RepositoryBinding(
+        tmp_path,
+        ["https://Example.test:8443/Owner/Repo.git"],
+    )
+    resolved = binding.resolve("ssh://example.test:8443/Owner/Repo")
+
+    assert resolved.identity == "example.test:8443/Owner/Repo"
+    assert resolved.is_bound is True
+    assert binding.resolve("ssh://example.test:8443/Owner/Repo") is resolved
+    assert binding.canonical_identity(
+        "ssh://example.test:8443/Owner/Repo"
+    ) == resolved.identity
+    assert binding.is_bound("ssh://example.test:8443/Owner/Repo") is True
+    assert binding.is_bound("https://example.test/Owner/Repo") is False
+    assert binding.is_bound("https://example.test:8443/owner/Repo") is False
+    assert binding.is_bound("https://example.test:invalid/Owner/Repo") is False
     assert canonical_repository_identity(
         "https://Example.test:8443/Owner/Repo.git", base=tmp_path
     ) == "example.test:8443/Owner/Repo"
@@ -2116,6 +2133,90 @@ def test_unbound_ready_urls_are_rejected_without_live_observation(
         prepare_worktree(manifest, repository, target, dry_run=True, probe=probe)
     assert all(url != str(foreign) for url, _ref in live_calls)
     assert target.exists() is False
+
+
+def test_audit_and_prepare_share_binding_and_never_contact_unbound_urls(
+    audited_repository: tuple[Path, dict], tmp_path: Path,
+):
+    repository, manifest = audited_repository
+    manifest["repositories"]["upstream"]["url"] = (
+        "https://Example.test:443/Owner/Upstream.git"
+    )
+    manifest["repositories"]["fork"]["url"] = (
+        "ssh://Example.test:8443/Owner/Fork.git"
+    )
+    configured_urls = [
+        "ssh://example.test:22/Owner/Upstream",
+        "https://example.test:8443/Owner/Fork",
+    ]
+    probe = GitProbe(repository)
+    probe.remote_urls = lambda: configured_urls  # type: ignore[method-assign]
+    live_calls: list[tuple[str | None, str | None]] = []
+
+    def recording_live_ref(url: str | None, ref: str | None) -> dict:
+        live_calls.append((url, ref))
+        commit = probe.resolve_commit(ref) if isinstance(ref, str) else None
+        return {
+            "repository": url,
+            "ref": ref,
+            "commit": commit or "unknown",
+            "state": "known" if commit is not None else "unknown",
+        }
+
+    probe.live_ref = recording_live_ref  # type: ignore[method-assign]
+
+    report = audit_manifest(
+        manifest,
+        repository,
+        probe=probe,
+        strict_release=True,
+    )
+    receipt = prepare_worktree(
+        manifest,
+        repository,
+        tmp_path / "bound-prepare",
+        dry_run=True,
+        probe=probe,
+    )
+
+    assert report["ready"] is True, report["findings"]
+    assert receipt["dry_run"] is True
+    assert receipt["would_apply"]
+    assert live_calls
+
+    live_calls.clear()
+    unbound = deepcopy(manifest)
+    unbound["repositories"]["upstream"]["url"] = (
+        "https://example.test:443/owner/Upstream.git"
+    )
+    unbound["repositories"]["fork"]["url"] = (
+        "https://example.test/Owner/Fork.git"
+    )
+
+    report = audit_manifest(
+        unbound,
+        repository,
+        probe=probe,
+        strict_release=True,
+    )
+    with pytest.raises(PreparationBlocked) as caught:
+        prepare_worktree(
+            unbound,
+            repository,
+            tmp_path / "unbound-binding-prepare",
+            dry_run=True,
+            probe=probe,
+        )
+
+    assert "release_repository_unbound" in finding_codes(report)
+    assert "source_repository_unbound" in finding_codes(report)
+    assert {
+        "prepare_integration_repository_unbound",
+        "prepare_upstream_repository_unbound",
+        "prepare_source_repository_unbound",
+    }.issubset({finding.code for finding in caught.value.findings})
+    assert live_calls == []
+    assert (tmp_path / "unbound-binding-prepare").exists() is False
 
 
 def test_review_draft_never_contacts_unbound_manifest_urls(

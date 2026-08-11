@@ -10,7 +10,7 @@ from typing import Any, Sequence
 from .audit import (
     DISABLED_HOOKS_PATH,
     GitProbe,
-    canonical_repository_identity,
+    RepositoryBinding,
     component_cohesion_findings,
     sanitized_git_environment,
 )
@@ -126,29 +126,6 @@ def _preflight(
         if isinstance(manifest.get("repositories"), dict)
         else {}
     )
-    configured_remote_identities: set[str] = set()
-    for remote_url in probe.remote_urls():
-        try:
-            configured_remote_identities.add(
-                canonical_repository_identity(remote_url, base=repository)
-            )
-        except (OSError, ValueError):
-            continue
-
-    def repository_is_bound(repository_name: object) -> bool:
-        declared = (
-            repositories.get(repository_name, {})
-            if isinstance(repository_name, str)
-            else {}
-        )
-        url = declared.get("url") if isinstance(declared, dict) else None
-        if not isinstance(url, str) or not url.strip():
-            return False
-        try:
-            identity = canonical_repository_identity(url, base=repository)
-        except (OSError, ValueError):
-            return False
-        return identity in configured_remote_identities
 
     def repository_url(repository_name: object) -> str | None:
         declared = (
@@ -159,21 +136,15 @@ def _preflight(
         url = declared.get("url") if isinstance(declared, dict) else None
         return url if isinstance(url, str) and url.strip() else None
 
-    def repository_identity(repository_name: object) -> str | None:
-        url = repository_url(repository_name)
-        if url is None:
-            return None
-        try:
-            return canonical_repository_identity(url, base=repository)
-        except (OSError, ValueError):
-            return None
+    repository_binding = RepositoryBinding(repository, probe.remote_urls())
 
     integration_repository_name = integration.get("repository")
-    integration_repository_bound = repository_is_bound(integration_repository_name)
     integration_repository_url = repository_url(integration_repository_name)
-    integration_repository_identity = repository_identity(
-        integration_repository_name
+    integration_repository_resolution = repository_binding.resolve(
+        integration_repository_url
     )
+    integration_repository_bound = integration_repository_resolution.is_bound
+    integration_repository_identity = integration_repository_resolution.identity
     if not integration_repository_bound:
         _add(
             findings,
@@ -208,9 +179,11 @@ def _preflight(
         else:
             published_old_commit = observed
 
-    upstream_repository_bound = repository_is_bound(
-        integration.get("upstream_repository")
+    upstream_repository_url = repository_url(integration.get("upstream_repository"))
+    upstream_repository_resolution = repository_binding.resolve(
+        upstream_repository_url
     )
+    upstream_repository_bound = upstream_repository_resolution.is_bound
     if not upstream_repository_bound:
         _add(
             findings,
@@ -219,7 +192,7 @@ def _preflight(
         )
     if manifest.get("manifest_state") == "ready" and upstream_repository_bound:
         live_upstream = probe.live_ref(
-            repository_url(integration.get("upstream_repository")),
+            upstream_repository_url,
             integration.get("upstream_ref"),
         )
         if live_upstream.get("commit") != base:
@@ -250,8 +223,10 @@ def _preflight(
         source_ref = source.get("ref")
         source_ref_valid = isinstance(source_ref, str) and probe.check_ref_format(source_ref)
         source_tip = probe.resolve_commit(source_ref) if source_ref_valid else None
-        source_repository_bound = repository_is_bound(source.get("repository"))
-        source_repository_identity = repository_identity(source.get("repository"))
+        source_url = repository_url(source.get("repository"))
+        source_repository_resolution = repository_binding.resolve(source_url)
+        source_repository_bound = source_repository_resolution.is_bound
+        source_repository_identity = source_repository_resolution.identity
         if not source_ref_valid:
             _add(
                 findings,
@@ -305,7 +280,6 @@ def _preflight(
             and source_ref_valid
             and source_repository_bound
         ):
-            source_url = repository_url(source.get("repository"))
             if source_url is not None:
                 cache_key = (source_url, source_ref)
                 if cache_key not in live_source_cache:
