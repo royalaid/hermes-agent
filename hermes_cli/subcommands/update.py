@@ -6,7 +6,19 @@ Handler injected to avoid importing ``main``.
 
 from __future__ import annotations
 
+import argparse
+import math
 from typing import Callable
+
+
+def _bounded_timeout(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(number) or not 0.1 <= number <= 120.0:
+        raise argparse.ArgumentTypeError("must be between 0.1 and 120 seconds")
+    return number
 
 
 def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
@@ -25,11 +37,65 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Gateway mode: use file-based IPC for prompts instead of stdin (used internally by /update)",
     )
-    update_parser.add_argument(
+    lifecycle_mode = update_parser.add_mutually_exclusive_group()
+    lifecycle_mode.add_argument(
         "--check",
         action="store_true",
         default=False,
         help="Check whether an update is available without installing anything",
+    )
+    lifecycle_mode.add_argument(
+        "--preflight",
+        action="store_true",
+        default=False,
+        help="Inspect local update readiness without network access or mutation",
+    )
+    lifecycle_mode.add_argument(
+        "--drain",
+        action="store_true",
+        default=False,
+        help="Quiesce only verified Hermes MCP bridges (requires --yes)",
+    )
+    lifecycle_mode.add_argument(
+        "--resume-deferred-gateway",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    update_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit one machine-readable JSON document for --preflight/--drain",
+    )
+    update_parser.add_argument(
+        "--timeout-seconds",
+        type=_bounded_timeout,
+        default=12.0,
+        metavar="N",
+        help="Bounded wait for --drain (maximum 120 seconds)",
+    )
+    update_parser.add_argument(
+        "--bridge-lease-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    update_parser.add_argument(
+        "--invocation-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    update_parser.add_argument(
+        "--root",
+        dest="resume_root",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    update_parser.add_argument(
+        "--defer-gateway-resume",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
     )
     update_parser.add_argument(
         "--no-backup",
@@ -48,7 +114,12 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "-y",
         action="store_true",
         default=False,
-        help="Assume yes for interactive prompts (config migration, stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
+        help=(
+            "Assume yes for interactive prompts (config migration, stash restore). "
+            "On Windows this also authorizes interruption of only exact, verified "
+            "Codex or Claude Hermes MCP bridges. API-key entry is skipped; run "
+            "'hermes config migrate' separately for those."
+        ),
     )
     update_parser.add_argument(
         "--branch",

@@ -19,7 +19,7 @@ from hermes_cli import main as hermes_main
 # ``shutil.which`` so the existing test setup keeps working without
 # per-test changes.
 @pytest.fixture(autouse=True)
-def _patch_managed_uv(request):
+def _patch_managed_uv(request, platform_neutral_update_lifecycle):
     """Make managed_uv helpers follow shutil.which mocking in tests."""
     import shutil
 
@@ -337,3 +337,52 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+@pytest.mark.parametrize(
+    ("reset_returncode", "remaining_unmerged"),
+    [(1, "conflicted.py\n"), (0, "conflicted.py\n")],
+    ids=["reset-failed", "unmerged-remained"],
+)
+def test_restore_conflict_requires_proven_cleanup_before_success(
+    tmp_path, monkeypatch, capsys, reset_returncode, remaining_unmerged
+):
+    import subprocess
+
+    from hermes_cli import update_cmd
+
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(list(command))
+        joined = " ".join(command)
+        if "stash apply" in joined:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="conflict")
+        if "diff --name-only --diff-filter=U" in joined:
+            occurrence = sum(
+                "diff --name-only --diff-filter=U" in " ".join(value)
+                for value in calls
+            )
+            output = "conflicted.py\n" if occurrence == 1 else remaining_unmerged
+            return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+        if "reset --hard HEAD" in joined:
+            return subprocess.CompletedProcess(
+                command, reset_returncode, stdout="", stderr="reset failed"
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", run)
+
+    assert (
+        update_cmd._restore_stashed_changes(
+            ["git"], tmp_path, "stash-commit-123", prompt_user=False
+        )
+        is False
+    )
+    assert any("reset --hard HEAD" in " ".join(command) for command in calls)
+    assert sum(
+        "diff --name-only --diff-filter=U" in " ".join(command)
+        for command in calls
+    ) == 2
+    assert not any("stash drop" in " ".join(command) for command in calls)
+    assert "Could not prove the conflicted working tree was cleaned" in capsys.readouterr().out
