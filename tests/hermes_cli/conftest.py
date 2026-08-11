@@ -105,7 +105,12 @@ def platform_neutral_update_lifecycle(monkeypatch):
     monkeypatch.setattr(
         cli_main,
         "_prepare_atomic_windows_update",
-        lambda _args, *, root: (None, "test-invocation-123456"),
+        lambda _args, *, root, transaction: setattr(
+            transaction, "lease", {"lease_id": "test-lease-123456"}
+        ),
+    )
+    monkeypatch.setattr(
+        cli_main, "_release_update_quiesce_lease", lambda _root, _lease: True
     )
     monkeypatch.setattr(cli_main, "_WindowsMutationJob", _TestMutationJob)
     monkeypatch.setattr(cli_main, "_UpdateLeaseHeartbeat", _TestLeaseHeartbeat)
