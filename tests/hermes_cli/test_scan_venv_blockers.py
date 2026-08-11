@@ -1162,10 +1162,23 @@ class _FakeProcess:
 
 
 class _FakeAncestor:
-    def __init__(self, name: str, exe: str, argv: list[str]):
+    def __init__(
+        self,
+        name: str,
+        exe: str,
+        argv: list[str],
+        *,
+        pid: int = 10,
+        created_at: float = 1.0,
+    ):
+        self.pid = pid
+        self._created_at = created_at
         self._name = name
         self._exe = exe
         self._argv = argv
+
+    def create_time(self):
+        return self._created_at
 
     def name(self):
         return self._name
@@ -1197,6 +1210,106 @@ def _snapshot(
     )
 
 
+def test_snapshot_distinguishes_pid_reuse_from_exit(monkeypatch) -> None:
+    no_such_process = type("NoSuchProcess", (Exception,), {})
+    initial = types.SimpleNamespace(
+        create_time=lambda: 100.0,
+        cmdline=lambda: [r"C:\Python311\python.exe", "-m", "worker"],
+        exe=lambda: r"C:\Python311\python.exe",
+        name=lambda: "python.exe",
+    )
+    reused = types.SimpleNamespace(create_time=lambda: 100.001)
+    processes = iter([initial, reused])
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda _pid: next(processes),
+        NoSuchProcess=no_such_process,
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    with pytest.raises(RuntimeError, match="changed generation"):
+        scanner._snapshot_for_pid(20, parent_by_pid={20: 10})
+
+    exit_reads = 0
+
+    def _exited_after_identity(_pid):
+        nonlocal exit_reads
+        exit_reads += 1
+        if exit_reads == 1:
+            return initial
+        raise no_such_process
+
+    fake_psutil.Process = _exited_after_identity
+    assert scanner._snapshot_for_pid(20, parent_by_pid={20: 10}) is None
+
+
+def test_scan_keeps_identity_refresh_generation_change_as_hard_blocker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    module = "agent.transports.hermes_tools_mcp_server"
+    initial = types.SimpleNamespace(
+        create_time=lambda: 100.0,
+        cmdline=lambda: [r"C:\Python311\python.exe", "-m", module],
+        exe=lambda: r"C:\Python311\python.exe",
+        name=lambda: "python.exe",
+    )
+    reused = types.SimpleNamespace(create_time=lambda: 100.001)
+    processes = iter([initial, reused])
+    parent_maps = MagicMock(return_value={20: 10})
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        Process=lambda _pid: next(processes),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (20, "python.exe", f"python.exe -m {module}")
+        ],
+    )
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["mcp_bridges"] == []
+    assert [entry["pid"] for entry in result["processes"]] == [20]
+    assert result["processes"][0]["action"] == "refuse"
+    assert parent_maps.call_count == 1
+
+
+def test_terminate_refuses_pid_reused_during_identity_refresh(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    initial = MagicMock()
+    initial.create_time.return_value = 100.0
+    initial.cmdline.return_value = [
+        r"C:\Python311\python.exe",
+        "-m",
+        "agent.transports.hermes_tools_mcp_server",
+    ]
+    initial.exe.return_value = r"C:\Python311\python.exe"
+    initial.ppid.return_value = 10
+    initial.name.return_value = "python.exe"
+    reused = types.SimpleNamespace(create_time=lambda: 100.001)
+    processes = iter([initial, reused])
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda _pid: next(processes),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=100.0)
+    initial.kill.assert_not_called()
+
+
 def test_scan_reports_worker_before_wrapper_and_keeps_relationship(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -1218,6 +1331,19 @@ def test_scan_reports_worker_before_wrapper_and_keeps_relationship(
         exe=root / ".hermes-runtime" / "python" / "generation" / "python.exe",
         argv=("python.exe", "-m", module),
         created_at=101.0,
+    )
+    parent_maps = MagicMock(return_value={10: 1, 20: 10})
+    live_created_at = {10: 100.0, 20: 101.0}
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(
+            _ppid_map=parent_maps,
+            Process=lambda pid: types.SimpleNamespace(
+                create_time=lambda: live_created_at[int(pid)]
+            ),
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        ),
     )
     monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
     monkeypatch.setattr(
@@ -1244,6 +1370,218 @@ def test_scan_reports_worker_before_wrapper_and_keeps_relationship(
     assert result["mcp_bridges"][1]["role"] == "mcp_bridge_wrapper"
     assert all(entry["owner"] == "codex" for entry in result["mcp_bridges"])
     assert owner_probe.call_count == 1
+    assert parent_maps.call_count == 2
+
+
+def test_scan_owner_cache_is_bound_to_anchor_generation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    module = "agent.transports.hermes_tools_mcp_server"
+    wrappers = {
+        pid: _snapshot(
+            pid=pid,
+            ppid=10,
+            exe=venv / "Scripts" / "python.exe",
+            argv=(str(venv / "Scripts" / "python.exe"), "-m", module),
+            created_at=created_at,
+        )
+        for pid, created_at in ((20, 100.0), (30, 200.0))
+    }
+    parent_maps = MagicMock(return_value={20: 10, 30: 10, 10: 1})
+    live_created_at = {20: 100.0, 30: 200.0}
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        Process=lambda pid: types.SimpleNamespace(
+            create_time=lambda: live_created_at[int(pid)]
+        ),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    owner_probe = MagicMock(side_effect=["codex", "unknown"])
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (pid, "python.exe", " ".join(snapshot.argv))
+            for pid, snapshot in wrappers.items()
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid, **_kwargs: wrappers[pid],
+    )
+    monkeypatch.setattr(scanner, "_owner_from_ancestry", owner_probe)
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert [entry["owner"] for entry in result["mcp_bridges"]] == [
+        "codex",
+        "unknown",
+    ]
+    assert result["mcp_bridges"][1]["action"] == "refuse"
+    assert owner_probe.call_count == 2
+
+
+def test_scan_fails_closed_when_fresh_parent_snapshot_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=1,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "-m", "worker"),
+        created_at=100.0,
+    )
+    parent_maps = MagicMock(
+        side_effect=[{10: 1}, PermissionError("fresh parent map denied")]
+    )
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (10, "python.exe", " ".join(wrapper.argv))
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda _pid, **_kwargs: wrapper,
+    )
+
+    with pytest.raises(RuntimeError, match="parent process enumeration failed"):
+        scanner.scan_venv_blockers(root)
+
+    assert parent_maps.call_count == 2
+
+
+def test_scan_keeps_generation_recheck_error_as_hard_blocker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=1,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "-m", "worker"),
+        created_at=100.0,
+    )
+    parent_maps = MagicMock(return_value={10: 1})
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        Process=lambda _pid: (_ for _ in ()).throw(PermissionError("denied")),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (10, "python.exe", " ".join(wrapper.argv))
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda _pid, **_kwargs: wrapper,
+    )
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["mcp_bridges"] == []
+    assert [entry["pid"] for entry in result["processes"]] == [10]
+    assert result["processes"][0]["action"] == "refuse"
+    assert parent_maps.call_count == 2
+
+
+def test_scan_does_not_offer_worker_after_pid_generation_changes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    module = "agent.transports.hermes_tools_mcp_server"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=1,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "-m", module),
+        created_at=100.0,
+    )
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=Path(r"C:\Python311\python.exe"),
+        argv=(r"C:\Python311\python.exe", "-m", module),
+        created_at=201.0,
+    )
+    parent_maps = MagicMock(
+        side_effect=[
+            {10: 1, 20: 10},  # discovery generation
+            {10: 1, 20: 10},  # fresh classification generation
+        ]
+    )
+
+    def _detect(*, root, strict, _parent_by_pid=None):
+        assert root == tmp_path / "install"
+        assert strict is True
+        parents = _parent_by_pid
+        if parents is None:
+            parents = parent_maps()
+        assert parents == {10: 1, 20: 10}
+        return [
+            (10, "python.exe", " ".join(wrapper.argv)),
+            (20, "python.exe", " ".join(worker.argv)),
+        ]
+
+    live_created_at = {10: 100.0, 20: 201.001}
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        Process=lambda pid: types.SimpleNamespace(
+            create_time=lambda: live_created_at[int(pid)]
+        ),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(update_cmd, "_detect_venv_python_processes", _detect)
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid, **_kwargs: {10: wrapper, 20: worker}[pid],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_owner_from_ancestry",
+        lambda _snapshot, **_kwargs: "codex",
+    )
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert all(entry["pid"] != 20 for entry in result["mcp_bridges"])
+    assert [entry["pid"] for entry in result["processes"]] == [20]
+    assert result["processes"][0]["action"] == "refuse"
+    assert parent_maps.call_count == 2
 
 
 def test_unreadable_target_gateway_is_a_hard_blocker_not_exempted(
@@ -1277,14 +1615,12 @@ def test_unreadable_target_gateway_is_a_hard_blocker_not_exempted(
     assert result["processes"][0]["actionability"] == "hard_block"
 
 
-def test_managed_worker_remains_exactly_actionable_after_wrapper_dies(
+def test_terminate_refuses_managed_worker_after_wrapper_exits(
     monkeypatch, tmp_path: Path
 ) -> None:
     root = tmp_path / "install"
     venv = root / "venv"
-    process = _FakeProcess(
-        parents=[_FakeAncestor("codex.exe", r"C:\tools\codex.exe", ["codex.exe"])]
-    )
+    process = _FakeProcess()
     worker = _snapshot(
         pid=20,
         ppid=10,
@@ -1296,8 +1632,64 @@ def test_managed_worker_remains_exactly_actionable_after_wrapper_dies(
     monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
     monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda pid: worker)
 
-    assert scanner.terminate_mcp_bridge(root, pid=20, created_at=101.0)
-    assert process.kills == 1
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=101.0)
+    assert process.kills == 0
+
+
+def test_terminate_refuses_reused_unreadable_ancestor_before_codex(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+
+    def unreadable_name():
+        raise RuntimeError("ancestor metadata unreadable")
+
+    unreadable_parent = types.SimpleNamespace(
+        pid=10,
+        create_time=lambda: 99.0,
+        name=unreadable_name,
+        exe=lambda: r"C:\tools\old-parent.exe",
+        cmdline=lambda: ["old-parent.exe"],
+    )
+    codex = _FakeAncestor(
+        "codex.exe",
+        r"C:\tools\codex.exe",
+        ["codex.exe"],
+        pid=1,
+        created_at=90.0,
+    )
+    process = _FakeProcess(parents=[unreadable_parent, codex])
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(
+            str(venv / "Scripts" / "python.exe"),
+            "-m",
+            "agent.transports.hermes_tools_mcp_server",
+        ),
+        created_at=100.0,
+        process=process,
+    )
+    live_ancestors = {
+        10: types.SimpleNamespace(create_time=lambda: 99.001),
+        1: types.SimpleNamespace(create_time=lambda: 90.0),
+    }
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(Process=lambda pid: live_ancestors[int(pid)]),
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid: worker if int(pid) == worker.pid else None,
+    )
+
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=100.0)
+    assert process.kills == 0
 
 
 def test_external_worker_termination_targets_worker_not_live_wrapper(
@@ -1342,7 +1734,9 @@ def test_external_worker_termination_targets_worker_not_live_wrapper(
     assert wrapper_process.kills == 0
 
 
-def test_node_hosted_claude_ancestry_is_attributed_exactly(tmp_path: Path) -> None:
+def test_node_hosted_claude_ancestry_is_attributed_exactly(
+    monkeypatch, tmp_path: Path
+) -> None:
     claude = _FakeAncestor(
         "node.exe",
         r"C:\Program Files\nodejs\node.exe",
@@ -1350,6 +1744,11 @@ def test_node_hosted_claude_ancestry_is_attributed_exactly(tmp_path: Path) -> No
             r"C:\Program Files\nodejs\node.exe",
             r"C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js",
         ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(Process=lambda _pid: claude),
     )
     snapshot = _snapshot(
         pid=20,
@@ -1366,6 +1765,102 @@ def test_node_hosted_claude_ancestry_is_attributed_exactly(tmp_path: Path) -> No
     )
     assert record["actionable"] is True
     assert record["action"] == "terminate_exact_mcp"
+
+
+@pytest.mark.parametrize(
+    ("parent_created_at", "expected_owner"),
+    [
+        (99.0, "codex"),
+        (100.0, "codex"),
+        (100.005, "unknown"),
+        (100.02, "unknown"),
+    ],
+)
+def test_snapshot_parent_map_rejects_reused_owner_pid(
+    monkeypatch,
+    tmp_path: Path,
+    parent_created_at: float,
+    expected_owner: str,
+) -> None:
+    parent = types.SimpleNamespace(
+        pid=10,
+        create_time=lambda: parent_created_at,
+        name=lambda: "codex.exe",
+        exe=lambda: r"C:\tools\codex.exe",
+        cmdline=lambda: ["codex.exe"],
+    )
+    fake_psutil = types.SimpleNamespace(Process=lambda _pid: parent)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=tmp_path / "python.exe",
+        argv=("python.exe", "-m", "agent.transports.hermes_tools_mcp_server"),
+        created_at=100.0,
+    )
+
+    assert (
+        scanner._owner_from_ancestry(
+            snapshot,
+            parent_by_pid={20: 10, 10: 0},
+        )
+        == expected_owner
+    )
+
+
+def test_snapshot_parent_map_rejects_owner_generation_changed_during_read(
+    monkeypatch, tmp_path: Path
+) -> None:
+    parent = types.SimpleNamespace(
+        pid=10,
+        create_time=lambda: 99.0,
+        name=lambda: "codex.exe",
+        exe=lambda: r"C:\tools\codex.exe",
+        cmdline=lambda: ["codex.exe"],
+    )
+    reused = types.SimpleNamespace(create_time=lambda: 99.001)
+    processes = iter([parent, reused])
+    fake_psutil = types.SimpleNamespace(Process=lambda _pid: next(processes))
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=tmp_path / "python.exe",
+        argv=("python.exe", "-m", "agent.transports.hermes_tools_mcp_server"),
+        created_at=100.0,
+    )
+
+    assert (
+        scanner._owner_from_ancestry(
+            snapshot,
+            parent_by_pid={20: 10, 10: 0},
+        )
+        == "unknown"
+    )
+
+
+def test_live_parent_ancestry_rejects_generation_changed_during_read(
+    monkeypatch, tmp_path: Path
+) -> None:
+    parent = _FakeAncestor(
+        "codex.exe",
+        r"C:\tools\codex.exe",
+        ["codex.exe"],
+        created_at=99.0,
+    )
+    reused = types.SimpleNamespace(create_time=lambda: 99.001)
+    fake_psutil = types.SimpleNamespace(Process=lambda _pid: reused)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=tmp_path / "python.exe",
+        argv=("python.exe", "-m", "agent.transports.hermes_tools_mcp_server"),
+        created_at=100.0,
+        process=_FakeProcess(parents=[parent]),
+    )
+
+    assert scanner._owner_from_ancestry(snapshot) == "unknown"
 
 
 @pytest.mark.parametrize("created_at", [float("nan"), float("inf"), -1.0, 102.0])
