@@ -5,10 +5,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { TextDecoder } from 'node:util'
 
+import {
+  hasExactKeys,
+  hasHandoffCapabilitySyntax,
+  resolveCanonicalAbsolutePath,
+  sameCanonicalPath
+} from './handoff-wire-validation'
+
 export const HANDOFF_RESULT_MAX_AGE_MS = 30 * 60 * 1000
 export const HANDOFF_RESULT_CLOCK_SKEW_MS = 5 * 1000
 
-const CAPABILITY_PATTERN = /^[A-Za-z0-9._-]{16,128}$/
 const GIT_SHA_PATTERN = /^[0-9a-fA-F]{40}$/
 const ARCHIVE_SHA_PATTERN = /^[0-9a-fA-F]{64}$/
 
@@ -218,51 +224,19 @@ export function handoffResultPath(hermesHome: string): string {
 }
 
 export function handoffAckPath(hermesHome: string, attemptId: string): string {
-  if (!CAPABILITY_PATTERN.test(attemptId)) {
+  if (!hasHandoffCapabilitySyntax(attemptId)) {
     throw new TypeError('invalid update attempt id')
   }
 
   return path.join(hermesHome, `.hermes-update-ack-${attemptId}.json`)
 }
 
-function exactKeys(value: unknown, expected: string[]): value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false
-  }
-  const actual = Object.keys(value).sort()
-  const sortedExpected = [...expected].sort()
-
-  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index])
-}
-
 function isPositiveInteger(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) > 0
 }
 
-function canonicalPath(candidate: unknown): string | null {
-  if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) {
-    return null
-  }
-
-  try {
-    return fs.realpathSync.native(candidate)
-  } catch {
-    return null
-  }
-}
-
-function pathIdentity(candidate: string): string {
-  return process.platform === 'win32' ? candidate.toLowerCase() : candidate
-}
-
-function sameCanonicalPath(left: string, right: string): boolean {
-  return pathIdentity(left) === pathIdentity(right)
-}
-
 function parseHealth(value: unknown): RuntimeHealth | null {
-  if (!exactKeys(value, HEALTH_KEYS)) {
-    return null
-  }
+  if (!hasExactKeys(value, HEALTH_KEYS)) {return null}
 
   if (
     value.critical_syntax !== true ||
@@ -288,16 +262,14 @@ function parseReceipt(
   requestedAt: number,
   maxAgeMs: number
 ): HandoffReceipt | null {
-  if (!exactKeys(value, RECEIPT_KEYS)) {
-    return null
-  }
+  if (!hasExactKeys(value, RECEIPT_KEYS)) {return null}
 
   if (
     value.schema_version !== 1 ||
     typeof value.invocation_id !== 'string' ||
-    !CAPABILITY_PATTERN.test(value.invocation_id) ||
+    !hasHandoffCapabilitySyntax(value.invocation_id) ||
     typeof value.lease_id !== 'string' ||
-    !CAPABILITY_PATTERN.test(value.lease_id) ||
+    !hasHandoffCapabilitySyntax(value.lease_id) ||
     value.branch !== branch ||
     value.success !== true ||
     value.gateway_resume_deferred !== true ||
@@ -306,7 +278,7 @@ function parseReceipt(
     return null
   }
 
-  const receiptRoot = canonicalPath(value.root)
+  const receiptRoot = resolveCanonicalAbsolutePath(value.root)
   const health = parseHealth(value.health)
 
   if (!receiptRoot || !sameCanonicalPath(receiptRoot, root) || !health) {
@@ -369,9 +341,7 @@ function parseReceipt(
 }
 
 function parseCleanup(value: unknown): HandoffCleanup | null {
-  if (!exactKeys(value, CLEANUP_KEYS)) {
-    return null
-  }
+  if (!hasExactKeys(value, CLEANUP_KEYS)) {return null}
 
   if (typeof value.update_marker_released !== 'boolean' || typeof value.bridge_lease_released !== 'boolean') {
     return null
@@ -384,9 +354,7 @@ function parseCleanup(value: unknown): HandoffCleanup | null {
 }
 
 function parseRelaunch(value: unknown): HandoffRelaunch | null {
-  if (!exactKeys(value, RELAUNCH_KEYS)) {
-    return null
-  }
+  if (!hasExactKeys(value, RELAUNCH_KEYS)) {return null}
 
   if (!['pending', 'acknowledged', 'failed'].includes(String(value.state)) || !isPositiveInteger(value.requested_at)) {
     return null
@@ -406,7 +374,7 @@ function parseRelaunch(value: unknown): HandoffRelaunch | null {
   if (value.executable === null) {
     executable = null
   } else {
-    executable = canonicalPath(value.executable) ?? undefined
+    executable = resolveCanonicalAbsolutePath(value.executable) ?? undefined
   }
 
   const acknowledgedAt =
@@ -441,9 +409,7 @@ function parseRelaunch(value: unknown): HandoffRelaunch | null {
 }
 
 function parseDesktop(value: unknown): HandoffDesktopProof | null {
-  if (!exactKeys(value, DESKTOP_KEYS) || typeof value.backend_ready !== 'boolean') {
-    return null
-  }
+  if (!hasExactKeys(value, DESKTOP_KEYS) || typeof value.backend_ready !== 'boolean') {return null}
 
   if (!(
     value.build_id === null ||
@@ -466,7 +432,7 @@ function parseDesktop(value: unknown): HandoffDesktopProof | null {
   if (value.root === null) {
     root = null
   } else {
-    const canonical = canonicalPath(value.root)
+    const canonical = resolveCanonicalAbsolutePath(value.root)
 
     if (!canonical) {
       return null
@@ -533,14 +499,12 @@ function parseHandoffResultValue(
   value: unknown,
   { expectedRoot, now = Date.now, maxAgeMs = HANDOFF_RESULT_MAX_AGE_MS }: ReadHandoffResultOptions = {}
 ): HandoffResult | null {
-  if (!exactKeys(value, RESULT_KEYS)) {
-    return null
-  }
+  if (!hasExactKeys(value, RESULT_KEYS)) {return null}
 
   if (
     value.schema_version !== 2 ||
     typeof value.attempt_id !== 'string' ||
-    !CAPABILITY_PATTERN.test(value.attempt_id) ||
+    !hasHandoffCapabilitySyntax(value.attempt_id) ||
     !['pending', 'complete', 'failed'].includes(String(value.state)) ||
     typeof value.ok !== 'boolean' ||
     !(value.exit_code === null || Number.isInteger(value.exit_code)) ||
@@ -561,14 +525,14 @@ function parseHandoffResultValue(
     return null
   }
 
-  const root = canonicalPath(value.root)
+  const root = resolveCanonicalAbsolutePath(value.root)
 
   if (!root) {
     return null
   }
 
   if (expectedRoot !== undefined) {
-    const canonicalExpectedRoot = canonicalPath(expectedRoot)
+    const canonicalExpectedRoot = resolveCanonicalAbsolutePath(expectedRoot)
 
     if (!canonicalExpectedRoot || !sameCanonicalPath(root, canonicalExpectedRoot)) {
       return null
@@ -749,7 +713,7 @@ function parseLegacyHandoffResult(raw: Buffer): LegacyHandoffResult | null {
     return null
   }
 
-  if (!exactKeys(value, LEGACY_RESULT_KEYS)) {
+  if (!hasExactKeys(value, LEGACY_RESULT_KEYS)) {
     return null
   }
 
@@ -791,7 +755,7 @@ function parsePosixHandoffResult(raw: Buffer): ParsedPosixHandoffResult | null {
     return null
   }
 
-  if (!exactKeys(value, POSIX_RESULT_KEYS)) {
+  if (!hasExactKeys(value, POSIX_RESULT_KEYS)) {
     return null
   }
 
@@ -1045,8 +1009,8 @@ export function writeHandoffAck(
     return null
   }
 
-  const root = canonicalPath(currentRoot)
-  const executable = canonicalPath(currentExecutable)
+  const root = resolveCanonicalAbsolutePath(currentRoot)
+  const executable = resolveCanonicalAbsolutePath(currentExecutable)
   const expectedBuildId = expectedHandoffBuildId(pending)
 
   if (
@@ -1205,9 +1169,9 @@ export async function waitForTerminalHandoffResult(
     pollMs <= 0 ||
     !Number.isFinite(timeoutMs) ||
     timeoutMs < 0 ||
-    (attemptId !== undefined && !CAPABILITY_PATTERN.test(attemptId)) ||
-    (typeof invocationId === 'string' && !CAPABILITY_PATTERN.test(invocationId)) ||
-    (typeof leaseId === 'string' && !CAPABILITY_PATTERN.test(leaseId))
+    (attemptId !== undefined && !hasHandoffCapabilitySyntax(attemptId)) ||
+    (typeof invocationId === 'string' && !hasHandoffCapabilitySyntax(invocationId)) ||
+    (typeof leaseId === 'string' && !hasHandoffCapabilitySyntax(leaseId))
   ) {
     return null
   }
