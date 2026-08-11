@@ -945,6 +945,95 @@ def test_pause_refuses_unreadable_identity_immediately_before_force_stop(
     assert terminated == []
 
 
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_accepts_definitive_exit_during_windows_tree_kill(
+    _winp,
+    monkeypatch,
+):
+    """A gateway may exit after exact proof but before taskkill opens it."""
+    import gateway.status as status_mod
+    import hermes_cli.gateway as gateway_mod
+    from hermes_cli import gateway_windows
+
+    pid = 202
+    records = {pid: _gateway_record(pid)}
+    dead: set[int] = set()
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_psutil(records, dead=dead),
+    )
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [pid])
+    monkeypatch.setattr(gateway_mod, "find_profile_gateway_processes", lambda: [])
+    monkeypatch.setattr(gateway_mod, "_get_restart_drain_timeout", lambda: 0.1)
+    monkeypatch.setattr(
+        cli_main,
+        "_wait_for_windows_update_gateway_exit",
+        lambda _pids, *, timeout: {pid},
+    )
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
+    attempts = []
+
+    def exits_during_taskkill(value, force=False):
+        attempts.append((value, force))
+        dead.add(pid)
+        raise OSError(f'ERROR: The process "{pid}" not found.')
+
+    monkeypatch.setattr(status_mod, "terminate_pid", exits_during_taskkill)
+
+    token = cli_main._pause_windows_gateways_for_update()
+
+    assert token["unmapped_pids"] == [pid]
+    assert attempts == [(pid, True)]
+
+
+@pytest.mark.parametrize("post_error_state", ["live", "reused", "unreadable"])
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_refuses_unproved_exit_after_windows_tree_kill_error(
+    _winp,
+    monkeypatch,
+    post_error_state,
+):
+    """A taskkill error is harmless only after definitive exit proof."""
+    import gateway.status as status_mod
+    import hermes_cli.gateway as gateway_mod
+    from hermes_cli import gateway_windows
+
+    pid = 202
+    records = {pid: _gateway_record(pid)}
+    unreadable: set[int] = set()
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_psutil(records, unreadable=unreadable),
+    )
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [pid])
+    monkeypatch.setattr(gateway_mod, "find_profile_gateway_processes", lambda: [])
+    monkeypatch.setattr(gateway_mod, "_get_restart_drain_timeout", lambda: 0.1)
+    monkeypatch.setattr(
+        cli_main,
+        "_wait_for_windows_update_gateway_exit",
+        lambda _pids, *, timeout: {pid},
+    )
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
+    attempts = []
+
+    def fails_without_exit(value, force=False):
+        attempts.append((value, force))
+        if post_error_state == "reused":
+            records[pid] = _gateway_record(pid, created_at=records[pid]["created_at"] + 1)
+        elif post_error_state == "unreadable":
+            unreadable.add(pid)
+        raise OSError(f'ERROR: The process "{pid}" not found.')
+
+    monkeypatch.setattr(status_mod, "terminate_pid", fails_without_exit)
+
+    with pytest.raises(RuntimeError, match="could not be safely stopped"):
+        cli_main._pause_windows_gateways_for_update()
+
+    assert attempts == [(pid, True)]
+
+
 # ---------------------------------------------------------------------------
 # venv-side launcher ancestors (the uv launcher/worker split)
 #
@@ -1269,6 +1358,167 @@ def test_late_gateway_identity_revalidates_exact_live_argv(monkeypatch):
     records[300]["argv"] = [records[300]["exe"], "-i"]
 
     assert not cli_main._revalidate_pausable_gateway_identity(identities[0])
+
+
+_LATE_GATEWAY_TASKKILL_ERROR = "FEHLER: Der Prozess wurde nicht gefunden."
+
+
+def _configure_late_gateway_update(
+    monkeypatch,
+    *,
+    exit_before_proof: bool = False,
+    post_taskkill_state: str | None = None,
+):
+    """Drive ``_cmd_update_impl`` through its late gateway-holder loop."""
+    import gateway.status as status_mod
+
+    pid = 300
+    records = {pid: _gateway_record(pid)}
+    dead: set[int] = set()
+    unreadable: set[int] = set()
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_psutil(records, dead=dead, unreadable=unreadable),
+    )
+
+    observations = SimpleNamespace(
+        detect_calls=0,
+        terminate_calls=[],
+        taskkill_errors=[],
+        source_setup_calls=[],
+    )
+    scans = [
+        [(pid, "python.exe", "display only")],
+        [(pid + 1, "python.exe", "python.exe -i")],
+    ]
+
+    def detect_holders():
+        result = scans[observations.detect_calls]
+        observations.detect_calls += 1
+        return result
+
+    def classify_late_gateway(matches):
+        identities = update_cmd._leftover_pausable_gateway_pids(matches)
+        if exit_before_proof:
+            dead.add(pid)
+        return identities
+
+    def terminate_late_gateway(value, force=False):
+        observations.terminate_calls.append((value, force))
+        if post_taskkill_state is None:
+            pytest.fail("an exited late gateway reached taskkill")
+        if post_taskkill_state == "exited":
+            dead.add(pid)
+        elif post_taskkill_state == "reused":
+            records[pid] = _gateway_record(
+                pid,
+                created_at=records[pid]["created_at"] + 1,
+            )
+        elif post_taskkill_state == "unreadable":
+            unreadable.add(pid)
+        elif post_taskkill_state != "live":
+            raise AssertionError(f"unexpected taskkill state: {post_taskkill_state}")
+        observations.taskkill_errors.append(_LATE_GATEWAY_TASKKILL_ERROR)
+        raise OSError(_LATE_GATEWAY_TASKKILL_ERROR)
+
+    def fail_after_holder_guard(*_args, **_kwargs):
+        observations.source_setup_calls.append(True)
+        pytest.fail("update advanced past the later hard-holder refusal")
+
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: True)
+    monkeypatch.setattr(cli_main, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(cli_main, "_run_pre_update_backup", lambda _args: None)
+    monkeypatch.setattr(
+        cli_main,
+        "_pause_windows_gateways_for_update",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cli_main, "_detect_venv_python_processes", detect_holders
+    )
+    monkeypatch.setattr(
+        cli_main, "_leftover_pausable_gateway_pids", classify_late_gateway
+    )
+    monkeypatch.setattr(
+        cli_main, "_orphaned_desktop_backend_pids", lambda _holders: None
+    )
+    monkeypatch.setattr(status_mod, "terminate_pid", terminate_late_gateway)
+    monkeypatch.setattr(update_cmd._time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli_main, "_resolve_update_branch", fail_after_holder_guard)
+    monkeypatch.setattr(update_cmd.subprocess, "run", fail_after_holder_guard)
+
+    args = SimpleNamespace(
+        defer_gateway_resume=False,
+        force=False,
+        force_venv=False,
+        yes=True,
+    )
+    return args, observations
+
+
+def test_cmd_update_late_gateway_exact_exit_before_proof_is_harmless(monkeypatch):
+    args, observations = _configure_late_gateway_update(
+        monkeypatch,
+        exit_before_proof=True,
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main._cmd_update_impl(
+            args,
+            gateway_mode=False,
+            transaction=update_cmd._UpdateTransaction(),
+        )
+
+    assert exit_info.value.code == 2
+    assert observations.detect_calls == 2
+    assert observations.terminate_calls == []
+    assert observations.source_setup_calls == []
+
+
+def test_cmd_update_late_gateway_taskkill_error_accepts_exact_exit(monkeypatch):
+    args, observations = _configure_late_gateway_update(
+        monkeypatch,
+        post_taskkill_state="exited",
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main._cmd_update_impl(
+            args,
+            gateway_mode=False,
+            transaction=update_cmd._UpdateTransaction(),
+        )
+
+    assert exit_info.value.code == 2
+    assert observations.detect_calls == 2
+    assert observations.terminate_calls == [(300, True)]
+    assert observations.taskkill_errors == [_LATE_GATEWAY_TASKKILL_ERROR]
+    assert observations.source_setup_calls == []
+
+
+@pytest.mark.parametrize("post_taskkill_state", ["live", "reused", "unreadable"])
+def test_cmd_update_late_gateway_taskkill_error_refuses_unproved_exit(
+    monkeypatch,
+    post_taskkill_state,
+):
+    args, observations = _configure_late_gateway_update(
+        monkeypatch,
+        post_taskkill_state=post_taskkill_state,
+    )
+
+    with pytest.raises(RuntimeError, match="could not be safely stopped") as exc_info:
+        cli_main._cmd_update_impl(
+            args,
+            gateway_mode=False,
+            transaction=update_cmd._UpdateTransaction(),
+        )
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == _LATE_GATEWAY_TASKKILL_ERROR
+    assert observations.detect_calls == 1
+    assert observations.terminate_calls == [(300, True)]
+    assert observations.taskkill_errors == [_LATE_GATEWAY_TASKKILL_ERROR]
+    assert observations.source_setup_calls == []
 
 
 
