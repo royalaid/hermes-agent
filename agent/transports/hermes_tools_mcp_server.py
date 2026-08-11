@@ -49,9 +49,18 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Optional
+import threading
+from typing import Any, Callable, Optional
+
+from hermes_mcp_update_gate import (
+    infer_install_root,
+    live_quiesce_lease,
+    marker_path,
+)
 
 logger = logging.getLogger(__name__)
+
+_UPDATE_QUIESCE_POLL_SECONDS = 1.0
 
 # JSON Schema type -> Python type mapping for signature generation
 _JSON_TO_PY = {
@@ -149,6 +158,57 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_unblock",
     "kanban_link",
 )
+
+
+def _update_quiesce_marker_path():
+    """Return the bridge-specific lease path without importing Hermes config."""
+    return marker_path()
+
+
+def _update_quiesce_requested() -> bool:
+    """Return whether this installation currently has an active update lease."""
+    root = infer_install_root()
+    if root is None:
+        return False
+    try:
+        return (
+            live_quiesce_lease(
+                _update_quiesce_marker_path(),
+                install_root=root,
+            )
+            is not None
+        )
+    except Exception:
+        # Unreadable or continuously changing consent state is not permission
+        # to keep a native-module bridge alive during source mutation.
+        logger.exception("Could not prove the update quiesce lease inactive")
+        return True
+
+
+def _watch_for_update_quiesce(
+    stop_event: threading.Event,
+    *,
+    requested: Callable[[], bool] = _update_quiesce_requested,
+    exit_process: Callable[[int], Any] = os._exit,
+    poll_seconds: float = _UPDATE_QUIESCE_POLL_SECONDS,
+) -> None:
+    """Stop an already-running bridge when its installation is quiesced.
+
+    FastMCP does not expose a synchronous shutdown hook for its stdio runner.
+    The bridge therefore exits its own process after the lease has been fully
+    validated.  This remains cooperative: an updater never gains authority to
+    terminate arbitrary processes merely by writing the marker.
+    """
+    while not stop_event.is_set():
+        try:
+            quiesce = requested()
+        except Exception:
+            logger.exception("Update quiesce watcher could not read its lease")
+            quiesce = True
+        if quiesce:
+            exit_process(0)
+            return
+        stop_event.wait(max(0.0, float(poll_seconds)))
 
 
 def _build_server() -> Any:
@@ -266,9 +326,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.environ.setdefault("HERMES_QUIET", "1")
     os.environ.setdefault("HERMES_REDACT_SECRETS", "true")
 
+    # Recheck after package import but before loading FastMCP/model_tools.  The
+    # earlier agent-package gate prevents native imports for new launches;
+    # this check also keeps direct unit/in-process callers deterministic.
+    if _update_quiesce_requested():
+        return 0
+
+    stop_event = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_for_update_quiesce,
+        args=(stop_event,),
+        kwargs={"requested": _update_quiesce_requested},
+        name="hermes-mcp-update-quiesce",
+        daemon=True,
+    )
+    watcher.start()
+
     try:
         server = _build_server()
     except ImportError as exc:
+        stop_event.set()
         sys.stderr.write(f"hermes-tools MCP server cannot start: {exc}\n")
         return 2
 
@@ -282,6 +359,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.exception("hermes-tools MCP server crashed")
         sys.stderr.write(f"hermes-tools MCP server error: {exc}\n")
         return 1
+    finally:
+        stop_event.set()
     return 0
 
 

@@ -1,0 +1,284 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-agent.nousresearch.com/schemas/update-readiness-v1.json",
+  "title": "Hermes update readiness v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "mode", "ok", "ready", "blocked", "reason",
+    "root", "venv", "processes", "mcp_bridges", "pausable_gateways",
+    "pausable_gateway_processes", "git", "last_update_receipt", "lease",
+    "actions", "error"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "mode": {"enum": ["preflight", "drain"]},
+    "ok": {"type": "boolean"},
+    "ready": {"type": "boolean"},
+    "blocked": {"type": "boolean"},
+    "reason": {"type": ["string", "null"]},
+    "root": {"type": "string"},
+    "venv": {"type": "string"},
+    "processes": {"type": "array", "items": {"$ref": "#/$defs/process"}},
+    "mcp_bridges": {"type": "array", "items": {"$ref": "#/$defs/mcpBridge"}},
+    "pausable_gateways": {"type": "integer", "minimum": 0},
+    "pausable_gateway_processes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/process"}
+    },
+    "git": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/git"}]},
+    "last_update_receipt": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/receipt"}]
+    },
+    "lease": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/lease"}]},
+    "actions": {"type": "array", "items": {"$ref": "#/$defs/action"}},
+    "error": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/error"}]}
+  },
+  "$defs": {
+    "owner": {"enum": ["codex", "claude", "desktop", "gateway", "unknown"]},
+    "role": {
+      "enum": [
+        "other", "desktop_backend", "gateway_run", "update_lock_holder",
+        "mcp_bridge_wrapper", "mcp_bridge_worker"
+      ]
+    },
+    "actionability": {
+      "enum": ["hard_block", "downstream_drainable", "exact_mcp_bridge"]
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid", "name", "cmdline", "owner", "role", "actionable",
+        "actionability", "action"
+      ],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "name": {"type": "string"},
+        "cmdline": {"type": "string"},
+        "created_at": {"type": "number", "exclusiveMinimum": 0},
+        "owner": {"$ref": "#/$defs/owner"},
+        "role": {"$ref": "#/$defs/role"},
+        "actionable": {"type": "boolean"},
+        "actionability": {"$ref": "#/$defs/actionability"},
+        "action": {"enum": ["refuse", "pause_downstream"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"role": {"const": "gateway_run"}}, "required": ["role"]},
+          "then": {
+            "properties": {
+              "owner": {"const": "gateway"},
+              "actionable": {"const": false},
+              "actionability": {"const": "downstream_drainable"},
+              "action": {"const": "pause_downstream"}
+            }
+          },
+          "else": {
+            "properties": {
+              "actionable": {"const": false},
+              "actionability": {"const": "hard_block"},
+              "action": {"const": "refuse"}
+            }
+          }
+        }
+      ]
+    },
+    "mcpBridge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid", "name", "cmdline", "created_at", "owner", "role",
+        "actionable", "actionability", "action"
+      ],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "name": {"type": "string"},
+        "cmdline": {"type": "string"},
+        "created_at": {"type": "number", "exclusiveMinimum": 0},
+        "owner": {"$ref": "#/$defs/owner"},
+        "role": {"enum": ["mcp_bridge_wrapper", "mcp_bridge_worker"]},
+        "actionable": {"type": "boolean"},
+        "actionability": {"enum": ["hard_block", "exact_mcp_bridge"]},
+        "action": {"enum": ["refuse", "terminate_exact_mcp"]},
+        "wrapper_pid": {"type": "integer", "minimum": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"actionable": {"const": true}}, "required": ["actionable"]},
+          "then": {
+            "properties": {
+              "owner": {"enum": ["codex", "claude"]},
+              "actionability": {"const": "exact_mcp_bridge"},
+              "action": {"const": "terminate_exact_mcp"}
+            }
+          },
+          "else": {
+            "properties": {
+              "actionability": {"const": "hard_block"},
+              "action": {"const": "refuse"}
+            }
+          }
+        }
+      ]
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "head", "branch", "dirty", "tracking_remote", "target_branch",
+        "target_ref", "target_sha"
+      ],
+      "properties": {
+        "head": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+        "branch": {"type": "string"},
+        "dirty": {"type": "boolean"},
+        "tracking_remote": {"type": "string"},
+        "target_branch": {"type": "string"},
+        "target_ref": {"type": "string", "pattern": "^refs/remotes/"},
+        "target_sha": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"}
+          ]
+        }
+      }
+    },
+    "lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "lease_fingerprint", "owner_pid", "created_at",
+        "expires_at", "handoff_grace_until", "install_root"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "lease_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "owner_pid": {"type": "integer", "minimum": 1},
+        "created_at": {"type": "integer", "minimum": 1},
+        "expires_at": {"type": "integer", "minimum": 1},
+        "handoff_grace_until": {"type": "integer", "minimum": 1},
+        "install_root": {"type": "string"}
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "critical_syntax", "critical_imports", "dependencies", "node_dependencies"
+      ],
+      "properties": {
+        "critical_syntax": {"const": true},
+        "critical_imports": {"const": true},
+        "dependencies": {"const": true},
+        "node_dependencies": {"const": true}
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "invocation_id", "lease_id", "mode", "root",
+        "remote", "branch", "target_ref", "target_sha", "resulting_head",
+        "archive_sha", "timestamp", "success", "gateway_resume_deferred", "health"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "invocation_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{16,128}$"},
+        "lease_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{16,128}$"},
+        "mode": {"enum": ["git", "archive"]},
+        "root": {"type": "string"},
+        "remote": {"type": ["string", "null"]},
+        "branch": {"type": "string"},
+        "target_ref": {"type": ["string", "null"]},
+        "target_sha": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{7,64}$"},
+        "resulting_head": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{7,64}$"},
+        "archive_sha": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{64}$"},
+        "timestamp": {"type": "integer", "minimum": 1},
+        "success": {"const": true},
+        "gateway_resume_deferred": {"type": "boolean"},
+        "health": {"$ref": "#/$defs/health"}
+      }
+    },
+    "action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "pid", "created_at", "owner", "role"],
+          "properties": {
+            "type": {"const": "terminate-mcp-bridge"},
+            "pid": {"type": "integer", "minimum": 1},
+            "created_at": {"type": "number", "exclusiveMinimum": 0},
+            "owner": {"enum": ["codex", "claude"]},
+            "role": {"enum": ["mcp_bridge_wrapper", "mcp_bridge_worker"]},
+            "terminated": {"type": "boolean"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "sequence"],
+          "properties": {
+            "type": {"const": "clear-scan"},
+            "sequence": {"type": "integer", "minimum": 1, "maximum": 2}
+          }
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"type": "string"},
+        "message": {"type": "string"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"ready": {"const": true}}},
+      "then": {
+        "properties": {
+          "blocked": {"const": false},
+          "reason": {"type": "null"},
+          "error": {"type": "null"},
+          "processes": {"maxItems": 0},
+          "mcp_bridges": {"maxItems": 0}
+        }
+      },
+      "else": {"properties": {"reason": {"type": "string", "minLength": 1}}}
+    },
+    {
+      "if": {"properties": {"ok": {"const": false}}},
+      "then": {
+        "properties": {
+          "ready": {"const": false},
+          "error": {"$ref": "#/$defs/error"}
+        }
+      },
+      "else": {"properties": {"error": {"type": "null"}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {"const": "drain"},
+          "ready": {"const": true}
+        },
+        "required": ["mode", "ready"]
+      },
+      "then": {"properties": {"lease": {"$ref": "#/$defs/lease"}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {"const": "preflight"},
+          "ready": {"const": true}
+        },
+        "required": ["mode", "ready"]
+      },
+      "then": {"properties": {"lease": {"type": "null"}}}
+    }
+  ]
+}
