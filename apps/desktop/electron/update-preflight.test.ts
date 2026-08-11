@@ -229,6 +229,40 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, ['release', 'scan', 'consent', 'lease', 'wait:900', 'scan', 'wait:1100', 'scan'])
   })
 
+  it('waits for a generic holder first seen on the stability scan, then proves a fresh stable interval', async () => {
+    const transient = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
+
+    const genericOnly: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [transient] })
+    }
+
+    const { calls, deps } = makeDeps([blockedByBridges(), clear(), genericOnly, clear(), clear()])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 0,
+      genericHolderPollMs: 5,
+      genericHolderTimeoutMs: 10,
+      respawnIntervalMs: 7
+    })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'consent',
+      'lease',
+      'wait:0',
+      'scan',
+      'wait:7',
+      'scan',
+      'wait:5',
+      'scan',
+      'wait:7',
+      'scan'
+    ])
+  })
+
   it('uses one PID/create-time fallback pass for exact wrappers and workers, never a process tree', async () => {
     const wrapper = bridge()
     const worker = bridge({ pid: 102, createdAt: 124.5, role: 'mcp_bridge_worker' })
@@ -375,6 +409,68 @@ describe('MCP bridge drain', () => {
     ])
   })
 
+  it.each([
+    {
+      phase: 'cooperative exit',
+      scans: [
+        blockedByBridges(),
+        {
+          kind: 'blocked',
+          result: result({
+            blocked: true,
+            processes: [{ pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }]
+          })
+        },
+        { kind: 'probe-failure', error: 'poll probe failed' }
+      ],
+      expectedCalls: ['release', 'scan', 'consent', 'lease', 'wait:0', 'scan', 'wait:5', 'scan']
+    },
+    {
+      phase: 'fallback termination',
+      scans: [
+        blockedByBridges(),
+        blockedByBridges(),
+        {
+          kind: 'blocked',
+          result: result({
+            blocked: true,
+            processes: [{ pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }]
+          })
+        },
+        { kind: 'probe-failure', error: 'poll probe failed' }
+      ],
+      expectedCalls: [
+        'release',
+        'scan',
+        'consent',
+        'lease',
+        'wait:0',
+        'scan',
+        'terminate:101:123.5',
+        'wait:0',
+        'scan',
+        'wait:5',
+        'scan'
+      ]
+    }
+  ] satisfies Array<{ phase: string; scans: ScanOutcome[]; expectedCalls: string[] }>)(
+    'fails closed on a probe failure while polling generic holders after $phase',
+    async ({ scans, expectedCalls }) => {
+      const { calls, deps } = makeDeps(scans)
+
+      const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+        cooperativeExitMs: 0,
+        genericHolderPollMs: 5,
+        genericHolderTimeoutMs: 10,
+        terminationSettleMs: 0
+      })
+
+      assert.equal(outcome.kind, 'probe-failure')
+      assert.equal(outcome.error, 'poll probe failed')
+      assert.deepEqual(calls, [...expectedCalls, `clear-lease:${lease.leaseId}`])
+    }
+  )
+
   it('fails closed without terminating when any current MCP record is unproven', async () => {
     const transient = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
 
@@ -419,7 +515,7 @@ describe('MCP bridge drain', () => {
     assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
   })
 
-  it('counts 32 paired wrappers and workers as 32 logical fallback groups', async () => {
+  it('allows exactly 64 fallback records across 32 logical bridge groups', async () => {
     const bridges = pairedBridgeGroups(32)
     const terminated: McpBridgeProcess[] = []
 
@@ -442,6 +538,30 @@ describe('MCP bridge drain', () => {
     assert.equal(terminated.slice(0, 32).every(current => current.role === 'mcp_bridge_worker'), true)
     assert.equal(terminated.slice(32).every(current => current.role === 'mcp_bridge_wrapper'), true)
     assert.equal(new Set(terminated.map(current => current.wrapperPid ?? current.pid)).size, 32)
+  })
+
+  it('refuses 65 fallback records even when they fit within 32 logical bridge groups', async () => {
+    const bridges = [
+      ...pairedBridgeGroups(32),
+      bridge({
+        pid: 5_000,
+        createdAt: 6_000,
+        role: 'mcp_bridge_worker',
+        wrapperPid: 1_000
+      })
+    ]
+
+    const { calls, deps } = makeDeps([blockedByBridges(), blockedByBridges(bridges)])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, { cooperativeExitMs: 0 })
+
+    assert.equal(outcome.kind, 'blocked')
+    assert.equal(outcome.reason, 'quiesce-incomplete')
+    assert.equal(
+      calls.some(call => call.startsWith('terminate:')),
+      false
+    )
+    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
   })
 
   it('refuses 33 paired wrapper and worker groups before terminating any record', async () => {
@@ -508,18 +628,149 @@ describe('MCP bridge drain', () => {
     assert.ok(calls.indexOf('terminate-end:102') < calls.indexOf('terminate-start:101'))
   })
 
-  it('clears its lease when a bridge respawns between the two clear scans', async () => {
-    const { calls, deps } = makeDeps([blockedByBridges(), clear(), blockedByBridges()])
+  it.each([
+    { blocker: 'an exact bridge', outcome: blockedByBridges() },
+    {
+      blocker: 'mixed generic and exact holders',
+      outcome: {
+        kind: 'blocked',
+        result: result({
+          blocked: true,
+          processes: [{ pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }],
+          mcpBridges: [bridge()]
+        })
+      }
+    },
+    {
+      blocker: 'an unproven MCP record',
+      outcome: blockedByBridges([
+        bridge({
+          owner: 'unknown',
+          actionable: false,
+          actionability: 'hard_block',
+          action: 'refuse'
+        })
+      ])
+    }
+  ] satisfies Array<{ blocker: string; outcome: ScanOutcome }>)(
+    'clears its lease when $blocker appears on the stability scan',
+    async ({ outcome: blocker }) => {
+      const { calls, deps } = makeDeps([blockedByBridges(), clear(), blocker])
+
+      const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+        cooperativeExitMs: 900,
+        respawnIntervalMs: 1_100
+      })
+
+      assert.equal(outcome.kind, 'blocked')
+      assert.equal(outcome.reason, 'quiesce-incomplete')
+      assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
+      assert.ok(!calls.some(call => call.startsWith('terminate:')))
+    }
+  )
+
+  it('returns a probe failure from the stability scan and clears its lease', async () => {
+    const { calls, deps } = makeDeps([
+      blockedByBridges(),
+      clear(),
+      { kind: 'probe-failure', error: 'stability probe failed' }
+    ])
 
     const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
-      cooperativeExitMs: 900,
-      respawnIntervalMs: 1_100
+      cooperativeExitMs: 0,
+      respawnIntervalMs: 7
+    })
+
+    assert.equal(outcome.kind, 'probe-failure')
+    assert.equal(outcome.error, 'stability probe failed')
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'consent',
+      'lease',
+      'wait:0',
+      'scan',
+      'wait:7',
+      'scan',
+      `clear-lease:${lease.leaseId}`
+    ])
+  })
+
+  it('returns a probe failure while polling a generic holder from the stability scan', async () => {
+    const genericOnly: ScanOutcome = {
+      kind: 'blocked',
+      result: result({
+        blocked: true,
+        processes: [{ pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }]
+      })
+    }
+
+    const { calls, deps } = makeDeps([
+      blockedByBridges(),
+      clear(),
+      genericOnly,
+      { kind: 'probe-failure', error: 'stability poll failed' }
+    ])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 0,
+      genericHolderPollMs: 5,
+      genericHolderTimeoutMs: 10,
+      respawnIntervalMs: 7
+    })
+
+    assert.equal(outcome.kind, 'probe-failure')
+    assert.equal(outcome.error, 'stability poll failed')
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'consent',
+      'lease',
+      'wait:0',
+      'scan',
+      'wait:7',
+      'scan',
+      'wait:5',
+      'scan',
+      `clear-lease:${lease.leaseId}`
+    ])
+  })
+
+  it('refuses a generic holder that reaches the final-scan polling deadline', async () => {
+    const persistent = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
+
+    const genericOnly: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [persistent] })
+    }
+
+    const { calls, deps } = makeDeps([blockedByBridges(), clear(), genericOnly, genericOnly, genericOnly])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 0,
+      genericHolderPollMs: 5,
+      genericHolderTimeoutMs: 10,
+      respawnIntervalMs: 7
     })
 
     assert.equal(outcome.kind, 'blocked')
     assert.equal(outcome.reason, 'quiesce-incomplete')
-    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
-    assert.ok(!calls.some(call => call.startsWith('terminate:')))
+    assert.deepEqual(outcome.result?.processes, [persistent])
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'consent',
+      'lease',
+      'wait:0',
+      'scan',
+      'wait:7',
+      'scan',
+      'wait:5',
+      'scan',
+      'wait:5',
+      'scan',
+      `clear-lease:${lease.leaseId}`
+    ])
   })
 
   it('gets newcomer consent before the lease and catches a bridge spawned after a clear observation', async () => {
