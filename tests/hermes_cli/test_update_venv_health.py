@@ -42,6 +42,21 @@ def _fake_venv_python(tmp_path, *, windows: bool = False):
     return py
 
 
+def test_venv_health_probe_reports_timeout_as_unknown(tmp_path):
+    from hermes_cli import update_cmd
+
+    _fake_venv_python(tmp_path)
+    timeout = subprocess.TimeoutExpired(["python", "-c", "probe"], 60)
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        cli_main, "_is_windows", return_value=False
+    ), patch.object(update_cmd.subprocess, "run", side_effect=timeout):
+        healthy, detail = update_cmd._venv_core_imports_healthy()
+
+    assert healthy is None
+    assert "timed out" in detail.lower()
+
+
 
 
 # ---------------------------------------------------------------------------
