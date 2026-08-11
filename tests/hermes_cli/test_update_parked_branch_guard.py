@@ -98,6 +98,28 @@ def test_clean_fully_merged_branch_is_safe_to_switch(repo_pair):
     assert reason == ""
 
 
+def test_guard_uses_the_resolved_tracking_ref(repo_pair):
+    """A retargeted update must not fall back to origin/<branch>."""
+    _git(
+        repo_pair,
+        "update-ref",
+        "refs/remotes/fork/main",
+        "refs/remotes/origin/main",
+    )
+    _git(repo_pair, "update-ref", "-d", "refs/remotes/origin/main")
+
+    safe, reason = update_cmd._assess_parked_branch_switch(
+        GIT,
+        repo_pair,
+        "old-feature",
+        "main",
+        "refs/remotes/fork/main",
+    )
+
+    assert safe is True
+    assert reason == ""
+
+
 def test_dirty_tree_blocks_auto_switch(repo_pair):
     """Uncommitted changes on the parked branch → do not touch it."""
     (repo_pair / "a.txt").write_text("local edit\n")

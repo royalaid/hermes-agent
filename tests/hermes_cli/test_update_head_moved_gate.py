@@ -91,6 +91,10 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None
     )
+    # The production path purges cached modules after pulling fresh source.
+    # This unit fixture patches the already-imported backup module below, so
+    # keep that exact object alive across parametrized cases.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(
         hermes_main, "_run_pre_update_backup", lambda *a, **k: None
     )
@@ -131,6 +135,74 @@ def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "✓ Code updated!" in out
     assert "Code did not move" not in out
+
+
+@pytest.mark.parametrize(
+    ("node_failures", "terminal_event"),
+    [([], "receipt"), (["ui-tui"], "summary")],
+    ids=["proven-success", "degraded-node-refresh"],
+)
+def test_sibling_cron_restore_precedes_terminal_update_outcome(
+    monkeypatch, tmp_path, node_failures, terminal_event
+):
+    """Sibling recovery runs before either success proof or degraded output."""
+    from hermes_cli import backup, update_cmd
+
+    target_sha = "def456"
+    base = _make_head_moved_side_effect(post_sha=target_sha)
+
+    def run_side_effect(command, **kwargs):
+        joined = " ".join(str(value) for value in command)
+        if "rev-parse --verify refs/remotes/origin/main" in joined:
+            return SimpleNamespace(returncode=0, stdout=f"{target_sha}\n", stderr="")
+        return base(command, **kwargs)
+
+    _patch_update_deps(monkeypatch, tmp_path, run_side_effect)
+    events = []
+    snapshots = {"sibling": "snapshot-id"}
+    monkeypatch.setattr(update_cmd, "_LAST_SIBLING_SNAPSHOTS", snapshots)
+    monkeypatch.setattr(
+        backup,
+        "restore_cron_jobs_all_profiles",
+        lambda value: events.append("restore") or ([] if value is snapshots else None),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_validate_critical_modules_import", lambda _root: (True, None, None)
+    )
+    monkeypatch.setattr(
+        update_cmd, "_update_node_dependencies", lambda: list(node_failures)
+    )
+    monkeypatch.setattr(
+        update_cmd, "_rebuild_desktop_after_update", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_record_update_success",
+        lambda *_args, **_kwargs: events.append("receipt"),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_print_update_summary",
+        lambda **_kwargs: events.append("summary"),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_print_update_completion",
+        lambda _message: events.append("completion"),
+    )
+
+    hermes_main.cmd_update(
+        SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+    )
+
+    assert events[0] == "restore"
+    assert terminal_event in events[1:]
+    if terminal_event == "receipt":
+        assert events[-2:] == ["receipt", "completion"]
+        assert "summary" not in events
+    else:
+        assert events[-1] == "summary"
+        assert "receipt" not in events
 
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
