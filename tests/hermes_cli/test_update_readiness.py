@@ -20,6 +20,7 @@ from hermes_cli import (
     update_quiesce,
     update_readiness,
     update_receipt,
+    update_transaction,
 )
 from hermes_cli.subcommands.update import build_update_parser
 
@@ -715,6 +716,11 @@ def test_drain_acquires_outer_lock_then_lease_before_actionable_scan(
         "_claim_update_quiesce_lease",
         lambda _root: events.append("lease-acquire") or lease,
     )
+    monkeypatch.setattr(
+        update_quiesce,
+        "_release_update_quiesce_lease",
+        lambda *_args: events.append("lease-release") or True,
+    )
 
     def drain(*_args, **_kwargs):
         events.append("first-scan")
@@ -1162,9 +1168,10 @@ def test_receipt_is_profile_global_and_requires_current_live_lease(
     fake_main = SimpleNamespace(PROJECT_ROOT=root)
     monkeypatch.setattr(update_cmd, "_m", lambda: fake_main)
     lease = gate.write_quiesce_lease(root, owner_pid=os.getpid())
-    args = SimpleNamespace(
-        _update_invocation_id="invocation-test-123456",
-        _update_quiesce_lease=lease,
+    args = SimpleNamespace()
+    transaction = update_transaction._UpdateTransaction(
+        invocation_id="invocation-test-123456",
+        lease=lease,
     )
     health = {
         "critical_syntax": True,
@@ -1175,6 +1182,7 @@ def test_receipt_is_profile_global_and_requires_current_live_lease(
 
     receipt = update_cmd._record_update_success(
         args,
+        transaction=transaction,
         mode="git",
         branch="main",
         remote="origin",
@@ -1195,6 +1203,7 @@ def test_receipt_is_profile_global_and_requires_current_live_lease(
     with pytest.raises(RuntimeError, match="ownership was lost"):
         update_cmd._record_update_success(
             args,
+            transaction=transaction,
             mode="git",
             branch="main",
             remote="origin",
@@ -1214,14 +1223,16 @@ def test_receipt_refuses_unproven_health(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(update_cmd, "_m", lambda: SimpleNamespace(PROJECT_ROOT=root))
     lease = gate.write_quiesce_lease(root, owner_pid=os.getpid())
-    args = SimpleNamespace(
-        _update_invocation_id="invocation-test-123456",
-        _update_quiesce_lease=lease,
+    args = SimpleNamespace()
+    transaction = update_transaction._UpdateTransaction(
+        invocation_id="invocation-test-123456",
+        lease=lease,
     )
 
     with pytest.raises(RuntimeError, match="health proof"):
         update_cmd._record_update_success(
             args,
+            transaction=transaction,
             mode="archive",
             branch="main",
             remote=None,
@@ -1249,9 +1260,11 @@ def test_deferred_receipt_failure_preserves_pre_stop_recovery_plan(
     lease = gate.write_quiesce_lease(root, owner_pid=os.getpid())
     args = SimpleNamespace(
         defer_gateway_resume=True,
-        _update_invocation_id="invocation-receipt-123456",
-        _update_quiesce_lease=lease,
-        _windows_gateway_resume_plan={
+    )
+    transaction = update_transaction._UpdateTransaction(
+        invocation_id="invocation-receipt-123456",
+        lease=lease,
+        gateway_resume_plan={
             "resume_needed": False,
             "profiles": {},
             "profile_identities": {},
@@ -1271,6 +1284,7 @@ def test_deferred_receipt_failure_preserves_pre_stop_recovery_plan(
     with pytest.raises(OSError, match="receipt publication"):
         update_cmd._record_update_success(
             args,
+            transaction=transaction,
             mode="git",
             branch="main",
             remote="origin",
@@ -1287,13 +1301,13 @@ def test_deferred_receipt_failure_preserves_pre_stop_recovery_plan(
         )
 
     plan = update_deferred_gateway._deferred_gateway_plan_path(
-        root, args._update_invocation_id
+        root, transaction.invocation_id
     )
     assert plan.is_file()
     assert update_deferred_gateway._load_deferred_gateway_plan(
         plan,
         root=root,
-        invocation_id=args._update_invocation_id,
+        invocation_id=transaction.invocation_id,
         lease_id=lease["lease_id"],
     ) is not None
 
@@ -1354,11 +1368,11 @@ def test_receipt_sanitizer_rejects_git_head_that_does_not_match_target(
     assert update_receipt._sanitize_update_receipt(value, tmp_path) is None
 
 
-def _deferred_args(root: Path, *, token: dict) -> SimpleNamespace:
-    return SimpleNamespace(
-        _update_invocation_id="invocation-deferred-123456",
-        _update_quiesce_lease={"lease_id": "lease-deferred-123456"},
-        _windows_gateway_resume_plan=token,
+def _deferred_transaction(*, token: dict) -> update_transaction._UpdateTransaction:
+    return update_transaction._UpdateTransaction(
+        invocation_id="invocation-deferred-123456",
+        lease={"lease_id": "lease-deferred-123456"},
+        gateway_resume_plan=token,
     )
 
 
@@ -1380,9 +1394,11 @@ def test_deferred_gateway_plan_is_private_exact_and_multi_profile(
         "unmapped": [],
         "cold_start_if_installed": False,
     }
-    args = _deferred_args(root, token=token)
+    transaction = _deferred_transaction(token=token)
 
-    path = update_deferred_gateway._write_deferred_gateway_plan(args, root)
+    path = update_deferred_gateway._write_deferred_gateway_plan(
+        root, transaction=transaction
+    )
     raw = json.loads(path.read_text(encoding="utf-8"))
 
     assert path == home / ".hermes-gateway-resume-invocation-deferred-123456.json"
@@ -1402,8 +1418,8 @@ def test_deferred_gateway_plan_is_private_exact_and_multi_profile(
     assert update_deferred_gateway._sanitize_deferred_gateway_plan(
         raw,
         root=root,
-        invocation_id=args._update_invocation_id,
-        lease_id=args._update_quiesce_lease["lease_id"],
+        invocation_id=transaction.invocation_id,
+        lease_id=transaction.lease["lease_id"],
     ) is not None
 
 
@@ -1422,8 +1438,7 @@ def test_deferred_gateway_plan_rejects_noncanonical_top_level_types(
     root = home / "hermes-agent"
     root.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    args = _deferred_args(
-        root,
+    transaction = _deferred_transaction(
         token={
             "resume_needed": False,
             "profiles": {},
@@ -1434,19 +1449,21 @@ def test_deferred_gateway_plan_rejects_noncanonical_top_level_types(
         },
     )
     payload = json.loads(
-        update_deferred_gateway._write_deferred_gateway_plan(args, root).read_text(encoding="utf-8")
+        update_deferred_gateway._write_deferred_gateway_plan(
+            root, transaction=transaction
+        ).read_text(encoding="utf-8")
     )
     payload[field] = replacement
     unsigned = {key: value for key, value in payload.items() if key != "auth"}
     payload["auth"] = update_deferred_gateway._gateway_plan_auth(
-        unsigned, args._update_quiesce_lease["lease_id"]
+        unsigned, transaction.lease["lease_id"]
     )
 
     assert update_deferred_gateway._sanitize_deferred_gateway_plan(
         payload,
         root=root,
-        invocation_id=args._update_invocation_id,
-        lease_id=args._update_quiesce_lease["lease_id"],
+        invocation_id=transaction.invocation_id,
+        lease_id=transaction.lease["lease_id"],
     ) is None
 
 
@@ -1457,8 +1474,7 @@ def test_deferred_gateway_plan_writer_requires_matching_profile_pid(
     root = home / "hermes-agent"
     root.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    args = _deferred_args(
-        root,
+    transaction = _deferred_transaction(
         token={
             "resume_needed": True,
             "profiles": {"work": 101},
@@ -1472,7 +1488,9 @@ def test_deferred_gateway_plan_writer_requires_matching_profile_pid(
     )
 
     with pytest.raises(RuntimeError, match="does not match its PID"):
-        update_deferred_gateway._write_deferred_gateway_plan(args, root)
+        update_deferred_gateway._write_deferred_gateway_plan(
+            root, transaction=transaction
+        )
 
 
 def test_deferred_gateway_plan_refuses_unmapped_or_foreign_bytes(
@@ -1492,20 +1510,22 @@ def test_deferred_gateway_plan_refuses_unmapped_or_foreign_bytes(
     }
     with pytest.raises(RuntimeError, match="unmapped"):
         update_deferred_gateway._write_deferred_gateway_plan(
-            _deferred_args(root, token=token), root
+            root, transaction=_deferred_transaction(token=token)
         )
 
     token["unmapped_pids"] = []
     token["unmapped"] = []
-    args = _deferred_args(root, token=token)
-    path = update_deferred_gateway._write_deferred_gateway_plan(args, root)
+    transaction = _deferred_transaction(token=token)
+    path = update_deferred_gateway._write_deferred_gateway_plan(
+        root, transaction=transaction
+    )
     foreign = json.loads(path.read_text(encoding="utf-8"))
     foreign["cold_start_if_installed"] = True
     assert update_deferred_gateway._sanitize_deferred_gateway_plan(
         foreign,
         root=root,
-        invocation_id=args._update_invocation_id,
-        lease_id=args._update_quiesce_lease["lease_id"],
+        invocation_id=transaction.invocation_id,
+        lease_id=transaction.lease["lease_id"],
     ) is None
 
 
@@ -1613,8 +1633,7 @@ def test_deferred_plan_consume_is_exact_and_completed_replay_is_idempotent(
     root = home / "hermes-agent"
     root.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    args = _deferred_args(
-        root,
+    transaction = _deferred_transaction(
         token={
             "resume_needed": True,
             "profiles": {},
@@ -1624,20 +1643,22 @@ def test_deferred_plan_consume_is_exact_and_completed_replay_is_idempotent(
             "cold_start_if_installed": False,
         },
     )
-    pending = update_deferred_gateway._write_deferred_gateway_plan(args, root)
+    pending = update_deferred_gateway._write_deferred_gateway_plan(
+        root, transaction=transaction
+    )
     raw = pending.read_text(encoding="utf-8")
 
     assert update_deferred_gateway._consume_deferred_gateway_plan(pending, raw) is True
     assert not pending.exists()
     completed = update_deferred_gateway._deferred_gateway_plan_path(
-        root, args._update_invocation_id, completed=True
+        root, transaction.invocation_id, completed=True
     )
     assert completed.read_text(encoding="utf-8") == raw
     assert update_deferred_gateway._load_deferred_gateway_plan(
         completed,
         root=root,
-        invocation_id=args._update_invocation_id,
-        lease_id=args._update_quiesce_lease["lease_id"],
+        invocation_id=transaction.invocation_id,
+        lease_id=transaction.lease["lease_id"],
     ) is not None
 
 
@@ -1648,8 +1669,7 @@ def test_deferred_plan_consume_unlink_failure_rolls_back_completed_authority(
     root = home / "hermes-agent"
     root.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    args = _deferred_args(
-        root,
+    transaction = _deferred_transaction(
         token={
             "resume_needed": True,
             "profiles": {},
@@ -1659,10 +1679,12 @@ def test_deferred_plan_consume_unlink_failure_rolls_back_completed_authority(
             "cold_start_if_installed": False,
         },
     )
-    pending = update_deferred_gateway._write_deferred_gateway_plan(args, root)
+    pending = update_deferred_gateway._write_deferred_gateway_plan(
+        root, transaction=transaction
+    )
     raw = pending.read_text(encoding="utf-8")
     completed = update_deferred_gateway._deferred_gateway_plan_path(
-        root, args._update_invocation_id, completed=True
+        root, transaction.invocation_id, completed=True
     )
     original_unlink = Path.unlink
 
@@ -1685,8 +1707,7 @@ def test_deferred_plan_loader_recovers_authenticated_consume_tombstone(
     root = home / "hermes-agent"
     root.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    args = _deferred_args(
-        root,
+    transaction = _deferred_transaction(
         token={
             "resume_needed": False,
             "profiles": {},
@@ -1696,7 +1717,9 @@ def test_deferred_plan_loader_recovers_authenticated_consume_tombstone(
             "cold_start_if_installed": False,
         },
     )
-    pending = update_deferred_gateway._write_deferred_gateway_plan(args, root)
+    pending = update_deferred_gateway._write_deferred_gateway_plan(
+        root, transaction=transaction
+    )
     raw = pending.read_text(encoding="utf-8")
     tombstone = pending.with_name(f"{pending.name}.consume-999-recovery")
     os.replace(pending, tombstone)
@@ -1704,8 +1727,8 @@ def test_deferred_plan_loader_recovers_authenticated_consume_tombstone(
     loaded = update_deferred_gateway._load_deferred_gateway_plan(
         pending,
         root=root,
-        invocation_id=args._update_invocation_id,
-        lease_id=args._update_quiesce_lease["lease_id"],
+        invocation_id=transaction.invocation_id,
+        lease_id=transaction.lease["lease_id"],
     )
 
     assert loaded is not None
@@ -1789,9 +1812,12 @@ def test_atomic_prepare_releases_initial_lease_when_post_drain_renewal_fails(
         lambda _root, lease: released.append(lease) or True,
     )
     args = SimpleNamespace(yes=True, bridge_lease_id=None, timeout_seconds=1.0)
+    transaction = update_transaction._UpdateTransaction()
 
     with pytest.raises(RuntimeError, match="injected renewal failure"):
-        update_quiesce._prepare_atomic_windows_update(args, root=root)
+        update_quiesce._prepare_atomic_windows_update(
+            args, root=root, transaction=transaction
+        )
 
     assert released == [initial]
 
@@ -1845,7 +1871,11 @@ def test_deferred_update_does_not_kill_gateway_missing_from_frozen_plan(
     )
 
     with pytest.raises(SystemExit) as exit_info:
-        cli_main._cmd_update_impl(args, gateway_mode=False)
+        cli_main._cmd_update_impl(
+            args,
+            gateway_mode=False,
+            transaction=update_transaction._UpdateTransaction(),
+        )
 
     assert exit_info.value.code == 2
     assert revalidated == []
@@ -2114,12 +2144,23 @@ def test_malformed_invocation_id_exits_before_any_bridge_stop(monkeypatch):
     assert lifecycle_calls == []
 
 
-@pytest.mark.parametrize("body_fails", [False, True], ids=["success", "body-failure"])
+@pytest.mark.parametrize(
+    ("body_fails", "cleanup_outcome", "expected_error"),
+    [
+        pytest.param(False, "released", None, id="success"),
+        pytest.param(True, "released", "body", id="body-failure"),
+        pytest.param(False, "unproven", "cleanup", id="cleanup-unproven"),
+        pytest.param(False, "raises", "cleanup-exception", id="cleanup-exception"),
+    ],
+)
 @pytest.mark.windows_only
 def test_windows_cmd_update_orders_all_transaction_cleanup(
-    monkeypatch, body_fails: bool
+    monkeypatch,
+    body_fails: bool,
+    cleanup_outcome: str,
+    expected_error: str | None,
 ) -> None:
-    """Exercise the real wrapper order on success and updater-body failure."""
+    """Pin wrapper cleanup order and make lease-cleanup failure observable."""
     from hermes_cli import config as config_module
     from hermes_cli import main as cli_main
     from hermes_cli import update_lock
@@ -2169,12 +2210,18 @@ def test_windows_cmd_update_orders_all_transaction_cleanup(
         def stop(self):
             events.append("heartbeat-stop")
 
-    def body(args, *, gateway_mode):
+    def body(args, *, gateway_mode, transaction):
         assert gateway_mode is False
         events.append("body")
-        args._windows_gateway_resume_plan = resume_plan
+        transaction.gateway_resume_plan = resume_plan
         if body_fails:
             raise BodyFailure("injected update body failure")
+
+    def prepare(_args, *, root, transaction):
+        assert root == cli_main.PROJECT_ROOT
+        events.append("prepare")
+        transaction.lease = lease
+        transaction.invocation_id = "invocation-order-123456"
 
     monkeypatch.setattr(config_module, "is_managed", lambda: False)
     monkeypatch.setattr(
@@ -2194,8 +2241,7 @@ def test_windows_cmd_update_orders_all_transaction_cleanup(
     monkeypatch.setattr(
         cli_main,
         "_prepare_atomic_windows_update",
-        lambda _args, *, root: events.append("prepare")
-        or (lease, "invocation-order-123456"),
+        prepare,
     )
     monkeypatch.setattr(cli_main, "_WindowsMutationJob", FakeJob)
     monkeypatch.setattr(cli_main, "_UpdateLeaseHeartbeat", FakeHeartbeat)
@@ -2207,12 +2253,15 @@ def test_windows_cmd_update_orders_all_transaction_cleanup(
         if plan is resume_plan
         else pytest.fail("wrong gateway resume plan"),
     )
-    monkeypatch.setattr(
-        cli_main,
-        "_release_update_quiesce_lease",
-        lambda root, value: events.append("lease-release")
-        or (root == cli_main.PROJECT_ROOT and value is lease),
-    )
+    def release_lease(root, value):
+        events.append("lease-release")
+        assert root == cli_main.PROJECT_ROOT
+        assert value is lease
+        if cleanup_outcome == "raises":
+            raise PermissionError("injected lease cleanup failure")
+        return cleanup_outcome == "released"
+
+    monkeypatch.setattr(cli_main, "_release_update_quiesce_lease", release_lease)
     args = SimpleNamespace(
         preflight=False,
         drain=False,
@@ -2222,8 +2271,16 @@ def test_windows_cmd_update_orders_all_transaction_cleanup(
         defer_gateway_resume=False,
     )
 
-    if body_fails:
+    if expected_error == "body":
         with pytest.raises(BodyFailure, match="injected update body failure"):
+            cli_main.cmd_update(args)
+    elif expected_error == "cleanup":
+        with pytest.raises(
+            RuntimeError, match="bridge lease cleanup could not be proven"
+        ):
+            cli_main.cmd_update(args)
+    elif expected_error == "cleanup-exception":
+        with pytest.raises(PermissionError, match="injected lease cleanup failure"):
             cli_main.cmd_update(args)
     else:
         cli_main.cmd_update(args)
@@ -2244,3 +2301,10 @@ def test_windows_cmd_update_orders_all_transaction_cleanup(
         "lock-release",
         "output-finalize",
     ]
+    assert not {
+        "_update_invocation_id",
+        "_update_quiesce_lease",
+        "_update_handoff_owner_pid",
+        "_windows_gateway_resume_plan",
+        "_deferred_gateway_plan_written",
+    }.intersection(vars(args))
