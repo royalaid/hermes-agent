@@ -82,14 +82,37 @@ def test_import_guard_ignores_non_import_errors(monkeypatch, tmp_path):
     assert ok is True
 
 
-def test_import_guard_is_non_fatal_when_probe_cannot_run(monkeypatch, tmp_path):
-    """If we can't spawn the probe, don't block the user's update."""
+def test_import_guard_reports_unknown_when_probe_cannot_run(monkeypatch, tmp_path):
+    """A launch failure must not be promoted to affirmative import health."""
 
     def boom(*_a, **_kw):
         raise OSError("cannot spawn")
 
     monkeypatch.setattr(update_cmd.subprocess, "run", boom)
-    assert update_cmd._validate_critical_modules_import(tmp_path) == (True, None, None)
+    ok, module, detail = update_cmd._validate_critical_modules_import(tmp_path)
+
+    assert ok is None
+    assert module is None
+    assert detail is not None and "cannot spawn" in detail
+
+
+def test_import_guard_reports_unknown_for_unrecognized_probe_exit(
+    monkeypatch, tmp_path
+):
+    """Only exit zero is proof that every critical module imported."""
+
+    result = type(
+        "Result",
+        (),
+        {"returncode": 9, "stdout": "", "stderr": "probe crashed"},
+    )()
+    monkeypatch.setattr(update_cmd.subprocess, "run", lambda *_a, **_kw: result)
+
+    ok, module, detail = update_cmd._validate_critical_modules_import(tmp_path)
+
+    assert ok is None
+    assert module is None
+    assert detail == "probe crashed"
 
 
 # ---------------------------------------------------------------------------
