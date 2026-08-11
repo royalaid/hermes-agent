@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -378,6 +381,102 @@ class TestStripUnmanagedPluginTables:
         # File parses cleanly as TOML (the original duplicate-key error is gone).
         import tomllib
         tomllib.loads(new_text)
+
+
+# ---- Hermes tools MCP launch provenance ----
+
+
+class TestHermesToolsMcpEntry:
+    def test_uses_safe_path_before_module(self):
+        entry = _build_hermes_tools_mcp_entry()
+
+        assert entry["args"] == [
+            "-P",
+            "-m",
+            "agent.transports.hermes_tools_mcp_server",
+        ]
+
+    def test_safe_path_excludes_caller_cwd_and_preserves_pythonpath(
+        self, monkeypatch, tmp_path
+    ):
+        caller_cwd = tmp_path / "caller"
+        module_root = tmp_path / "module-root"
+        caller_cwd.mkdir()
+        module_root.mkdir()
+        (caller_cwd / "mcp_launch_probe.py").write_text(
+            'ORIGIN = "caller-cwd"\n', encoding="utf-8"
+        )
+        (module_root / "mcp_launch_probe.py").write_text(
+            'ORIGIN = "pythonpath"\n', encoding="utf-8"
+        )
+        monkeypatch.setenv("PYTHONPATH", str(module_root))
+        entry = _build_hermes_tools_mcp_entry()
+        env = {**os.environ, **entry["env"]}
+
+        completed = subprocess.run(
+            [
+                entry["command"],
+                entry["args"][0],
+                "-c",
+                "import mcp_launch_probe; print(mcp_launch_probe.ORIGIN)",
+            ],
+            cwd=caller_cwd,
+            env=env,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert completed.stdout.strip() == "pythonpath"
+
+    def test_native_source_root_wins_over_msys_path_and_caller_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli import codex_runtime_plugin_migration as migration
+
+        caller_cwd = tmp_path / "caller"
+        shadow_package = caller_cwd / "agent" / "transports"
+        shadow_package.mkdir(parents=True)
+        (caller_cwd / "agent" / "__init__.py").write_text("", encoding="utf-8")
+        (shadow_package / "__init__.py").write_text("", encoding="utf-8")
+        (shadow_package / "hermes_tools_mcp_server.py").write_text(
+            'ORIGIN = "caller-cwd"\n', encoding="utf-8"
+        )
+        inherited_pythonpath = "/c/not-a-native-hermes-checkout"
+        monkeypatch.setenv("PYTHONPATH", inherited_pythonpath)
+
+        entry = _build_hermes_tools_mcp_entry()
+        source_root = str(Path(migration.__file__).resolve().parent.parent)
+        pythonpath_entries = entry["env"]["PYTHONPATH"].split(os.pathsep)
+
+        assert pythonpath_entries == [source_root, inherited_pythonpath]
+
+        env = {**os.environ, **entry["env"]}
+        completed = subprocess.run(
+            [
+                entry["command"],
+                entry["args"][0],
+                "-c",
+                (
+                    "from importlib.util import find_spec; "
+                    "from pathlib import Path; "
+                    "spec = find_spec('agent.transports.hermes_tools_mcp_server'); "
+                    "print(Path(spec.origin).resolve())"
+                ),
+            ],
+            cwd=caller_cwd,
+            env=env,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        )
+
+        expected_module = (
+            Path(source_root) / "agent" / "transports" / "hermes_tools_mcp_server.py"
+        ).resolve()
+        assert Path(completed.stdout.strip()) == expected_module
 
 
 # ---- Bug C: HERMES_HOME tempdir leak into ~/.codex/config.toml ----
