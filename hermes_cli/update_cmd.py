@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import get_default_hermes_root, venv_bin_dir, venv_python_path
+from hermes_constants import venv_bin_dir, venv_python_path
 from hermes_cli.update_deferred_gateway import (
     _cmd_update_resume_deferred_gateway,
     _validate_deferred_update_request,
@@ -87,6 +87,10 @@ class _VerifiedProcessIdentity:
     install_root: str = ""
     role: str = ""
     working_directory: str = ""
+    venv_ancestor_pid: int = 0
+    venv_ancestor_created_at: float = 0.0
+    venv_ancestor_argv: tuple[str, ...] = ()
+    venv_ancestor_executable: str = ""
 
 
 def _record_update_success(
@@ -324,7 +328,9 @@ def _refresh_update_target_sha(
     except OSError:
         return None
 
-def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
+def _validate_critical_files_syntax(
+    root,
+) -> tuple[bool | None, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
     These are the files imported on every ``hermes`` startup; if any of them
@@ -341,28 +347,28 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
     we only care about the compile-or-not signal.
 
     Returns ``(ok, failing_path, error_message)``. ``ok=True`` means every
-    file parsed cleanly.
+    required file parsed cleanly, ``False`` means a syntax error was proven,
+    and ``None`` means the probe could not establish either result.
     """
     import py_compile
     import tempfile
 
     root = Path(root)
-    with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
-        for relpath in _UPDATE_CRITICAL_FILES:
-            path = root / relpath
-            if not path.exists():
-                # Missing file is suspicious but not necessarily fatal — a future
-                # refactor may legitimately remove one of these. Skip and move on.
-                continue
-            # Mirror the relative path under the tmpdir so two different
-            # files with the same basename don't collide on the cfile name.
-            cfile = Path(tmpdir) / (relpath.replace("/", "__") + "c")
-            try:
+    path: Path | None = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
+            for relpath in _UPDATE_CRITICAL_FILES:
+                path = root / relpath
+                if not path.is_file():
+                    return None, str(path), "required critical file is missing"
+                # Mirror the relative path under the tmpdir so two different
+                # files with the same basename don't collide on the cfile name.
+                cfile = Path(tmpdir) / (relpath.replace("/", "__") + "c")
                 py_compile.compile(str(path), cfile=str(cfile), doraise=True)
-            except py_compile.PyCompileError as exc:
-                return False, str(path), str(exc)
-            except OSError as exc:
-                return False, str(path), f"could not read: {exc}"
+    except py_compile.PyCompileError as exc:
+        return False, str(path), str(exc)
+    except OSError as exc:
+        return None, str(path) if path is not None else None, str(exc)
     return True, None, None
 
 
@@ -378,7 +384,9 @@ _UPDATE_CRITICAL_MODULES = (
 )
 
 
-def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | None]:
+def _validate_critical_modules_import(
+    root,
+) -> tuple[bool | None, str | None, str | None]:
     """Import each module in ``_UPDATE_CRITICAL_MODULES`` in a subprocess.
 
     ``_validate_critical_files_syntax`` only *parses* files, so it cannot see
@@ -401,7 +409,8 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
     different Python than the install's own, and probing the wrong
     interpreter would test a tree the user never runs.
 
-    Returns ``(ok, failing_module, error_message)``.
+    Returns ``(ok, failing_module, error_message)``. ``None`` means the
+    subprocess did not provide an affirmative import result.
     """
     from hermes_constants import FIRST_PARTY_MODULE_ROOTS
 
@@ -433,10 +442,14 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
             venv_python = venv_python_path(
                 Path(root) / "venv", windows=_m()._is_windows()
             )
-            if venv_python.exists():
+            try:
+                venv_python.stat()
+            except FileNotFoundError:
+                pass
+            else:
                 interpreter = str(venv_python)
-        except Exception:
-            pass  # fall back to the running interpreter
+        except Exception as exc:
+            return None, None, f"could not resolve probe interpreter: {exc}"
         result = subprocess.run(
             [interpreter, "-c", probe],
             cwd=str(root),
@@ -446,15 +459,17 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
             errors="replace",
             timeout=120,
         )
-    except (OSError, subprocess.SubprocessError):
-        # Can't run the probe — don't block the update on our own tooling.
-        return True, None, None
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, None, str(exc)
     if result.returncode == 3:
         parts = (result.stdout or "").split("\n", 1)
         module = parts[0].strip() or "unknown"
         detail = parts[1].strip() if len(parts) > 1 else ""
         return False, module, detail
-    return True, None, None
+    if result.returncode == 0:
+        return True, None, None
+    detail = (result.stderr or result.stdout or "").strip()
+    return None, None, detail or f"import probe exited {result.returncode}"
 
 def _gateway_prompt(prompt_text: str, default: str = "", timeout: float = 300.0) -> str:
     """File-based IPC prompt for gateway mode.
@@ -1152,6 +1167,14 @@ def _update_via_zip(args, *, transaction: _UpdateTransaction):
     # #70636).
     _m()._refresh_active_memory_provider_dependencies()
 
+    dependency_probe_ok, dependency_detail = _venv_core_imports_healthy()
+    dependencies_ok = dependency_probe_ok if dependencies_ok else False
+    if dependency_probe_ok is not True:
+        print(
+            "⚠ Python dependency health could not be proven after update: "
+            f"{dependency_detail}"
+        )
+
     # Now that dependencies are installed, verify the tree actually imports.
     # The copy loop above replaces top-level entries one at a time in
     # os.listdir order, so an interruption between (say) `agent/` and `tools/`
@@ -1164,7 +1187,7 @@ def _update_via_zip(args, *, transaction: _UpdateTransaction):
     syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
         _m().PROJECT_ROOT
     )
-    if not syntax_ok:
+    if syntax_ok is False:
         print()
         print(f"✗ Updated checkout failed syntax validation: {failing_path}")
         if syntax_error:
@@ -1174,7 +1197,7 @@ def _update_via_zip(args, *, transaction: _UpdateTransaction):
     import_ok, failing_module, import_error = _validate_critical_modules_import(
         _m().PROJECT_ROOT
     )
-    if not import_ok:
+    if import_ok is False:
         print()
         print("✗ Update left the install in an unimportable state:")
         print(f"  {failing_module}: {import_error}")
@@ -1184,6 +1207,9 @@ def _update_via_zip(args, *, transaction: _UpdateTransaction):
         _m().sys.exit(1)
 
     node_failures = _update_node_dependencies()
+    node_dependencies_ok = _node_dependencies_healthy_read_only()
+    if node_failures:
+        node_dependencies_ok = False
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
     # Sync skills
@@ -1294,6 +1320,14 @@ def _update_via_zip(args, *, transaction: _UpdateTransaction):
         )
         print("  Code and Python deps are updated, but the dashboard/TUI may")
         print("  be in a mixed state until the Node deps are rebuilt.")
+    elif not all(
+        value is True
+        for value in (syntax_ok, import_ok, dependencies_ok, node_dependencies_ok)
+    ):
+        print(
+            "⚠ Update did not pass the final runtime health proof; "
+            "no success receipt was written."
+        )
     else:
         _record_update_success(
             args,
@@ -1309,7 +1343,7 @@ def _update_via_zip(args, *, transaction: _UpdateTransaction):
                 "critical_syntax": syntax_ok,
                 "critical_imports": import_ok,
                 "dependencies": dependencies_ok,
-                "node_dependencies": not bool(node_failures),
+                "node_dependencies": node_dependencies_ok,
             },
         )
         _print_update_completion("✓ Update complete!")
@@ -2331,35 +2365,37 @@ def _npm_manifests_digest() -> str | None:
 
     Returns None when the lockfile is missing (never skip then).
     """
-    if not (_m().PROJECT_ROOT / "package-lock.json").exists():
+    lockfile = _m().PROJECT_ROOT / "package-lock.json"
+    try:
+        lockfile.stat()
+    except FileNotFoundError:
         return None
     h = hashlib.sha256()
     for p in _npm_manifest_paths():
         h.update(str(p.relative_to(_m().PROJECT_ROOT)).encode())
-        try:
-            h.update(p.read_bytes())
-        except OSError:
-            h.update(b"<missing>")
+        h.update(p.read_bytes())
     return h.hexdigest()
 
-def _npm_lockfile_changed(hermes_root: Path) -> bool:
-    current = _npm_manifests_digest()
-    if current is None:
-        return True
-    # Also check that node_modules exists; a matching hash with missing
-    # node_modules means the cache was recorded by another checkout.
-    if not (_m().PROJECT_ROOT / "node_modules").is_dir():
-        return True
-    # A matching lockfile hash over a tree whose web build toolchain never
-    # landed must NOT skip the reinstall — otherwise every later `hermes
-    # update` keeps rebuilding against a half-installed tree and serving a
-    # stale dist.
-    web_dir = _m().PROJECT_ROOT / "web"
-    if (web_dir / "package.json").is_file() and not _web_build_toolchain_ready(
-        *_web_toolchain_roots(web_dir)
-    ):
-        return True
+
+def _npm_lockfile_changed(hermes_root: Path) -> bool | None:
+    """Return whether Node dependencies need repair, or ``None`` if unknown."""
     try:
+        current = _npm_manifests_digest()
+        if current is None:
+            return True
+        # Also check that node_modules exists; a matching hash with missing
+        # node_modules means the cache was recorded by another checkout.
+        if not (_m().PROJECT_ROOT / "node_modules").is_dir():
+            return True
+        # A matching lockfile hash over a tree whose web build toolchain never
+        # landed must NOT skip the reinstall — otherwise every later `hermes
+        # update` keeps rebuilding against a half-installed tree and serving a
+        # stale dist.
+        web_dir = _m().PROJECT_ROOT / "web"
+        if (web_dir / "package.json").is_file() and not _web_build_toolchain_ready(
+            *_web_toolchain_roots(web_dir)
+        ):
+            return True
         # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
         cache_key = hashlib.sha256(str(_m().PROJECT_ROOT).encode()).hexdigest()[:12]
         cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
@@ -2367,25 +2403,33 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
             return True
         return cache_file.read_text(encoding="utf-8").strip() != current
     except OSError:
-        return True
+        return None
 
 
-def _node_dependencies_healthy_read_only() -> bool:
+def _node_dependencies_healthy_read_only() -> bool | None:
     """Prove Node dependency state without installing or rewriting caches."""
-    if not (_m().PROJECT_ROOT / "package.json").is_file():
+    package_json = _m().PROJECT_ROOT / "package.json"
+    try:
+        package_json.stat()
+    except FileNotFoundError:
         return True
+    except OSError:
+        return None
+    if not package_json.is_file():
+        return False
     try:
         from hermes_constants import get_default_hermes_root
 
-        return not _npm_lockfile_changed(get_default_hermes_root())
+        changed = _npm_lockfile_changed(get_default_hermes_root())
+        return None if changed is None else not changed
     except Exception:
-        return False
+        return None
 
 def _record_npm_lockfile_hash(hermes_root: Path) -> None:
-    digest = _npm_manifests_digest()
-    if digest is None:
-        return
     try:
+        digest = _npm_manifests_digest()
+        if digest is None:
+            return
         cache_key = hashlib.sha256(str(_m().PROJECT_ROOT).encode()).hexdigest()[:12]
         cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
         cache_file.write_text(digest, encoding="utf-8")
@@ -2470,7 +2514,7 @@ def _update_node_dependencies() -> list[str]:
     except Exception:
         pass
 
-    if not _m()._npm_lockfile_changed(shared_hermes_root):
+    if _m()._npm_lockfile_changed(shared_hermes_root) is False:
         logger.info("npm lockfile unchanged, skipping npm install")
         return []
 
@@ -3133,7 +3177,7 @@ def _wait_for_windows_update_gateway_exit(
             pass
     return survivors
 
-def _venv_core_imports_healthy() -> tuple[bool, str]:
+def _venv_core_imports_healthy() -> tuple[bool | None, str]:
     """Probe the project venv for the core imports the backend needs to boot.
 
     Runs a tiny import check inside the venv interpreter (NOT this process —
@@ -3146,12 +3190,14 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     the user's install stays broken no matter how many times they update
     (ryanc's incident, July 2026).
 
-    Returns ``(healthy, detail)``. Never raises; unknown states report
-    healthy so a probe failure can't force needless reinstalls.
+    Returns ``(healthy, detail)``. Never raises; unknown states return
+    ``None`` so they may trigger repair but can never authorize a receipt.
     """
     venv_dir = _m().PROJECT_ROOT / "venv"
     venv_python = venv_python_path(venv_dir, windows=_m()._is_windows())
-    if not venv_python.exists():
+    try:
+        venv_python.stat()
+    except FileNotFoundError:
         # No venv interpreter at all. In a dev checkout that's normal (the
         # dev may run hermes from any interpreter), so report healthy to
         # avoid forcing reinstalls. But on a MANAGED install (the Windows
@@ -3167,6 +3213,8 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         if any(m.exists() for m in managed_markers):
             return False, f"venv python missing ({venv_python})"
         return True, ""
+    except OSError as exc:
+        return None, f"could not inspect venv python ({venv_python}): {exc}"
 
     # Core web/serve imports plus their newest transitive deps. Import (not
     # just metadata) — a package can have intact dist-info but a missing
@@ -3190,7 +3238,7 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         )
     except Exception as exc:
         logger.debug("venv health probe failed to run: %s", exc)
-        return True, ""
+        return None, str(exc)
 
     missing = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
     if result.returncode != 0 and not missing:
@@ -3512,7 +3560,7 @@ _GATEWAY_STOP_ROLES = frozenset(
 
 
 class _GatewayOutsideInstall(RuntimeError):
-    """A discovered gateway process is rooted outside the target install."""
+    """A discovered gateway cannot be bound to the target install's venv."""
 
 
 def _canonical_process_path(value: str | Path) -> str:
@@ -3526,17 +3574,98 @@ def _process_path_is_within(value: str, parent: str) -> bool:
         return False
 
 
+def _gateway_venv_roots(install_root: str) -> tuple[str, str]:
+    return (
+        _canonical_process_path(Path(install_root) / "venv"),
+        _canonical_process_path(Path(install_root) / ".venv"),
+    )
+
+
+def _gateway_process_uses_target_venv(
+    executable: str,
+    argv: tuple[str, ...],
+    venv_roots: tuple[str, str],
+) -> bool:
+    """Return whether both live executable facts bind to the target venv."""
+    if not executable or not argv or not os.path.isabs(argv[0]):
+        return False
+    argv_executable = _canonical_process_path(argv[0])
+    return any(
+        _process_path_is_within(executable, root)
+        and _process_path_is_within(argv_executable, root)
+        for root in venv_roots
+    )
+
+
+def _capture_target_venv_gateway_ancestor(
+    process,
+    *,
+    process_pid: int,
+    venv_roots: tuple[str, str],
+    psutil,
+    is_pausable_gateway,
+) -> tuple[int, float, tuple[str, ...], str] | None:
+    """Freeze the first exact gateway-shaped ancestor in the target venv."""
+    seen = {int(process_pid)}
+    current = process
+    for _depth in range(32):
+        try:
+            current = current.parent()
+        except psutil.NoSuchProcess:
+            return None
+        except Exception as exc:
+            raise RuntimeError(
+                f"gateway process {process_pid} ancestry is unreadable"
+            ) from exc
+        if current is None:
+            return None
+        ancestor_pid = int(current.pid)
+        if ancestor_pid <= 0 or ancestor_pid in seen:
+            raise RuntimeError(
+                f"gateway process {process_pid} ancestry is invalid"
+            )
+        seen.add(ancestor_pid)
+        try:
+            created_at = float(current.create_time())
+            argv = tuple(str(value) for value in (current.cmdline() or []))
+            executable_raw = str(current.exe() or "")
+        except psutil.NoSuchProcess:
+            return None
+        except Exception as exc:
+            raise RuntimeError(
+                f"gateway process {process_pid} ancestry is unreadable"
+            ) from exc
+        if not math.isfinite(created_at) or created_at <= 0:
+            raise RuntimeError(
+                f"gateway ancestor {ancestor_pid} creation time is invalid"
+            )
+        if not executable_raw or not os.path.isabs(executable_raw):
+            raise RuntimeError(
+                f"gateway ancestor {ancestor_pid} executable is unreadable"
+            )
+        executable = _canonical_process_path(executable_raw)
+        if (
+            argv
+            and is_pausable_gateway(list(argv))
+            and _gateway_process_uses_target_venv(executable, argv, venv_roots)
+        ):
+            return ancestor_pid, created_at, argv, executable
+    raise RuntimeError(f"gateway process {process_pid} ancestry is too deep")
+
+
 def _capture_gateway_stop_identity(
     pid: int,
     *,
     role: str,
     root: Path | str | None = None,
 ) -> _VerifiedProcessIdentity | None:
-    """Capture one exact, root-bound gateway identity before any stop.
+    """Capture one exact, target-venv-bound gateway identity before any stop.
 
     ``None`` means the PID definitively exited. Unreadable or weakly
     classified state raises so callers refuse the update instead of turning a
-    discovery-time numeric PID into tree-kill authority.
+    discovery-time numeric PID into tree-kill authority. A shared Hermes-home
+    cwd is profile state, not install ownership; a base-interpreter worker must
+    instead have an exact gateway-shaped ancestor in this install's venv.
     """
     if role not in _GATEWAY_STOP_ROLES:
         raise RuntimeError(f"unsupported gateway stop role: {role}")
@@ -3576,26 +3705,30 @@ def _capture_gateway_stop_identity(
     )
     executable = _canonical_process_path(executable_raw)
     working_directory = _canonical_process_path(cwd_raw)
-    global_home = _canonical_process_path(get_default_hermes_root())
-    if not any(
-        _process_path_is_within(working_directory, allowed_root)
-        for allowed_root in (install_root, global_home)
-    ):
+    venv_roots = _gateway_venv_roots(install_root)
+    direct_venv_binding = _gateway_process_uses_target_venv(
+        executable, argv, venv_roots
+    )
+    ancestor_binding: tuple[int, float, tuple[str, ...], str] | None = None
+    if not direct_venv_binding and role != "gateway_launcher":
+        ancestor_binding = _capture_target_venv_gateway_ancestor(
+            process,
+            process_pid=numeric_pid,
+            venv_roots=venv_roots,
+            psutil=psutil,
+            is_pausable_gateway=_is_pausable_gateway,
+        )
+    if not direct_venv_binding and ancestor_binding is None:
         raise _GatewayOutsideInstall(
-            f"gateway process {numeric_pid} is not rooted in this install"
+            f"gateway process {numeric_pid} is not bound to this install's venv"
         )
-    if role == "gateway_launcher":
-        launcher_roots = (
-            _canonical_process_path(Path(install_root) / "venv"),
-            _canonical_process_path(Path(install_root) / ".venv"),
-        )
-        if not any(
-            _process_path_is_within(executable, launcher_root)
-            for launcher_root in launcher_roots
-        ):
-            raise RuntimeError(
-                f"gateway launcher {numeric_pid} is outside this install's venv"
-            )
+
+    (
+        venv_ancestor_pid,
+        venv_ancestor_created_at,
+        venv_ancestor_argv,
+        venv_ancestor_executable,
+    ) = ancestor_binding or (0, 0.0, (), "")
 
     return _VerifiedProcessIdentity(
         pid=numeric_pid,
@@ -3606,11 +3739,23 @@ def _capture_gateway_stop_identity(
         install_root=install_root,
         role=role,
         working_directory=working_directory,
+        venv_ancestor_pid=venv_ancestor_pid,
+        venv_ancestor_created_at=venv_ancestor_created_at,
+        venv_ancestor_argv=venv_ancestor_argv,
+        venv_ancestor_executable=venv_ancestor_executable,
     )
 
 
 def _gateway_stop_identity_state(identity: _VerifiedProcessIdentity) -> str:
     """Return ``match``, ``exited``, or fail-closed ``refuse``."""
+    ancestor_fields = (
+        identity.venv_ancestor_pid,
+        identity.venv_ancestor_created_at,
+        identity.venv_ancestor_argv,
+        identity.venv_ancestor_executable,
+    ) if isinstance(identity, _VerifiedProcessIdentity) else ()
+    has_ancestor_binding = bool(ancestor_fields) and all(ancestor_fields)
+    has_partial_ancestor_binding = bool(ancestor_fields) and any(ancestor_fields)
     if not (
         isinstance(identity, _VerifiedProcessIdentity)
         and identity.kind == "pausable_gateway"
@@ -3619,6 +3764,13 @@ def _gateway_stop_identity_state(identity: _VerifiedProcessIdentity) -> str:
         and identity.executable
         and identity.install_root
         and identity.working_directory
+        and (has_ancestor_binding or not has_partial_ancestor_binding)
+    ):
+        return "refuse"
+    if not has_ancestor_binding and not _gateway_process_uses_target_venv(
+        identity.executable,
+        identity.argv,
+        _gateway_venv_roots(identity.install_root),
     ):
         return "refuse"
     try:
@@ -3654,29 +3806,13 @@ def _venv_launcher_ancestors(
     "venv-blocked: N process(es) hold the install" dead-end, where the
     reported holder is a gateway the updater believes it already stopped).
 
-    Walking one hop up from each mapped gateway PID and keeping ancestors
-    that live under the project venv closes the gap. Only the venv-side
-    parent is returned — unrelated ancestors (the Scheduled Task's
-    ``cmd.exe``, an operator's shell) are ignored so we never widen the
-    blast radius beyond the gateway's own launcher. Unreadable or changed
-    target identities raise so the caller refuses before any force-stop.
+    Worker capture already froze the first gateway-shaped target-venv ancestor
+    with its PID/create-time/argv/executable. Materialize that same ancestor as
+    a separately stoppable launcher identity here. Unreadable, unbound, or
+    changed identities raise so the caller refuses before any force-stop.
     """
     if not _m()._is_windows() or not workers:
         return []
-    try:
-        import psutil
-    except Exception:
-        return []
-
-    # Never return ourselves or our own ancestry: a CLI ``hermes update``
-    # runs from the venv python and would otherwise nominate itself.
-    skip: set[int] = {os.getpid()}
-    try:
-        for anc in psutil.Process().parents():
-            skip.add(int(anc.pid))
-    except Exception:
-        pass
-
     found: list[_VerifiedProcessIdentity] = []
     found_pids: set[int] = set()
     worker_pids = {int(identity.pid) for identity in workers}
@@ -3685,48 +3821,31 @@ def _venv_launcher_ancestors(
             raise RuntimeError(
                 f"gateway worker {worker.pid} changed before launcher capture"
             )
-        try:
-            parent = psutil.Process(int(worker.pid)).parent()
-        except psutil.NoSuchProcess:
+        ppid = int(worker.venv_ancestor_pid)
+        if ppid <= 0:
             continue
-        except Exception as exc:
+        if ppid in found_pids or ppid in worker_pids:
+            continue
+        identity = _capture_gateway_stop_identity(
+            ppid,
+            role="gateway_launcher",
+            root=worker.install_root,
+        )
+        if identity is None:
             raise RuntimeError(
-                f"gateway worker {worker.pid} parent is unreadable"
-            ) from exc
-        if parent is None:
-            continue
-        ppid = int(parent.pid)
-        if ppid in skip or ppid in found_pids or ppid in worker_pids:
-            continue
-        try:
-            identity = _capture_gateway_stop_identity(
-                ppid,
-                role="gateway_launcher",
-                root=worker.install_root,
+                f"gateway launcher {ppid} exited before its identity was frozen"
             )
-        except RuntimeError as exc:
-            # An unrelated shell/cmd parent is not a launcher candidate. A
-            # target-venv executable whose remaining identity is unreadable is
-            # a hard refusal, not permission to kill it by PID.
-            try:
-                parent_exe = _canonical_process_path(parent.exe() or "")
-                venv_roots = (
-                    _canonical_process_path(Path(worker.install_root) / "venv"),
-                    _canonical_process_path(Path(worker.install_root) / ".venv"),
-                )
-            except Exception as probe_exc:
-                raise RuntimeError(
-                    f"gateway launcher candidate {ppid} is unreadable"
-                ) from probe_exc
-            if any(
-                _process_path_is_within(parent_exe, venv_root)
-                for venv_root in venv_roots
-            ):
-                raise exc
-            continue
-        if identity is not None:
-            found.append(identity)
-            found_pids.add(ppid)
+        if (
+            identity.pid != worker.venv_ancestor_pid
+            or identity.created_at != worker.venv_ancestor_created_at
+            or identity.argv != worker.venv_ancestor_argv
+            or identity.executable != worker.venv_ancestor_executable
+        ):
+            raise RuntimeError(
+                f"gateway launcher {ppid} changed before its identity was frozen"
+            )
+        found.append(identity)
+        found_pids.add(ppid)
     return found
 
 
@@ -4001,13 +4120,14 @@ def _pause_windows_gateways_for_update(
                 ) from exc
             logger.debug("Could not map Windows gateway PIDs to profiles: %s", exc)
 
-    # Convert discovery PIDs into immutable, root-bound process identities
+    # Convert discovery PIDs into immutable, venv-bound process identities
     # before the first wait or stop. A PID that exits during the drain can be
     # reused immediately; the numeric value and a post-wait argv read are not
-    # authority to tree-kill the replacement. Global process discovery can
-    # also see gateways from another Hermes checkout. Ignore one only when it
-    # is unmapped by this install and its live cwd proves the foreign root;
-    # target profile state that names the PID remains a hard refusal.
+    # authority to tree-kill the replacement. Global process/profile discovery
+    # can also see gateways from another Hermes checkout that intentionally
+    # shares the same Hermes home. Shared profile state and cwd are therefore
+    # never ownership proof: every worker must bind to this install's venv,
+    # directly or through an exact gateway-shaped venv ancestor.
     verified_by_pid: dict[int, _VerifiedProcessIdentity] = {}
     for pid in running_pids:
         proc = profile_processes.get(pid)
@@ -4017,6 +4137,11 @@ def _pause_windows_gateways_for_update(
                 int(pid), role=role, root=_m().PROJECT_ROOT
             )
         except _GatewayOutsideInstall:
+            # Global process discovery sees exact gateway argv from every
+            # checkout. An unbound PID with no profile mapping belongs to no
+            # target fleet and must remain untouched. A target profile that
+            # names the same unbound PID is still a hard refusal: that state
+            # may represent a stale/reused PID or a broken ownership chain.
             if proc is not None:
                 raise
             continue
@@ -4110,7 +4235,7 @@ def _pause_windows_gateways_for_update(
         proc = profile_processes[pid]
         _write_update_planned_stop_marker(Path(proc.path), int(pid))
 
-    # Resolve each mapped worker's venv-side launcher BEFORE draining: the
+    # Resolve every verified worker's venv-side launcher BEFORE draining: the
     # drain stops tracking a PID exactly when it dies, so a gracefully
     # drained worker is gone by the time the wait returns — and a dead pid's
     # parent cannot be recovered (psutil raises NoSuchProcess). The snapshot
@@ -4122,8 +4247,8 @@ def _pause_windows_gateways_for_update(
     # mapped and is what ``_detect_venv_python_processes()`` reports
     # downstream. Left alive, it trips the venv-holder guard and aborts the
     # update even though the gateway itself is stopped.
-    mapped_identities = [verified_by_pid[pid] for pid in mapped_pids]
-    launcher_identities = _m()._venv_launcher_ancestors(mapped_identities)
+    gateway_identities = list(verified_by_pid.values())
+    launcher_identities = _m()._venv_launcher_ancestors(gateway_identities)
 
     print("→ Stopping Windows gateway process(es) before updating Hermes...")
     try:
@@ -4160,8 +4285,12 @@ def _pause_windows_gateways_for_update(
         candidates[int(pid)] = identity
 
     force_killed: list[int] = []
-    for pid in sorted(candidates):
-        identity = candidates[pid]
+    ordered_candidates = sorted(
+        candidates.values(),
+        key=lambda value: (value.role == "gateway_launcher", value.pid),
+    )
+    for identity in ordered_candidates:
+        pid = identity.pid
         state = _gateway_stop_identity_state(identity)
         if state == "exited":
             continue
@@ -4463,6 +4592,26 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
             f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
         )
 
+
+def _legacy_manual_gateway_pids(
+    find_gateway_pids,
+    service_pids: set[int],
+    *,
+    deferred_gateway_resume: bool,
+) -> list[int]:
+    """Discover manual gateways only when the legacy restart path owns them.
+
+    Every Windows update freezes and stops its exact install fleet before
+    mutation. The outer transaction is the sole owner of that identity-bound
+    token and resumes it after mutation containment is disarmed. Re-running
+    global discovery here would discard those proofs and can see/raw-kill a
+    gateway from another checkout that shares the global Hermes home.
+    """
+    if deferred_gateway_resume or _m()._is_windows():
+        return []
+    return list(find_gateway_pids(exclude_pids=service_pids, all_profiles=True))
+
+
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
 
@@ -4675,20 +4824,25 @@ def _cmd_update_impl(
     deferred_gateway_resume = bool(
         getattr(args, "defer_gateway_resume", False)
     )
-    if deferred_gateway_resume:
-        # Prove the prior fleet is losslessly representable before the first
-        # backup/source mutation.  Unmapped argv is never persisted or passed
-        # across the privileged handoff boundary.
-        def _publish_resume_plan_before_stop(token: dict) -> None:
-            transaction.gateway_resume_plan = token
+
+    def _publish_gateway_resume_plan_before_stop(token: dict) -> None:
+        # The outer command's finally block is the rollback owner. Publish the
+        # in-memory token before the first ordinary or deferred stop so even a
+        # later identity refusal resumes gateways already drained in this call.
+        transaction.gateway_resume_plan = token
+        if deferred_gateway_resume:
             _write_deferred_gateway_plan(
                 Path(_m().PROJECT_ROOT),
                 transaction=transaction,
             )
 
+    if deferred_gateway_resume:
+        # Prove the prior fleet is losslessly representable before the first
+        # backup/source mutation.  Unmapped argv is never persisted or passed
+        # across the privileged handoff boundary.
         _windows_gateway_resume = _m()._pause_windows_gateways_for_update(
             require_structured_resume=True,
-            before_stop=_publish_resume_plan_before_stop,
+            before_stop=_publish_gateway_resume_plan_before_stop,
         )
     else:
         _windows_gateway_resume = None
@@ -4704,7 +4858,9 @@ def _cmd_update_impl(
     # post-update cron-jobs safety net uses it to detect job loss.
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
     if not deferred_gateway_resume:
-        _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
+        _windows_gateway_resume = _m()._pause_windows_gateways_for_update(
+            before_stop=_publish_gateway_resume_plan_before_stop,
+        )
         transaction.gateway_resume_plan = _windows_gateway_resume
 
     # With gateways paused, anything still running from the venv interpreter
@@ -5001,46 +5157,54 @@ def _cmd_update_impl(
         )
         commit_count = int(result.stdout.strip())
 
+        fork_sync_performed = False
+        fork_sync_requires_full_update = False
+        fork_synced_head: str | None = None
+        if (
+            commit_count == 0
+            and is_fork
+            and branch == "main"
+            and update_target.remote == "origin"
+        ):
+            # A fork can be current relative to origin while upstream/main is
+            # newer.  Sync first, then compare the checked-out identity.  If
+            # it changed (or cannot be proven unchanged), continue through the
+            # same dependency/build/health pipeline as any fetched update.
+            before_fork_sync = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            _m()._sync_with_upstream_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                fork_remote=update_target.remote,
+            )
+            fork_sync_performed = True
+            fork_synced_head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            target_sha = _refresh_update_target_sha(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                update_target,
+                env=git_env,
+            )
+            fork_sync_requires_full_update = (
+                before_fork_sync is None
+                or fork_synced_head is None
+                or before_fork_sync != fork_synced_head
+            )
+            if fork_sync_requires_full_update:
+                commit_count = 1
+
         if commit_count == 0:
             _invalidate_update_cache()
             local_state_restored = True
-
-            # Keep the legacy upstream reconciliation origin-specific. A main
-            # branch explicitly owned by another remote is authoritative and
-            # must not leak into origin/upstream synchronization.
-            if (
-                is_fork
-                and branch == "main"
-                and update_target.remote == "origin"
-            ):
-                _m()._sync_with_upstream_if_needed(
-                    git_cmd,
-                    _m().PROJECT_ROOT,
-                    fork_remote=update_target.remote,
-                )
 
             # Upstream fork synchronization can advance the checked-out
             # target even when the selected fork ref had no new commits. Keep
             # the installed target identity before restoring the caller's
             # original branch; a receipt must never describe that other HEAD.
-            installed_target_head = _capture_head_sha(
-                git_cmd, _m().PROJECT_ROOT
+            installed_target_head = (
+                fork_synced_head
+                if fork_sync_performed
+                else _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             )
-            if (
-                is_fork
-                and branch == "main"
-                and update_target.remote == "origin"
-            ):
-                # A failed fork push leaves local HEAD ahead of the selected
-                # remote target. Refresh the exact refspec and keep the two
-                # identities distinct so receipt validation fails closed.
-                target_sha = _refresh_update_target_sha(
-                    git_cmd,
-                    _m().PROJECT_ROOT,
-                    update_target,
-                    env=git_env,
-                )
-
             # Return to the branch that owned the user's local changes before
             # reapplying its stash. Applying while still on the update target
             # can create conflicts that do not exist on the original branch.
@@ -5106,11 +5270,13 @@ def _cmd_update_impl(
             # install stays bricked.
             healthy, detail = _venv_core_imports_healthy()
             dependencies_ok = healthy
-            completion_message: str | None = None
-            if not healthy:
-                print("⚠ Checkout is current, but the venv is unhealthy:")
+            python_repair_attempted = False
+            if healthy is not True:
+                state = "unhealthy" if healthy is False else "unproven"
+                print(f"⚠ Checkout is current, but venv health is {state}:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
+                python_repair_attempted = True
                 _write_update_incomplete_marker()
                 from hermes_cli.managed_uv import ensure_uv
 
@@ -5142,15 +5308,12 @@ def _cmd_update_impl(
                 _m()._clear_update_incomplete_marker()
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 dependencies_ok = healthy_after
-                if healthy_after:
+                if healthy_after is True:
                     print("✓ Dependencies repaired!")
-                    completion_message = "✓ Update complete!"
                 else:
-                    print(f"⚠ Venv still unhealthy after repair: {detail_after}")
+                    state = "unhealthy" if healthy_after is False else "unproven"
+                    print(f"⚠ Venv health is still {state} after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
-            else:
-                completion_message = "✓ Already up to date!"
-                _repair_node_deps_on_current_checkout(_print_update_completion)
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
                 print(
@@ -5161,56 +5324,93 @@ def _cmd_update_impl(
                     "long-lived processes still use the previous runtime."
                 )
                 print("  Restart each of them to pick up the repaired runtime.")
-            if completion_message is not None:
-                if not local_state_restored:
-                    print(
-                        "⚠ Local changes were not restored cleanly; "
-                        "no success receipt was written."
-                    )
-                    sys.exit(1)
-                syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
-                    _m().PROJECT_ROOT
+            if not local_state_restored:
+                print(
+                    "⚠ Local changes were not restored cleanly; "
+                    "no success receipt was written."
                 )
-                if not syntax_ok:
-                    print(f"✗ Current checkout failed syntax validation: {failing_path}")
-                    if syntax_error:
-                        print(f"  {syntax_error}")
-                    sys.exit(1)
-                node_dependencies_ok = _node_dependencies_healthy_read_only()
-                if not node_dependencies_ok:
+                sys.exit(1)
+
+            syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
+                _m().PROJECT_ROOT
+            )
+            if syntax_ok is False:
+                print(f"✗ Current checkout failed syntax validation: {failing_path}")
+                if syntax_error:
+                    print(f"  {syntax_error}")
+                sys.exit(1)
+
+            import_ok, failing_module, import_error = (
+                _validate_critical_modules_import(_m().PROJECT_ROOT)
+            )
+            if import_ok is False:
+                print(f"⚠ Critical module still fails to import: {failing_module}")
+                if import_error:
+                    print(f"  {import_error}")
+
+            node_dependencies_ok = _node_dependencies_healthy_read_only()
+            node_repair_attempted = False
+            node_failures: list[str] = []
+            if node_dependencies_ok is not True:
+                node_repair_attempted = True
+                print("→ Repairing Node.js dependencies...")
+                node_failures = _update_node_dependencies()
+                reproved_node_health = _node_dependencies_healthy_read_only()
+                node_dependencies_ok = (
+                    reproved_node_health if not node_failures else False
+                )
+                if node_dependencies_ok is True:
+                    print("✓ Node dependencies repaired!")
+                elif node_failures:
                     print(
-                        "⚠ Checkout is current, but Node dependency health could "
-                        "not be proven; no success receipt was written."
+                        "⚠ Node dependency repair failed for "
+                        f"{', '.join(node_failures)}."
                     )
-                    return
-                resulting_head = installed_target_head
-                if resulting_head is None or target_sha != resulting_head:
-                    print(
-                        "⚠ Installed Git identity could not be proven; "
-                        "no success receipt was written."
-                    )
-                else:
-                    _record_update_success(
-                        args,
-                        transaction=transaction,
-                        mode="git",
-                        branch=branch,
-                        remote=update_target.remote,
-                        target_ref=update_target.tracking_ref,
-                        target_sha=target_sha,
-                        resulting_head=resulting_head,
-                        archive_sha=None,
-                        health={
-                            "critical_syntax": syntax_ok,
-                            "critical_imports": dependencies_ok,
-                            "dependencies": dependencies_ok,
-                            "node_dependencies": node_dependencies_ok,
-                        },
-                    )
-                    _print_update_completion(completion_message)
+
+            health = {
+                "critical_syntax": syntax_ok,
+                "critical_imports": import_ok,
+                "dependencies": dependencies_ok,
+                "node_dependencies": node_dependencies_ok,
+            }
+            if not all(value is True for value in health.values()):
+                print(
+                    "⚠ Update did not pass the final runtime health proof; "
+                    "no success receipt was written."
+                )
+                return
+
+            resulting_head = installed_target_head
+            if resulting_head is None or target_sha != resulting_head:
+                print(
+                    "⚠ Installed Git identity could not be proven; "
+                    "no success receipt was written."
+                )
+            else:
+                _record_update_success(
+                    args,
+                    transaction=transaction,
+                    mode="git",
+                    branch=branch,
+                    remote=update_target.remote,
+                    target_ref=update_target.tracking_ref,
+                    target_sha=target_sha,
+                    resulting_head=resulting_head,
+                    archive_sha=None,
+                    health=health,
+                )
+                completion_message = (
+                    "✓ Update complete!"
+                    if python_repair_attempted or node_repair_attempted
+                    else "✓ Already up to date!"
+                )
+                _print_update_completion(completion_message)
             return
 
-        print(f"→ Found {commit_count} new commit(s)")
+        if fork_sync_requires_full_update:
+            print("→ Fork synchronization changed the checkout; finishing update...")
+        else:
+            print(f"→ Found {commit_count} new commit(s)")
 
         print("→ Pulling updates...")
         update_succeeded = False
@@ -5269,7 +5469,7 @@ def _cmd_update_impl(
             syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
                 _m().PROJECT_ROOT
             )
-            if not syntax_ok:
+            if syntax_ok is False:
                 print()
                 print("✗ Pulled code has a syntax error in a critical file:")
                 print(f"  {failing_path}")
@@ -5357,11 +5557,12 @@ def _cmd_update_impl(
             and branch == "main"
             and update_target.remote == "origin"
         ):
-            _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                fork_remote=update_target.remote,
-            )
+            if not fork_sync_performed:
+                _m()._sync_with_upstream_if_needed(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    fork_remote=update_target.remote,
+                )
             target_sha = _refresh_update_target_sha(
                 git_cmd,
                 _m().PROJECT_ROOT,
@@ -5480,6 +5681,14 @@ def _cmd_update_impl(
         # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
         _m()._refresh_active_memory_provider_dependencies()
 
+        dependency_probe_ok, dependency_detail = _venv_core_imports_healthy()
+        dependencies_ok = dependency_probe_ok if dependencies_ok else False
+        if dependency_probe_ok is not True:
+            print(
+                "  ⚠ Python dependency health could not be proven after update: "
+                f"{dependency_detail}"
+            )
+
         # Everything that can legitimately produce a transient ImportError has
         # now run (bytecode sweep, dependency reinstall, lazy refresh), so a
         # module that still won't import is real breakage. Warn only — never
@@ -5491,14 +5700,22 @@ def _cmd_update_impl(
         import_ok, failing_module, import_error = _validate_critical_modules_import(
             _m().PROJECT_ROOT
         )
-        if not import_ok:
+        if import_ok is not True:
             print()
-            print(f"  ⚠ {failing_module} still fails to import after updating:")
-            print(f"      {import_error}")
+            if import_ok is False:
+                print(f"  ⚠ {failing_module} still fails to import after updating:")
+                print(f"      {import_error}")
+            else:
+                print("  ⚠ Critical import health could not be proven after updating.")
+                if import_error:
+                    print(f"      {import_error}")
             print("    Run `hermes update` again — if it persists, reinstall:")
             print("    https://hermes-agent.nousresearch.com")
 
         node_failures = _update_node_dependencies()
+        node_dependencies_ok = _node_dependencies_healthy_read_only()
+        if node_failures:
+            node_dependencies_ok = False
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
         # Rebuild the desktop app if the source tree changed since the last
@@ -5925,7 +6142,10 @@ def _cmd_update_impl(
             )
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
-        elif not import_ok or not dependencies_ok:
+        elif not all(
+            value is True
+            for value in (syntax_ok, import_ok, dependencies_ok, node_dependencies_ok)
+        ):
             print(
                 "⚠ Update did not pass the final runtime health proof; "
                 "no success receipt was written."
@@ -5952,7 +6172,7 @@ def _cmd_update_impl(
                         "critical_syntax": syntax_ok,
                         "critical_imports": import_ok,
                         "dependencies": dependencies_ok,
-                        "node_dependencies": not bool(node_failures),
+                        "node_dependencies": node_dependencies_ok,
                     },
                 )
                 _print_update_completion("✓ Update complete!")
@@ -6580,14 +6800,22 @@ def _cmd_update_impl(
             # Exclude PIDs that belong to just-restarted services so we don't
             # immediately kill the process that systemd/launchd just spawned.
             service_pids = _get_service_pids()
-            manual_pids = find_gateway_pids(
-                exclude_pids=service_pids, all_profiles=True
+            manual_pids = _legacy_manual_gateway_pids(
+                find_gateway_pids,
+                service_pids,
+                deferred_gateway_resume=deferred_gateway_resume,
             )
-            profile_processes = {
-                proc.pid: proc
-                for proc in find_profile_gateway_processes(exclude_pids=service_pids)
-                if proc.pid in manual_pids
-            }
+            profile_processes = (
+                {
+                    proc.pid: proc
+                    for proc in find_profile_gateway_processes(
+                        exclude_pids=service_pids
+                    )
+                    if proc.pid in manual_pids
+                }
+                if manual_pids
+                else {}
+            )
             for pid, proc in profile_processes.items():
                 restart_mode = _prepare_profile_gateway_update_restart(
                     proc.profile, pid
@@ -6695,38 +6923,39 @@ def _cmd_update_impl(
             # graceful paths a brief window to complete, then SIGKILL
             # any remaining pre-update PIDs so the watcher / service
             # manager can relaunch with fresh code.
-            try:
-                _time.sleep(3.0)
-                _service_pids_after = _get_service_pids()
-                _surviving = find_gateway_pids(
-                    exclude_pids=_service_pids_after,
-                    all_profiles=True,
-                )
-                # Scope to PIDs we already tried to kill during this
-                # update (killed_pids).  Anything new is a gateway that
-                # started AFTER our restart attempt — respecting user
-                # intent, we don't kill those.
-                _stuck = [pid for pid in _surviving if pid in killed_pids]
-                if _stuck:
-                    print()
-                    print(
-                        f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
+            if killed_pids:
+                try:
+                    _time.sleep(3.0)
+                    _service_pids_after = _get_service_pids()
+                    _surviving = find_gateway_pids(
+                        exclude_pids=_service_pids_after,
+                        all_profiles=True,
                     )
-                    from gateway.status import terminate_pid as _terminate_pid
-                    for pid in _stuck:
-                        try:
-                            # Routes through taskkill /T /F on Windows,
-                            # SIGKILL on POSIX — _signal.SIGKILL doesn't
-                            # exist on Windows so the old raw os.kill call
-                            # used to crash the entire update path.
-                            _terminate_pid(pid, force=True)
-                        except (ProcessLookupError, PermissionError, OSError):
-                            pass
-                    # Give the OS a beat to reap the processes so the
-                    # watchers see them exit and respawn.
-                    _time.sleep(1.5)
-            except Exception as _sweep_exc:
-                logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
+                    # Scope to PIDs we already tried to kill during this
+                    # update (killed_pids).  Anything new is a gateway that
+                    # started AFTER our restart attempt — respecting user
+                    # intent, we don't kill those.
+                    _stuck = [pid for pid in _surviving if pid in killed_pids]
+                    if _stuck:
+                        print()
+                        print(
+                            f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
+                        )
+                        from gateway.status import terminate_pid as _terminate_pid
+                        for pid in _stuck:
+                            try:
+                                # Routes through taskkill /T /F on Windows,
+                                # SIGKILL on POSIX — _signal.SIGKILL doesn't
+                                # exist on Windows so the old raw os.kill call
+                                # used to crash the entire update path.
+                                _terminate_pid(pid, force=True)
+                            except (ProcessLookupError, PermissionError, OSError):
+                                pass
+                        # Give the OS a beat to reap the processes so the
+                        # watchers see them exit and respawn.
+                        _time.sleep(1.5)
+                except Exception as _sweep_exc:
+                    logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
 
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
