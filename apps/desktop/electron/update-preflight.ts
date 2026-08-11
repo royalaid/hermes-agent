@@ -52,7 +52,7 @@ const DEFAULT_GENERIC_HOLDER_POLL_MS = 1_000
 const DEFAULT_GENERIC_HOLDER_TIMEOUT_MS = 30_000
 const DEFAULT_RESPAWN_INTERVAL_MS = 1_500
 const DEFAULT_TERMINATION_SETTLE_MS = 750
-const MAX_FALLBACK_BRIDGES = 32
+const MAX_FALLBACK_BRIDGE_GROUPS = 32
 
 function wait(delayMs: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, delayMs))
@@ -70,6 +70,10 @@ function exactMcpOnly(result: VenvBlockerScanResult): boolean {
 
 function exactActionableMcpBridges(result: VenvBlockerScanResult): boolean {
   return result.mcpBridges.length > 0 && result.mcpBridges.every(isExactActionableMcpBridge)
+}
+
+function logicalMcpBridgeGroupCount(result: VenvBlockerScanResult): number {
+  return new Set(result.mcpBridges.map(bridge => bridge.wrapperPid ?? bridge.pid)).size
 }
 
 function genericHoldersOnly(result: VenvBlockerScanResult): boolean {
@@ -298,8 +302,9 @@ export async function runWindowsUpdatePreflight(
 
     if (firstClear.kind === 'blocked') {
       const exactCurrentBridges = exactActionableMcpBridges(firstClear.result)
+      const logicalBridgeGroups = logicalMcpBridgeGroupCount(firstClear.result)
 
-      if (!exactCurrentBridges || firstClear.result.mcpBridges.length > MAX_FALLBACK_BRIDGES) {
+      if (!exactCurrentBridges || logicalBridgeGroups > MAX_FALLBACK_BRIDGE_GROUPS) {
         return {
           kind: 'blocked',
           reason: 'quiesce-incomplete',
