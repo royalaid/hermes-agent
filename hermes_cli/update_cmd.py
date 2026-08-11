@@ -3746,6 +3746,25 @@ def _is_current_update_shim_argv(argv: list[str]) -> bool:
     return False
 
 
+def _is_current_standalone_scanner_argv(
+    argv: list[str], target_root: Path | str
+) -> bool:
+    """Prove the exact Desktop blocker-scan trampoline for this root."""
+    if (
+        len(argv) != 5
+        or argv[1] != "-m"
+        or argv[2] != "hermes_cli._scan_venv_blockers"
+        or argv[3] != "--root"
+    ):
+        return False
+    try:
+        return os.path.normcase(os.path.realpath(argv[4])) == os.path.normcase(
+            os.path.realpath(target_root)
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _detect_venv_python_processes(
     *,
     exclude_pids: set[int] | None = None,
@@ -3803,10 +3822,10 @@ def _detect_venv_python_processes(
     skip.add(os.getpid())
     # A native console-script or uv-created Windows venv can leave one
     # load-bearing launcher directly above the real base-Python process.
-    # Exclude only an exact current-invocation ``hermes.exe ... update`` or
-    # ``python.exe -m hermes_cli.main ... update`` parent. Higher venv
-    # ancestors may be agents or other native-module holders and remain
-    # fail-closed blockers.
+    # Exclude only an exact current-invocation ``hermes.exe ... update``,
+    # ``python.exe -m hermes_cli.main ... update``, or Desktop's standalone
+    # scanner for this same root. Higher venv ancestors may be agents or other
+    # native-module holders and remain fail-closed blockers.
     try:
         parent = psutil.Process(os.getpid()).parent()
         expected_hermes = venv_bin_dir(venv_dir, windows=True) / "hermes.exe"
@@ -3833,7 +3852,10 @@ def _detect_venv_python_processes(
         ):
             from hermes_cli._scan_venv_blockers import _hermes_cli_command
 
-            exact_python = _hermes_cli_command(parent_argv) == "update"
+            exact_python = (
+                _hermes_cli_command(parent_argv) == "update"
+                or _is_current_standalone_scanner_argv(parent_argv, target_root)
+            )
         if exact_hermes or exact_python:
             skip.add(int(parent.pid))
     except Exception:
