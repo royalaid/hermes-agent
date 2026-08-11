@@ -21,6 +21,7 @@ function startupOptions(overrides: Record<string, unknown> = {}) {
     ensureLocalRuntime: vi.fn(async backend => ({ ...backend, command: 'hermes' })),
     prepareLocalBackend: vi.fn(async () => bootstrapBackend),
     resolveRemote: vi.fn(async () => null),
+    startHandoffResultPoll: vi.fn(),
     waitForDecision: vi.fn(async () => 'continue-local' as const),
     waitForLocalStart: vi.fn(async () => {}),
     ...overrides
@@ -90,12 +91,23 @@ test('remote apply re-resolves the saved connection without ensuring a local run
 
 test('an already-saved remote bypasses every local startup step', async () => {
   const savedRemote = { baseUrl: 'https://gateway.example.com/hermes' }
-  const options = startupOptions({ resolveRemote: vi.fn(async () => savedRemote) })
+  const order: string[] = []
+
+  const options = startupOptions({
+    resolveRemote: vi.fn(async () => {
+      order.push('resolve-remote')
+
+      return savedRemote
+    }),
+    startHandoffResultPoll: vi.fn(() => order.push('start-handoff-result-poll'))
+  })
 
   assert.deepEqual(await runPrimaryBackendStartup(options), {
     kind: 'remote',
     connection: { baseUrl: savedRemote.baseUrl, mode: 'remote' }
   })
+  assert.deepEqual(order, ['start-handoff-result-poll', 'resolve-remote'])
+  assert.deepEqual(options.startHandoffResultPoll.mock.calls, [[]])
   assert.equal(options.waitForLocalStart.mock.calls.length, 0)
   assert.equal(options.prepareLocalBackend.mock.calls.length, 0)
   assert.equal(options.waitForDecision.mock.calls.length, 0)

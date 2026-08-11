@@ -8,21 +8,17 @@
  *
  * Two independent signals mean "an update owns the venv right now":
  *
- *  - the on-disk marker (`HERMES_HOME/.hermes-update-in-progress`), written
- *    by the updater — and by the desktop itself just before hand-off — and
+ *  - the on-disk marker (`HERMES_HOME/.hermes-update-in-progress`), atomically
+ *    claimed by the updater with its own PID, and
  *  - the in-process `updateInFlight` flag, true for the whole
- *    `applyUpdates()` critical section.
+ *    either Desktop update handoff critical section.
  *
- * The marker alone is NOT enough (#73822): `applyUpdates` kills its own
- * backend early (`releaseBackendLock`) but only writes the marker AFTER the
- * Windows venv-blocker scan. Killing the backend drops the renderer's
- * WebSocket, the renderer reconnects within ~1s, and a marker-only gate
- * happily spawns a fresh backend inside the update's own critical section —
- * which `scanVenvBlockers` then reports as a blocker, aborting every update
- * attempt forever. Consulting the flag closes that window. On the success
- * path the marker is written BEFORE the flag clears in `applyUpdates`'
- * `finally`, so there is no instant where both signals are false and a
- * waiter could slip through mid-update.
+ * The marker alone is NOT enough (#73822): normal update and bootstrap
+ * recovery both release tracked backends before preflight, while the updater
+ * can claim its marker only after handoff. A marker-only gate can respawn a
+ * backend inside that gap and create a new blocker. Consulting the shared
+ * transaction closes the preflight-to-updater-claim window, and handoff
+ * succeeds only after the exact updater PID owns the marker.
  */
 
 export type UpdateGateReason = 'marker' | 'update-in-flight' | null
@@ -30,8 +26,32 @@ export type UpdateGateReason = 'marker' | 'update-in-flight' | null
 export interface UpdateGateDeps {
   /** True when a live on-disk update marker exists (see update-marker.ts). */
   hasLiveMarker: () => boolean
-  /** True while this process is inside applyUpdates()' critical section. */
+  /** True while this process is inside either update handoff transaction. */
   isUpdateInFlight: () => boolean
+}
+
+/** One synchronous, process-local mutex shared by every Desktop handoff path. */
+export class UpdateInFlightTransaction {
+  private active = false
+
+  readonly isActive = (): boolean => this.active
+
+  async run<T>(operation: () => T | Promise<T>): Promise<T> {
+    if (this.active) {
+      throw new Error('An update is already in progress.')
+    }
+
+    // Set before invoking operation: its first statement may already await a
+    // preflight, and backend reconnects must observe the closed gate in that
+    // same turn of the event loop.
+    this.active = true
+
+    try {
+      return await operation()
+    } finally {
+      this.active = false
+    }
+  }
 }
 
 /** Why the gate is closed right now, or null when it is open. */
@@ -47,7 +67,12 @@ export function updateGateReason(deps: UpdateGateDeps): UpdateGateReason {
   return null
 }
 
-export type UpdateClearanceOutcome = 'clear' | 'finished' | 'timeout'
+export interface StillBlockedUpdateClearance {
+  kind: 'still-blocked-timeout'
+  reason: Exclude<UpdateGateReason, null>
+}
+
+export type UpdateClearanceOutcome = 'clear' | 'finished' | StillBlockedUpdateClearance
 
 export interface WaitForUpdateClearanceOptions {
   timeoutMs: number
@@ -58,14 +83,19 @@ export interface WaitForUpdateClearanceOptions {
   sleep?: (ms: number) => Promise<void>
 }
 
+export interface WaitForLocalBackendClearanceOptions extends WaitForUpdateClearanceOptions {
+  /** Called after each bounded UI wait while the safety gate remains closed. */
+  onStillBlocked?: (reason: Exclude<UpdateGateReason, null>) => void | Promise<void>
+}
+
 /**
  * Park until no update signal remains, or the deadline passes.
  *
  * Returns 'clear' when the gate was already open (no wait happened),
- * 'finished' when it opened during the wait, and 'timeout' when the deadline
- * expired with the gate still closed (callers proceed anyway — matching the
- * long-standing marker-gate behavior, since a wedged updater must not brick
- * the app forever).
+ * 'finished' when it opened during the wait, and a typed still-blocked result
+ * when the bounded UI wait expires. A timeout is never permission to start a
+ * local backend; callers must keep the venv gate closed while the reason
+ * remains present.
  */
 export async function waitForUpdateClearance(
   deps: UpdateGateDeps,
@@ -91,5 +121,33 @@ export async function waitForUpdateClearance(
     reason = updateGateReason(deps)
   }
 
-  return reason ? 'timeout' : 'finished'
+  return reason ? { kind: 'still-blocked-timeout', reason } : 'finished'
+}
+
+/**
+ * Keep a local backend parked across any number of bounded UI wait windows.
+ * The callback lets primary and pool callers surface actionable state without
+ * turning a live or unreadable marker into permission to re-lock the venv.
+ */
+export async function waitForLocalBackendClearance(
+  deps: UpdateGateDeps,
+  options: WaitForLocalBackendClearanceOptions
+): Promise<'clear' | 'finished'> {
+  const { onStillBlocked, ...waitOptions } = options
+  let waited = false
+
+  while (true) {
+    const outcome = await waitForUpdateClearance(deps, waitOptions)
+
+    if (outcome === 'clear') {
+      return waited ? 'finished' : 'clear'
+    }
+
+    if (outcome === 'finished') {
+      return 'finished'
+    }
+
+    waited = true
+    await onStillBlocked?.(outcome.reason)
+  }
 }
