@@ -34,11 +34,16 @@ class TestGetDefaultHermesRoot:
     """Tests for get_default_hermes_root() — Docker/custom deployment awareness."""
 
     def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
-        """When HERMES_HOME is not set, returns ~/.hermes."""
+        """Without HERMES_HOME, return the platform-native global root."""
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        assert get_default_hermes_root() == tmp_path / ".hermes"
+        expected = (
+            Path(os.environ["LOCALAPPDATA"]) / "hermes"
+            if os.name == "nt" and os.environ.get("LOCALAPPDATA")
+            else tmp_path / ".hermes"
+        )
+        assert get_default_hermes_root() == expected
 
 
 
@@ -54,6 +59,44 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setenv("HERMES_HOME", str(profile))
         assert get_default_hermes_root() == docker_root
 
+    def test_explicit_custom_profile_ignores_process_home(
+        self, tmp_path, monkeypatch
+    ):
+        process_root = tmp_path / "process-root"
+        explicit_root = tmp_path / "explicit-root"
+        monkeypatch.setenv("HERMES_HOME", str(process_root))
+
+        assert (
+            get_default_hermes_root(explicit_root / "profiles" / "work")
+            == explicit_root
+        )
+
+    def test_whitespace_process_home_uses_platform_default(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", "   ")
+        if os.name == "nt":
+            local_appdata = tmp_path / "LocalAppData"
+            monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+            expected = local_appdata / "hermes"
+        else:
+            monkeypatch.setattr(Path, "home", lambda: tmp_path)
+            expected = tmp_path / ".hermes"
+
+        assert get_default_hermes_root() == expected
+
+    @pytest.mark.windows_only
+    def test_custom_profile_segment_is_case_insensitive_on_windows(
+        self, tmp_path, monkeypatch
+    ):
+        custom_root = tmp_path / "custom-hermes"
+        profile = custom_root / "Profiles" / "coder"
+        profile.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "unrelated-home")
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+
+        assert get_default_hermes_root() == custom_root
+
     @pytest.mark.windows_only
     def test_no_hermes_home_returns_localappdata_root_on_windows(self, tmp_path, monkeypatch):
         """Native Windows falls back to %LOCALAPPDATA%\\hermes, not ~/.hermes."""
@@ -63,6 +106,26 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
 
         assert get_default_hermes_root() == local_appdata / "hermes"
+
+
+@pytest.mark.windows_only
+def test_node_path_resolution_skips_access_denied_directory(tmp_path, monkeypatch):
+    denied = tmp_path / "denied"
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    npm = allowed / "npm.cmd"
+    npm.write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", os.pathsep.join((str(denied), str(allowed))))
+    original = Path.is_file
+
+    def guarded_is_file(path):
+        if path.parent == denied:
+            raise PermissionError("access denied")
+        return original(path)
+
+    monkeypatch.setattr(Path, "is_file", guarded_is_file)
+
+    assert find_node_executable_on_path("npm") == str(npm)
 
 
 
@@ -93,6 +156,16 @@ class TestGetProcessHermesHome:
         home = tmp_path / "launch-home"
         monkeypatch.setenv("HERMES_HOME", str(home))
         assert get_process_hermes_home() == home
+
+    def test_context_override_does_not_move_process_home(self, tmp_path, monkeypatch):
+        launch_home = tmp_path / "launch-home"
+        task_home = tmp_path / "task-home"
+        monkeypatch.setenv("HERMES_HOME", str(launch_home))
+        token = set_hermes_home_override(task_home)
+        try:
+            assert get_process_hermes_home() == launch_home
+        finally:
+            reset_hermes_home_override(token)
 
 
 
