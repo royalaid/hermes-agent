@@ -11,12 +11,15 @@ import time as _time
 from pathlib import Path
 from typing import NoReturn
 
+from hermes_mcp_update_gate import _publish_exclusive_atomic
+
 from hermes_cli.update_quiesce import (
     _claim_update_quiesce_lease,
     _release_update_quiesce_lease,
     _transfer_update_quiesce_lease,
 )
 from hermes_cli.update_receipt import _IDENTIFIER_RE, _load_update_receipt
+from hermes_cli.update_transaction import _UpdateTransaction
 
 
 _DEFERRED_GATEWAY_PLAN_PREFIX = ".hermes-gateway-resume-"
@@ -38,37 +41,6 @@ def _deferred_gateway_plan_path(
     return get_default_hermes_root() / (
         f"{_DEFERRED_GATEWAY_PLAN_PREFIX}{invocation_id}{suffix}"
     )
-
-
-def _write_private_exclusive(path: Path, raw: str) -> None:
-    """Publish fully-written private bytes without overwriting a claim."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".hermes-gateway-plan-{secrets.token_hex(16)}"
-    descriptor = None
-    try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-            0o600,
-        )
-        encoded = raw.encode("utf-8")
-        offset = 0
-        while offset < len(encoded):
-            written = os.write(descriptor, encoded[offset:])
-            if written <= 0:
-                raise OSError("short write while publishing gateway resume plan")
-            offset += written
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        os.link(temporary, path)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
 
 
 def _gateway_plan_auth(payload: dict, lease_id: str) -> str:
@@ -186,16 +158,20 @@ def _sanitize_deferred_gateway_plan(
     }
 
 
-def _write_deferred_gateway_plan(args, root: Path) -> Path:
-    invocation_id = getattr(args, "_update_invocation_id", None)
-    lease = getattr(args, "_update_quiesce_lease", None)
-    token = getattr(args, "_windows_gateway_resume_plan", None) or {}
+def _write_deferred_gateway_plan(
+    root: Path,
+    *,
+    transaction: _UpdateTransaction,
+) -> Path:
+    invocation_id = transaction.invocation_id
+    lease = transaction.lease
+    token = transaction.gateway_resume_plan or {}
     if not isinstance(invocation_id, str) or not isinstance(lease, dict):
         raise RuntimeError("deferred gateway plan lacks update correlation")
     lease_id = lease.get("lease_id")
     if not isinstance(lease_id, str):
         raise RuntimeError("deferred gateway plan lacks lease correlation")
-    existing_path = getattr(args, "_deferred_gateway_plan_written", None)
+    existing_path = transaction.deferred_gateway_plan_path
     if isinstance(existing_path, Path):
         try:
             existing = json.loads(existing_path.read_text(encoding="utf-8"))
@@ -254,10 +230,14 @@ def _write_deferred_gateway_plan(args, root: Path) -> Path:
     if sanitized is None:
         raise RuntimeError("refusing invalid deferred gateway plan")
     path = _deferred_gateway_plan_path(root, invocation_id)
-    _write_private_exclusive(
-        path, json.dumps(sanitized, sort_keys=True, separators=(",", ":"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _publish_exclusive_atomic(
+        path,
+        json.dumps(sanitized, sort_keys=True, separators=(",", ":")),
+        temporary_prefix=".hermes-gateway-plan-",
+        short_write_message="short write while publishing gateway resume plan",
     )
-    setattr(args, "_deferred_gateway_plan_written", path)
+    transaction.deferred_gateway_plan_path = path
     return path
 
 
