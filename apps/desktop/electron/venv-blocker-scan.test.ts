@@ -281,6 +281,11 @@ describe('parseVenvBlockerScanOutput', () => {
     )
 
     assert.equal(outcome.kind, 'blocked')
+
+    if (outcome.kind === 'blocked') {
+      assert.equal(outcome.result.mcpBridges[0]?.wrapperPid, 42)
+      assert.equal(outcome.result.mcpBridges[1]?.wrapperPid, undefined)
+    }
   })
 
   it('classifies Python http.server blockers as safe local previews with a human label', () => {

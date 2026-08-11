@@ -45,6 +45,7 @@ export interface McpBridgeProcess extends VenvBlockerIdentity {
   createdAt: number
   owner: 'claude' | 'codex' | 'desktop' | 'unknown'
   role: 'mcp_bridge_worker' | 'mcp_bridge_wrapper'
+  wrapperPid?: number
 }
 
 export interface VenvBlockerScanResult {
@@ -425,7 +426,8 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
         role,
         actionable,
         actionability,
-        action
+        action,
+        ...(wrapperPid === undefined ? {} : { wrapperPid })
       },
       ...(wrapperPid === undefined ? {} : { wrapperPid })
     })
