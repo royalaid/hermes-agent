@@ -9,7 +9,8 @@ from pathlib import Path
 
 _UPDATE_RECEIPT_NAME = ".hermes-update-receipt.json"
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{16,128}$")
-_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_ARCHIVE_SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _receipt_path(root: Path) -> Path:
@@ -71,10 +72,14 @@ def _sanitize_update_receipt(value: object, root: Path) -> dict | None:
     if target_ref is not None and not isinstance(target_ref, str):
         return None
     shas: dict[str, str | None] = {}
-    for field in ("target_sha", "resulting_head", "archive_sha"):
+    for field, pattern in (
+        ("target_sha", _SHA_RE),
+        ("resulting_head", _SHA_RE),
+        ("archive_sha", _ARCHIVE_SHA_RE),
+    ):
         candidate = value.get(field)
         if candidate is not None and (
-            not isinstance(candidate, str) or _SHA_RE.fullmatch(candidate) is None
+            not isinstance(candidate, str) or pattern.fullmatch(candidate) is None
         ):
             return None
         shas[field] = candidate.lower() if candidate else None
@@ -94,7 +99,6 @@ def _sanitize_update_receipt(value: object, root: Path) -> dict | None:
         or shas["target_sha"] is not None
         or shas["resulting_head"] is not None
         or shas["archive_sha"] is None
-        or len(shas["archive_sha"]) != 64
     ):
         return None
     health = value.get("health")

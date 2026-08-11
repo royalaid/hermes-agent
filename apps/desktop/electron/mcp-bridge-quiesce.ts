@@ -86,6 +86,14 @@ interface StagedHandoffDeps extends Omit<AdoptionDeps, 'requiredOwnerPid' | 'tim
   verifyRequiredOwnerGeneration: () => boolean | Promise<boolean>
 }
 
+interface RevocationDeps {
+  maxAttempts?: number
+  now?: () => number
+  ownerPid?: number
+}
+
+export type McpBridgeQuiesceRevocationResult = 'revoked' | 'unproven'
+
 export type StagedMcpBridgeLeaseHandoff =
   | { kind: 'adopted'; lease: McpBridgeQuiesceLease }
   | { kind: 'legacy-transfer'; lease: McpBridgeQuiesceLease }
@@ -552,7 +560,7 @@ function markerMtimeIsFresh(file: string, now: number): boolean {
   }
 }
 
-function inspectRecoveryArtifacts(marker: string, now: number): RecoveryState {
+function inspectRecoveryArtifacts(marker: string, now: number, deps: IdentityDeps = {}): RecoveryState {
   const candidates = listCasArtifacts(marker)
 
   if (candidates === null) {
@@ -582,7 +590,11 @@ function inspectRecoveryArtifacts(marker: string, now: number): RecoveryState {
     const timeValid = lease !== null && lease.createdAt <= now + MCP_BRIDGE_CLOCK_SKEW_SECONDS
 
     if (lease && emergencyValid && timeValid) {
-      if (now <= lease.expiresAt) {
+      const emergency = purpose === 'emergency'
+      const ownerIsActive = emergency || syncPidIdentity(lease.ownerPid, lease.createdAt, deps) !== 'stale'
+      const active = now <= lease.expiresAt && (ownerIsActive || now <= lease.handoffGraceUntil)
+
+      if (active) {
         state = 'active'
 
         continue
@@ -763,7 +775,7 @@ export function acquireMcpBridgeQuiesceLease(
 
   const marker = mcpBridgeQuiesceMarkerPath(hermesHome)
 
-  if (inspectRecoveryArtifacts(marker, now) !== 'clear') {
+  if (inspectRecoveryArtifacts(marker, now, deps) !== 'clear') {
     return null
   }
 
@@ -825,7 +837,7 @@ export function markMcpBridgeQuiesceLeaseForHandoff(
     !expectedRaw ||
     !Number.isSafeInteger(now) ||
     now <= 0 ||
-    inspectRecoveryArtifacts(marker, now) !== 'clear'
+    inspectRecoveryArtifacts(marker, now, deps) !== 'clear'
   ) {
     return null
   }
@@ -862,7 +874,7 @@ export function transferMcpBridgeQuiesceLease(
     now <= 0 ||
     !Number.isSafeInteger(ownerPid) ||
     ownerPid <= 0 ||
-    inspectRecoveryArtifacts(marker, now) !== 'clear' ||
+    inspectRecoveryArtifacts(marker, now, deps) !== 'clear' ||
     syncPidIdentity(ownerPid, now, deps) !== 'matching'
   ) {
     return null
@@ -903,7 +915,7 @@ export async function waitForMcpBridgeQuiesceLeaseAdoption(
     }
 
     const now = Math.floor((deps.now ?? epochSeconds)())
-    const recovery = inspectRecoveryArtifacts(marker, now)
+    const recovery = inspectRecoveryArtifacts(marker, now, { isPidAlive: deps.isPidAlive })
 
     if (recovery !== 'clear') {
       await sleep(pollMs)
@@ -995,7 +1007,7 @@ export async function handOffMcpBridgeLeaseToStagedUpdater(
   do {
     const now = Math.floor((deps.now ?? epochSeconds)())
 
-    if (inspectRecoveryArtifacts(marker, now) !== 'clear') {
+    if (inspectRecoveryArtifacts(marker, now, { isPidAlive: deps.isPidAlive }) !== 'clear') {
       await sleep(pollMs)
 
       continue
@@ -1106,7 +1118,7 @@ export function pruneInactiveMcpBridgeQuiesceLease(
 ): 'absent' | 'active' | 'removed' | 'unreadable' {
   const marker = mcpBridgeQuiesceMarkerPath(hermesHome)
   const now = Math.floor((deps.now ?? epochSeconds)())
-  const recovery = inspectRecoveryArtifacts(marker, now)
+  const recovery = inspectRecoveryArtifacts(marker, now, deps)
 
   if (recovery === 'active') {
     return 'active'
@@ -1159,4 +1171,121 @@ export function clearMcpBridgeQuiesceLease(
   }
 
   return removePathIfExact(marker, expectedRaw, marker, 'release')
+}
+
+/**
+ * Revoke one handoff capability across an owner transfer.
+ *
+ * The release artifact is published before the primary is touched. Both the
+ * TypeScript and PowerShell lease writers treat any CAS artifact as a closed
+ * gate, so a writer that already sampled the old generation can finish at
+ * most one CAS before this bounded sweep removes it. The short-lived artifact
+ * remains as durable revocation proof and follows the normal 90/91-second
+ * recovery rule.
+ */
+export function revokeMcpBridgeQuiesceLease(
+  hermesHome: string,
+  expected: McpBridgeQuiesceLease,
+  deps: RevocationDeps = {}
+): McpBridgeQuiesceRevocationResult {
+  const marker = mcpBridgeQuiesceMarkerPath(hermesHome)
+  const now = Math.floor((deps.now ?? epochSeconds)())
+  const ownerPid = deps.ownerPid ?? process.pid
+
+  if (
+    !LEASE_ID_PATTERN.test(expected.leaseId) ||
+    !canonicalRoot(expected.installRoot) ||
+    !Number.isSafeInteger(now) ||
+    now <= 0 ||
+    !Number.isSafeInteger(ownerPid) ||
+    ownerPid <= 0
+  ) {
+    return 'unproven'
+  }
+
+  const revocationRaw = serializeLease({
+    ...expected,
+    ownerPid,
+    createdAt: now,
+    expiresAt: now + MCP_BRIDGE_HANDOFF_GRACE_SECONDS,
+    handoffGraceUntil: now + MCP_BRIDGE_HANDOFF_GRACE_SECONDS
+  })
+  const revocation = publishCasArtifact(marker, 'release', revocationRaw)
+
+  if (!revocation) {
+    return 'unproven'
+  }
+
+  const matchesCapability = (lease: McpBridgeQuiesceLease | null): boolean =>
+    Boolean(
+      lease && lease.leaseId === expected.leaseId && rootsMatch(lease.installRoot, expected.installRoot)
+    )
+
+  for (let attempt = 0; attempt < (deps.maxAttempts ?? 8); attempt += 1) {
+    const primary = readRaw(marker)
+
+    if (primary.kind === 'unreadable') {
+      return 'unproven'
+    }
+
+    if (primary.kind === 'present') {
+      if (!matchesCapability(parseLease(primary.raw))) {
+        return 'unproven'
+      }
+
+      if (!removePathIfExact(marker, primary.raw, marker, 'release')) {
+        continue
+      }
+    }
+
+    const artifacts = listCasArtifacts(marker)
+
+    if (artifacts === null) {
+      return 'unproven'
+    }
+
+    let retry = false
+
+    for (const artifact of artifacts) {
+      if (artifact === revocation) {
+        continue
+      }
+
+      const snapshot = readRaw(artifact)
+
+      if (snapshot.kind === 'absent') {
+        retry = true
+
+        continue
+      }
+
+      if (snapshot.kind === 'unreadable' || !matchesCapability(parseLease(snapshot.raw))) {
+        return 'unproven'
+      }
+
+      if (!removeArtifactIfExact(artifact, snapshot.raw, marker)) {
+        retry = true
+      }
+    }
+
+    if (retry) {
+      continue
+    }
+
+    const finalPrimary = readRaw(marker)
+    const finalArtifacts = listCasArtifacts(marker)
+    const finalRevocation = readRaw(revocation)
+
+    if (
+      finalPrimary.kind === 'absent' &&
+      finalArtifacts?.length === 1 &&
+      finalArtifacts[0] === revocation &&
+      finalRevocation.kind === 'present' &&
+      finalRevocation.raw.equals(revocationRaw)
+    ) {
+      return 'revoked'
+    }
+  }
+
+  return 'unproven'
 }
