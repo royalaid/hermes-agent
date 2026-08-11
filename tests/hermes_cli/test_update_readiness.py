@@ -128,6 +128,19 @@ def _payload(root: Path, *, mode="preflight", ready=True, reason=None, error=Non
     )
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 def test_schema_and_runtime_validator_pin_exact_17_key_contract(tmp_path: Path):
     schema_path = Path(update_cmd.__file__).with_name("update_readiness.schema.v1.json")
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -718,6 +731,7 @@ def test_drain_handles_clear_then_respawn_and_requires_fresh_two_scan_proof(
     bridge = _bridge()
     scans = iter([_scan(), _scan(bridges=[bridge]), _scan(bridges=[bridge]), _scan(), _scan()])
     terminated = []
+    clock = _FakeClock()
     monkeypatch.setattr(scanner, "scan_venv_blockers", lambda _root: next(scans))
     monkeypatch.setattr(
         scanner,
@@ -726,7 +740,8 @@ def test_drain_handles_clear_then_respawn_and_requires_fresh_two_scan_proof(
     )
     monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
     monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
-    monkeypatch.setattr(update_quiesce._time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(update_quiesce._time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(update_quiesce._time, "sleep", clock.sleep)
     monkeypatch.setattr(gate, "write_quiesce_lease", lambda *_args, **_kwargs: _lease(tmp_path))
 
     payload = update_quiesce._drain_under_update_lease(
@@ -744,6 +759,309 @@ def test_drain_handles_clear_then_respawn_and_requires_fresh_two_scan_proof(
         if action["type"] == "clear-scan"
     ] == [1, 2]
     update_cmd.validate_update_readiness(payload)
+
+
+def test_atomic_prepare_waits_for_transient_hard_holder_and_reproves_stability(
+    tmp_path: Path, monkeypatch
+):
+    """A scheduled helper in the handoff gap may exit without intervention."""
+    import hermes_cli._scan_venv_blockers as scanner
+
+    root = tmp_path / "install"
+    root.mkdir()
+    initial = _lease(root)
+    hard = _scan(processes=[_process()])
+    clear = _scan()
+    scans = iter([hard, clear, hard, clear, clear, clear, clear])
+    scan_times: list[float] = []
+    clock = _FakeClock()
+
+    def scan(_root: Path) -> dict:
+        scan_times.append(clock.now)
+        return next(scans)
+
+    monkeypatch.setattr(
+        update_quiesce,
+        "_claim_update_quiesce_lease",
+        lambda *_args, **_kwargs: initial,
+    )
+    monkeypatch.setattr(scanner, "scan_venv_blockers", scan)
+    monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_quiesce._time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(update_quiesce._time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        gate,
+        "write_quiesce_lease",
+        lambda *_args, **_kwargs: initial,
+    )
+    monkeypatch.setattr(
+        update_quiesce,
+        "_release_update_quiesce_lease",
+        lambda *_args, **_kwargs: pytest.fail("successful prepare released its lease"),
+    )
+    args = SimpleNamespace(
+        yes=True,
+        bridge_lease_id=None,
+        branch="main",
+        timeout_seconds=12.0,
+        force_venv=False,
+        invocation_id=None,
+    )
+    transaction = update_transaction._UpdateTransaction()
+
+    update_quiesce._prepare_atomic_windows_update(
+        args,
+        root=root,
+        transaction=transaction,
+    )
+
+    assert transaction.lease is initial
+    assert scan_times == [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    assert clock.sleeps == [0.5] * 6
+
+
+def test_atomic_prepare_default_covers_twenty_second_scheduled_helper(
+    tmp_path: Path, monkeypatch
+):
+    import hermes_cli._scan_venv_blockers as scanner
+
+    root = tmp_path / "install"
+    root.mkdir()
+    initial = _lease(root)
+    hard = _scan(processes=[_process()])
+    clear = _scan()
+    clock = _FakeClock()
+
+    monkeypatch.setattr(
+        update_quiesce,
+        "_claim_update_quiesce_lease",
+        lambda *_args, **_kwargs: initial,
+    )
+    monkeypatch.setattr(
+        scanner,
+        "scan_venv_blockers",
+        lambda _root: hard if clock.now < 20.0 else clear,
+    )
+    monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_quiesce._time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(update_quiesce._time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        gate,
+        "write_quiesce_lease",
+        lambda *_args, **_kwargs: initial,
+    )
+    monkeypatch.setattr(
+        update_quiesce,
+        "_release_update_quiesce_lease",
+        lambda *_args, **_kwargs: pytest.fail("successful prepare released its lease"),
+    )
+    args = SimpleNamespace(
+        yes=True,
+        bridge_lease_id=None,
+        branch="main",
+        # argparse's legacy default reaches the atomic path as a literal 12.
+        timeout_seconds=12.0,
+        force_venv=False,
+        invocation_id=None,
+    )
+    transaction = update_transaction._UpdateTransaction()
+
+    update_quiesce._prepare_atomic_windows_update(
+        args,
+        root=root,
+        transaction=transaction,
+    )
+
+    assert transaction.lease is initial
+    assert clock.now == 21.5
+    assert clock.now < 30.0
+
+
+def test_drain_scan_crossing_deadline_cannot_authorize_success(
+    tmp_path: Path, monkeypatch
+):
+    import hermes_cli._scan_venv_blockers as scanner
+
+    clock = _FakeClock()
+    scan_count = 0
+
+    def scan(_root: Path) -> dict:
+        nonlocal scan_count
+        scan_count += 1
+        if scan_count == 2:
+            clock.now += 1.0
+        return _scan()
+
+    monkeypatch.setattr(scanner, "scan_venv_blockers", scan)
+    monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_quiesce._time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(update_quiesce._time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        gate,
+        "write_quiesce_lease",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a scan that crossed the deadline authorized success"
+        ),
+    )
+
+    payload = update_quiesce._drain_under_update_lease(
+        tmp_path,
+        _lease(tmp_path),
+        branch="main",
+        timeout_seconds=1.0,
+    )
+
+    assert payload["ready"] is False
+    assert payload["reason"] == "drain-timeout"
+    assert scan_count == 2
+    assert clock.now == 1.5
+
+
+def test_standalone_drain_still_refuses_hard_holder_immediately(
+    tmp_path: Path, monkeypatch
+):
+    import hermes_cli._scan_venv_blockers as scanner
+
+    scans = 0
+
+    def scan(_root: Path) -> dict:
+        nonlocal scans
+        scans += 1
+        return _scan(processes=[_process()])
+
+    monkeypatch.setattr(scanner, "scan_venv_blockers", scan)
+    monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(
+        update_quiesce._time,
+        "sleep",
+        lambda _seconds: pytest.fail("standalone drain waited on a hard holder"),
+    )
+
+    payload = update_quiesce._drain_under_update_lease(
+        tmp_path,
+        _lease(tmp_path),
+        branch="main",
+        timeout_seconds=1.0,
+    )
+
+    assert payload["ready"] is False
+    assert payload["reason"] == "venv-blocked"
+    assert scans == 1
+
+
+def test_atomic_prepare_bounds_persistent_hard_holder_at_thirty_seconds(
+    tmp_path: Path, monkeypatch
+):
+    import hermes_cli._scan_venv_blockers as scanner
+
+    root = tmp_path / "install"
+    root.mkdir()
+    initial = _lease(root)
+    hard = _scan(processes=[_process()])
+    clock = _FakeClock()
+    released: list[dict] = []
+    scan_times: list[float] = []
+
+    monkeypatch.setattr(
+        update_quiesce,
+        "_claim_update_quiesce_lease",
+        lambda *_args, **_kwargs: initial,
+    )
+    monkeypatch.setattr(
+        scanner,
+        "scan_venv_blockers",
+        lambda _root: scan_times.append(clock.now) or hard,
+    )
+    monkeypatch.setattr(
+        scanner,
+        "terminate_mcp_bridge",
+        lambda *_args, **_kwargs: pytest.fail("hard holder must never be terminated"),
+    )
+    monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_quiesce._time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(update_quiesce._time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        update_quiesce,
+        "_release_update_quiesce_lease",
+        lambda _root, lease: released.append(lease) or True,
+    )
+    args = SimpleNamespace(
+        yes=True,
+        bridge_lease_id=None,
+        branch="main",
+        # The public option belongs to standalone --drain; atomic preparation
+        # applies its safe 30-second floor.
+        timeout_seconds=1.0,
+        force_venv=False,
+        invocation_id=None,
+    )
+    transaction = update_transaction._UpdateTransaction()
+
+    with pytest.raises(SystemExit) as exit_info:
+        update_quiesce._prepare_atomic_windows_update(
+            args,
+            root=root,
+            transaction=transaction,
+        )
+
+    assert exit_info.value.code == 2
+    assert len(scan_times) == 60
+    assert scan_times[:2] == [0.0, 0.5]
+    assert scan_times[-1] == 29.5
+    assert clock.now == 30.0
+    assert released == [initial]
+    assert transaction.lease is None
+
+
+def test_atomic_prepare_fails_closed_on_scan_error(
+    tmp_path: Path, monkeypatch
+):
+    import hermes_cli._scan_venv_blockers as scanner
+
+    root = tmp_path / "install"
+    root.mkdir()
+    initial = _lease(root)
+    released: list[dict] = []
+    monkeypatch.setattr(
+        update_quiesce,
+        "_claim_update_quiesce_lease",
+        lambda *_args, **_kwargs: initial,
+    )
+    monkeypatch.setattr(
+        scanner,
+        "scan_venv_blockers",
+        lambda _root: (_ for _ in ()).throw(RuntimeError("scanner unavailable")),
+    )
+    monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(
+        update_quiesce,
+        "_release_update_quiesce_lease",
+        lambda _root, lease: released.append(lease) or True,
+    )
+    args = SimpleNamespace(
+        yes=True,
+        bridge_lease_id=None,
+        branch="main",
+        timeout_seconds=12.0,
+        force_venv=False,
+        invocation_id=None,
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        update_quiesce._prepare_atomic_windows_update(
+            args,
+            root=root,
+            transaction=update_transaction._UpdateTransaction(),
+        )
+
+    assert exit_info.value.code == 1
+    assert released == [initial]
 
 
 def test_drain_acquires_outer_lock_then_lease_before_actionable_scan(
