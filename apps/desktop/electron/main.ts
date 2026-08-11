@@ -220,6 +220,7 @@ import {
   markMcpBridgeQuiesceLeaseForHandoff,
   type McpBridgeQuiesceLease,
   pruneInactiveMcpBridgeQuiesceLease,
+  revokeMcpBridgeQuiesceLease,
   waitForMcpBridgeQuiesceLeaseAdoption
 } from './mcp-bridge-quiesce'
 import {
@@ -1971,7 +1972,7 @@ function handoffRelaunchRequestBlocksBackend(): boolean {
 function updateGateDeps() {
   return {
     hasLiveMarker: () => Boolean(readLiveUpdateMarker(HERMES_HOME)) || handoffRelaunchRequestBlocksBackend(),
-    isUpdateInFlight: updateInFlightTransaction.isActive
+    isUpdateInFlight: () => updateInFlightTransaction.isActive() || updateHandoffRevocationPending
   }
 }
 
@@ -3152,6 +3153,7 @@ async function readCommitLog(cwd, branch, isShallow) {
 }
 
 const updateInFlightTransaction = new UpdateInFlightTransaction()
+let updateHandoffRevocationPending = false
 
 // Set to true when the desktop is about to quit so a detached swap/install/
 // uninstall script can take over. On macOS, app.quit() closes windows but
@@ -3925,6 +3927,26 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean } = {}
       })
 
       if (!adoptedLease) {
+        updateHandoffRevocationPending = true
+        const revocation = revokeMcpBridgeQuiesceLease(HERMES_HOME, bridgeLease)
+
+        if (revocation !== 'revoked') {
+          const message =
+            'Update aborted: Hermes could not prove that the unacknowledged updater handoff was revoked. Local backends remain parked; close Hermes fully before retrying.'
+          rememberLog('[updates] repo hand-off timed out and exact lease revocation was unproven')
+          emitUpdateProgress({ stage: 'error', message, percent: null })
+
+          return { ok: false, error: 'update-handoff-revocation-unproven', message }
+        }
+
+        // Keep the release artifact as durable cancellation evidence. The
+        // detached script may already have won its adoption CAS; its next
+        // mandatory lease refresh now fails before mutation. The live update
+        // marker keeps backend starts parked until that script exits and
+        // performs its ownership-bound cleanup.
+        bridgeLease = null
+        updateHandoffRevocationPending = false
+
         const message = 'Update aborted: the repo updater did not acknowledge the protected handoff.'
         rememberLog('[updates] repo hand-off script did not adopt matching bridge and update markers')
         emitUpdateProgress({ stage: 'error', message, percent: null })
