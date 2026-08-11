@@ -54,3 +54,63 @@ def _suppress_concurrent_hermes_gate(request, monkeypatch):
         lambda *_a, **_k: [],
         raising=False,
     )
+
+
+@pytest.fixture
+def platform_neutral_update_lifecycle(monkeypatch):
+    """Neutralize updater side effects without pretending to be another OS.
+
+    Git/config-focused tests still enter the real host branch.  On native
+    Windows this fixture replaces only the outer process-coordination effects
+    (lock, bridge lease, Job, gateway pause, and holder scan) with inert test
+    doubles.  That preserves truthful platform selection while preventing a
+    unit test from touching live Hermes processes or install-global markers.
+    """
+    from hermes_cli import main as cli_main
+    from hermes_cli import update_lock
+
+    class _TestUpdateLock:
+        holder = None
+
+        def acquire(self):
+            return True
+
+        def prove_claim(self):
+            return True
+
+        def release(self):
+            return None
+
+    class _TestMutationJob:
+        def abort(self, _reason=""):
+            raise AssertionError("test updater unexpectedly lost its lease")
+
+        def disarm(self):
+            return None
+
+    class _TestLeaseHeartbeat:
+        lost = False
+        loss_reason = None
+
+        def __init__(self, _root, _lease, *, fail_stop):
+            self.fail_stop = fail_stop
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(update_lock, "UpdateLock", _TestUpdateLock)
+    monkeypatch.setattr(
+        cli_main,
+        "_prepare_atomic_windows_update",
+        lambda _args, *, root: (None, "test-invocation-123456"),
+    )
+    monkeypatch.setattr(cli_main, "_WindowsMutationJob", _TestMutationJob)
+    monkeypatch.setattr(cli_main, "_UpdateLeaseHeartbeat", _TestLeaseHeartbeat)
+    monkeypatch.setattr(
+        cli_main, "_pause_windows_gateways_for_update", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(cli_main, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(cli_main, "_venv_scripts_dir", lambda: None)

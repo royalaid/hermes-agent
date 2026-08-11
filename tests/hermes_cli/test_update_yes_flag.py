@@ -12,7 +12,19 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _platform_neutral_update_flow(platform_neutral_update_lifecycle):
+    """Keep config-prompt tests free of updater lifecycle side effects."""
+    with patch("hermes_cli.update_cmd._update_node_dependencies", return_value=[]), patch(
+        "hermes_cli.update_cmd._node_dependencies_healthy_read_only",
+        return_value=True,
+    ):
+        yield
 
 
 def _make_run_side_effect(
@@ -223,7 +235,9 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
         from hermes_cli.update_cmd import _sync_with_upstream_if_needed
 
         with patch(
-            "hermes_cli.update_cmd._has_upstream_remote", return_value=False
+            "hermes_cli.update_cmd._get_remote_url", return_value=None
+        ), patch(
+            "hermes_cli.update_cmd._assert_safe_git_configuration"
         ), patch(
             "hermes_cli.update_cmd._should_skip_upstream_prompt", return_value=False
         ), patch(

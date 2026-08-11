@@ -115,7 +115,7 @@ class TestFindStaleDashboardPids:
 
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX kill semantics")
+@pytest.mark.linux_only
 class TestKillStaleDashboardPosix:
     """Kill path on Linux / macOS: SIGTERM then SIGKILL any survivors."""
 
