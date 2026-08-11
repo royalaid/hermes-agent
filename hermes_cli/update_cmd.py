@@ -4956,7 +4956,9 @@ def _pause_windows_gateways_for_update(
             force_killed.append(int(pid))
         except ProcessLookupError:
             continue
-        except (PermissionError, OSError) as exc:
+        except OSError as exc:
+            if _gateway_stop_identity_state(identity) == "exited":
+                continue
             raise RuntimeError(
                 f"gateway process {pid} could not be safely stopped"
             ) from exc
@@ -5729,14 +5731,23 @@ def _cmd_update_impl(
                     "hold the venv after the pause; stopping them"
                 )
                 for _identity in _gateway_holders:
+                    _identity_state = _gateway_stop_identity_state(_identity)
+                    if _identity_state == "exited":
+                        continue
+                    if _identity_state != "match":
+                        raise RuntimeError(
+                            f"gateway process {_identity.pid} changed before force-stop"
+                        )
                     try:
-                        if not _revalidate_pausable_gateway_identity(_identity):
-                            raise RuntimeError(
-                                f"gateway process {_identity.pid} changed before force-stop"
-                            )
                         terminate_pid(int(_identity.pid), force=True)
                     except ProcessLookupError:
                         continue
+                    except OSError as exc:
+                        if _gateway_stop_identity_state(_identity) == "exited":
+                            continue
+                        raise RuntimeError(
+                            f"leftover gateway {_identity.pid} could not be safely stopped"
+                        ) from exc
                     except Exception as exc:
                         raise RuntimeError(
                             f"leftover gateway {_identity.pid} could not be safely stopped"
