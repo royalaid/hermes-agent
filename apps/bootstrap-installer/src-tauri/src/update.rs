@@ -1152,7 +1152,14 @@ fn has_recovery_artifacts(path: &Path) -> Result<bool> {
 }
 
 fn ensure_no_recovery_artifacts(path: &Path) -> Result<()> {
-    let now = unix_time_seconds();
+    ensure_no_recovery_artifacts_at(path, unix_time_seconds(), pid_matches_claim)
+}
+
+fn ensure_no_recovery_artifacts_at(
+    path: &Path,
+    now: u64,
+    owner_matches_claim: impl Fn(u32, u64) -> bool,
+) -> Result<()> {
     for artifact in recovery_artifacts(path)? {
         let raw = std::fs::read(&artifact)
             .map_err(|err| anyhow!("reading handoff recovery artifact: {err}"))?;
@@ -1161,7 +1168,8 @@ fn ensure_no_recovery_artifacts(path: &Path) -> Result<()> {
             .map(|value| value.to_string_lossy())
             .unwrap_or_default();
         let stale = if let Ok(lease) = serde_json::from_slice::<BridgeQuiesceLease>(&raw) {
-            let max_lifetime = if name.contains(".cas-emergency-") {
+            let emergency = name.contains(".cas-emergency-");
+            let max_lifetime = if emergency {
                 120
             } else {
                 BRIDGE_LEASE_MAX_SECONDS
@@ -1178,11 +1186,18 @@ fn ensure_no_recovery_artifacts(path: &Path) -> Result<()> {
                     > BRIDGE_LEASE_HANDOFF_GRACE_SECONDS
             {
                 false
-            } else {
+            } else if emergency {
                 // Emergency recovery is deliberately non-adoptable and blocks
-                // even when its owner is dead. Every valid lease artifact is
-                // retired only after its bounded expiry.
-                lease.expires_at <= now
+                // through its bounded expiry even when its owner is dead.
+                now > lease.expires_at
+            } else {
+                // Ordinary CAS generations follow the same owner/handoff
+                // contract as the primary lease. A dead owner keeps the gate
+                // closed through the final grace second, then its exact bytes
+                // may be retired without waiting for the full lease lifetime.
+                now > lease.expires_at
+                    || (now > lease.handoff_grace_until
+                        && !owner_matches_claim(lease.owner_pid, lease.created_at))
             }
         } else if let Some((pid, claimed_at)) = update_marker_identity_from_raw(&raw) {
             !pid_matches_claim(pid, claimed_at)
@@ -5137,30 +5152,62 @@ mod tests {
     }
 
     #[test]
+    fn dead_owner_recovery_blocks_at_90_seconds_and_retires_at_91() {
+        let dir = unique_tmp_dir("bridge-dead-owner-recovery");
+        let install_root = dir.join("hermes-agent");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let marker = dir.join(BRIDGE_LEASE_FILENAME);
+        let lease = BridgeQuiesceLease {
+            schema_version: 1,
+            lease_id: "lease-dead-owner-0123456789abcdef".into(),
+            owner_pid: 4242,
+            created_at: 100_000,
+            expires_at: 101_200,
+            handoff_grace_until: 100_090,
+            install_root: install_root.to_string_lossy().into_owned(),
+        };
+        let artifact = bridge_lease_sibling(&marker, ".cas-shadow-4242-0123456789abcdef").unwrap();
+        std::fs::write(&artifact, serde_json::to_vec(&lease).unwrap()).unwrap();
+
+        assert!(
+            ensure_no_recovery_artifacts_at(&marker, 100_090, |_, _| false).is_err(),
+            "dead-owner recovery still blocks through the final grace second"
+        );
+        assert!(artifact.exists());
+        assert!(
+            ensure_no_recovery_artifacts_at(&marker, 100_091, |_, _| true).is_err(),
+            "a matching owner keeps ordinary recovery active after handoff grace"
+        );
+        assert!(artifact.exists());
+        ensure_no_recovery_artifacts_at(&marker, 100_091, |_, _| false)
+            .expect("dead-owner recovery retires after handoff grace by exact-byte CAS");
+        assert!(!artifact.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn emergency_recovery_blocks_until_its_bounded_expiry_then_retires() {
         let dir = unique_tmp_dir("bridge-emergency");
         let install_root = dir.join("hermes-agent");
         std::fs::create_dir_all(&install_root).unwrap();
         let marker = dir.join(BRIDGE_LEASE_FILENAME);
-        let now = unix_time_seconds();
-        let mut lease = BridgeQuiesceLease {
+        let lease = BridgeQuiesceLease {
             schema_version: 1,
             lease_id: "lease-emergency-0123456789abcdef".into(),
             owner_pid: 4,
-            created_at: now,
-            expires_at: now + 120,
-            handoff_grace_until: now + 90,
+            created_at: 100_000,
+            expires_at: 100_120,
+            handoff_grace_until: 100_090,
             install_root: install_root.to_string_lossy().into_owned(),
         };
         let emergency = bridge_lease_sibling(&marker, ".cas-emergency-1-0123456789abcdef").unwrap();
         std::fs::write(&emergency, serde_json::to_vec(&lease).unwrap()).unwrap();
-        assert!(ensure_no_recovery_artifacts(&marker).is_err());
-
-        lease.created_at = now.saturating_sub(120);
-        lease.expires_at = now;
-        lease.handoff_grace_until = lease.created_at + 90;
-        std::fs::write(&emergency, serde_json::to_vec(&lease).unwrap()).unwrap();
-        ensure_no_recovery_artifacts(&marker)
+        assert!(
+            ensure_no_recovery_artifacts_at(&marker, 100_120, |_, _| false).is_err(),
+            "emergency recovery blocks through its bounded expiry"
+        );
+        assert!(emergency.exists());
+        ensure_no_recovery_artifacts_at(&marker, 100_121, |_, _| false)
             .expect("expired bounded emergency artifact retires by exact-byte CAS");
         assert!(!emergency.exists());
         let _ = std::fs::remove_dir_all(&dir);
