@@ -25,7 +25,8 @@ import {
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
   OFFICIAL_REPO_HTTPS_URL,
-  resolveUpdateRemote
+  resolveUpdateRemote,
+  updateBranchFetchArgs
 } from './update-remote'
 
 test('canonicalGitHubRemote normalizes SSH and HTTPS forms to the same value', () => {
@@ -134,4 +135,13 @@ test('resolveUpdateRemote keeps an authoritative official SSH branch remote on a
     }),
     { name: OFFICIAL_REPO_HTTPS_URL, url: OFFICIAL_REPO_HTTPS_URL }
   )
+})
+
+test('update checks force-refresh the exact configured tracking ref they read', () => {
+  assert.deepEqual(updateBranchFetchArgs('fork', 'fork-integration'), [
+    'fetch',
+    '--quiet',
+    'fork',
+    '+refs/heads/fork-integration:refs/remotes/fork/fork-integration'
+  ])
 })

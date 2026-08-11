@@ -93,11 +93,22 @@ function resolveUpdateRemote({ branchRemote, branchRemoteUrl, originUrl }) {
   return { name: 'origin', url: String(originUrl || '').trim() }
 }
 
+/** Refresh the exact tracking ref read by the subsequent update comparison. */
+function updateBranchFetchArgs(remote: string, branch: string): string[] {
+  return [
+    'fetch',
+    '--quiet',
+    remote,
+    `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`
+  ]
+}
+
 export {
   canonicalGitHubRemote,
   isOfficialSshRemote,
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
   OFFICIAL_REPO_HTTPS_URL,
-  resolveUpdateRemote
+  resolveUpdateRemote,
+  updateBranchFetchArgs
 }
