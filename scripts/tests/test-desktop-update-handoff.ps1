@@ -206,6 +206,23 @@ public static class FakeHermes {
             ReplaceLease(leasePath, raw, "update-adopt");
             Thread.Sleep(750);
         }
+        if (mode == "pre-plan-fail" || mode == "invalid-plan-fail" || mode == "ambiguous-plan-fail") {
+            var home = Path.GetDirectoryName(leasePath);
+            var pending = Path.Combine(home, ".hermes-gateway-resume-" + invocationId + ".json");
+            if (mode == "invalid-plan-fail") {
+                File.WriteAllText(pending, "not-json");
+            } else if (mode == "ambiguous-plan-fail") {
+                WritePlan(home, Path.Combine(home, "hermes-agent"), invocationId, leaseId);
+                File.Copy(pending, Path.Combine(home, ".hermes-gateway-resume-" + invocationId + ".completed"));
+            }
+            if (File.Exists(leasePath) && parentLeaseOwnerPid > 0) {
+                var returned = File.ReadAllText(leasePath);
+                returned = Regex.Replace(returned, "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + parentLeaseOwnerPid);
+                ReplaceLease(leasePath, returned, "update-return-before-plan");
+            }
+            Console.Error.WriteLine("simulated pre-plan update refusal");
+            return 2;
+        }
         if (!String.IsNullOrEmpty(leaseId) && !String.IsNullOrEmpty(invocationId) && !String.IsNullOrEmpty(leasePath)) {
             var home = Path.GetDirectoryName(leasePath);
             WritePlan(home, Path.Combine(home, "hermes-agent"), invocationId, leaseId);
@@ -905,6 +922,42 @@ try {
     Assert-Equal 0 $code 'stderr-heavy update child is drained concurrently without deadlock'
     Assert-True (-not (Test-Path -LiteralPath $stderrHeavy.Lease)) 'stderr-heavy child cleans its exact adopted lease'
 
+    $prePlanFailure = New-TestInstall 'pre-plan-failure' $fakeHermes
+    $prePlanLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $prePlanFailure $prePlanLeaseId
+    $code = Invoke-TestHandoff $prePlanFailure (New-PreflightJson $prePlanFailure $true $true) 0 '' $prePlanLeaseId 'pre-plan-fail'
+    Assert-Equal 13 $code 'pre-plan updater refusal remains a fail-closed recovery failure'
+    Assert-True (-not (Test-Path -LiteralPath $prePlanFailure.Sentinel)) 'pre-plan updater refusal performs no mutation'
+    Assert-True (-not (Test-Path -LiteralPath $prePlanFailure.ResumeCapture)) 'pre-plan updater refusal starts no recovery child'
+    Assert-True (-not (Test-Path -LiteralPath $prePlanFailure.UpdateMarker)) 'pre-plan updater refusal releases the exact update marker'
+    Assert-True (-not (Test-Path -LiteralPath $prePlanFailure.Lease)) 'pre-plan updater refusal releases the returned bridge lease'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $prePlanFailure.Home -Filter '.hermes-gateway-resume-*' -File -ErrorAction SilentlyContinue).Count) 'pre-plan updater refusal leaves no gateway plan artifact'
+    Assert-True (Test-Path -LiteralPath $prePlanFailure.Result) 'pre-plan updater refusal publishes a terminal result'
+    if (Test-Path -LiteralPath $prePlanFailure.Result) {
+        $prePlanResult = [System.IO.File]::ReadAllText($prePlanFailure.Result) | ConvertFrom-Json
+        Assert-Equal 13 ([int]$prePlanResult.exit_code) 'pre-plan terminal result remains fail-closed'
+        Assert-True ([string]$prePlanResult.message -match 'Hermes update failed \(exit 2\)') 'pre-plan terminal result retains the original update failure detail'
+        Assert-True ([string]$prePlanResult.message -match 'could not verify whether gateway recovery was required or completed') 'pre-plan terminal result accurately reports unverified recovery state'
+        Assert-True ([string]$prePlanResult.message -notmatch 'without restoring') 'pre-plan terminal result does not assert that an unstopped fleet was not restored'
+    }
+
+    foreach ($ambiguousMode in @('invalid-plan-fail', 'ambiguous-plan-fail')) {
+        $ambiguousPlan = New-TestInstall $ambiguousMode $fakeHermes
+        $ambiguousPlanLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $ambiguousPlan $ambiguousPlanLeaseId
+        $code = Invoke-TestHandoff $ambiguousPlan (New-PreflightJson $ambiguousPlan $true $true) 0 '' $ambiguousPlanLeaseId $ambiguousMode
+        Assert-Equal 13 $code "$ambiguousMode remains a failed fleet recovery"
+        Assert-True (-not (Test-Path -LiteralPath $ambiguousPlan.Sentinel)) "$ambiguousMode performs no mutation"
+        Assert-True (-not (Test-Path -LiteralPath $ambiguousPlan.ResumeCapture)) "$ambiguousMode starts no unproved recovery child"
+        Assert-True (-not (Test-Path -LiteralPath $ambiguousPlan.UpdateMarker)) "$ambiguousMode releases the exact update marker"
+        Assert-True (-not (Test-Path -LiteralPath $ambiguousPlan.Lease)) "$ambiguousMode releases the returned bridge lease"
+        if (Test-Path -LiteralPath $ambiguousPlan.Result) {
+            $ambiguousResult = [System.IO.File]::ReadAllText($ambiguousPlan.Result) | ConvertFrom-Json
+            Assert-True ([string]$ambiguousResult.message -match 'could not verify whether gateway recovery was required or completed') "$ambiguousMode reports the unproved recovery state"
+        }
+        $invalidVenvHomes += $ambiguousPlan.Home
+    }
+
     $foreignRace = New-TestInstall 'foreign-race' $fakeHermes
     $raceLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $foreignRace $raceLeaseId
@@ -934,7 +987,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $foreign.Sentinel)) 'foreign lease is never followed by mutation'
     Assert-Equal $before ([System.IO.File]::ReadAllText($foreign.Lease)) 'foreign live lease is neither rewritten nor deleted'
 } finally {
-    $cleanupPaths = @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $leased.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
+    $cleanupPaths = @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $leased.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $prePlanFailure.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
     foreach ($path in $cleanupPaths) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
