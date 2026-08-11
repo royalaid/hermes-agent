@@ -3296,26 +3296,40 @@ def _detect_venv_python_processes(
 
     skip: set[int] = set(exclude_pids or set())
     skip.add(os.getpid())
-    # A native console-script launch has one load-bearing venv shim directly
-    # above this updater process. Exclude only that exact current-invocation
-    # ``hermes.exe ... update`` parent. Higher venv ancestors may be agents or
-    # other native-module holders and remain fail-closed blockers.
+    # A native console-script or uv-created Windows venv can leave one
+    # load-bearing launcher directly above the real base-Python process.
+    # Exclude only an exact current-invocation ``hermes.exe ... update`` or
+    # ``python.exe -m hermes_cli.main ... update`` parent. Higher venv
+    # ancestors may be agents or other native-module holders and remain
+    # fail-closed blockers.
     try:
         parent = psutil.Process(os.getpid()).parent()
-        expected_shim = venv_bin_dir(venv_dir, windows=True) / "hermes.exe"
+        expected_hermes = venv_bin_dir(venv_dir, windows=True) / "hermes.exe"
+        expected_python = venv_python_path(venv_dir, windows=True)
         parent_argv = [str(value) for value in (parent.cmdline() or [])]
         parent_exe = str(parent.exe() or "")
-        same_exe = os.path.normcase(os.path.realpath(parent_exe)) == os.path.normcase(
-            os.path.realpath(expected_shim)
+        parent_exe_key = os.path.normcase(os.path.realpath(parent_exe))
+        parent_argv0_key = (
+            os.path.normcase(os.path.realpath(parent_argv[0]))
+            if parent_argv
+            else ""
         )
-        same_argv0 = bool(parent_argv) and os.path.normcase(
-            os.path.realpath(parent_argv[0])
-        ) == os.path.normcase(os.path.realpath(expected_shim))
-        if (
-            same_exe
-            and same_argv0
+        expected_hermes_key = os.path.normcase(os.path.realpath(expected_hermes))
+        expected_python_key = os.path.normcase(os.path.realpath(expected_python))
+        exact_hermes = (
+            parent_exe_key == expected_hermes_key
+            and parent_argv0_key == expected_hermes_key
             and _is_current_update_shim_argv(parent_argv)
+        )
+        exact_python = False
+        if (
+            parent_exe_key == expected_python_key
+            and parent_argv0_key == expected_python_key
         ):
+            from hermes_cli._scan_venv_blockers import _hermes_cli_command
+
+            exact_python = _hermes_cli_command(parent_argv) == "update"
+        if exact_hermes or exact_python:
             skip.add(int(parent.pid))
     except Exception:
         pass
