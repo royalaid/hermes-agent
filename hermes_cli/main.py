@@ -9834,7 +9834,7 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
 
-    _update_quiesce_lease = None
+    _update_transaction = _UpdateTransaction()
     _update_lease_heartbeat = None
     _update_mutation_job = None
     from hermes_cli.update_quiesce import (
@@ -9844,24 +9844,32 @@ def cmd_update(args):
         _UpdateLeaseHeartbeat,
         _WindowsMutationJob,
     )
+    from hermes_cli.update_transaction import _UpdateTransaction
 
     try:
         if _is_windows():
-            _update_quiesce_lease, _invocation_id = _prepare_atomic_windows_update(
+            _prepare_atomic_windows_update(
                 args,
                 root=PROJECT_ROOT,
+                transaction=_update_transaction,
             )
+            if _update_transaction.lease is None:
+                raise RuntimeError("Windows update preparation returned no lease")
             # Self-assignment makes every subsequently spawned git/uv/pip/npm
             # descendant part of the same kill-on-close job. Lease loss can
             # therefore fail-stop the whole mutation tree, not just orphan it.
             _update_mutation_job = _WindowsMutationJob()
             _update_lease_heartbeat = _UpdateLeaseHeartbeat(
                 PROJECT_ROOT,
-                _update_quiesce_lease,
+                _update_transaction.lease,
                 fail_stop=_update_mutation_job.abort,
             )
             _update_lease_heartbeat.start()
-        _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
+        _self()._cmd_update_impl(
+            args,
+            gateway_mode=gateway_mode,
+            transaction=_update_transaction,
+        )
         if _update_lease_heartbeat is not None and _update_lease_heartbeat.lost:
             # Production heartbeat loss invokes os._exit immediately.  Keep
             # this explicit guard for injected/test fail-stop callbacks and
@@ -9879,37 +9887,34 @@ def cmd_update(args):
                 # pip/npm descendant can continue mutating, then fully disarm
                 # before starting any trusted long-lived gateway process.
                 _update_mutation_job.disarm()
-            _gateway_resume_plan = getattr(
-                args, "_windows_gateway_resume_plan", None
-            )
+            _gateway_resume_plan = _update_transaction.gateway_resume_plan
             if _gateway_resume_plan is not None:
-                setattr(args, "_windows_gateway_resume_plan", None)
+                _update_transaction.gateway_resume_plan = None
                 if not bool(getattr(args, "defer_gateway_resume", False)):
                     _self()._resume_windows_gateways_after_update(_gateway_resume_plan)
         finally:
             try:
-                if _update_quiesce_lease is not None:
+                if _update_transaction.lease is not None:
                     if bool(getattr(args, "defer_gateway_resume", False)):
-                        _handoff_owner = getattr(
-                            args, "_update_handoff_owner_pid", None
-                        )
+                        _handoff_owner = _update_transaction.handoff_owner_pid
                         if not isinstance(_handoff_owner, int) or _handoff_owner <= 0:
                             raise RuntimeError(
                                 "deferred gateway resume has no verified handoff owner"
                             )
-                        _update_quiesce_lease = _transfer_update_quiesce_lease(
+                        _update_transaction.lease = _transfer_update_quiesce_lease(
                             PROJECT_ROOT,
-                            _update_quiesce_lease,
+                            _update_transaction.lease,
                             new_owner_pid=_handoff_owner,
                         )
                     else:
                         if not _release_update_quiesce_lease(
-                            PROJECT_ROOT, _update_quiesce_lease
+                            PROJECT_ROOT, _update_transaction.lease
                         ):
                             raise RuntimeError(
                                 "update completed but bridge lease cleanup "
                                 "could not be proven"
                             )
+                        _update_transaction.lease = None
             finally:
                 # A failed exact lease transfer deliberately leaves the gate
                 # fail-closed, but it must not strand the independent outer
@@ -12050,11 +12055,6 @@ def _advertise_agent_env() -> None:
     os.environ.setdefault("HERMES_AGENT", "true")
 
 
-def _read_only_update_preflight_requested(argv: list[str] | None = None) -> bool:
-    """Recognize the exact read-only update mode before startup cleanup."""
-    return _early_read_only_update_preflight_requested(argv)
-
-
 def _try_read_only_update_preflight_launch() -> bool:
     """Parse and dispatch preflight before any config/startup filesystem work."""
     values = sys.argv[1:]
@@ -12092,23 +12092,19 @@ def main():
     if _try_read_only_update_preflight_launch():
         return
 
-    read_only_update_preflight = _read_only_update_preflight_requested()
-
     # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
     # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
     # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
-    if not read_only_update_preflight:
-        try:
-            _cleanup_quarantined_exes()
-        except Exception:
-            pass
+    try:
+        _cleanup_quarantined_exes()
+    except Exception:
+        pass
 
     # If the checkout changed since the last launch (hermes update, manual
     # git pull, old-updater update that predates newer clears), sweep stale
     # __pycache__ once so no process — this one's lazy imports included —
     # resolves fresh source against old bytecode. Never raises.
-    if not read_only_update_preflight:
-        _sweep_stale_bytecode_if_checkout_changed()
+    _sweep_stale_bytecode_if_checkout_changed()
 
     # Self-heal a venv left half-built by an interrupted ``hermes update``
     # (Ctrl-C, terminal close, WSL OOM mid-install). Skip when the user is
