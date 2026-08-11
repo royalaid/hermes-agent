@@ -13,7 +13,7 @@ import math
 import os
 import shlex
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Mapping, NoReturn, Sequence
 
@@ -38,6 +38,10 @@ _SENSITIVE_LONG_FLAGS: list[str] = [
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         raise ValueError(message)
+
+
+class _ProcessGenerationChanged(RuntimeError):
+    """Raised when one PID names different processes during identity capture."""
 
 
 @dataclass(frozen=True)
@@ -377,9 +381,9 @@ def _snapshot_for_pid(
 
     try:
         process = psutil.Process(int(pid))
+        created_at = float(process.create_time())
         argv_value = process.cmdline()
         exe = process.exe()
-        created_at = float(process.create_time())
         ppid = int(
             process.ppid()
             if parent_by_pid is None
@@ -393,6 +397,14 @@ def _snapshot_for_pid(
     argv = tuple(str(value) for value in argv_value)
     if not exe or not argv or not math.isfinite(created_at) or created_at <= 0:
         raise RuntimeError(f"process {pid} returned incomplete identity metadata")
+    try:
+        same_generation = _process_generation_matches(pid, created_at)
+    except psutil.NoSuchProcess:
+        return None
+    if not same_generation:
+        raise _ProcessGenerationChanged(
+            f"process {pid} changed generation during identity refresh"
+        )
     return _ProcessSnapshot(
         pid=int(pid),
         ppid=ppid,
@@ -402,6 +414,16 @@ def _snapshot_for_pid(
         created_at=created_at,
         process=process,
     )
+
+
+def _process_generation_matches(pid: int, created_at: float) -> bool:
+    """Compare against an uncached Process so PID reuse cannot splice metadata."""
+    import psutil  # noqa: PLC0415
+
+    live_created_at = float(psutil.Process(int(pid)).create_time())
+    if not math.isfinite(live_created_at) or live_created_at <= 0:
+        raise RuntimeError(f"process {pid} returned incomplete identity metadata")
+    return live_created_at == created_at
 
 
 def _mcp_role(
@@ -477,7 +499,18 @@ def _owner_from_ancestry(
     """Attribute a bridge only when a live ancestor proves the owner."""
     if parent_by_pid is None:
         try:
-            parents = snapshot.process.parents()
+            parents = []
+            descendant_created_at = snapshot.created_at
+            for parent in snapshot.process.parents():
+                parent_created_at = float(parent.create_time())
+                if (
+                    not math.isfinite(parent_created_at)
+                    or parent_created_at <= 0
+                    or parent_created_at > descendant_created_at
+                ):
+                    return "unknown"
+                parents.append((parent, parent_created_at))
+                descendant_created_at = parent_created_at
         except Exception:
             return "unknown"
     else:
@@ -485,24 +518,44 @@ def _owner_from_ancestry(
 
         parents = []
         ancestor_pid = snapshot.ppid
+        descendant_created_at = snapshot.created_at
         seen: set[int] = set()
         while ancestor_pid > 0 and ancestor_pid not in seen:
             seen.add(ancestor_pid)
             try:
-                parents.append(psutil.Process(ancestor_pid))
+                parent = psutil.Process(ancestor_pid)
+                parent_created_at = float(parent.create_time())
             except Exception:
-                pass
+                break
+            if (
+                not math.isfinite(parent_created_at)
+                or parent_created_at <= 0
+                or parent_created_at > descendant_created_at
+            ):
+                break
+            parents.append((parent, parent_created_at))
+            descendant_created_at = parent_created_at
             try:
                 ancestor_pid = int(parent_by_pid.get(ancestor_pid, 0))
             except (TypeError, ValueError):
                 break
-    for parent in parents:
+    for parent, expected_created_at in parents:
         try:
             name = str(parent.name() or "").lower()
             exe = str(parent.exe() or "").lower()
             argv = [str(value).lower() for value in (parent.cmdline() or [])]
         except Exception:
+            try:
+                if not _process_generation_matches(parent.pid, expected_created_at):
+                    break
+            except Exception:
+                break
             continue
+        try:
+            if not _process_generation_matches(parent.pid, expected_created_at):
+                break
+        except Exception:
+            break
         basenames = {
             Path(name).stem.lower(),
             Path(exe).stem.lower(),
@@ -597,6 +650,40 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
         if snapshot is not None:
             snapshots[pid] = snapshot
 
+    # Bind the refreshed identities to one fresh parent-table generation. The
+    # discovery map can predate these exe/argv/create-time reads; reusing it
+    # would splice a recycled PID's new identity onto its predecessor's parent
+    # edge. Bracket one shared map with fresh create-time reads instead of
+    # calling Process.ppid() (and rebuilding the full Windows map) per PID.
+    if callable(ppid_map_fn) and snapshots:
+        try:
+            parent_by_pid = {int(pid): int(ppid) for pid, ppid in ppid_map_fn().items()}
+        except Exception as exc:
+            raise RuntimeError(
+                "scan aborted: parent process enumeration failed"
+            ) from exc
+        stale_pids: set[int] = set()
+        for pid, snapshot in snapshots.items():
+            try:
+                same_generation = _process_generation_matches(pid, snapshot.created_at)
+            except psutil.NoSuchProcess:
+                stale_pids.add(pid)
+                continue
+            except Exception:
+                unreadable.add(pid)
+                stale_pids.add(pid)
+                continue
+            if not same_generation:
+                unreadable.add(pid)
+                stale_pids.add(pid)
+                continue
+            snapshots[pid] = replace(
+                snapshot,
+                ppid=int(parent_by_pid.get(pid, 0)),
+            )
+        for pid in stale_pids:
+            snapshots.pop(pid, None)
+
     wrappers = {
         pid
         for pid, snapshot in snapshots.items()
@@ -606,7 +693,7 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
     mcp_bridges: list[dict[str, Any]] = []
     processes: list[dict[str, Any]] = []
     gateways: list[dict[str, Any]] = []
-    owner_by_parent_pid: dict[int, str] = {}
+    owner_by_anchor_generation: dict[tuple[int, float, int], str] = {}
     for pid, (scanned_name, scanned_cmdline) in by_pid.items():
         snapshot = snapshots.get(pid)
         if snapshot is None and pid not in unreadable:
@@ -620,7 +707,12 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
                     if wrapper_pid is not None
                     else snapshot
                 )
-                owner = owner_by_parent_pid.get(owner_anchor.ppid)
+                owner_key = (
+                    owner_anchor.pid,
+                    owner_anchor.created_at,
+                    owner_anchor.ppid,
+                )
+                owner = owner_by_anchor_generation.get(owner_key)
                 if owner is None:
                     owner = (
                         _owner_from_ancestry(owner_anchor)
@@ -630,7 +722,7 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
                             parent_by_pid=parent_by_pid,
                         )
                     )
-                    owner_by_parent_pid[owner_anchor.ppid] = owner
+                    owner_by_anchor_generation[owner_key] = owner
                 mcp_bridges.append(
                     _mcp_record(
                         snapshot,
@@ -706,9 +798,9 @@ def _live_mcp_bridge_process(
     if is_exact_mcp_module_argv(snapshot.argv) and _within(snapshot.exe, _venv_dir(root)):
         wrappers.add(snapshot.pid)
 
-    # Rebuild the live ancestry needed for an external uv/base worker. A
-    # managed-runtime worker remains owned by the target root after its wrapper
-    # exits, so no ancestry is needed for that case.
+    # Rebuild the live ancestry needed for owner authorization and for an
+    # external uv/base worker's wrapper relationship. Managed-runtime location
+    # proves the worker role without a live wrapper, but not who owns it.
     try:
         parents = snapshot.process.parents()
     except Exception:
