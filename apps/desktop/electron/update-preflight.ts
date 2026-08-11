@@ -63,9 +63,7 @@ function errorText(error: unknown): string {
 }
 
 function exactMcpOnly(result: VenvBlockerScanResult): boolean {
-  return (
-    result.processes.length === 0 && result.mcpBridges.length > 0 && result.mcpBridges.every(isExactActionableMcpBridge)
-  )
+  return result.processes.length === 0 && exactActionableMcpBridges(result)
 }
 
 function exactActionableMcpBridges(result: VenvBlockerScanResult): boolean {
