@@ -14,7 +14,13 @@ import pytest
 from jsonschema import Draft202012Validator
 
 import hermes_mcp_update_gate as gate
-from hermes_cli import update_cmd
+from hermes_cli import (
+    update_cmd,
+    update_deferred_gateway,
+    update_quiesce,
+    update_readiness,
+    update_receipt,
+)
 from hermes_cli.subcommands.update import build_update_parser
 
 
@@ -82,7 +88,7 @@ def _payload(root: Path, *, mode="preflight", ready=True, reason=None, error=Non
             {"type": "clear-scan", "sequence": 1},
             {"type": "clear-scan", "sequence": 2},
         ]
-    return update_cmd._readiness_payload(
+    return update_readiness._readiness_payload(
         mode=mode,
         root=root,
         ok=error is None,
@@ -158,7 +164,7 @@ def test_preflight_json_is_one_document_with_stable_exit(
 ):
     document = payload(tmp_path)
     monkeypatch.setattr(
-        update_cmd, "_build_update_preflight", lambda *_args, **_kwargs: document
+        update_readiness, "_build_update_preflight", lambda *_args, **_kwargs: document
     )
     args = SimpleNamespace(branch="main", json=True)
 
@@ -299,9 +305,9 @@ def test_preflight_fails_closed_when_scanner_probe_fails(tmp_path: Path, monkeyp
     import hermes_cli._scan_venv_blockers as scanner
 
     monkeypatch.setattr(scanner, "scan_venv_blockers", lambda _root: (_ for _ in ()).throw(RuntimeError("denied")))
-    monkeypatch.setattr(update_cmd, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_readiness, "_load_update_receipt", lambda _root: None)
 
-    payload = update_cmd._build_update_preflight(tmp_path, "main")
+    payload = update_readiness._build_update_preflight(tmp_path, "main")
 
     assert payload["ok"] is False
     assert payload["ready"] is False
@@ -320,14 +326,14 @@ def test_foreign_update_lock_is_a_stable_preflight_blocker(tmp_path: Path, monke
         raw="999\n100\n",
     )
     monkeypatch.setattr(scanner, "scan_venv_blockers", lambda _root: _scan())
-    monkeypatch.setattr(update_cmd, "_git_preflight_metadata", lambda *_args: None)
-    monkeypatch.setattr(update_cmd, "_load_update_receipt", lambda _root: None)
-    monkeypatch.setattr(update_cmd, "_read_update_holder_read_only", lambda: holder)
+    monkeypatch.setattr(update_readiness, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_readiness, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_readiness, "_read_update_holder_read_only", lambda: holder)
     monkeypatch.setattr(update_lock, "_handoff_pid", lambda: None)
     monkeypatch.setattr(update_lock, "_is_ancestor_pid", lambda _pid: False)
     monkeypatch.setattr(gate, "live_quiesce_lease", lambda *_args, **_kwargs: None)
 
-    payload = update_cmd._build_update_preflight(tmp_path, "main")
+    payload = update_readiness._build_update_preflight(tmp_path, "main")
 
     assert payload["ready"] is False
     assert payload["reason"] == "update-running"
@@ -342,16 +348,16 @@ def test_independent_preflight_does_not_promise_an_active_lease_can_be_adopted(
 
     lease = _lease(tmp_path)
     monkeypatch.setattr(scanner, "scan_venv_blockers", lambda _root: _scan())
-    monkeypatch.setattr(update_cmd, "_git_preflight_metadata", lambda *_args: None)
-    monkeypatch.setattr(update_cmd, "_load_update_receipt", lambda _root: None)
-    monkeypatch.setattr(update_cmd, "_read_update_holder_read_only", lambda: None)
+    monkeypatch.setattr(update_readiness, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_readiness, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_readiness, "_read_update_holder_read_only", lambda: None)
     monkeypatch.setattr(gate, "live_quiesce_lease", lambda *_args, **_kwargs: lease)
 
-    payload = update_cmd._build_update_preflight(tmp_path, "main")
+    payload = update_readiness._build_update_preflight(tmp_path, "main")
 
     assert payload["ready"] is False
     assert payload["reason"] == "quiesce-lease-active"
-    assert payload["lease"] == update_cmd._public_quiesce_lease(lease)
+    assert payload["lease"] == update_readiness._public_quiesce_lease(lease)
     assert "lease_id" not in payload["lease"]
     update_cmd.validate_update_readiness(payload)
 
@@ -375,7 +381,7 @@ def test_standalone_drain_pause_is_not_an_adoptable_update_handoff(
     # A separate updater has no capability or ancestry relation to the drain
     # child. The bounded pause is intentionally not a drain-then-apply seam.
     with pytest.raises(RuntimeError, match="another updater owns"):
-        update_cmd._claim_update_quiesce_lease(root)
+        update_quiesce._claim_update_quiesce_lease(root)
 
     expired_pause = {
         **pause,
@@ -387,10 +393,10 @@ def test_standalone_drain_pause_is_not_an_adoptable_update_handoff(
         json.dumps(expired_pause, sort_keys=True), encoding="utf-8"
     )
 
-    claimed = update_cmd._claim_update_quiesce_lease(root)
+    claimed = update_quiesce._claim_update_quiesce_lease(root)
     assert claimed["owner_pid"] == os.getpid()
     assert claimed["lease_id"] != pause["lease_id"]
-    assert update_cmd._release_update_quiesce_lease(root, claimed)
+    assert update_quiesce._release_update_quiesce_lease(root, claimed)
 
 
 def test_preflight_accepts_exact_capability_owned_by_live_ancestor(
@@ -401,14 +407,14 @@ def test_preflight_accepts_exact_capability_owned_by_live_ancestor(
 
     lease = {**_lease(tmp_path), "owner_pid": 777}
     monkeypatch.setattr(scanner, "scan_venv_blockers", lambda _root: _scan())
-    monkeypatch.setattr(update_cmd, "_git_preflight_metadata", lambda *_args: None)
-    monkeypatch.setattr(update_cmd, "_load_update_receipt", lambda _root: None)
-    monkeypatch.setattr(update_cmd, "_read_update_holder_read_only", lambda: None)
+    monkeypatch.setattr(update_readiness, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_readiness, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_readiness, "_read_update_holder_read_only", lambda: None)
     monkeypatch.setattr(gate, "live_quiesce_lease", lambda *_args, **_kwargs: lease)
     monkeypatch.setattr(update_lock, "_handoff_pid", lambda: None)
     monkeypatch.setattr(update_lock, "_is_ancestor_pid", lambda pid: pid == 777)
 
-    payload = update_cmd._build_update_preflight(
+    payload = update_readiness._build_update_preflight(
         tmp_path,
         "main",
         expected_lease_id=lease["lease_id"],
@@ -433,7 +439,7 @@ def test_matching_capability_cannot_be_adopted_from_unrelated_owner(
     monkeypatch.setattr(update_lock, "_is_ancestor_pid", lambda _pid: False)
 
     with pytest.raises(RuntimeError, match="not this process or its live ancestor"):
-        update_cmd._claim_update_quiesce_lease(
+        update_quiesce._claim_update_quiesce_lease(
             tmp_path, expected_lease_id=lease["lease_id"]
         )
 
@@ -448,7 +454,7 @@ def test_heartbeat_loss_fail_stops_before_another_mutation(
     lease = gate.write_quiesce_lease(root, owner_pid=os.getpid())
     gate.marker_path().write_text("foreign-malformed", encoding="utf-8")
     events: list[str] = []
-    heartbeat = update_cmd._UpdateLeaseHeartbeat(
+    heartbeat = update_quiesce._UpdateLeaseHeartbeat(
         root,
         lease,
         fail_stop=lambda reason: events.append(f"fail-stop:{reason}"),
@@ -493,7 +499,7 @@ def test_heartbeat_probe_exception_fail_stops_before_renewal(
         "write_quiesce_lease",
         lambda *_args, **_kwargs: events.append("renewed"),
     )
-    heartbeat = update_cmd._UpdateLeaseHeartbeat(
+    heartbeat = update_quiesce._UpdateLeaseHeartbeat(
         root,
         lease,
         fail_stop=lambda reason: events.append(f"fail-stop:{reason}"),
@@ -627,12 +633,12 @@ def test_preflight_refuses_mismatched_lease_capability(tmp_path: Path, monkeypat
 
     lease = _lease(tmp_path)
     monkeypatch.setattr(scanner, "scan_venv_blockers", lambda _root: _scan())
-    monkeypatch.setattr(update_cmd, "_git_preflight_metadata", lambda *_args: None)
-    monkeypatch.setattr(update_cmd, "_load_update_receipt", lambda _root: None)
-    monkeypatch.setattr(update_cmd, "_read_update_holder_read_only", lambda: None)
+    monkeypatch.setattr(update_readiness, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_readiness, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_readiness, "_read_update_holder_read_only", lambda: None)
     monkeypatch.setattr(gate, "live_quiesce_lease", lambda *_args, **_kwargs: lease)
 
-    payload = update_cmd._build_update_preflight(
+    payload = update_readiness._build_update_preflight(
         tmp_path,
         "main",
         expected_lease_id="different-lease-123456",
@@ -656,12 +662,12 @@ def test_drain_handles_clear_then_respawn_and_requires_fresh_two_scan_proof(
         "terminate_mcp_bridge",
         lambda _root, *, pid, created_at: terminated.append((pid, created_at)) or True,
     )
-    monkeypatch.setattr(update_cmd, "_git_preflight_metadata", lambda *_args: None)
-    monkeypatch.setattr(update_cmd, "_load_update_receipt", lambda _root: None)
-    monkeypatch.setattr(update_cmd._time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_quiesce._time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(gate, "write_quiesce_lease", lambda *_args, **_kwargs: _lease(tmp_path))
 
-    payload = update_cmd._drain_under_update_lease(
+    payload = update_quiesce._drain_under_update_lease(
         tmp_path,
         _lease(tmp_path),
         branch="main",
@@ -705,7 +711,7 @@ def test_drain_acquires_outer_lock_then_lease_before_actionable_scan(
     lease = _lease(tmp_path)
     monkeypatch.setattr(update_lock, "UpdateLock", FakeLock)
     monkeypatch.setattr(
-        update_cmd,
+        update_quiesce,
         "_claim_update_quiesce_lease",
         lambda _root: events.append("lease-acquire") or lease,
     )
@@ -714,7 +720,7 @@ def test_drain_acquires_outer_lock_then_lease_before_actionable_scan(
         events.append("first-scan")
         return _payload(tmp_path, mode="drain")
 
-    monkeypatch.setattr(update_cmd, "_drain_under_update_lease", drain)
+    monkeypatch.setattr(update_quiesce, "_drain_under_update_lease", drain)
     args = SimpleNamespace(yes=True, json=True, branch="main", timeout_seconds=5)
 
     with pytest.raises(SystemExit) as raised:
@@ -756,19 +762,19 @@ def test_drain_cleanup_failure_still_releases_outer_lock(
 
     monkeypatch.setattr(update_lock, "UpdateLock", FakeLock)
     monkeypatch.setattr(
-        update_cmd,
+        update_quiesce,
         "_claim_update_quiesce_lease",
         lambda _root: events.append("lease-acquire") or lease,
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_quiesce,
         "_drain_under_update_lease",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("scan failed")
         ),
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_quiesce,
         "_release_update_quiesce_lease",
         lambda *_args: (_ for _ in ()).throw(PermissionError("cleanup denied")),
     )
@@ -880,7 +886,7 @@ def test_malicious_tracking_remote_is_rejected_before_git_uses_it(
     monkeypatch.setattr(update_cmd.subprocess, "run", run)
 
     with pytest.raises(ValueError, match="invalid update remote"):
-        update_cmd._resolve_update_target(["git"], tmp_path, "main")
+        update_readiness._resolve_update_target(["git"], tmp_path, "main")
 
     assert not any("remote" in command for command in seen)
 
@@ -894,7 +900,7 @@ def _git(cwd: Path, *args: str) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=update_cmd._sanitized_git_env(),
+        env=update_readiness._sanitized_git_env(),
     )
     return result.stdout.strip()
 
@@ -934,13 +940,13 @@ def test_divergent_fork_uses_same_remote_ref_for_fetch_compare_and_reset(tmp_pat
     _git(repo, "reset", "--hard", origin_sha)
     _git(repo, "config", "branch.main.remote", "fork")
 
-    target = update_cmd._resolve_update_target(["git"], repo, "main")
+    target = update_readiness._resolve_update_target(["git"], repo, "main")
     _git(repo, "fetch", "--", target.remote, target.refspec)
     merge = subprocess.run(
         ["git", "merge", "--ff-only", target.tracking_ref],
         cwd=repo,
         capture_output=True,
-        env=update_cmd._sanitized_git_env(),
+        env=update_readiness._sanitized_git_env(),
     )
     assert merge.returncode != 0
     _git(repo, "reset", "--hard", target.tracking_ref)
@@ -984,7 +990,7 @@ def test_preflight_git_probe_is_read_only_and_ignores_routing_env(
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(hostile))
 
-    metadata = update_cmd._git_preflight_metadata(repo, "main")
+    metadata = update_readiness._git_preflight_metadata(repo, "main")
 
     assert metadata is not None
     assert metadata["head"] == _git(repo, "rev-parse", "HEAD")
@@ -1018,7 +1024,7 @@ def test_mutation_guard_sanitizes_git_routing_for_all_inherited_helpers(
     for key, value in hostile.items():
         monkeypatch.setenv(key, value)
 
-    with update_cmd._GitRoutingEnvironmentGuard():
+    with update_readiness._GitRoutingEnvironmentGuard():
         inherited = subprocess.run(
             [
                 sys.executable,
@@ -1036,7 +1042,7 @@ def test_mutation_guard_sanitizes_git_routing_for_all_inherited_helpers(
 
 
 def test_git_command_disables_repository_hooks() -> None:
-    command = update_cmd._git_cmd()
+    command = update_readiness._git_cmd()
 
     assert "-c" in command
     assert f"core.hooksPath={os.devnull}" in command
@@ -1068,7 +1074,7 @@ def test_local_executable_git_configuration_is_refused_before_worktree_access(
     _git(repo, "config", selector, "python sentinel.py")
 
     with pytest.raises(RuntimeError, match="executable filter/merge"):
-        update_cmd._assert_safe_git_configuration(update_cmd._git_cmd(), repo)
+        update_readiness._assert_safe_git_configuration(update_readiness._git_cmd(), repo)
 
 
 def test_worktree_scope_executable_git_configuration_is_refused(tmp_path: Path):
@@ -1079,7 +1085,7 @@ def test_worktree_scope_executable_git_configuration_is_refused(tmp_path: Path):
     _git(repo, "config", "--worktree", "filter.evil.process", "python sentinel.py")
 
     with pytest.raises(RuntimeError, match="executable filter/merge"):
-        update_cmd._assert_safe_git_configuration(update_cmd._git_cmd(), repo)
+        update_readiness._assert_safe_git_configuration(update_readiness._git_cmd(), repo)
 
 
 @pytest.mark.parametrize(
@@ -1133,11 +1139,11 @@ def test_hardened_git_commands_do_not_load_global_executable_filters(
     (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
 
     result = subprocess.run(
-        update_cmd._git_cmd() + operation,
+        update_readiness._git_cmd() + operation,
         cwd=repo,
         capture_output=True,
         text=True,
-        env=update_cmd._sanitized_git_env(),
+        env=update_readiness._sanitized_git_env(),
     )
 
     assert result.returncode == 0, result.stderr
@@ -1179,8 +1185,8 @@ def test_receipt_is_profile_global_and_requires_current_live_lease(
         health=health,
     )
 
-    receipt_path = home / update_cmd._UPDATE_RECEIPT_NAME
-    assert update_cmd._receipt_path(root) == receipt_path
+    receipt_path = home / update_receipt._UPDATE_RECEIPT_NAME
+    assert update_receipt._receipt_path(root) == receipt_path
     assert receipt_path.exists()
     assert receipt["lease_id"] == lease["lease_id"]
 
@@ -1280,11 +1286,11 @@ def test_deferred_receipt_failure_preserves_pre_stop_recovery_plan(
             },
         )
 
-    plan = update_cmd._deferred_gateway_plan_path(
+    plan = update_deferred_gateway._deferred_gateway_plan_path(
         root, args._update_invocation_id
     )
     assert plan.is_file()
-    assert update_cmd._load_deferred_gateway_plan(
+    assert update_deferred_gateway._load_deferred_gateway_plan(
         plan,
         root=root,
         invocation_id=args._update_invocation_id,
@@ -1316,7 +1322,7 @@ def test_receipt_sanitizer_rejects_false_health_field(tmp_path: Path):
         },
     }
 
-    assert update_cmd._sanitize_update_receipt(value, tmp_path) is None
+    assert update_receipt._sanitize_update_receipt(value, tmp_path) is None
 
 
 def test_receipt_sanitizer_rejects_git_head_that_does_not_match_target(
@@ -1345,7 +1351,7 @@ def test_receipt_sanitizer_rejects_git_head_that_does_not_match_target(
         },
     }
 
-    assert update_cmd._sanitize_update_receipt(value, tmp_path) is None
+    assert update_receipt._sanitize_update_receipt(value, tmp_path) is None
 
 
 def _deferred_args(root: Path, *, token: dict) -> SimpleNamespace:
@@ -1376,7 +1382,7 @@ def test_deferred_gateway_plan_is_private_exact_and_multi_profile(
     }
     args = _deferred_args(root, token=token)
 
-    path = update_cmd._write_deferred_gateway_plan(args, root)
+    path = update_deferred_gateway._write_deferred_gateway_plan(args, root)
     raw = json.loads(path.read_text(encoding="utf-8"))
 
     assert path == home / ".hermes-gateway-resume-invocation-deferred-123456.json"
@@ -1393,7 +1399,7 @@ def test_deferred_gateway_plan_is_private_exact_and_multi_profile(
     }
     assert [entry["name"] for entry in raw["profiles"]] == ["default", "work"]
     assert "lease-deferred-123456" not in path.read_text(encoding="utf-8")
-    assert update_cmd._sanitize_deferred_gateway_plan(
+    assert update_deferred_gateway._sanitize_deferred_gateway_plan(
         raw,
         root=root,
         invocation_id=args._update_invocation_id,
@@ -1428,15 +1434,15 @@ def test_deferred_gateway_plan_rejects_noncanonical_top_level_types(
         },
     )
     payload = json.loads(
-        update_cmd._write_deferred_gateway_plan(args, root).read_text(encoding="utf-8")
+        update_deferred_gateway._write_deferred_gateway_plan(args, root).read_text(encoding="utf-8")
     )
     payload[field] = replacement
     unsigned = {key: value for key, value in payload.items() if key != "auth"}
-    payload["auth"] = update_cmd._gateway_plan_auth(
+    payload["auth"] = update_deferred_gateway._gateway_plan_auth(
         unsigned, args._update_quiesce_lease["lease_id"]
     )
 
-    assert update_cmd._sanitize_deferred_gateway_plan(
+    assert update_deferred_gateway._sanitize_deferred_gateway_plan(
         payload,
         root=root,
         invocation_id=args._update_invocation_id,
@@ -1466,7 +1472,7 @@ def test_deferred_gateway_plan_writer_requires_matching_profile_pid(
     )
 
     with pytest.raises(RuntimeError, match="does not match its PID"):
-        update_cmd._write_deferred_gateway_plan(args, root)
+        update_deferred_gateway._write_deferred_gateway_plan(args, root)
 
 
 def test_deferred_gateway_plan_refuses_unmapped_or_foreign_bytes(
@@ -1485,17 +1491,17 @@ def test_deferred_gateway_plan_refuses_unmapped_or_foreign_bytes(
         "cold_start_if_installed": False,
     }
     with pytest.raises(RuntimeError, match="unmapped"):
-        update_cmd._write_deferred_gateway_plan(
+        update_deferred_gateway._write_deferred_gateway_plan(
             _deferred_args(root, token=token), root
         )
 
     token["unmapped_pids"] = []
     token["unmapped"] = []
     args = _deferred_args(root, token=token)
-    path = update_cmd._write_deferred_gateway_plan(args, root)
+    path = update_deferred_gateway._write_deferred_gateway_plan(args, root)
     foreign = json.loads(path.read_text(encoding="utf-8"))
     foreign["cold_start_if_installed"] = True
-    assert update_cmd._sanitize_deferred_gateway_plan(
+    assert update_deferred_gateway._sanitize_deferred_gateway_plan(
         foreign,
         root=root,
         invocation_id=args._update_invocation_id,
@@ -1514,9 +1520,11 @@ def test_deferred_fleet_partial_retry_does_not_duplicate_started_profile(monkeyp
     running: dict[str, int] = {}
     starts: list[str] = []
     fail_work = True
-    monkeypatch.setattr(update_cmd, "_running_gateway_profiles", lambda: dict(running))
+    monkeypatch.setattr(update_deferred_gateway, "_running_gateway_profiles", lambda: dict(running))
     monkeypatch.setattr(
-        update_cmd, "_profile_process_still_matches", lambda _pid, _created: False
+        update_deferred_gateway,
+        "_profile_process_still_matches",
+        lambda _pid, _created: False,
     )
 
     def spawn(profile: str) -> int:
@@ -1528,16 +1536,16 @@ def test_deferred_fleet_partial_retry_does_not_duplicate_started_profile(monkeyp
         running[profile] = 900 + len(starts)
         return running[profile]
 
-    monkeypatch.setattr(update_cmd, "_spawn_deferred_gateway_profile", spawn)
+    monkeypatch.setattr(update_deferred_gateway, "_spawn_deferred_gateway_profile", spawn)
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_wait_for_deferred_gateway_profile",
         lambda profile, **_kwargs: profile in running,
     )
 
     with pytest.raises(RuntimeError, match="partial"):
-        update_cmd._resume_deferred_gateway_fleet(plan)
-    update_cmd._resume_deferred_gateway_fleet(plan)
+        update_deferred_gateway._resume_deferred_gateway_fleet(plan)
+    update_deferred_gateway._resume_deferred_gateway_fleet(plan)
 
     assert starts == ["default", "work", "work"]
 
@@ -1548,30 +1556,34 @@ def test_deferred_fleet_pid_reuse_is_not_treated_as_old_live_gateway(monkeypatch
         "cold_start_if_installed": False,
     }
     running: dict[str, int] = {}
-    monkeypatch.setattr(update_cmd, "_running_gateway_profiles", lambda: dict(running))
+    monkeypatch.setattr(update_deferred_gateway, "_running_gateway_profiles", lambda: dict(running))
     monkeypatch.setattr(
-        update_cmd, "_profile_process_still_matches", lambda _pid, _created: False
+        update_deferred_gateway,
+        "_profile_process_still_matches",
+        lambda _pid, _created: False,
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_spawn_deferred_gateway_profile",
         lambda profile: running.setdefault(profile, 404),
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_wait_for_deferred_gateway_profile",
         lambda profile, **_kwargs: profile in running,
     )
 
-    update_cmd._resume_deferred_gateway_fleet(plan)
+    update_deferred_gateway._resume_deferred_gateway_fleet(plan)
     assert running == {"work": 404}
 
     running.clear()
     monkeypatch.setattr(
-        update_cmd, "_profile_process_still_matches", lambda _pid, _created: True
+        update_deferred_gateway,
+        "_profile_process_still_matches",
+        lambda _pid, _created: True,
     )
     with pytest.raises(RuntimeError, match="still running"):
-        update_cmd._resume_deferred_gateway_fleet(plan)
+        update_deferred_gateway._resume_deferred_gateway_fleet(plan)
 
 
 def test_deferred_fleet_refuses_exact_old_process_even_if_profile_is_running(
@@ -1582,14 +1594,16 @@ def test_deferred_fleet_refuses_exact_old_process_even_if_profile_is_running(
         "cold_start_if_installed": False,
     }
     monkeypatch.setattr(
-        update_cmd, "_running_gateway_profiles", lambda: {"work": 202}
+        update_deferred_gateway, "_running_gateway_profiles", lambda: {"work": 202}
     )
     monkeypatch.setattr(
-        update_cmd, "_profile_process_still_matches", lambda _pid, _created: True
+        update_deferred_gateway,
+        "_profile_process_still_matches",
+        lambda _pid, _created: True,
     )
 
     with pytest.raises(RuntimeError, match="still running"):
-        update_cmd._resume_deferred_gateway_fleet(plan)
+        update_deferred_gateway._resume_deferred_gateway_fleet(plan)
 
 
 def test_deferred_plan_consume_is_exact_and_completed_replay_is_idempotent(
@@ -1610,16 +1624,16 @@ def test_deferred_plan_consume_is_exact_and_completed_replay_is_idempotent(
             "cold_start_if_installed": False,
         },
     )
-    pending = update_cmd._write_deferred_gateway_plan(args, root)
+    pending = update_deferred_gateway._write_deferred_gateway_plan(args, root)
     raw = pending.read_text(encoding="utf-8")
 
-    assert update_cmd._consume_deferred_gateway_plan(pending, raw) is True
+    assert update_deferred_gateway._consume_deferred_gateway_plan(pending, raw) is True
     assert not pending.exists()
-    completed = update_cmd._deferred_gateway_plan_path(
+    completed = update_deferred_gateway._deferred_gateway_plan_path(
         root, args._update_invocation_id, completed=True
     )
     assert completed.read_text(encoding="utf-8") == raw
-    assert update_cmd._load_deferred_gateway_plan(
+    assert update_deferred_gateway._load_deferred_gateway_plan(
         completed,
         root=root,
         invocation_id=args._update_invocation_id,
@@ -1645,9 +1659,9 @@ def test_deferred_plan_consume_unlink_failure_rolls_back_completed_authority(
             "cold_start_if_installed": False,
         },
     )
-    pending = update_cmd._write_deferred_gateway_plan(args, root)
+    pending = update_deferred_gateway._write_deferred_gateway_plan(args, root)
     raw = pending.read_text(encoding="utf-8")
-    completed = update_cmd._deferred_gateway_plan_path(
+    completed = update_deferred_gateway._deferred_gateway_plan_path(
         root, args._update_invocation_id, completed=True
     )
     original_unlink = Path.unlink
@@ -1659,7 +1673,7 @@ def test_deferred_plan_consume_unlink_failure_rolls_back_completed_authority(
 
     monkeypatch.setattr(Path, "unlink", fail_consume_tombstone_unlink)
 
-    assert update_cmd._consume_deferred_gateway_plan(pending, raw) is False
+    assert update_deferred_gateway._consume_deferred_gateway_plan(pending, raw) is False
     assert pending.read_text(encoding="utf-8") == raw
     assert not completed.exists()
 
@@ -1682,12 +1696,12 @@ def test_deferred_plan_loader_recovers_authenticated_consume_tombstone(
             "cold_start_if_installed": False,
         },
     )
-    pending = update_cmd._write_deferred_gateway_plan(args, root)
+    pending = update_deferred_gateway._write_deferred_gateway_plan(args, root)
     raw = pending.read_text(encoding="utf-8")
     tombstone = pending.with_name(f"{pending.name}.consume-999-recovery")
     os.replace(pending, tombstone)
 
-    loaded = update_cmd._load_deferred_gateway_plan(
+    loaded = update_deferred_gateway._load_deferred_gateway_plan(
         pending,
         root=root,
         invocation_id=args._update_invocation_id,
@@ -1753,10 +1767,12 @@ def test_atomic_prepare_releases_initial_lease_when_post_drain_renewal_fails(
     initial = {"lease_id": "lease-prepare-123456"}
     released = []
     monkeypatch.setattr(
-        update_cmd, "_claim_update_quiesce_lease", lambda *_args, **_kwargs: initial
+        update_quiesce,
+        "_claim_update_quiesce_lease",
+        lambda *_args, **_kwargs: initial,
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_quiesce,
         "_drain_under_update_lease",
         lambda *_args, **_kwargs: {"ok": True, "ready": True},
     )
@@ -1768,14 +1784,14 @@ def test_atomic_prepare_releases_initial_lease_when_post_drain_renewal_fails(
         ),
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_quiesce,
         "_release_update_quiesce_lease",
         lambda _root, lease: released.append(lease) or True,
     )
     args = SimpleNamespace(yes=True, bridge_lease_id=None, timeout_seconds=1.0)
 
     with pytest.raises(RuntimeError, match="injected renewal failure"):
-        update_cmd._prepare_atomic_windows_update(args, root=root)
+        update_quiesce._prepare_atomic_windows_update(args, root=root)
 
     assert released == [initial]
 
@@ -1868,12 +1884,12 @@ def test_hidden_deferred_resume_emits_exact_first_adoption_frame(
     monkeypatch.setattr(update_lock, "UpdateLock", FakeLock)
     monkeypatch.setattr(gate, "read_quiesce_lease", lambda _path: prior)
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_claim_update_quiesce_lease",
         lambda *_args, **_kwargs: {**prior, "owner_pid": os.getpid()},
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_load_update_receipt",
         lambda _root: {
             "invocation_id": invocation_id,
@@ -1887,10 +1903,10 @@ def test_hidden_deferred_resume_emits_exact_first_adoption_frame(
             return None
         return "raw-plan", {"profiles": [], "cold_start_if_installed": False}
 
-    monkeypatch.setattr(update_cmd, "_load_deferred_gateway_plan", load_plan)
-    monkeypatch.setattr(update_cmd, "_resume_deferred_gateway_fleet", lambda _plan: None)
-    monkeypatch.setattr(update_cmd, "_consume_deferred_gateway_plan", lambda *_a: True)
-    monkeypatch.setattr(update_cmd, "_release_update_quiesce_lease", lambda *_a: True)
+    monkeypatch.setattr(update_deferred_gateway, "_load_deferred_gateway_plan", load_plan)
+    monkeypatch.setattr(update_deferred_gateway, "_resume_deferred_gateway_fleet", lambda _plan: None)
+    monkeypatch.setattr(update_deferred_gateway, "_consume_deferred_gateway_plan", lambda *_a: True)
+    monkeypatch.setattr(update_deferred_gateway, "_release_update_quiesce_lease", lambda *_a: True)
 
     with pytest.raises(SystemExit) as exit_info:
         update_cmd._cmd_update_resume_deferred_gateway(args, root=root)
@@ -1917,7 +1933,7 @@ def test_completed_deferred_resume_without_lease_emits_no_adoption_frame(
         resume_root=str(root),
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_load_deferred_gateway_plan",
         lambda *_args, **_kwargs: ("completed", {}),
     )
@@ -1962,17 +1978,17 @@ def test_deferred_resume_cleanup_failure_returns_lease_and_releases_lock(
     monkeypatch.setattr(update_lock, "UpdateLock", FakeLock)
     monkeypatch.setattr(gate, "read_quiesce_lease", lambda _path: prior)
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_claim_update_quiesce_lease",
         lambda *_args, **_kwargs: {**prior, "owner_pid": os.getpid()},
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_load_deferred_gateway_plan",
         lambda *_args, **_kwargs: ("completed", {}),
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_load_update_receipt",
         lambda _root: {
             "invocation_id": invocation_id,
@@ -1981,10 +1997,10 @@ def test_deferred_resume_cleanup_failure_returns_lease_and_releases_lock(
         },
     )
     monkeypatch.setattr(
-        update_cmd, "_release_update_quiesce_lease", lambda *_args: False
+        update_deferred_gateway, "_release_update_quiesce_lease", lambda *_args: False
     )
     monkeypatch.setattr(
-        update_cmd,
+        update_deferred_gateway,
         "_transfer_update_quiesce_lease",
         lambda _root, lease, *, new_owner_pid: transfers.append(
             (lease, new_owner_pid)
