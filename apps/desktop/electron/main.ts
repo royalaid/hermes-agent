@@ -180,6 +180,11 @@ import {
   hasHandoffRelaunchRequest,
   inspectHandoffRelaunchExit
 } from './handoff-relaunch-exit'
+import {
+  createHandoffRelaunchExitWatch,
+  type HandoffRelaunchExitWatchDisposition,
+  type HandoffRelaunchExitWatchIdentity
+} from './handoff-relaunch-exit-watch'
 import { consumeLegacyHandoffResult, consumePosixHandoffResult, type HandoffResult } from './handoff-result'
 import { retryHandoffResultLifecycle, runHandoffResultLifecycle } from './handoff-result-orchestration'
 import {
@@ -245,6 +250,12 @@ import {
   registryGatewayWsUrl,
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
+import {
+  cancelPoolBackendStart,
+  deletePoolBackendEntryIfCurrent,
+  throwIfPoolBackendStartCancelled,
+  waitForPoolBackendStartClearance
+} from './pool-backend-lifecycle'
 import { selectPoolEvictions } from './pool-eviction'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
@@ -1923,6 +1934,8 @@ const HANDOFF_RESULT_WAIT_POLL_MS = 200
 const HANDOFF_RESULT_RETRY_MS = 1_000
 const HANDOFF_RESULT_POST_MARKER_GRACE_MS = 30_000
 const HANDOFF_RELAUNCH_EXIT_POLL_MS = 250
+const HANDOFF_RELAUNCH_EXIT_DEBOUNCE_MS = 50
+const HANDOFF_RELAUNCH_EXIT_IDLE_POLL_MS = 30_000
 // How long the desktop lingers on the "updating, don't reopen" overlay after
 // spawning the detached updater, before it quits to release the venv shim. The
 // old 600ms was long enough to register the child process but far too short for
@@ -2054,7 +2067,6 @@ function consumeAndReportLegacyHandoffResult() {
   )
 }
 
-let handoffRelaunchExitWatchStarted = false
 let handoffRelaunchExitWatchStatus = ''
 
 function logHandoffRelaunchExitWatchStatus(status: string) {
@@ -2065,13 +2077,16 @@ function logHandoffRelaunchExitWatchStatus(status: string) {
   rememberLog(`[updates] ${status}`)
 }
 
-async function inspectHandoffRelaunchExitOnce(): Promise<boolean> {
+async function inspectHandoffRelaunchExitOnce(
+  identity: HandoffRelaunchExitWatchIdentity
+): Promise<HandoffRelaunchExitWatchDisposition> {
   try {
     const decision = await inspectHandoffRelaunchExit(HERMES_HOME, {
       authorization: handoffRelaunchAuthorization,
-      currentRoot: resolveUpdateRoot(),
-      currentExecutable: process.execPath,
-      currentPid: process.pid
+      currentRoot: identity.currentRoot,
+      currentExecutable: identity.currentExecutable,
+      currentPid: identity.currentPid,
+      getProcessStartedAt: () => identity.currentProcessStartedAt
     })
 
     if (decision.kind === 'quit-acknowledged') {
@@ -2082,7 +2097,7 @@ async function inspectHandoffRelaunchExitOnce(): Promise<boolean> {
       isQuittingForHandoff = true
       app.quit()
 
-      return false
+      return 'stop'
     }
 
     if (decision.kind === 'authorized-relaunch') {
@@ -2103,6 +2118,8 @@ async function inspectHandoffRelaunchExitOnce(): Promise<boolean> {
         )
       } else {
         handoffRelaunchExitWatchStatus = ''
+
+        return 'idle'
       }
     }
   } catch (error) {
@@ -2113,22 +2130,24 @@ async function inspectHandoffRelaunchExitOnce(): Promise<boolean> {
     )
   }
 
-  const next = setTimeout(() => {
-    void inspectHandoffRelaunchExitOnce()
-  }, HANDOFF_RELAUNCH_EXIT_POLL_MS)
-
-  next.unref()
-
-  return true
+  return 'active'
 }
 
-async function startHandoffRelaunchExitWatch(): Promise<boolean> {
-  if (handoffRelaunchExitWatchStarted) {
-    return true
-  }
-  handoffRelaunchExitWatchStarted = true
+const handoffRelaunchExitWatch = createHandoffRelaunchExitWatch({
+  activePollMs: HANDOFF_RELAUNCH_EXIT_POLL_MS,
+  debounceMs: HANDOFF_RELAUNCH_EXIT_DEBOUNCE_MS,
+  hermesHome: HERMES_HOME,
+  idlePollMs: HANDOFF_RELAUNCH_EXIT_IDLE_POLL_MS,
+  inspect: inspectHandoffRelaunchExitOnce,
+  currentExecutable: process.execPath,
+  currentPid: process.pid,
+  resolveCurrentProcessStartedAt: queryWindowsProcessCreatedAt,
+  resolveCurrentRoot: resolveUpdateRoot,
+  watchDirectory: (directory, onChange) => fs.watch(directory, (_eventType, filename) => onChange(filename))
+})
 
-  return inspectHandoffRelaunchExitOnce()
+async function startHandoffRelaunchExitWatch(): Promise<boolean> {
+  return handoffRelaunchExitWatch.start()
 }
 
 function shouldRetryHandoffResultDiscovery(): boolean {
@@ -9929,13 +9948,12 @@ async function ensureBackend(profile) {
     token: null,
     connectionPromise: null,
     lastActiveAt: Date.now(),
-    remoteBaseUrl: null
+    remoteBaseUrl: null,
+    startAbortController: new AbortController()
   }
 
   entry.connectionPromise = spawnPoolBackend(key, entry).catch(async error => {
-    if (backendPool.get(key) === entry) {
-      backendPool.delete(key)
-    }
+    deletePoolBackendEntryIfCurrent(backendPool, key, entry)
 
     stopBackendChild(entry.process)
     await waitForBackendExit(entry.process)
@@ -10002,7 +10020,8 @@ async function ensureRegistryBackend(connectionId, profile) {
       token: null,
       connectionPromise: null,
       lastActiveAt: Date.now(),
-      remoteBaseUrl: null
+      remoteBaseUrl: null,
+      startAbortController: new AbortController()
     }
 
     localEntry.connectionPromise = spawnPoolBackend(profileKey, localEntry, {
@@ -10040,7 +10059,8 @@ async function ensureRegistryBackend(connectionId, profile) {
     token: null,
     connectionPromise: null,
     lastActiveAt: Date.now(),
-    remoteBaseUrl: null
+    remoteBaseUrl: null,
+    startAbortController: new AbortController()
   }
 
   entry.connectionPromise = connectRegistryBackend(source, profile, key, entry).catch(error => {
@@ -10240,8 +10260,11 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   const remote = opts.forceLocal ? null : await resolveRemoteBackend(profile)
   profileDeletionGate.assertCanStart(profile)
 
+  throwIfPoolBackendStartCancelled(backendPool, poolKey, entry)
+
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
+    throwIfPoolBackendStartCancelled(backendPool, poolKey, entry)
 
     // Recorded on the entry so revalidation can probe this descriptor without
     // awaiting connectionPromise, which may still be pending for a sibling.
@@ -10265,7 +10288,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   {
     let poolAnnounced = false
 
-    await waitForLocalBackendClearance(updateGateDeps(), {
+    await waitForPoolBackendStartClearance(backendPool, poolKey, entry, updateGateDeps(), {
       onWaitTick: reason => {
         if (!poolAnnounced) {
           poolAnnounced = true
@@ -10290,6 +10313,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  throwIfPoolBackendStartCancelled(backendPool, poolKey, entry)
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
@@ -10351,13 +10375,13 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     releaseBackendChild(child)
-    backendPool.delete(poolKey)
+    deletePoolBackendEntryIfCurrent(backendPool, poolKey, entry)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     releaseBackendChild(child)
-    backendPool.delete(poolKey)
+    deletePoolBackendEntryIfCurrent(backendPool, poolKey, entry)
 
     if (!ready) {
       rejectStart?.(
@@ -10398,6 +10422,8 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     )
   }
 
+  throwIfPoolBackendStartCancelled(backendPool, poolKey, entry)
+
   return {
     baseUrl,
     mode: 'local',
@@ -10418,7 +10444,8 @@ function stopPoolBackend(profile) {
     return
   }
 
-  backendPool.delete(profile)
+  cancelPoolBackendStart(backendPool, profile, entry)
+  deletePoolBackendEntryIfCurrent(backendPool, profile, entry)
   stopBackendChild(entry.process)
 }
 
@@ -10428,7 +10455,8 @@ async function teardownPoolBackendAndWait(profile) {
     .filter(item => item.entry)
 
   for (const { entry, key } of entries) {
-    backendPool.delete(key)
+    cancelPoolBackendStart(backendPool, key, entry)
+    deletePoolBackendEntryIfCurrent(backendPool, key, entry)
     stopBackendChild(entry.process)
   }
 
@@ -15360,6 +15388,8 @@ app.on('before-quit', event => {
   if (heldQuitForActiveWork(event)) {
     return
   }
+
+  handoffRelaunchExitWatch.stop()
 
   if (!backendQuitTeardownDone) {
     event.preventDefault()
