@@ -561,8 +561,12 @@ def _build_hermes_tools_mcp_entry() -> dict:
 
     The command runs the worktree's Python via the current sys.executable
     so a hermes installed under /opt/, /usr/local/, or a venv all work.
-    HERMES_HOME and PYTHONPATH are passed through so the spawned process
-    sees the same config + module layout the user is running."""
+    HERMES_HOME is passed through, while PYTHONPATH starts with the source
+    root containing this module and then preserves inherited entries. This
+    keeps the spawned process on the same Hermes generation even when the
+    inherited path uses syntax native Python cannot resolve. ``-P`` keeps the
+    caller's working directory from shadowing that authoritative source root.
+    """
     import sys
 
     env: dict[str, str] = {}
@@ -584,18 +588,30 @@ def _build_hermes_tools_mcp_entry() -> dict:
         hermes_home = ""
     if hermes_home:
         env["HERMES_HOME"] = hermes_home
-    # PYTHONPATH passes through so a worktree-launched hermes finds the
-    # branch's modules instead of the installed package.
-    pythonpath = os.environ.get("PYTHONPATH")
-    if pythonpath:
-        env["PYTHONPATH"] = pythonpath
+    # Always put the checkout/package root that loaded this module first.
+    # A Git-Bash-launched Windows process can inherit an MSYS-style /c/...
+    # PYTHONPATH that native Python interprets as C:\c\..., so passthrough
+    # alone is not sufficient. Keep non-empty inherited entries behind the
+    # native authoritative root to preserve intentional overlays without
+    # allowing an empty entry to reintroduce the caller's working directory.
+    source_root = str(Path(__file__).resolve().parent.parent)
+    source_root_key = os.path.normcase(os.path.normpath(source_root))
+    pythonpath_entries = [source_root]
+    inherited_pythonpath = os.environ.get("PYTHONPATH") or ""
+    for entry in inherited_pythonpath.split(os.pathsep):
+        if not entry:
+            continue
+        if os.path.normcase(os.path.normpath(entry)) == source_root_key:
+            continue
+        pythonpath_entries.append(entry)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
     # Quiet mode + redaction defaults so the MCP wire stays clean.
     env["HERMES_QUIET"] = "1"
     env["HERMES_REDACT_SECRETS"] = env.get("HERMES_REDACT_SECRETS", "true")
 
     out: dict[str, Any] = {
         "command": sys.executable,
-        "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        "args": ["-P", "-m", "agent.transports.hermes_tools_mcp_server"],
     }
     if env:
         out["env"] = env

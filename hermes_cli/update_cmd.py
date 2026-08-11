@@ -37,7 +37,7 @@ import time as _time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_bin_dir, venv_python_path
@@ -3350,6 +3350,7 @@ def _detect_venv_python_processes(
     exclude_pids: set[int] | None = None,
     root: Path | str | None = None,
     strict: bool = False,
+    _parent_by_pid: Mapping[int, int] | None = None,
 ) -> list[tuple[int, str, str]]:
     """Find live processes running from the project venv's interpreter.
 
@@ -3442,7 +3443,22 @@ def _detect_venv_python_processes(
         pass
 
     matches: list[tuple[int, str, str]] = []
+    # Keep a process-table snapshot for a second pass. Windows venv launchers
+    # created by uv (and by CPython's redirector) stay alive as a tiny process
+    # under ``venv\\Scripts`` while the interpreter that actually imports
+    # Hermes runs from the base-Python installation. That worker's argv and
+    # cwd need not mention the venv at all, so path/string matching alone
+    # cannot find it. The second pass admits such a worker only when the same
+    # process-table snapshot proves an exact, same-invocation target-venv
+    # wrapper ancestor. The strict Desktop scanner immediately re-reads every
+    # returned PID's exe/argv/create-time/ppid before classifying or acting.
+    process_rows: list[dict[str, object]] = []
     try:
+        # Do not request ``ppid`` here. On Windows psutil implements that attr
+        # by rebuilding the entire PID map once *per process*; on a 1,100-PID
+        # host that turned this scan from <2s into ~36s. The second pass takes
+        # one native ppid-map snapshot only if a matching external-Python
+        # invocation exists.
         proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
     except Exception as exc:
         if strict:
@@ -3480,7 +3496,6 @@ def _detect_venv_python_processes(
         cmdline_low = cmdline_raw.lower()
         cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
         name_value = str(info.get("name") or "")
-
         # ``psutil.process_iter(attrs=...)`` substitutes ``None`` for each
         # AccessDenied attribute instead of raising.  With no exe/argv/cwd we
         # cannot prove whether an elevated Python/Hermes process belongs to
@@ -3497,6 +3512,22 @@ def _detect_venv_python_processes(
             raise RuntimeError(
                 f"process {numeric_pid} ({name_value}) identity metadata was unreadable"
             )
+
+        process_rows.append(
+            {
+                "process": proc,
+                "pid": numeric_pid,
+                # Test doubles and some psutil versions may already provide a
+                # ppid. Real Windows process_iter does not because we omit the
+                # expensive attr above; the second pass fills it lazily.
+                "ppid": info.get("ppid"),
+                "exe": str(exe or ""),
+                "exe_norm": exe_norm,
+                "name": name_value,
+                "argv": cmdline_values,
+                "cmdline": cmdline_raw,
+            }
+        )
 
         # Primary match: the executable itself lives under this venv
         # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
@@ -3532,6 +3563,90 @@ def _detect_venv_python_processes(
         # were misreported as blockers and the update dead-ended. Truncate
         # only at display time.
         matches.append((numeric_pid, str(name), cmdline_raw))
+
+    matched_pids = {pid for pid, _name, _cmdline in matches}
+    target_venv_wrappers = {
+        int(row["pid"]): row
+        for row in process_rows
+        if str(row["exe_norm"]).startswith(venv_prefix)
+        and Path(str(row["exe"])).name.casefold() in {"python.exe", "pythonw.exe"}
+        and bool(row["argv"])
+    }
+    rows_by_pid = {int(row["pid"]): row for row in process_rows}
+    wrapper_argv_tails = {
+        tuple(str(value) for value in row["argv"])[1:]
+        for row in target_venv_wrappers.values()
+    }
+    external_wrapper_candidates = [
+        row
+        for row in process_rows
+        if int(row["pid"]) not in matched_pids
+        and Path(str(row["exe"])).name.casefold()
+        in {"python.exe", "pythonw.exe"}
+        and tuple(str(value) for value in row["argv"])[1:]
+        in wrapper_argv_tails
+    ]
+    parent_by_pid = _parent_by_pid
+    if parent_by_pid is None and any(
+        row["ppid"] is None for row in external_wrapper_candidates
+    ):
+        try:
+            # psutil deliberately uses this single native snapshot internally
+            # on Windows. Calling Process.ppid() (or asking process_iter for
+            # the attr) once per candidate rebuilds the same map every time.
+            parent_by_pid = {
+                int(pid): int(ppid) for pid, ppid in psutil._ppid_map().items()
+            }
+        except Exception as exc:
+            if strict:
+                raise RuntimeError("parent process enumeration failed") from exc
+            parent_by_pid = {}
+    if parent_by_pid is not None:
+        for row in process_rows:
+            row["ppid"] = parent_by_pid.get(int(row["pid"]))
+
+    def _snapshot_points_to_target_wrapper(row: dict[str, object]) -> bool:
+        """Prove a same-invocation wrapper chain from one process snapshot."""
+        candidate_tail = tuple(str(value) for value in row["argv"])[1:]
+        current = row
+        seen: set[int] = set()
+        while True:
+            raw_parent = current["ppid"]
+            if raw_parent is None:
+                if strict:
+                    raise RuntimeError(
+                        f"process {int(current['pid'])} was absent from the parent snapshot"
+                    )
+                return False
+            try:
+                ancestor = int(raw_parent)
+            except (TypeError, ValueError):
+                return False
+            if ancestor <= 0 or ancestor in seen:
+                return False
+            seen.add(ancestor)
+            wrapper = target_venv_wrappers.get(ancestor)
+            if wrapper is not None:
+                wrapper_tail = tuple(str(value) for value in wrapper["argv"])[1:]
+                return bool(candidate_tail and candidate_tail == wrapper_tail)
+            parent_row = rows_by_pid.get(ancestor)
+            if parent_row is None:
+                return False
+            current = parent_row
+
+    for row in external_wrapper_candidates:
+        numeric_pid = int(row["pid"])
+        exe_value = str(row["exe"])
+
+        if not _snapshot_points_to_target_wrapper(row):
+            # Do not inspect or fail on unrelated base-Python processes. In
+            # particular, another Hermes installation may have its own exact
+            # MCP bridge whose ancestry is unreadable to this user; without a
+            # process-table edge to this target venv it is outside this scan.
+            continue
+
+        name = str(row["name"]) or Path(exe_value).name
+        matches.append((numeric_pid, name, str(row["cmdline"])))
     return matches
 
 def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
