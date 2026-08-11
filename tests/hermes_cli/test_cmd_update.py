@@ -116,6 +116,7 @@ class TestCmdUpdateNpmLockfileCache:
 
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         (tmp_path / "package-lock.json").write_text('{"lockfileVersion": 3}')
+        (tmp_path / "package.json").write_text('{"dependencies": {}}')
 
         hm._record_npm_lockfile_hash(tmp_path)
 
@@ -141,6 +142,22 @@ class TestCmdUpdateNpmLockfileCache:
             '{"dependencies": {"left-pad": "^1.0.0"}}'
         )
         assert hm._npm_lockfile_changed(tmp_path) is True
+
+    def test_node_health_probe_reports_cache_read_failure_as_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        (tmp_path / "package.json").write_text("{}")
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+
+        with patch.object(
+            update_cmd,
+            "_npm_lockfile_changed",
+            side_effect=OSError("cache unreadable"),
+        ):
+            assert update_cmd._node_dependencies_healthy_read_only() is None
 
 
 
@@ -813,6 +830,175 @@ class TestCmdUpdateBranchFlag:
         )
         record.assert_not_called()
         assert "identity could not be proven" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("initial_health", [False, None])
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_no_update_repairs_and_reproves_node_dependencies(
+        self,
+        mock_run,
+        _mock_which,
+        initial_health,
+        capsys,
+    ):
+        from hermes_cli import update_cmd
+
+        installed_sha = "a" * 40
+        base = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="0"
+        )
+
+        def side_effect(command, **kwargs):
+            joined = " ".join(str(value) for value in command)
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=f"{installed_sha}\n", stderr=""
+                )
+            return base(command, **kwargs)
+
+        mock_run.side_effect = side_effect
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(
+                update_cmd, "_venv_core_imports_healthy", return_value=(True, "")
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_files_syntax",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_modules_import",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd,
+                "_node_dependencies_healthy_read_only",
+                side_effect=[initial_health, True],
+            ) as prove_node,
+            patch.object(
+                update_cmd, "_update_node_dependencies", return_value=[]
+            ) as repair_node,
+            patch.object(
+                update_cmd, "_capture_head_sha", return_value=installed_sha
+            ),
+            patch.object(update_cmd, "_record_update_success") as record,
+        ):
+            cmd_update(args)
+
+        repair_node.assert_called_once_with()
+        assert prove_node.call_count == 2
+        record.assert_called_once()
+        assert all(record.call_args.kwargs["health"].values())
+        assert "Node dependencies repaired" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_no_update_unknown_import_health_suppresses_success_receipt(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        installed_sha = "a" * 40
+        base = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="0"
+        )
+
+        def side_effect(command, **kwargs):
+            joined = " ".join(str(value) for value in command)
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=f"{installed_sha}\n", stderr=""
+                )
+            return base(command, **kwargs)
+
+        mock_run.side_effect = side_effect
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(
+                update_cmd, "_venv_core_imports_healthy", return_value=(True, "")
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_files_syntax",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_modules_import",
+                return_value=(None, None, "probe timed out"),
+            ),
+            patch.object(
+                update_cmd, "_node_dependencies_healthy_read_only", return_value=True
+            ),
+            patch.object(
+                update_cmd, "_capture_head_sha", return_value=installed_sha
+            ),
+            patch.object(update_cmd, "_record_update_success") as record,
+        ):
+            cmd_update(args)
+
+        record.assert_not_called()
+        assert "health proof" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_fork_sync_that_advances_head_runs_full_update_pipeline(
+        self, mock_run, _mock_which
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        before_sha = "a" * 40
+        after_sha = "b" * 40
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="0"
+        )
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(update_cmd, "_is_fork", return_value=True),
+            patch.object(hm, "_sync_with_upstream_if_needed") as sync,
+            patch.object(
+                update_cmd,
+                "_capture_head_sha",
+                side_effect=[before_sha, after_sha, after_sha, after_sha],
+            ),
+            patch.object(
+                update_cmd, "_refresh_update_target_sha", return_value=after_sha
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_files_syntax",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_modules_import",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd, "_venv_core_imports_healthy", return_value=(True, "")
+            ),
+            patch.object(
+                update_cmd, "_node_dependencies_healthy_read_only", return_value=True
+            ),
+            patch.object(update_cmd, "_record_update_success"),
+        ):
+            cmd_update(args)
+
+        commands = [
+            " ".join(str(value) for value in call.args[0])
+            for call in mock_run.call_args_list
+        ]
+        assert any(
+            "merge --ff-only refs/remotes/origin/main" in command
+            for command in commands
+        )
+        sync.assert_called_once()
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")

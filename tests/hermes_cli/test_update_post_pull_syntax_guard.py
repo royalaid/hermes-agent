@@ -65,9 +65,8 @@ def _populate_critical_tree(root: Path, *, broken_file: str | None = None) -> No
 
 
 
-def test_validate_critical_files_syntax_tolerates_missing_files(tmp_path):
-    """A refactor may legitimately remove one of the critical files — the
-    guard should skip missing files, not falsely flag the install as broken."""
+def test_validate_critical_files_syntax_reports_missing_files_as_unknown(tmp_path):
+    """A missing required file cannot prove the checkout parses cleanly."""
     # Populate everything except hermes_constants.py
     for relpath in hermes_main._UPDATE_CRITICAL_FILES:
         if relpath == "hermes_constants.py":
@@ -78,9 +77,9 @@ def test_validate_critical_files_syntax_tolerates_missing_files(tmp_path):
 
     ok, failing_path, error = hermes_main._validate_critical_files_syntax(tmp_path)
 
-    assert ok is True
-    assert failing_path is None
-    assert error is None
+    assert ok is None
+    assert failing_path is not None and failing_path.endswith("hermes_constants.py")
+    assert error is not None and "missing" in error
 
 
 # ---------------------------------------------------------------------------
@@ -89,4 +88,3 @@ def test_validate_critical_files_syntax_tolerates_missing_files(tmp_path):
 # release; if a future ``hermes update`` would brick users, this test fails
 # in CI first.
 # ---------------------------------------------------------------------------
-

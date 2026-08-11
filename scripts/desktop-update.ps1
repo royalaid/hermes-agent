@@ -283,16 +283,51 @@ function Get-CanonicalInstallRoot([string]$Path) {
     }
 }
 
-function Test-ProcessAlive([int64]$ProcessId) {
-    if ($ProcessId -le 0 -or $ProcessId -gt [int]::MaxValue) { return $false }
+function Resolve-ManagedVenvPythonLaunch([string]$VenvPython) {
     try {
-        $process = [System.Diagnostics.Process]::GetProcessById([int]$ProcessId)
-        return -not $process.HasExited
-    } catch [System.ArgumentException] {
-        return $false
+        $launcher = (Resolve-Path -LiteralPath $VenvPython -ErrorAction Stop).ProviderPath
+        $launcher = [System.IO.Path]::GetFullPath($launcher)
+        $expectedLauncher = (Resolve-Path -LiteralPath (Join-Path $InstallRoot 'venv\Scripts\python.exe') -ErrorAction Stop).ProviderPath
+        $expectedLauncher = [System.IO.Path]::GetFullPath($expectedLauncher)
+        if (-not [string]::Equals($launcher, $expectedLauncher, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'the managed Python launcher is outside the exact install venv'
+        }
+
+        $venvRoot = Split-Path -Parent (Split-Path -Parent $launcher)
+        $configPath = Join-Path $venvRoot 'pyvenv.cfg'
+        $configInfo = Get-Item -LiteralPath $configPath -ErrorAction Stop
+        if ($configInfo.Length -le 0 -or $configInfo.Length -gt 16384) {
+            throw 'pyvenv.cfg has an invalid size'
+        }
+        $values = @{}
+        foreach ($line in [System.IO.File]::ReadAllLines($configPath, [System.Text.Encoding]::UTF8)) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+            $separator = $trimmed.IndexOf('=')
+            if ($separator -le 0) { throw 'pyvenv.cfg contains a malformed entry' }
+            $key = $trimmed.Substring(0, $separator).Trim().ToLowerInvariant()
+            if ($key -ne 'home' -and $key -ne 'executable') { continue }
+            if ($values.ContainsKey($key)) { throw "pyvenv.cfg repeats $key" }
+            $value = $trimmed.Substring($separator + 1).Trim()
+            if (-not $value -or -not [System.IO.Path]::IsPathRooted($value)) {
+                throw "pyvenv.cfg has an invalid $key"
+            }
+            $values[$key] = $value
+        }
+        if (-not $values.ContainsKey('home') -or -not $values.ContainsKey('executable')) {
+            throw 'pyvenv.cfg does not identify the base interpreter'
+        }
+        $baseHome = (Resolve-Path -LiteralPath $values['home'] -ErrorAction Stop).ProviderPath
+        $baseHome = [System.IO.Path]::GetFullPath($baseHome).TrimEnd([char[]]@('\', '/'))
+        $basePython = (Resolve-Path -LiteralPath $values['executable'] -ErrorAction Stop).ProviderPath
+        $basePython = [System.IO.Path]::GetFullPath($basePython)
+        if (-not [string]::Equals((Split-Path -Leaf $basePython), 'python.exe', [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals((Split-Path -Parent $basePython).TrimEnd([char[]]@('\', '/')), $baseHome, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'pyvenv.cfg base interpreter is not the exact python.exe under home'
+        }
+        return [pscustomobject]@{ Executable = $basePython; Launcher = $launcher }
     } catch {
-        # An owner that cannot be inspected is not safe to steal from.
-        return $true
+        throw "the managed venv base interpreter could not be proven: $($_.Exception.Message)"
     }
 }
 
@@ -1862,8 +1897,13 @@ function Invoke-DeferredGatewayResume(
     $leaseLost = $false
     $timedOut = $false
     try {
+        # Windows venv python.exe can be a redirector process whose child runs
+        # Python. Launch the canonical base interpreter exactly as CPython's
+        # multiprocessing module does, so the retained Process handle, adoption
+        # frame PID, and lease owner all identify one generation.
+        $pythonLaunch = Resolve-ManagedVenvPythonLaunch $Exe
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $Exe
+        $psi.FileName = $pythonLaunch.Executable
         $quoted = @($HermesArgs | ForEach-Object {
             [HermesHandoff.UpdaterJob]::QuoteArgument([string]$_)
         })
@@ -1877,6 +1917,7 @@ function Invoke-DeferredGatewayResume(
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
         $psi.EnvironmentVariables['PYTHONUTF8'] = '1'
+        $psi.EnvironmentVariables['__PYVENV_LAUNCHER__'] = $pythonLaunch.Launcher
         $psi.EnvironmentVariables['HERMES_HOME'] = $HermesHome
         $psi.EnvironmentVariables['HERMES_UPDATE_HANDOFF_PID'] = "$PID"
         $proc = [System.Diagnostics.Process]::Start($psi)
@@ -2057,11 +2098,13 @@ function Invoke-DeferredGatewayResume(
             }
         }
         if ($timedOut -or $leaseLost) { $code = 8 }
+        $stdoutText = $out.ToString()
+        $stderrText = $err.ToString()
         return @{
             Code = $code
-            Output = $out.ToString() + $err.ToString()
-            Stdout = $out.ToString()
-            Stderr = $err.ToString()
+            Output = $stdoutText + $stderrText
+            Stdout = $stdoutText
+            Stderr = $stderrText
         }
     } catch {
         if ($proc) { Stop-ExactSpawnedProcessTree $proc $startedAtTicks }
