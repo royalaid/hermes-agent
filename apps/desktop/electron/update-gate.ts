@@ -77,6 +77,8 @@ export type UpdateClearanceOutcome = 'clear' | 'finished' | StillBlockedUpdateCl
 export interface WaitForUpdateClearanceOptions {
   timeoutMs: number
   pollMs: number
+  /** Cancels a parked backend start (pool eviction, teardown, or app quit). */
+  signal?: AbortSignal
   /** Invoked once per poll while parked (boot progress / logging). */
   onWaitTick?: (reason: Exclude<UpdateGateReason, null>) => void | Promise<void>
   now?: () => number
@@ -86,6 +88,70 @@ export interface WaitForUpdateClearanceOptions {
 export interface WaitForLocalBackendClearanceOptions extends WaitForUpdateClearanceOptions {
   /** Called after each bounded UI wait while the safety gate remains closed. */
   onStillBlocked?: (reason: Exclude<UpdateGateReason, null>) => void | Promise<void>
+}
+
+function abortError(): Error {
+  const error = new Error('The parked backend start was cancelled.')
+  error.name = 'AbortError'
+
+  return error
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw abortError()
+  }
+}
+
+async function waitForPoll(
+  ms: number,
+  signal: AbortSignal | undefined,
+  sleep?: (ms: number) => Promise<void>
+): Promise<void> {
+  throwIfAborted(signal)
+
+  if (!signal) {
+    await (sleep ? sleep(ms) : new Promise<void>(resolve => setTimeout(resolve, ms)))
+
+    return
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let settled = false
+
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+
+      if (timer !== null) {
+        clearTimeout(timer)
+      }
+
+      callback()
+    }
+
+    const onAbort = () => finish(() => reject(abortError()))
+
+    signal.addEventListener('abort', onAbort, { once: true })
+
+    if (sleep) {
+      void sleep(ms).then(
+        () => finish(resolve),
+        error => finish(() => reject(error))
+      )
+    } else {
+      timer = setTimeout(() => finish(resolve), ms)
+    }
+
+    if (signal.aborted) {
+      onAbort()
+    }
+  })
 }
 
 /**
@@ -102,7 +168,8 @@ export async function waitForUpdateClearance(
   options: WaitForUpdateClearanceOptions
 ): Promise<UpdateClearanceOutcome> {
   const now = options.now || Date.now
-  const sleep = options.sleep || (ms => new Promise<void>(r => setTimeout(r, ms)))
+
+  throwIfAborted(options.signal)
 
   let reason = updateGateReason(deps)
 
@@ -113,11 +180,13 @@ export async function waitForUpdateClearance(
   const deadline = now() + options.timeoutMs
 
   while (reason && now() < deadline) {
+    throwIfAborted(options.signal)
+
     if (options.onWaitTick) {
       await options.onWaitTick(reason)
     }
 
-    await sleep(options.pollMs)
+    await waitForPoll(options.pollMs, options.signal, options.sleep)
     reason = updateGateReason(deps)
   }
 
