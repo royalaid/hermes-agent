@@ -73,6 +73,79 @@ suppress_platform_ver_console()
 import os
 import sys
 
+
+_EARLY_TOP_LEVEL_VALUE_FLAGS = frozenset(
+    {
+        "-z",
+        "--oneshot",
+        "-m",
+        "--model",
+        "--provider",
+        "--reasoning",
+        "-t",
+        "--toolsets",
+        "-r",
+        "--resume",
+        "-s",
+        "--skills",
+        "--usage-file",
+        "--in",
+        "-c",
+        "--continue",
+        "-p",
+        "--profile",
+    }
+)
+
+
+def _early_read_only_update_preflight_index(
+    argv: "list[str] | None" = None,
+) -> "int | None":
+    """Return the operative update index for a public read-only preflight.
+
+    This deliberately performs only the minimum top-level tokenization needed
+    before argparse and the rest of the CLI are importable.  False positives
+    merely suppress best-effort startup maintenance for an invocation argparse
+    will reject; a false negative would violate preflight's read-only contract.
+    """
+    values = list(sys.argv[1:] if argv is None else argv)
+    first_positional: str | None = None
+    update_index: int | None = None
+    index = 0
+    while index < len(values):
+        token = values[index]
+        if token == "--":
+            if index + 1 < len(values):
+                first_positional = values[index + 1]
+                update_index = index + 1
+            break
+        if token.startswith("-"):
+            if "=" not in token and token in _EARLY_TOP_LEVEL_VALUE_FLAGS:
+                index += 2
+            else:
+                index += 1
+            continue
+        first_positional = token
+        update_index = index
+        break
+    if (
+        first_positional == "update"
+        and update_index is not None
+        and "--preflight" in values[update_index + 1 :]
+    ):
+        return update_index
+    return None
+
+
+def _early_read_only_update_preflight_requested(
+    argv: "list[str] | None" = None,
+) -> bool:
+    """Recognize public preflight before any startup path may write files."""
+    return _early_read_only_update_preflight_index(argv) is not None
+
+
+_READ_ONLY_UPDATE_PREFLIGHT_EARLY = _early_read_only_update_preflight_requested()
+
 # ── Startup fast-path bootstrap ─────────────────────────────────────────
 # Two lines of inline path math so ``python hermes_cli/main.py`` (script
 # mode — sys.path[0] is hermes_cli/, not the repo root) can import the
@@ -96,10 +169,11 @@ from hermes_cli import _startup_fast  # noqa: E402
 # the full recovery path below.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-try:
-    _early_recovery_mod.recover_if_needed()
-except Exception:
-    pass
+if not _READ_ONLY_UPDATE_PREFLIGHT_EARLY:
+    try:
+        _early_recovery_mod.recover_if_needed()
+    except Exception:
+        pass
 
 
 def _exit_after_oneshot(rc: object) -> None:
@@ -697,7 +771,8 @@ _apply_profile_override()
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+if not _READ_ONLY_UPDATE_PREFLIGHT_EARLY:
+    load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -716,8 +791,12 @@ try:
     # 3-4 config.yaml parses per invocation into one.
     from hermes_cli.config import read_raw_config as _read_raw_early
 
-    _cfg_path = get_hermes_home() / "config.yaml"
-    if _cfg_path.exists():
+    _cfg_path = (
+        None
+        if _READ_ONLY_UPDATE_PREFLIGHT_EARLY
+        else get_hermes_home() / "config.yaml"
+    )
+    if _cfg_path is not None and _cfg_path.exists():
         _early_cfg_raw = _read_raw_early() or {}
         # Managed scope: overlay administrator-pinned values so a managed
         # security.redact_secrets / network.force_ipv4 wins here too. This early
@@ -748,16 +827,17 @@ except Exception:
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
 try:
-    from hermes_logging import setup_logging as _setup_logging
+    if not _READ_ONLY_UPDATE_PREFLIGHT_EARLY:
+        from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
 except Exception:
     pass  # best-effort — don't crash the CLI if logging setup fails
 
@@ -5167,7 +5247,10 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _atomic_replace_dir,
     _capture_head_sha,
     _cmd_update_check,
+    _cmd_update_drain,
     _cmd_update_impl,
+    _cmd_update_preflight,
+    _cmd_update_resume_deferred_gateway,
     _cold_start_windows_gateway_after_update,
     _count_commits_between,
     _detect_venv_python_processes,
@@ -5183,6 +5266,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _format_venv_python_holders_message,
     _gateway_prompt,
     _get_origin_url,
+    _get_remote_url,
     _has_upstream_remote,
     _install_psutil_android_compat,
     _invalidate_update_cache,
@@ -5197,21 +5281,25 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _npm_manifests_digest,
     _orphaned_desktop_backend_pids,
     _pause_windows_gateways_for_update,
+    _prepare_atomic_windows_update,
     _print_curator_first_run_notice,
     _print_curator_recent_run_notice,
     _print_fts_optimize_available_notice,
     _print_stash_cleanup_guidance,
     _print_update_completion,
     _record_npm_lockfile_hash,
+    _revalidate_pausable_gateway_identity,
     _refresh_active_lazy_features,
     _refresh_active_memory_provider_dependencies,
     _refresh_bootstrap_cache_scripts,
     _refresh_windows_gateway_launchers,
     _reload_updated_runtime_modules,
     _resolve_pre_update_backup_mode,
+    _resolve_update_target,
     _resolve_stash_selector,
     _restore_stashed_changes,
     _resume_windows_gateways_after_update,
+    _release_update_quiesce_lease,
     _run_logged_subprocess,
     _run_pre_update_backup,
     _should_skip_upstream_prompt,
@@ -5220,11 +5308,13 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _stop_process_trees,
     _sync_fork_with_upstream,
     _sync_with_upstream_if_needed,
+    _transfer_update_quiesce_lease,
     _update_node_dependencies,
     _update_via_zip,
     _upgrade_pip_before_lazy_refresh,
     _validate_critical_files_syntax,
     _validate_critical_modules_import,
+    _validate_deferred_update_request,
     _venv_core_imports_healthy,
     _venv_launcher_ancestors,
     _wait_for_windows_update_gateway_exit,
@@ -5243,6 +5333,8 @@ from hermes_cli.update_cmd import (  # noqa: F401
     SKIP_UPSTREAM_PROMPT_FILE,
     _PRE_UPDATE_SNAPSHOT_KEEP,
     _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+    _UpdateLeaseHeartbeat,
+    _WindowsMutationJob,
 )
 
 # Stamp file recording the checkout fingerprint the bytecode cache was last
@@ -9389,6 +9481,23 @@ def cmd_update(args):
     runs the update, then restores stdio on the way out (even on
     ``sys.exit`` or unhandled exceptions).
     """
+    try:
+        _validate_deferred_update_request(args)
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        raise SystemExit(2)
+
+    # These two lifecycle modes are deliberately dispatched before install
+    # method checks, backups, update locks, network access, or dependency
+    # work. Preflight is a read-only local snapshot; drain mutates process
+    # state only under its dedicated owner-bound lease.
+    if getattr(args, "preflight", False):
+        _cmd_update_preflight(args, root=PROJECT_ROOT)
+    if getattr(args, "drain", False):
+        _cmd_update_drain(args, root=PROJECT_ROOT)
+    if getattr(args, "resume_deferred_gateway", False):
+        _cmd_update_resume_deferred_gateway(args, root=PROJECT_ROOT)
+
     from hermes_cli.config import (
         detect_install_method,
         format_docker_update_message,
@@ -9445,16 +9554,96 @@ def cmd_update(args):
     )
 
     _update_lock = UpdateLock()
-    if not _update_lock.acquire():
-        print(describe_holder(_update_lock.holder))
+    _lock_claimed = _update_lock.acquire()
+    # UpdateLock historically degrades open when its marker cannot be written.
+    # This mutation path now has a strict process-lifecycle contract: proceed
+    # only with our own written claim or a still-live parent handoff claim.
+    _lock_proven = bool(
+        _lock_claimed
+        and _update_lock.prove_claim()
+    )
+    if not _lock_proven:
+        if _update_lock.holder is not None:
+            print(describe_holder(_update_lock.holder))
+        else:
+            print("✗ Could not acquire the update safety lock; nothing was changed.")
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
 
+    _update_quiesce_lease = None
+    _update_lease_heartbeat = None
+    _update_mutation_job = None
     try:
+        if _is_windows():
+            _update_quiesce_lease, _invocation_id = _prepare_atomic_windows_update(
+                args,
+                root=PROJECT_ROOT,
+            )
+            # Self-assignment makes every subsequently spawned git/uv/pip/npm
+            # descendant part of the same kill-on-close job. Lease loss can
+            # therefore fail-stop the whole mutation tree, not just orphan it.
+            _update_mutation_job = _WindowsMutationJob()
+            _update_lease_heartbeat = _UpdateLeaseHeartbeat(
+                PROJECT_ROOT,
+                _update_quiesce_lease,
+                fail_stop=_update_mutation_job.abort,
+            )
+            _update_lease_heartbeat.start()
         _cmd_update_impl(args, gateway_mode=gateway_mode)
+        if _update_lease_heartbeat is not None and _update_lease_heartbeat.lost:
+            # Production heartbeat loss invokes os._exit immediately.  Keep
+            # this explicit guard for injected/test fail-stop callbacks and
+            # any platform where process termination unexpectedly returns.
+            raise RuntimeError(
+                _update_lease_heartbeat.loss_reason
+                or "update quiesce lease was lost during mutation"
+            )
     finally:
-        _update_lock.release()
-        _finalize_update_output(_update_io_state)
+        try:
+            if _update_lease_heartbeat is not None:
+                _update_lease_heartbeat.stop()
+            if _update_mutation_job is not None:
+                # Keep both update locks held until the Job proves no git/uv/
+                # pip/npm descendant can continue mutating, then fully disarm
+                # before starting any trusted long-lived gateway process.
+                _update_mutation_job.disarm()
+            _gateway_resume_plan = getattr(
+                args, "_windows_gateway_resume_plan", None
+            )
+            if _gateway_resume_plan is not None:
+                setattr(args, "_windows_gateway_resume_plan", None)
+                if not bool(getattr(args, "defer_gateway_resume", False)):
+                    _resume_windows_gateways_after_update(_gateway_resume_plan)
+        finally:
+            try:
+                if _update_quiesce_lease is not None:
+                    if bool(getattr(args, "defer_gateway_resume", False)):
+                        _handoff_owner = getattr(
+                            args, "_update_handoff_owner_pid", None
+                        )
+                        if not isinstance(_handoff_owner, int) or _handoff_owner <= 0:
+                            raise RuntimeError(
+                                "deferred gateway resume has no verified handoff owner"
+                            )
+                        _update_quiesce_lease = _transfer_update_quiesce_lease(
+                            PROJECT_ROOT,
+                            _update_quiesce_lease,
+                            new_owner_pid=_handoff_owner,
+                        )
+                    else:
+                        if not _release_update_quiesce_lease(
+                            PROJECT_ROOT, _update_quiesce_lease
+                        ):
+                            raise RuntimeError(
+                                "update completed but bridge lease cleanup "
+                                "could not be proven"
+                            )
+            finally:
+                # A failed exact lease transfer deliberately leaves the gate
+                # fail-closed, but it must not strand the independent outer
+                # update lock or redirected output handle.
+                _update_lock.release()
+                _finalize_update_output(_update_io_state)
 
 
 def _coalesce_session_name_args(argv: list) -> list:
@@ -11580,6 +11769,25 @@ def _advertise_agent_env() -> None:
     os.environ.setdefault("HERMES_AGENT", "true")
 
 
+def _read_only_update_preflight_requested(argv: list[str] | None = None) -> bool:
+    """Recognize the exact read-only update mode before startup cleanup."""
+    return _early_read_only_update_preflight_requested(argv)
+
+
+def _try_read_only_update_preflight_launch() -> bool:
+    """Parse and dispatch preflight before any config/startup filesystem work."""
+    values = sys.argv[1:]
+    update_index = _early_read_only_update_preflight_index(values)
+    if update_index is None:
+        return False
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_update_parser(subparsers, cmd_update=cmd_update)
+    args = parser.parse_args(values[update_index:])
+    cmd_update(args)
+    return True
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -11597,19 +11805,29 @@ def main():
     except Exception:
         pass
 
+    # `update --preflight` promises a read-only local snapshot. Dispatch it
+    # before quarantine/bytecode cleanup, config-home seeding, container
+    # routing, plugin discovery, or any other startup path that can write.
+    if _try_read_only_update_preflight_launch():
+        return
+
+    read_only_update_preflight = _read_only_update_preflight_requested()
+
     # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
     # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
     # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
-    try:
-        _cleanup_quarantined_exes()
-    except Exception:
-        pass
+    if not read_only_update_preflight:
+        try:
+            _cleanup_quarantined_exes()
+        except Exception:
+            pass
 
     # If the checkout changed since the last launch (hermes update, manual
     # git pull, old-updater update that predates newer clears), sweep stale
     # __pycache__ once so no process — this one's lazy imports included —
     # resolves fresh source against old bytecode. Never raises.
-    _sweep_stale_bytecode_if_checkout_changed()
+    if not read_only_update_preflight:
+        _sweep_stale_bytecode_if_checkout_changed()
 
     # Self-heal a venv left half-built by an interrupted ``hermes update``
     # (Ctrl-C, terminal close, WSL OOM mid-install). Skip when the user is
