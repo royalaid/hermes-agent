@@ -36,6 +36,7 @@ hermes skills uninstall <skill-name>
 | [**grok**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-grok) | Delegate coding to xAI Grok Build CLI (features, PRs). |
 | [**honcho**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-honcho) | Configure and troubleshoot Honcho memory for Hermes. |
 | [**openhands**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-openhands) | Delegate coding to OpenHands CLI (model-agnostic, LiteLLM). |
+| [**windows-update-readiness**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-windows-update-readiness) | Check and recover native-Windows Hermes updates. |
 
 ## blockchain
 

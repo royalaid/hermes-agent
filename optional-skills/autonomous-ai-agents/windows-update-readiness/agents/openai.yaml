@@ -1,0 +1,4 @@
+interface:
+  display_name: "Windows Update Readiness"
+  short_description: "Check Hermes updater safety on native Windows"
+  default_prompt: "Use $windows-update-readiness to check whether this native-Windows Hermes install can update safely."

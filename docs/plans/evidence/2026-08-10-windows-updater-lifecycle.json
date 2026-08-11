@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "artifact": "native-windows-updater-lifecycle-evidence",
+  "observed_at": "2026-08-10T11:38:54-07:00",
+  "live_process_observed_at": "2026-08-10T12:22:51.6531063-07:00",
+  "timezone": "America/Los_Angeles",
+  "scope": {
+    "platform": "native Windows",
+    "wsl_evidence_included": false,
+    "authority": "Only the native-Windows observations in this artifact are authoritative; WSL behavior is excluded.",
+    "privacy": "No raw argv, prompts, PIDs, tokens, environment values, or secrets are retained."
+  },
+  "ref_snapshot": {
+    "upstream_main": "e5bc6b21868efad57414b1d28abbbb5ce26765c9",
+    "published_fork_integration": "adafd77fa07f68dcaf58d9b28466c0bdd4cb115c",
+    "warning": "Refs move; these observed SHAs are reproducibility anchors, not update authority."
+  },
+  "source_log_sha256": {
+    "bootstrap-installer.log": "44246FA64F4B0591BFF40C7CC876B17B1CF125002B1792E3CF17EA726D855D48",
+    "desktop.log": "7B0157420636F406A7419696226BDB8C73C12885DF760C0C2B7284F3BBB10FE5",
+    "desktop.log.1": "41EB40B4CEF0000A71A54D3B0A94A013D01D4D593943C9A47E9995EA583DA5A0",
+    "update.log": "6FED4E496458EA9B59A38FC25A7B5394D5A414AF0F039272BBD417555D69518F",
+    "integration-release.log": "77E4F5467F242ACBBB40678EC1FDB0C54AFFFC7DADB67D5BBAA179597FD803B4"
+  },
+  "canonical_selection": {
+    "numeric_count_authority": "The hashed Desktop/update/release logs are the source of updater and release counts. The database queries are qualitative corroboration only.",
+    "event_classes": {
+      "venv_blocked": "[updates] venv-blocked",
+      "desktop_handoff": "[updates] launched repo hand-off script",
+      "bootstrap_handoff": "[bootstrap] handed off",
+      "release_terminal": "one terminal status for one scheduled release invocation"
+    },
+    "rules": [
+      "Sort retained updater events by timestamp in America/Los_Angeles.",
+      "Group one attempt as one contiguous staged-update sequence.",
+      "Fold repeated venv-blocked emissions within the same attempt; retain the raw-record count separately.",
+      "Count a false-success handoff only when a successful handoff initiation is followed by evidence that an install holder remained.",
+      "Define incident windows by the explicit date ranges below; do not count individual log lines as windows.",
+      "For scheduled releases from 2026-08-05 through 2026-08-10, select one terminal state per scheduled invocation.",
+      "Do not add duplicate events routed into more than one log family."
+    ],
+    "state_db": {
+      "schema_version": 25,
+      "sessions": 874,
+      "messages": 65271,
+      "role": "Qualitative title and FTS corroboration only; no numeric updater aggregate is derived from this database.",
+      "corroboration": "Qualitative screenshot-title and full-text-search corpus confirmation.",
+      "session_selection_sql": "SELECT source,title,datetime(started_at,'unixepoch'),datetime(COALESCE(last_activity_at,started_at),'unixepoch') FROM sessions WHERE title LIKE ? ORDER BY COALESCE(last_activity_at,started_at) DESC",
+      "fts_count_sql": "SELECT COUNT(*),COUNT(DISTINCT m.session_id),MIN(datetime(m.timestamp,'unixepoch')),MAX(datetime(m.timestamp,'unixepoch')) FROM messages_fts JOIN messages m ON m.id=messages_fts.rowid WHERE messages_fts MATCH ?",
+      "parameters_redacted": true
+    }
+  },
+  "incident_windows": [
+    {"id": "W01", "local_range": "2026-06-15"},
+    {"id": "W02", "local_range": "2026-06-16/2026-06-17"},
+    {"id": "W03", "local_range": "2026-06-29"},
+    {"id": "W04", "local_range": "2026-07-10"},
+    {"id": "W05", "local_range": "2026-07-20"},
+    {"id": "W06", "local_range": "2026-07-29T19:11"},
+    {"id": "W07", "local_range": "2026-07-29T23:31/2026-07-30"},
+    {"id": "W08", "local_range": "2026-07-31"},
+    {"id": "W09", "local_range": "2026-08-03"},
+    {"id": "W10", "local_range": "2026-08-06"},
+    {"id": "W11", "local_range": "2026-08-07"},
+    {"id": "W12", "local_range": "2026-08-08"},
+    {"id": "W13", "local_range": "2026-08-09"}
+  ],
+  "derived_counts": {
+    "incident_windows_lower_bound": 13,
+    "desktop_venv_blocked_records": 29,
+    "desktop_update_attempts": 28,
+    "folded_duplicate_blocker_records": 1,
+    "staged_handoffs_reporting_success": 15,
+    "staged_handoffs_with_holders_remaining": 15,
+    "maximum_blockers_in_one_scan": 50,
+    "scheduled_release_runs_2026_08_05_through_2026_08_10": 6,
+    "scheduled_release_failures": 5
+  },
+  "live_process_snapshot": {
+    "collection_method": "Approved read-only native-Windows CIM observation; no WSL-derived result is included.",
+    "selection": "Exact agent.transports.hermes_tools_mcp_server module identity, aggregated without raw argv or process IDs.",
+    "exact_mcp_module_processes": 38,
+    "target_venv_wrappers": 19,
+    "other_base_python_workers": 19,
+    "direct_parent_names": ["codex", "python"],
+    "owner_ancestor_names": ["chatgpt", "codex"],
+    "sanitized_owner_classification": "codex",
+    "hermes_desktop_processes": 0,
+    "pids_redacted": true,
+    "argv_redacted": true
+  },
+  "repair_chain": [
+    "79035c62fa624a9be8ef6214891a41e644c41dcc",
+    "b6d6a0838f05a5a2f9d7fc350f006f0998705794",
+    "43022558a040cf03e6f6f4761f5ac178eb737128",
+    "e950fbb0fc9c7a0bc96c55e763b709d7b48437cf",
+    "b028dd5d7f99a3a8e36b345a7796947f18bf77df",
+    "a68f85c46c1ebdc94fb4b95feb7de9685b34b0b3",
+    "e0573c650e8d995f9ad2527c276dfe0e2dddf7f5",
+    "deedb3db7f0e962b4e79f4c27ab24eaa350bcf2c",
+    "126528a77bda687013c274d8deaf9bcf5e5b97a5",
+    "fb3ead63b596d5cd48c3c53d03e16503794b99f9",
+    "48cf9e5266a68d6f46cd43969f538a43f39d2aba",
+    "79959e421703fbead19f43d7b7edf3f50470dbb6",
+    "28e28682e056952920b94574e5413a981031ebf2"
+  ]
+}
