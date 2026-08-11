@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-import re
 from typing import Any, Sequence
 
 from .audit import GitProbe
-from .manifest import Finding, PATCH_ROLES, validate_manifest
+from .manifest import (
+    Finding,
+    FULL_SHA_RE as _FULL_SHA_RE,
+    PATCH_ROLES,
+    validate_manifest,
+)
 
 
-_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REPLACEMENT_FIELDS = frozenset(
     {"source_commit", "integration_commit", "role", "related_to"}
 )

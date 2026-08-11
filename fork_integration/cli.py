@@ -13,7 +13,7 @@ from .finalize import (
     ReplacementFinalizationBlocked,
     finalize_component_replacement,
 )
-from .manifest import load_manifest, migrate_schema_1
+from .manifest import findings_as_dicts, load_manifest, migrate_schema_1
 from .prepare import PreparationBlocked, PreparationFailed, prepare_worktree
 from .publish import PublicationBlocked, PublicationFailed, publish_release_candidate
 
@@ -271,7 +271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ReplacementFinalizationBlocked as exc:
         report = {
             "ready": False,
-            "findings": [finding.to_dict() for finding in exc.findings],
+            "findings": findings_as_dicts(exc.findings),
         }
         print(json.dumps(report, indent=2, sort_keys=True))
         return 1

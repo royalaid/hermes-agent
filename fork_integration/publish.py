@@ -16,9 +16,9 @@ from .audit import (
     canonical_repository_identity,
     sanitized_git_environment,
 )
+from .manifest import FULL_SHA_RE as _FULL_SHA_RE
 
 
-_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 _CONFIG_VARIABLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
 

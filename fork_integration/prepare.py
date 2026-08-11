@@ -145,6 +145,7 @@ def _preflight(
     )
     integration_repository_bound = integration_repository_resolution.is_bound
     integration_repository_identity = integration_repository_resolution.identity
+    integration_transport_url = integration_repository_resolution.transport_url
     if not integration_repository_bound:
         _add(
             findings,
@@ -168,7 +169,7 @@ def _preflight(
         and integration_repository_bound
         and isinstance(integration_ref, str)
     ):
-        published = probe.live_ref(integration_repository_url, integration_ref)
+        published = probe.live_ref(integration_transport_url, integration_ref)
         observed = published.get("commit")
         if not isinstance(observed, str) or observed == "unknown":
             _add(
@@ -184,6 +185,7 @@ def _preflight(
         upstream_repository_url
     )
     upstream_repository_bound = upstream_repository_resolution.is_bound
+    upstream_transport_url = upstream_repository_resolution.transport_url
     if not upstream_repository_bound:
         _add(
             findings,
@@ -192,7 +194,7 @@ def _preflight(
         )
     if manifest.get("manifest_state") == "ready" and upstream_repository_bound:
         live_upstream = probe.live_ref(
-            upstream_repository_url,
+            upstream_transport_url,
             integration.get("upstream_ref"),
         )
         if live_upstream.get("commit") != base:
@@ -227,6 +229,7 @@ def _preflight(
         source_repository_resolution = repository_binding.resolve(source_url)
         source_repository_bound = source_repository_resolution.is_bound
         source_repository_identity = source_repository_resolution.identity
+        source_transport_url = source_repository_resolution.transport_url
         if not source_ref_valid:
             _add(
                 findings,
@@ -280,11 +283,11 @@ def _preflight(
             and source_ref_valid
             and source_repository_bound
         ):
-            if source_url is not None:
-                cache_key = (source_url, source_ref)
+            if source_transport_url is not None:
+                cache_key = (source_transport_url, source_ref)
                 if cache_key not in live_source_cache:
                     live_source_cache[cache_key] = probe.live_ref(
-                        source_url, source_ref
+                        source_transport_url, source_ref
                     )
                 live_source = live_source_cache[cache_key]
                 if live_source.get("commit") == "unknown":

@@ -4,18 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import stat as stat_module
 import subprocess
+import tempfile
 from typing import Any, Callable, Sequence
 from urllib.parse import unquote, urlsplit
 from urllib.request import url2pathname
 
 from .manifest import (
     Finding,
+    FULL_SHA_RE as _FULL_SHA_RE,
     findings_as_dicts,
     parse_manifest_json,
     validate_manifest,
@@ -26,7 +29,6 @@ UNKNOWN = "unknown"
 CANONICAL_MANIFEST_PATH = "fork_integration/hermes-fork-manifest.v2.json"
 DISABLED_HOOKS_PATH = f"{os.devnull}/fork-integration-disabled-hooks"
 _SUBJECT_SCOPE_RE = re.compile(r"^(?:\[[^]]+\]\s*)?[a-zA-Z]+\(([^)]+)\):")
-_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _ALLOWED_GIT_ENVIRONMENT_OVERRIDES = frozenset(
     {"GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"}
@@ -114,16 +116,12 @@ def canonical_repository_identity(url: str, *, base: Path) -> str:
         authority = host.casefold()
         if port is not None and port != default_ports.get(parsed.scheme.casefold()):
             authority += f":{port}"
-        normalized_path = parsed.path.strip("/")
-        if normalized_path.endswith(".git"):
-            normalized_path = normalized_path[:-4]
+        normalized_path = parsed.path.strip("/").removesuffix(".git")
         return f"{authority}/{normalized_path}"
     scp_match = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", value)
     if scp_match and not re.match(r"^[A-Za-z]:[\\/]", value):
         host, path = scp_match.groups()
-        normalized_path = path.strip("/")
-        if normalized_path.endswith(".git"):
-            normalized_path = normalized_path[:-4]
+        normalized_path = path.strip("/").removesuffix(".git")
         return f"{host.casefold()}/{normalized_path}"
     path = Path(value)
     if not path.is_absolute():
@@ -132,12 +130,53 @@ def canonical_repository_identity(url: str, *, base: Path) -> str:
     return normalized.casefold() if os.name == "nt" else normalized
 
 
+def _repository_transport_kind(url: str) -> str | None:
+    """Classify transports that are safe to contact after local binding."""
+
+    value = url.strip()
+    parsed = urlsplit(value)
+    if parsed.query or parsed.fragment:
+        return None
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        return "local"
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    scheme = parsed.scheme.casefold()
+    if scheme == "file":
+        return "local"
+    if scheme in {"https", "ssh"} and parsed.netloc:
+        return scheme
+    if scheme == "http" and parsed.netloc:
+        host = parsed.hostname
+        if host is not None:
+            try:
+                if ipaddress.ip_address(host).is_loopback:
+                    return "http-loopback"
+            except ValueError:
+                pass
+        return None
+    if scheme:
+        return None
+    if re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", value) and not re.match(
+        r"^[A-Za-z]:[\\/]", value
+    ):
+        return "ssh"
+    return "local"
+
+
+def _compatible_transport(candidate: str, configured: str) -> bool:
+    if candidate in {"https", "ssh"}:
+        return configured in {"https", "ssh"}
+    return candidate == configured and candidate in {"local", "http-loopback"}
+
+
 @dataclass(frozen=True)
 class RepositoryResolution:
     """Canonical identity and local-remote binding for one declared URL."""
 
     identity: str | None
     is_bound: bool
+    transport_url: str | None
 
 
 class RepositoryBinding:
@@ -149,11 +188,21 @@ class RepositoryBinding:
         configured_remote_urls: Sequence[str],
     ) -> None:
         self.repository = Path(repository).resolve()
-        self._configured_identities = frozenset(
-            identity
-            for url in configured_remote_urls
-            if (identity := self._canonical_identity(url)) is not None
-        )
+        configured_authorities: dict[str, list[tuple[str, str]]] = {}
+        for configured_url in configured_remote_urls:
+            if not isinstance(configured_url, str) or not configured_url.strip():
+                continue
+            identity = self._canonical_identity(configured_url)
+            transport = _repository_transport_kind(configured_url)
+            if identity is None or transport is None:
+                continue
+            configured_authorities.setdefault(identity, []).append(
+                (transport, configured_url.strip())
+            )
+        self._configured_authorities = {
+            identity: tuple(authorities)
+            for identity, authorities in configured_authorities.items()
+        }
         self._resolutions: dict[str, RepositoryResolution] = {}
 
     def _canonical_identity(self, url: object) -> str | None:
@@ -168,16 +217,29 @@ class RepositoryBinding:
         """Resolve a declaration once so identity and binding cannot diverge."""
 
         if not isinstance(url, str) or not url.strip():
-            return RepositoryResolution(identity=None, is_bound=False)
+            return RepositoryResolution(
+                identity=None, is_bound=False, transport_url=None
+            )
         cached = self._resolutions.get(url)
         if cached is not None:
             return cached
         identity = self._canonical_identity(url)
+        candidate_transport = _repository_transport_kind(url)
+        transport_url = next(
+            (
+                configured_url
+                for configured_transport, configured_url in self._configured_authorities.get(
+                    identity or "", ()
+                )
+                if candidate_transport is not None
+                and _compatible_transport(candidate_transport, configured_transport)
+            ),
+            None,
+        )
         resolution = RepositoryResolution(
             identity=identity,
-            is_bound=(
-                identity is not None and identity in self._configured_identities
-            ),
+            is_bound=transport_url is not None,
+            transport_url=transport_url,
         )
         self._resolutions[url] = resolution
         return resolution
@@ -270,20 +332,30 @@ class GitProbe:
         return GitResult(completed.returncode, completed.stdout, completed.stderr)
 
     def _run_global(self, args: Sequence[str]) -> GitResult:
-        command = ("git", *self._config_args(self.repository), *args)
-        self.commands.append(command)
         try:
-            completed = self._run_command(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="surrogateescape",
-                cwd=self.repository,
-                env=self._environment(),
-                timeout=30,
-            )
+            with tempfile.TemporaryDirectory(
+                prefix="hermes-fork-observe-"
+            ) as temporary:
+                isolated = Path(temporary)
+                command = (
+                    "git",
+                    *self._config_args(isolated),
+                    "-C",
+                    str(isolated),
+                    *args,
+                )
+                self.commands.append(command)
+                completed = self._run_command(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="surrogateescape",
+                    cwd=isolated,
+                    env=self._environment(),
+                    timeout=30,
+                )
         except subprocess.TimeoutExpired:
             return GitResult(124, "", "git command timed out")
         except OSError:
@@ -336,22 +408,37 @@ class GitProbe:
     ) -> str | None:
         if not _REMOTE_NAME_RE.fullmatch(remote) or remote.startswith("-"):
             return None
-        result = self._run(("remote", "get-url", remote), repository=repository)
-        url = result.stdout.strip()
+        result = self._run(
+            (
+                "config",
+                "--local",
+                "--no-includes",
+                "--get",
+                f"remote.{remote}.url",
+            ),
+            repository=repository,
+        )
+        url = result.stdout.splitlines()[0].strip() if result.stdout else ""
         return url if result.returncode == 0 and url else None
 
     def remote_urls(self) -> list[str]:
-        result = self._run(("remote",))
-        if result.returncode != 0:
+        result = self._run(
+            (
+                "config",
+                "--local",
+                "--no-includes",
+                "--null",
+                "--get-regexp",
+                r"^remote\..*\.url$",
+            )
+        )
+        if result.returncode not in {0, 1}:
             return []
         urls: list[str] = []
-        for remote in result.stdout.splitlines():
-            remote = remote.strip()
-            if not _REMOTE_NAME_RE.fullmatch(remote) or remote.startswith("-"):
-                continue
-            remote_result = self._run(("remote", "get-url", "--all", remote))
-            if remote_result.returncode == 0:
-                urls.extend(line.strip() for line in remote_result.stdout.splitlines() if line.strip())
+        for record in result.stdout.split("\0"):
+            _key, separator, value = record.partition("\n")
+            if separator and value.strip():
+                urls.append(value.strip())
         return urls
 
     def repository_is_clean(self) -> bool | None:
@@ -666,7 +753,7 @@ class GitProbe:
             return None
         result = self._run(("patch-id", "--stable"), input_text=patch.stdout)
         first = result.stdout.split(maxsplit=1)[0] if result.stdout.strip() else ""
-        return first if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", first) else None
+        return first if result.returncode == 0 and _FULL_SHA_RE.fullmatch(first) else None
 
     def changed_paths(self, commit: str) -> list[str] | None:
         if not _FULL_SHA_RE.fullmatch(commit):
@@ -1068,6 +1155,8 @@ def audit_manifest(
     integration_repository_bound = integration_repository_resolution.is_bound
     upstream_repository_bound = upstream_repository_resolution.is_bound
     integration_repository_identity = integration_repository_resolution.identity
+    integration_transport_url = integration_repository_resolution.transport_url
+    upstream_transport_url = upstream_repository_resolution.transport_url
 
     for label, ref in (
         ("integration.ref", integration_ref),
@@ -1107,7 +1196,7 @@ def audit_manifest(
 
     if observe_live:
         upstream_observation = (
-            git.live_ref(upstream_url, upstream_ref)
+            git.live_ref(upstream_transport_url, upstream_ref)
             if upstream_repository_bound
             else _unobserved_ref(
                 upstream_url,
@@ -1116,7 +1205,7 @@ def audit_manifest(
             )
         )
         published_observation = (
-            git.live_ref(integration_url, integration_ref)
+            git.live_ref(integration_transport_url, integration_ref)
             if integration_repository_bound
             else _unobserved_ref(
                 integration_url,
@@ -1226,6 +1315,7 @@ def audit_manifest(
         source_repository_resolution = repository_binding.resolve(source_url)
         source_repository_bound = source_repository_resolution.is_bound
         source_repository_identity = source_repository_resolution.identity
+        source_transport_url = source_repository_resolution.transport_url
 
         if isinstance(source_ref, str) and not source_ref_valid:
             _add(
@@ -1286,7 +1376,7 @@ def audit_manifest(
             )
         live_source: dict[str, Any] | None = None
         if observe_live and isinstance(source_url, str) and source_ref_valid:
-            cache_key = (source_url, source_ref)
+            cache_key = (source_transport_url, source_ref)
             if not source_repository_bound:
                 live_source = _unobserved_ref(
                     source_url,
@@ -1296,7 +1386,7 @@ def audit_manifest(
             else:
                 if cache_key not in live_source_cache:
                     live_source_cache[cache_key] = git.live_ref(
-                        source_url, source_ref
+                        source_transport_url, source_ref
                     )
                 live_source = live_source_cache[cache_key]
             if manifest_ready:

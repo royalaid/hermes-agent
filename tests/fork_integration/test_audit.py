@@ -224,7 +224,7 @@ def test_status_reports_exact_live_and_local_identities_without_mutating_refs(
     allowed_local = {
         "rev-parse",
         "symbolic-ref",
-        "remote",
+        "config",
         "show",
         "patch-id",
         "diff-tree",
@@ -233,8 +233,10 @@ def test_status_reports_exact_live_and_local_identities_without_mutating_refs(
         "check-ref-format",
     }
     for command in report["git_commands"]:
-        if "-C" not in command:
-            assert "ls-remote" in command
+        if "ls-remote" in command:
+            isolated = Path(command[command.index("-C") + 1])
+            assert isolated != repository
+            assert isolated.exists() is False
             continue
         subcommand = command[command.index("-C") + 2]
         assert subcommand in allowed_local
@@ -521,6 +523,7 @@ def test_repository_identity_preserves_nondefault_port_and_remote_path_case(
 
     assert resolved.identity == "example.test:8443/Owner/Repo"
     assert resolved.is_bound is True
+    assert resolved.transport_url == "https://Example.test:8443/Owner/Repo.git"
     assert binding.resolve("ssh://example.test:8443/Owner/Repo") is resolved
     assert binding.canonical_identity(
         "ssh://example.test:8443/Owner/Repo"
@@ -1440,6 +1443,44 @@ def test_publication_uses_atomic_expected_old_lease_and_verifies_live_head(
     assert run_git(Path(remote_url), "rev-parse", ref) == expected_new
 
 
+def test_publication_uses_configured_transport_authority_for_push_and_reconcile(
+    audited_repository: tuple[Path, dict],
+):
+    repository, manifest = audited_repository
+    expected_old = manifest["integration"]["expected_base_commit"]
+    ref = manifest["integration"]["ref"]
+    configured_url = manifest["repositories"]["fork"]["url"]
+    declared_url = Path(configured_url).as_uri()
+    manifest["repositories"]["fork"]["url"] = declared_url
+    run_git(repository, "push", "--force", "origin", f"{expected_old}:{ref}")
+    candidate = commit_canonical_manifest(repository, manifest)
+    push_commands: list[tuple[str, ...]] = []
+    reconcile_commands: list[tuple[str, ...]] = []
+
+    def recording_push(command, **kwargs):
+        push_commands.append(tuple(command))
+        return subprocess.run(command, **kwargs)
+
+    def recording_reconcile(command, **kwargs):
+        reconcile_commands.append(tuple(command))
+        return subprocess.run(command, **kwargs)
+
+    receipt = publish_release_candidate(
+        repository,
+        candidate,
+        expected_old,
+        run=recording_push,
+        reconcile_run=recording_reconcile,
+    )
+
+    assert receipt["publication_state"] == "published"
+    push = push_commands[0]
+    assert push[push.index("--") + 1] == configured_url
+    reconcile = next(command for command in reconcile_commands if "ls-remote" in command)
+    assert configured_url in reconcile
+    assert declared_url not in reconcile
+
+
 def test_publication_isolates_hostile_config_and_pushes_exactly_one_ref(
     audited_repository: tuple[Path, dict], tmp_path: Path,
 ):
@@ -2183,6 +2224,7 @@ def test_audit_and_prepare_share_binding_and_never_contact_unbound_urls(
     assert receipt["dry_run"] is True
     assert receipt["would_apply"]
     assert live_calls
+    assert {url for url, _ref in live_calls} == set(configured_urls)
 
     live_calls.clear()
     unbound = deepcopy(manifest)
@@ -2217,6 +2259,90 @@ def test_audit_and_prepare_share_binding_and_never_contact_unbound_urls(
     }.issubset({finding.code for finding in caught.value.findings})
     assert live_calls == []
     assert (tmp_path / "unbound-binding-prepare").exists() is False
+
+
+@pytest.mark.parametrize(
+    "candidate_url",
+    [
+        "http://example.test/Owner/Fork.git",
+        "git://example.test/Owner/Fork.git",
+        "ftp://example.test/Owner/Fork.git",
+        "ext::ssh example.test %S Owner/Fork.git",
+    ],
+)
+def test_downgraded_or_helper_repository_urls_are_never_contacted(
+    audited_repository: tuple[Path, dict],
+    candidate_url: str,
+):
+    repository, manifest = audited_repository
+    manifest["repositories"]["fork"]["url"] = candidate_url
+    configured_urls = [
+        manifest["repositories"]["upstream"]["url"],
+        "https://example.test/Owner/Fork.git",
+    ]
+    probe = GitProbe(repository)
+    probe.remote_urls = lambda: configured_urls  # type: ignore[method-assign]
+    live_calls: list[tuple[str | None, str | None]] = []
+
+    def recording_live_ref(url: str | None, ref: str | None) -> dict:
+        live_calls.append((url, ref))
+        return {"repository": url, "ref": ref, "commit": "f" * 40, "state": "known"}
+
+    probe.live_ref = recording_live_ref  # type: ignore[method-assign]
+
+    report = audit_manifest(
+        manifest,
+        repository,
+        observe_live=True,
+        probe=probe,
+        strict_release=True,
+    )
+
+    assert "release_repository_unbound" in finding_codes(report)
+    assert all(url != candidate_url for url, _ref in live_calls)
+
+
+def test_live_observation_ignores_repository_local_url_rewrites(
+    audited_repository: tuple[Path, dict], tmp_path: Path,
+):
+    repository, manifest = audited_repository
+    fork_url = Path(manifest["repositories"]["fork"]["url"]).as_uri()
+    manifest["repositories"]["fork"]["url"] = fork_url
+    run_git(repository, "remote", "set-url", "origin", fork_url)
+    wrong_remote = tmp_path / "rewrite-target.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(wrong_remote)],
+        check=True,
+        capture_output=True,
+    )
+    run_git(
+        repository,
+        "config",
+        f"url.{wrong_remote.as_uri()}.insteadOf",
+        fork_url,
+    )
+    raw_urls = GitProbe(repository).remote_urls()
+    assert fork_url in raw_urls
+    assert wrong_remote.as_uri() not in raw_urls
+    probe = GitProbe(repository)
+    configured_urls = [
+        manifest["repositories"]["upstream"]["url"],
+        fork_url,
+    ]
+    probe.remote_urls = lambda: configured_urls  # type: ignore[method-assign]
+
+    report = audit_manifest(
+        manifest,
+        repository,
+        observe_live=True,
+        probe=probe,
+        strict_release=True,
+    )
+
+    assert report["ready"] is True, report["findings"]
+    assert report["identities"]["published"]["commit"] == manifest["integration"][
+        "expected_head_commit"
+    ]
 
 
 def test_review_draft_never_contacts_unbound_manifest_urls(
