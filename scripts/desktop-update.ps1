@@ -2485,9 +2485,10 @@ try {
     # while breakaway permission would let arbitrary mutators escape. Keep the
     # parent-owned lease through the final rebuild, then resume only the
     # authenticated invocation-correlated plan outside containment. Recovery is
-    # attempted even after update/rebuild failure. A recovery failure is itself
-    # terminal and the result message retains the original update detail.
-    Write-HandoffLog 'restoring the verified gateway fleet outside mutation containment'
+    # attempted even after update/rebuild failure. An absent or invalid plan is
+    # ambiguous rather than proof that no gateway stopped, so it remains a
+    # fail-closed recovery failure while retaining the original update detail.
+    Write-HandoffLog 'verifying and restoring gateway recovery state outside mutation containment'
     $resumeArgs = $cliPrefix + @(
         'update', '--resume-deferred-gateway',
         '--invocation-id', $script:InvocationId,
@@ -2497,12 +2498,19 @@ try {
     $resume = Invoke-DeferredGatewayResume $hermesPython $resumeArgs
     Write-HandoffLog "deferred gateway recovery exit code: $($resume.Code)"
     if ($resume.Code -ne 0) {
-        $res.Output += "`nThe verified gateway fleet could not be restored after the update attempt."
+        $res.Output += "`nHermes could not verify whether gateway recovery was required or completed after the update attempt."
     }
 
     if ($resume.Code -ne 0) {
         $finalCode = 13
-        $finalMsg = 'The update attempt ended without restoring the verified Hermes gateway fleet.'
+        $recoveryFailure = 'Hermes could not verify whether gateway recovery was required or completed.'
+        if ($desktopBuildFailed) {
+            $finalMsg = "The Desktop rebuild failed, and $recoveryFailure"
+        } elseif ($res.Code -ne 0) {
+            $finalMsg = "Hermes update failed (exit $($res.Code)), and $recoveryFailure"
+        } else {
+            $finalMsg = $recoveryFailure
+        }
     } elseif ($res.Code -eq 0 -and -not $desktopBuildFailed) {
         $finalCode = 0
         $finalMsg = "Update complete."
