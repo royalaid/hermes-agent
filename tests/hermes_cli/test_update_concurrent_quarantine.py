@@ -267,7 +267,7 @@ def _gateway_record(
     cwd: str | None = None,
 ) -> dict:
     executable = exe or str(
-        cli_main.PROJECT_ROOT / ".hermes-runtime" / "python" / "python.exe"
+        cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
     )
     return {
         "created_at": float(created_at if created_at is not None else 1000 + pid),
@@ -354,36 +354,338 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
-def test_capture_gateway_identity_accepts_install_global_home_cwd(
+def test_capture_gateway_identity_accepts_target_venv_redirector_ancestor(
     _winp,
     monkeypatch,
     tmp_path,
 ):
-    """Managed gateways run from HERMES_HOME, one level above the checkout."""
-    global_home = tmp_path / "home"
-    install_root = global_home / "hermes-agent"
-    global_home.mkdir()
-    pid = 202
+    """A base-interpreter worker is bound by its exact target-venv parent."""
+    shared_home = tmp_path / "home"
+    install_root = tmp_path / "install-a"
+    shared_home.mkdir()
+    worker_pid = 202
+    launcher_pid = 201
+    worker_exe = r"C:\Python311\python.exe"
+    launcher_exe = str(install_root / "venv" / "Scripts" / "python.exe")
     records = {
-        pid: _gateway_record(
-            pid,
-            exe=r"C:\Python311\python.exe",
-            cwd=str(global_home),
-        )
+        worker_pid: _gateway_record(
+            worker_pid, exe=worker_exe, cwd=str(shared_home)
+        ),
+        launcher_pid: _gateway_record(
+            launcher_pid, exe=launcher_exe, cwd=str(shared_home)
+        ),
     }
-    monkeypatch.setitem(sys.modules, "psutil", _fake_gateway_psutil(records))
-    monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: global_home)
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_psutil(records, parents={worker_pid: launcher_pid}),
+    )
+    # The old implementation trusted this shared profile-state cwd by itself.
+    monkeypatch.setattr(
+        update_cmd,
+        "get_default_hermes_root",
+        lambda: shared_home,
+        raising=False,
+    )
 
     identity = update_cmd._capture_gateway_stop_identity(
-        pid,
+        worker_pid,
         role="gateway_worker",
         root=install_root,
     )
 
     assert identity is not None
-    assert identity.working_directory == update_cmd._canonical_process_path(
-        global_home
+    assert identity.venv_ancestor_pid == launcher_pid
+    assert identity.venv_ancestor_created_at == records[launcher_pid]["created_at"]
+    assert identity.venv_ancestor_argv == tuple(records[launcher_pid]["argv"])
+    assert identity.venv_ancestor_executable == update_cmd._canonical_process_path(
+        launcher_exe
     )
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_gateway_worker_revalidates_target_venv_ancestor_identity(
+    _winp,
+    monkeypatch,
+    tmp_path,
+):
+    """Ancestor PID reuse invalidates the worker's frozen stop capability."""
+    shared_home = tmp_path / "home"
+    install_root = tmp_path / "install-a"
+    shared_home.mkdir()
+    worker_pid = 202
+    launcher_pid = 201
+    records = {
+        worker_pid: _gateway_record(
+            worker_pid,
+            exe=r"C:\Python311\python.exe",
+            cwd=str(shared_home),
+        ),
+        launcher_pid: _gateway_record(
+            launcher_pid,
+            exe=str(install_root / "venv" / "Scripts" / "python.exe"),
+            cwd=str(shared_home),
+        ),
+    }
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_psutil(records, parents={worker_pid: launcher_pid}),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "get_default_hermes_root",
+        lambda: shared_home,
+        raising=False,
+    )
+    identity = update_cmd._capture_gateway_stop_identity(
+        worker_pid,
+        role="gateway_worker",
+        root=install_root,
+    )
+    assert identity is not None
+
+    records[launcher_pid]["created_at"] += 1.0
+
+    assert update_cmd._gateway_stop_identity_state(identity) == "refuse"
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_refuses_foreign_gateway_from_checkout_sharing_global_home(
+    _winp,
+    monkeypatch,
+    tmp_path,
+):
+    """Shared profile state is not authority to stop another checkout's worker."""
+    import gateway.status as status_mod
+    import hermes_cli.gateway as gateway_mod
+
+    worker_pid = 202
+    launcher_pid = 201
+    shared_home = tmp_path / "home"
+    target_install = tmp_path / "install-a"
+    foreign_install = tmp_path / "install-b"
+    profile_home = shared_home / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    profile_proc = SimpleNamespace(
+        profile="work",
+        path=profile_home,
+        pid=worker_pid,
+    )
+    records = {
+        worker_pid: _gateway_record(
+            worker_pid,
+            exe=r"C:\Python311\python.exe",
+            cwd=str(shared_home),
+        ),
+        launcher_pid: _gateway_record(
+            launcher_pid,
+            exe=str(foreign_install / "venv" / "Scripts" / "python.exe"),
+            cwd=str(shared_home),
+        ),
+    }
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_psutil(records, parents={worker_pid: launcher_pid}),
+    )
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", target_install)
+    monkeypatch.setattr(
+        update_cmd,
+        "get_default_hermes_root",
+        lambda: shared_home,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        gateway_mod, "find_gateway_pids", lambda **_k: [worker_pid]
+    )
+    monkeypatch.setattr(
+        gateway_mod, "find_profile_gateway_processes", lambda: [profile_proc]
+    )
+    waited_for = []
+    monkeypatch.setattr(
+        cli_main,
+        "_wait_for_windows_update_gateway_exit",
+        lambda pids, *, timeout: waited_for.extend(pids) or {worker_pid},
+    )
+    terminated = []
+    monkeypatch.setattr(
+        status_mod,
+        "terminate_pid",
+        lambda value, force=False: terminated.append((value, force)),
+    )
+
+    with pytest.raises(update_cmd._GatewayOutsideInstall):
+        cli_main._pause_windows_gateways_for_update()
+
+    assert waited_for == []
+    assert terminated == []
+
+
+@pytest.mark.parametrize("deferred_gateway_resume", [False, True])
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_windows_update_does_not_rediscover_global_manual_gateways(
+    _winp,
+    deferred_gateway_resume,
+) -> None:
+    calls = []
+
+    def discover(**kwargs):
+        calls.append(kwargs)
+        return [11436]
+
+    assert update_cmd._legacy_manual_gateway_pids(
+        discover,
+        {42},
+        deferred_gateway_resume=deferred_gateway_resume,
+    ) == []
+    assert calls == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_non_windows_legacy_update_still_discovers_manual_gateways(_winp) -> None:
+    calls = []
+
+    def discover(**kwargs):
+        calls.append(kwargs)
+        return [11436]
+
+    assert update_cmd._legacy_manual_gateway_pids(
+        discover,
+        {42},
+        deferred_gateway_resume=False,
+    ) == [11436]
+    assert calls == [{"exclude_pids": {42}, "all_profiles": True}]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_ordinary_partial_gateway_pause_is_resumed_by_outer_transaction(
+    _winp,
+    monkeypatch,
+) -> None:
+    """Publish the ordinary resume token before any drain can partly succeed."""
+    from hermes_cli import config as config_module
+    from hermes_cli import update_lock
+
+    events: list[str] = []
+    resume_plan = {
+        "resume_needed": True,
+        "profiles": {"first": 101, "second": 202},
+        "profile_identities": {
+            "first": {"pid": 101, "created_at": 1101.0},
+            "second": {"pid": 202, "created_at": 1202.0},
+        },
+        "unmapped_pids": [],
+        "unmapped": [],
+        "cold_start_if_installed": False,
+    }
+
+    class FakeLock:
+        holder = None
+
+        def acquire(self):
+            return True
+
+        def prove_claim(self):
+            return True
+
+        def release(self):
+            events.append("lock-release")
+
+    class FakeJob:
+        def abort(self, _reason=""):
+            events.append("job-abort")
+
+        def disarm(self):
+            events.append("job-disarm")
+
+    class FakeHeartbeat:
+        lost = False
+        loss_reason = None
+
+        def __init__(self, _root, _lease, *, fail_stop):
+            assert callable(fail_stop)
+
+        def start(self):
+            events.append("heartbeat-start")
+
+        def stop(self):
+            events.append("heartbeat-stop")
+
+    def prepare(_args, *, root, transaction):
+        assert root == cli_main.PROJECT_ROOT
+        transaction.lease = {"lease_id": "ordinary-pause-lease"}
+
+    def fail_after_first_drain(*, require_structured_resume=False, before_stop=None):
+        assert require_structured_resume is False
+        assert before_stop is not None
+        before_stop(resume_plan)
+        events.append("drain:first")
+        raise RuntimeError("second gateway identity changed")
+
+    monkeypatch.setattr(config_module, "is_managed", lambda: False)
+    monkeypatch.setattr(
+        config_module, "detect_install_method", lambda _root: "git"
+    )
+    monkeypatch.setattr(config_module, "load_config", lambda: {})
+    monkeypatch.setattr(update_lock, "UpdateLock", FakeLock)
+    monkeypatch.setattr(
+        cli_main,
+        "_install_hangup_protection",
+        lambda *, gateway_mode: {"installed": False},
+    )
+    monkeypatch.setattr(cli_main, "_finalize_update_output", lambda _state: None)
+    monkeypatch.setattr(cli_main, "_prepare_atomic_windows_update", prepare)
+    monkeypatch.setattr(cli_main, "_WindowsMutationJob", FakeJob)
+    monkeypatch.setattr(cli_main, "_UpdateLeaseHeartbeat", FakeHeartbeat)
+    monkeypatch.setattr(cli_main, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(
+        cli_main,
+        "_run_pre_update_backup",
+        lambda _args: events.append("backup") or None,
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_pause_windows_gateways_for_update",
+        fail_after_first_drain,
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_resume_windows_gateways_after_update",
+        lambda token: events.append("resume:fleet")
+        if token is resume_plan
+        else pytest.fail("wrong gateway resume plan"),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_release_update_quiesce_lease",
+        lambda root, lease: root == cli_main.PROJECT_ROOT
+        and lease == {"lease_id": "ordinary-pause-lease"},
+    )
+
+    args = SimpleNamespace(
+        preflight=False,
+        drain=False,
+        resume_deferred_gateway=False,
+        check=False,
+        gateway=False,
+        defer_gateway_resume=False,
+        force=False,
+        yes=False,
+    )
+
+    with pytest.raises(RuntimeError, match="second gateway identity changed"):
+        cli_main.cmd_update(args)
+
+    assert events == [
+        "heartbeat-start",
+        "backup",
+        "drain:first",
+        "heartbeat-stop",
+        "job-disarm",
+        "resume:fleet",
+        "lock-release",
+    ]
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
@@ -398,7 +700,6 @@ def test_pause_ignores_unmapped_gateway_from_another_install(
     from hermes_cli import gateway_windows
 
     pid = 202
-    target_home = tmp_path / "target-home"
     foreign_home = tmp_path / "foreign-home"
     records = {
         pid: _gateway_record(
@@ -408,7 +709,6 @@ def test_pause_ignores_unmapped_gateway_from_another_install(
         )
     }
     monkeypatch.setitem(sys.modules, "psutil", _fake_gateway_psutil(records))
-    monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: target_home)
     monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [pid])
     monkeypatch.setattr(gateway_mod, "find_profile_gateway_processes", lambda: [])
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
@@ -466,7 +766,6 @@ def test_pause_keeps_target_gateway_when_foreign_gateway_is_also_discovered(
         ),
     }
     monkeypatch.setitem(sys.modules, "psutil", _fake_gateway_psutil(records))
-    monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: target_home)
     monkeypatch.setattr(
         gateway_mod,
         "find_gateway_pids",
@@ -528,7 +827,6 @@ def test_pause_refuses_foreign_process_named_by_target_profile_state(
         )
     }
     monkeypatch.setitem(sys.modules, "psutil", _fake_gateway_psutil(records))
-    monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: target_home)
     monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [pid])
     monkeypatch.setattr(
         gateway_mod,
@@ -717,8 +1015,8 @@ def test_venv_launcher_ancestors_returns_venv_side_parent(_winp, monkeypatch):
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
-def test_venv_launcher_ancestors_ignores_non_venv_parents(_winp, monkeypatch):
-    """A Scheduled Task's cmd.exe / an operator shell is not a venv holder."""
+def test_capture_refuses_worker_with_only_non_venv_parents(_winp, monkeypatch):
+    """A shared cwd plus an unrelated shell ancestor cannot authorize a stop."""
     venv_exe = str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe")
     worker_exe = r"C:\Windows\System32\cmd.exe"
 
@@ -726,12 +1024,10 @@ def test_venv_launcher_ancestors_ignores_non_venv_parents(_winp, monkeypatch):
     fake = _fake_psutil_tree({200: 101}, venv_exe, worker_exe)
     monkeypatch.setitem(sys.modules, "psutil", fake)
 
-    worker = update_cmd._capture_gateway_stop_identity(
-        200, role="gateway_worker", root=cli_main.PROJECT_ROOT
-    )
-    assert worker is not None
-
-    assert cli_main._venv_launcher_ancestors([worker]) == []
+    with pytest.raises(update_cmd._GatewayOutsideInstall):
+        update_cmd._capture_gateway_stop_identity(
+            200, role="gateway_worker", root=cli_main.PROJECT_ROOT
+        )
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
@@ -856,7 +1152,9 @@ def test_pause_force_stop_revalidates_launcher_and_surviving_worker(
 
     cli_main._pause_windows_gateways_for_update()
 
-    assert terminated == [(launcher_pid, True), (worker_pid, True)]
+    # Revalidate and stop the worker while its frozen ancestor proof is still
+    # live, then stop the separately frozen launcher identity.
+    assert terminated == [(worker_pid, True), (launcher_pid, True)]
 
 
 # ---------------------------------------------------------------------------
@@ -873,7 +1171,7 @@ def test_pause_force_stop_revalidates_launcher_and_surviving_worker(
 
 
 GATEWAY_ARGV = [
-    r"C:\x\venv\Scripts\python.exe",
+    str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe"),
     "-m",
     "hermes_cli.main",
     "gateway",
