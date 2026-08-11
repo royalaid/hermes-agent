@@ -21,6 +21,7 @@ export interface McpBridgeConsentRequest {
 export interface UpdatePreflightDeps {
   acquireMcpBridgeLease: () => McpBridgeQuiesceLease | null
   clearMcpBridgeLease: (lease: McpBridgeQuiesceLease) => void
+  now?: () => number
   releaseTrackedBackendTrees: () => Promise<{ unlocked: boolean }>
   requestMcpBridgeConsent: (request: McpBridgeConsentRequest) => Promise<boolean>
   scan: () => Promise<ScanOutcome>
@@ -30,6 +31,8 @@ export interface UpdatePreflightDeps {
 
 export interface UpdatePreflightTiming {
   cooperativeExitMs?: number
+  genericHolderPollMs?: number
+  genericHolderTimeoutMs?: number
   respawnIntervalMs?: number
   terminationSettleMs?: number
 }
@@ -45,6 +48,8 @@ export type UpdatePreflightOutcome =
   | { kind: 'probe-failure'; error: string; message: string }
 
 const DEFAULT_COOPERATIVE_EXIT_MS = 1_500
+const DEFAULT_GENERIC_HOLDER_POLL_MS = 1_000
+const DEFAULT_GENERIC_HOLDER_TIMEOUT_MS = 30_000
 const DEFAULT_RESPAWN_INTERVAL_MS = 1_500
 const DEFAULT_TERMINATION_SETTLE_MS = 750
 const MAX_FALLBACK_BRIDGES = 32
@@ -61,6 +66,14 @@ function exactMcpOnly(result: VenvBlockerScanResult): boolean {
   return (
     result.processes.length === 0 && result.mcpBridges.length > 0 && result.mcpBridges.every(isExactActionableMcpBridge)
   )
+}
+
+function exactActionableMcpBridges(result: VenvBlockerScanResult): boolean {
+  return result.mcpBridges.length > 0 && result.mcpBridges.every(isExactActionableMcpBridge)
+}
+
+function genericHoldersOnly(result: VenvBlockerScanResult): boolean {
+  return result.processes.length > 0 && result.mcpBridges.length === 0
 }
 
 function normalizeOwner(owner?: string): string | null {
@@ -143,7 +156,10 @@ export async function runWindowsUpdatePreflight(
   timing: UpdatePreflightTiming = {}
 ): Promise<UpdatePreflightOutcome> {
   const sleep = deps.wait ?? wait
+  const now = deps.now ?? Date.now
   const cooperativeExitMs = timing.cooperativeExitMs ?? DEFAULT_COOPERATIVE_EXIT_MS
+  const genericHolderPollMs = Math.max(1, timing.genericHolderPollMs ?? DEFAULT_GENERIC_HOLDER_POLL_MS)
+  const genericHolderTimeoutMs = Math.max(0, timing.genericHolderTimeoutMs ?? DEFAULT_GENERIC_HOLDER_TIMEOUT_MS)
   const respawnIntervalMs = timing.respawnIntervalMs ?? DEFAULT_RESPAWN_INTERVAL_MS
   const terminationSettleMs = timing.terminationSettleMs ?? DEFAULT_TERMINATION_SETTLE_MS
 
@@ -174,6 +190,23 @@ export async function runWindowsUpdatePreflight(
     } catch (error) {
       return { kind: 'probe-failure', error: `scanner threw: ${errorText(error)}` }
     }
+  }
+
+  const pollGenericHoldersUntil = async (current: ScanOutcome, deadline: number): Promise<ScanOutcome> => {
+    let outcome = current
+
+    while (outcome.kind === 'blocked' && genericHoldersOnly(outcome.result)) {
+      const remainingMs = deadline - now()
+
+      if (remainingMs <= 0) {
+        break
+      }
+
+      await sleep(Math.min(genericHolderPollMs, remainingMs))
+      outcome = await scanFailClosed()
+    }
+
+    return outcome
   }
 
   const observed = await scanFailClosed()
@@ -236,13 +269,37 @@ export async function runWindowsUpdatePreflight(
   try {
     await sleep(cooperativeExitMs)
     let firstClear = await scanFailClosed()
+    let genericHolderDeadline: number | null = null
 
     if (firstClear.kind === 'probe-failure') {
       return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
     }
 
+    // The cooperative lease may already have drained every MCP bridge while a
+    // scheduled status/presence helper briefly holds the venv. It was never
+    // consented for termination, so only wait boundedly for its natural exit.
+    if (firstClear.kind === 'blocked' && genericHoldersOnly(firstClear.result)) {
+      genericHolderDeadline = now() + genericHolderTimeoutMs
+      firstClear = await pollGenericHoldersUntil(firstClear, genericHolderDeadline)
+
+      if (firstClear.kind === 'probe-failure') {
+        return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
+      }
+
+      if (firstClear.kind === 'blocked' && genericHoldersOnly(firstClear.result)) {
+        return {
+          kind: 'blocked',
+          reason: 'quiesce-incomplete',
+          result: firstClear.result,
+          message: formatBlockerMessage(firstClear.result)
+        }
+      }
+    }
+
     if (firstClear.kind === 'blocked') {
-      if (!exactMcpOnly(firstClear.result) || firstClear.result.mcpBridges.length > MAX_FALLBACK_BRIDGES) {
+      const exactCurrentBridges = exactActionableMcpBridges(firstClear.result)
+
+      if (!exactCurrentBridges || firstClear.result.mcpBridges.length > MAX_FALLBACK_BRIDGES) {
         return {
           kind: 'blocked',
           reason: 'quiesce-incomplete',
@@ -273,8 +330,22 @@ export async function runWindowsUpdatePreflight(
         }
       }
 
+      // A scheduled gateway-status or presence probe can start after the
+      // consent scan and briefly share this venv with an exact MCP bridge. It
+      // is never part of the consented termination set. Give such generic
+      // holders one bounded window to exit on their own after the exact bridge
+      // fallback, then refuse if they remain. The deadline includes the first
+      // post-termination settle scan so repeated probes cannot extend it.
+      genericHolderDeadline ??= now() + genericHolderTimeoutMs
+
       await sleep(terminationSettleMs)
       firstClear = await scanFailClosed()
+
+      if (firstClear.kind === 'probe-failure') {
+        return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
+      }
+
+      firstClear = await pollGenericHoldersUntil(firstClear, genericHolderDeadline)
 
       if (firstClear.kind === 'probe-failure') {
         return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
@@ -285,7 +356,10 @@ export async function runWindowsUpdatePreflight(
           kind: 'blocked',
           reason: 'quiesce-incomplete',
           result: firstClear.result,
-          message: quiesceIncompleteMessage(firstClear.result)
+          message:
+            firstClear.result.mcpBridges.length > 0
+              ? quiesceIncompleteMessage(firstClear.result)
+              : formatBlockerMessage(firstClear.result)
         }
       }
     }
