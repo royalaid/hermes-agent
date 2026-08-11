@@ -141,7 +141,10 @@ public static class FakeHermes {
             var output = Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_OUTPUT") ?? "";
             var argsCapture = Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_ARGS_CAPTURE");
             if (!String.IsNullOrEmpty(argsCapture))
-                File.AppendAllText(argsCapture, String.Join(" ", args) + Environment.NewLine);
+                File.AppendAllText(
+                    argsCapture,
+                    String.Join(" ", args) + "\t" + Directory.GetCurrentDirectory() + Environment.NewLine
+                );
             var preflightLeasePath = Environment.GetEnvironmentVariable("HERMES_TEST_LEASE_PATH");
             var capture = Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_LEASE_CAPTURE");
             if (!String.IsNullOrEmpty(preflightLeasePath) && !String.IsNullOrEmpty(capture) &&
@@ -607,8 +610,13 @@ try {
     if (Test-Path -LiteralPath $leased.PreflightArgsCapture) {
         $preflightArgLines = @([System.IO.File]::ReadAllLines($leased.PreflightArgsCapture))
         Assert-Equal 1 $preflightArgLines.Count 'successful handoff runs one capability-authorized initial preflight'
-        Assert-True ($preflightArgLines[0] -match '^-m hermes_cli\.main update ') 'preflight bypasses the console shim and runs managed Python directly'
-        Assert-True ($preflightArgLines[0] -match '--bridge-lease-id' -and $preflightArgLines[0] -match [regex]::Escape($leaseId)) 'initial preflight receives the matching private lease capability'
+        $preflightRecord = @($preflightArgLines[0] -split "`t", 2)
+        Assert-Equal 2 $preflightRecord.Count 'preflight capture records argv and working directory'
+        Assert-True ($preflightRecord[0] -match '^-m hermes_cli\.main update ') 'preflight bypasses the console shim and runs managed Python directly'
+        Assert-True ($preflightRecord[0] -match '--bridge-lease-id' -and $preflightRecord[0] -match [regex]::Escape($leaseId)) 'initial preflight receives the matching private lease capability'
+        if ($preflightRecord.Count -eq 2) {
+            Assert-Equal ([System.IO.Path]::GetFullPath($leased.Root).TrimEnd([char[]]@('\', '/'))) ([System.IO.Path]::GetFullPath($preflightRecord[1]).TrimEnd([char[]]@('\', '/'))) 'first contained managed preflight starts in the exact install root'
+        }
     }
     $scriptLeaseOwnerPid = -1
     if (Test-Path -LiteralPath $leased.PreflightLeaseCapture) {
