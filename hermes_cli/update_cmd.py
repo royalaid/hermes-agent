@@ -69,6 +69,7 @@ from hermes_cli.update_receipt import (
     _SHA_RE,
     _write_update_receipt,
 )
+from hermes_cli.update_transaction import _UpdateTransaction
 
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ class _VerifiedProcessIdentity:
 def _record_update_success(
     args,
     *,
+    transaction: _UpdateTransaction,
     mode: str,
     branch: str,
     remote: str | None,
@@ -101,8 +103,8 @@ def _record_update_success(
     health: dict[str, bool],
 ) -> dict | None:
     """Write a receipt only for an atomic invocation that owns a lease."""
-    invocation_id = getattr(args, "_update_invocation_id", None)
-    lease = getattr(args, "_update_quiesce_lease", None)
+    invocation_id = transaction.invocation_id
+    lease = transaction.lease
     lease_id = lease.get("lease_id") if isinstance(lease, dict) else None
     if not isinstance(invocation_id, str) or not isinstance(lease_id, str):
         return None
@@ -138,7 +140,7 @@ def _record_update_success(
         # Publish the authenticated, no-argv fleet state first.  The receipt
         # is the terminal mutation proof and must never claim a resumable
         # update when the private plan was not durably published.
-        _write_deferred_gateway_plan(args, root)
+        _write_deferred_gateway_plan(root, transaction=transaction)
     receipt = _write_update_receipt(
         root,
         invocation_id=invocation_id,
@@ -153,7 +155,6 @@ def _record_update_success(
         gateway_resume_deferred=deferred,
         health=health,
     )
-    setattr(args, "_update_receipt_written", True)
     return receipt
 
 
@@ -928,7 +929,7 @@ def _print_update_completion(message: str) -> None:
         print(f"=== hermes-update completed {action_id} ===")
 
 
-def _update_via_zip(args):
+def _update_via_zip(args, *, transaction: _UpdateTransaction):
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
@@ -1296,6 +1297,7 @@ def _update_via_zip(args):
     else:
         _record_update_success(
             args,
+            transaction=transaction,
             mode="archive",
             branch=branch,
             remote=None,
@@ -4548,7 +4550,12 @@ def _normalize_managed_eol(git_cmd, repo_root):
         pass
 
 @_with_sanitized_git_routing
-def _cmd_update_impl(args, gateway_mode: bool):
+def _cmd_update_impl(
+    args,
+    gateway_mode: bool,
+    *,
+    transaction: _UpdateTransaction,
+):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
     # In gateway mode, use file-based IPC for prompts instead of stdin
@@ -4606,8 +4613,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # backup/source mutation.  Unmapped argv is never persisted or passed
         # across the privileged handoff boundary.
         def _publish_resume_plan_before_stop(token: dict) -> None:
-            setattr(args, "_windows_gateway_resume_plan", token)
-            _write_deferred_gateway_plan(args, Path(_m().PROJECT_ROOT))
+            transaction.gateway_resume_plan = token
+            _write_deferred_gateway_plan(
+                Path(_m().PROJECT_ROOT),
+                transaction=transaction,
+            )
 
         _windows_gateway_resume = _m()._pause_windows_gateways_for_update(
             require_structured_resume=True,
@@ -4619,7 +4629,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # gateway plan only after the Job proves every mutating descendant exited
     # and disarms kill-on-close, while both update coordination markers remain
     # held. Starting it here would make the gateway inherit the mutation Job.
-    setattr(args, "_windows_gateway_resume_plan", _windows_gateway_resume)
+    transaction.gateway_resume_plan = _windows_gateway_resume
 
     # Pre-update backup — runs before any git/file mutation so users can
     # always roll back to the exact state they had before this update.
@@ -4628,7 +4638,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
     if not deferred_gateway_resume:
         _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
-        setattr(args, "_windows_gateway_resume_plan", _windows_gateway_resume)
+        transaction.gateway_resume_plan = _windows_gateway_resume
 
     # With gateways paused, anything still running from the venv interpreter
     # (most commonly the Desktop app's `hermes serve` backend) will keep .pyd
@@ -4789,7 +4799,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
-        _update_via_zip(args)
+        _update_via_zip(args, transaction=transaction)
         return
 
     # Fetch and pull
@@ -5104,6 +5114,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     _record_update_success(
                         args,
+                        transaction=transaction,
                         mode="git",
                         branch=branch,
                         remote=update_target.remote,
@@ -5846,6 +5857,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             else:
                 _record_update_success(
                     args,
+                    transaction=transaction,
                     mode="git",
                     branch=branch,
                     remote=update_target.remote,
@@ -6687,7 +6699,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            _update_via_zip(args)
+            _update_via_zip(args, transaction=transaction)
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
