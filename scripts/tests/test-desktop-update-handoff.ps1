@@ -379,6 +379,27 @@ function New-TestInstall([string]$Tag, [string]$FakeHermes) {
     }
 }
 
+function Write-TestPyvenvConfig([object]$Install, [string[]]$Lines) {
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Install.Root 'venv\pyvenv.cfg'),
+        (($Lines -join "`n") + "`n"),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function Assert-InvalidPyvenvRecoveryRejected([object]$Install, [int]$Code, [string]$Label) {
+    Assert-Equal 13 $Code "$Label exits with failed fleet recovery"
+    Assert-True (Test-Path -LiteralPath $Install.Sentinel) "$Label reaches the update before recovery validation"
+    Assert-True (-not (Test-Path -LiteralPath $Install.ResumeCapture)) "$Label starts no recovery interpreter"
+    Assert-True (-not (Test-Path -LiteralPath $Install.UpdateMarker)) "$Label releases the exact update marker"
+    Assert-True (-not (Test-Path -LiteralPath $Install.Lease)) "$Label releases the exact bridge lease"
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-update-in-progress.cas-*' -File -ErrorAction SilentlyContinue).Count) "$Label leaves no update-marker CAS artifacts"
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-venv-quiesce.cas-*' -File -ErrorAction SilentlyContinue).Count) "$Label leaves no lease CAS artifacts"
+    Assert-Equal 1 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-gateway-resume-*.json' -File -ErrorAction SilentlyContinue).Count) "$Label preserves one exact pending recovery plan"
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-gateway-resume-*.completed' -File -ErrorAction SilentlyContinue).Count) "$Label does not claim the recovery plan was completed"
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-gateway-resume-*.consume-*' -File -ErrorAction SilentlyContinue).Count) "$Label leaves no plan-consume artifacts"
+}
+
 function Write-TestLease([object]$Install, [string]$LeaseId) {
     $fixture = [System.IO.File]::ReadAllText($leaseFixture) | ConvertFrom-Json
     $now = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -500,6 +521,7 @@ function Invoke-LeasedTestHandoff(
 $suiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-desktop-update-suite-{0}" -f [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $suiteRoot -Force | Out-Null
 $fakeHermes = Join-Path $suiteRoot 'fake-hermes.exe'
+$invalidVenvHomes = @()
 
 try {
     New-FakeHermes $fakeHermes
@@ -621,6 +643,7 @@ try {
     Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $leasedDesktop
     $leaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $leased $leaseId
+    Assert-Equal 1 (@([System.IO.File]::ReadAllLines((Join-Path $leased.Root 'venv\pyvenv.cfg')) | Where-Object { $_ -match '^\s*executable\s*=' }).Count) 'explicit-executable recovery fixture has one executable key'
     $code = Invoke-TestHandoff $leased (New-PreflightJson $leased $true $true) 0 'preflight diagnostic' $leaseId 'normal' $leasedDesktop
     Assert-Equal 0 $code 'ready preflight with matching lease completes'
     Assert-Equal ('a' * 40) ([System.IO.File]::ReadAllText($leased.BuildShaCapture)) 'git rebuild stamp is pinned to the correlated resulting HEAD'
@@ -695,24 +718,101 @@ try {
     }
 
     $trampoline = New-TestInstall 'resume-trampoline' $fakeHermes
+    $trampolineBaseDir = Join-Path $trampoline.Root 'base-python'
+    [System.IO.File]::WriteAllText(
+        (Join-Path $trampoline.Root 'venv\pyvenv.cfg'),
+        "home = $trampolineBaseDir`n",
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    Assert-Equal 0 (@([System.IO.File]::ReadAllLines((Join-Path $trampoline.Root 'venv\pyvenv.cfg')) | Where-Object { $_ -match '^\s*executable\s*=' }).Count) 'home-only recovery fixture omits the executable key'
     $trampolineDesktop = Join-Path $trampoline.Home 'fake-desktop.exe'
     Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $trampolineDesktop
     $trampolineLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $trampoline $trampolineLeaseId
     $code = Invoke-TestHandoff $trampoline (New-PreflightJson $trampoline $true $true) 0 '' $trampolineLeaseId 'resume-trampoline' $trampolineDesktop
+    if ($code -ne 0) {
+        Get-Content -LiteralPath (Join-Path $trampoline.Home 'logs\desktop-update-handoff.log') -ErrorAction SilentlyContinue
+    }
     Assert-Equal 0 $code 'deferred resume bypasses the exact Windows venv redirector'
     Assert-True (-not (Test-Path -LiteralPath $trampoline.ResumeRedirectorCapture)) 'deferred resume never starts the redirector process'
+    Assert-True (Test-Path -LiteralPath $trampoline.ResumeCapture) 'home-only recovery starts the canonical base interpreter'
     Assert-True (-not (Test-Path -LiteralPath $trampoline.Lease)) 'base-interpreter resume clears the exact adopted lease'
     Assert-Equal 0 (@(Get-ChildItem -LiteralPath $trampoline.Home -Filter '.hermes-venv-quiesce.cas-*' -File -ErrorAction SilentlyContinue).Count) 'base-interpreter resume leaves no lease CAS artifacts'
     Assert-Equal 0 (@(Get-ChildItem -LiteralPath $trampoline.Home -Filter '.hermes-gateway-resume-*.json' -File -ErrorAction SilentlyContinue).Count) 'base-interpreter resume consumes the exact pending plan'
 
-    $invalidVenv = New-TestInstall 'invalid-pyvenv' $fakeHermes
-    [System.IO.File]::AppendAllText((Join-Path $invalidVenv.Root 'venv\pyvenv.cfg'), "home = C:\foreign`n")
-    $invalidVenvLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
-    Write-TestLease $invalidVenv $invalidVenvLeaseId
-    $code = Invoke-TestHandoff $invalidVenv (New-PreflightJson $invalidVenv $true $true) 0 '' $invalidVenvLeaseId
-    Assert-Equal 13 $code 'malformed pyvenv base identity fails closed after update'
-    Assert-True (-not (Test-Path -LiteralPath $invalidVenv.ResumeCapture)) 'invalid pyvenv identity starts no recovery interpreter'
+    $invalidVenvCases = @(
+        [pscustomobject]@{
+            Tag = 'missing-home'
+            Label = 'missing pyvenv home'
+            Configure = {
+                param($Install)
+                Write-TestPyvenvConfig $Install @('implementation = CPython')
+            }
+        },
+        [pscustomobject]@{
+            Tag = 'malformed-home'
+            Label = 'malformed pyvenv home entry'
+            Configure = {
+                param($Install)
+                $baseDir = Join-Path $Install.Root 'base-python'
+                Write-TestPyvenvConfig $Install @("home $baseDir", 'implementation = CPython')
+            }
+        },
+        [pscustomobject]@{
+            Tag = 'duplicate-home'
+            Label = 'duplicate pyvenv home key'
+            Configure = {
+                param($Install)
+                $baseDir = Join-Path $Install.Root 'base-python'
+                Write-TestPyvenvConfig $Install @("home = $baseDir", "HOME = $baseDir")
+            }
+        },
+        [pscustomobject]@{
+            Tag = 'missing-derived-python'
+            Label = 'missing home-derived python.exe'
+            Configure = {
+                param($Install)
+                $baseDir = Join-Path $Install.Root 'base-python'
+                Remove-Item -LiteralPath (Join-Path $baseDir 'python.exe') -Force
+                Write-TestPyvenvConfig $Install @("home = $baseDir")
+            }
+        },
+        [pscustomobject]@{
+            Tag = 'non-file-derived-python'
+            Label = 'non-file home-derived python.exe'
+            Configure = {
+                param($Install)
+                $baseDir = Join-Path $Install.Root 'base-python'
+                $basePython = Join-Path $baseDir 'python.exe'
+                Remove-Item -LiteralPath $basePython -Force
+                New-Item -ItemType Directory -Path $basePython | Out-Null
+                Write-TestPyvenvConfig $Install @("home = $baseDir")
+            }
+        },
+        [pscustomobject]@{
+            Tag = 'explicit-python-outside-home'
+            Label = 'explicit python.exe outside canonical home'
+            Configure = {
+                param($Install)
+                $baseDir = Join-Path $Install.Root 'base-python'
+                $outsideDir = Join-Path $Install.Root 'outside-base-python'
+                New-Item -ItemType Directory -Path $outsideDir | Out-Null
+                $outsidePython = Join-Path $outsideDir 'python.exe'
+                Copy-Item -LiteralPath $fakeHermes -Destination $outsidePython
+                Write-TestPyvenvConfig $Install @("home = $baseDir", "executable = $outsidePython")
+            }
+        }
+    )
+    foreach ($invalidVenvCase in $invalidVenvCases) {
+        $invalidVenv = New-TestInstall $invalidVenvCase.Tag $fakeHermes
+        $invalidVenvHomes += $invalidVenv.Home
+        $configureInvalidVenv = $invalidVenvCase.Configure
+        & $configureInvalidVenv $invalidVenv
+        $invalidVenvLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $invalidVenv $invalidVenvLeaseId
+        $code = Invoke-TestHandoff $invalidVenv (New-PreflightJson $invalidVenv $true $true) 0 '' $invalidVenvLeaseId
+        Assert-InvalidPyvenvRecoveryRejected $invalidVenv $code $invalidVenvCase.Label
+    }
 
     $archive = New-TestInstall 'archive-build-identity' $fakeHermes
     $archiveLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
@@ -834,7 +934,8 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $foreign.Sentinel)) 'foreign lease is never followed by mutation'
     Assert-Equal $before ([System.IO.File]::ReadAllText($foreign.Lease)) 'foreign live lease is neither rewritten nor deleted'
 } finally {
-    foreach ($path in @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $leased.Home, $trampoline.Home, $invalidVenv.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $foreignRace.Home, $foreign.Home, $suiteRoot)) {
+    $cleanupPaths = @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $leased.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
+    foreach ($path in $cleanupPaths) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
         }
