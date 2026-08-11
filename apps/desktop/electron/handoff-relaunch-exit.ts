@@ -12,13 +12,18 @@ import path from 'node:path'
 import { TextDecoder } from 'node:util'
 
 import { type HandoffResult, readHandoffResult } from './handoff-result'
+import {
+  hasExactKeys,
+  hasHandoffCapabilitySyntax,
+  resolveCanonicalAbsolutePath,
+  sameCanonicalPath
+} from './handoff-wire-validation'
 import { queryWindowsProcessCreatedAt } from './windows-process-identity'
 
 export const HANDOFF_RELAUNCH_REQUEST_MAX_TTL_SECONDS = 120
 export const HANDOFF_RELAUNCH_REQUEST_CLOCK_SKEW_MS = 5 * 1_000
 export const HANDOFF_RELAUNCH_RESULT_PUBLICATION_GRACE_MS = 5 * 1_000
 
-const CAPABILITY_PATTERN = /^[A-Za-z0-9._-]{16,128}$/
 const REQUEST_PREFIX = '.hermes-update-relaunch-request-'
 const REQUEST_SUFFIX = '.json'
 const REQUEST_MAX_BYTES = 64 * 1024
@@ -176,44 +181,13 @@ export function handoffRelaunchExitAckPath(
 }
 
 function assertAttemptId(attemptId: string): void {
-  if (!CAPABILITY_PATTERN.test(attemptId)) {
+  if (!hasHandoffCapabilitySyntax(attemptId)) {
     throw new TypeError('invalid update attempt id')
   }
 }
 
 function isPositiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0
-}
-
-function exactKeys(value: unknown, expected: string[]): value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return false
-  }
-
-  const actual = Object.keys(value).sort()
-  const wanted = [...expected].sort()
-
-  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index])
-}
-
-function canonicalPath(candidate: unknown): string | null {
-  if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) {
-    return null
-  }
-
-  try {
-    return fs.realpathSync.native(candidate)
-  } catch {
-    return null
-  }
-}
-
-function pathIdentity(candidate: string): string {
-  return process.platform === 'win32' ? candidate.toLowerCase() : candidate
-}
-
-function sameCanonicalPath(left: string, right: string): boolean {
-  return pathIdentity(left) === pathIdentity(right)
 }
 
 function decodeRequest(raw: Buffer): unknown | null {
@@ -243,7 +217,7 @@ function parseRequest(
   currentExecutable: string,
   nowMs: number
 ): RequestReadResult {
-  if (!exactKeys(value, REQUEST_KEYS)) {
+  if (!hasExactKeys(value, REQUEST_KEYS)) {
     return { kind: 'blocked', reason: 'request-malformed' }
   }
 
@@ -251,7 +225,7 @@ function parseRequest(
     value.schema_version !== 1 ||
     typeof value.attempt_id !== 'string' ||
     value.attempt_id !== filenameAttemptId ||
-    !CAPABILITY_PATTERN.test(value.attempt_id) ||
+    !hasHandoffCapabilitySyntax(value.attempt_id) ||
     !isPositiveInteger(value.requested_at) ||
     !isPositiveInteger(value.expires_at)
   ) {
@@ -275,8 +249,8 @@ function parseRequest(
     return { kind: 'expired' }
   }
 
-  const root = canonicalPath(value.root)
-  const executable = canonicalPath(value.executable)
+  const root = resolveCanonicalAbsolutePath(value.root)
+  const executable = resolveCanonicalAbsolutePath(value.executable)
 
   if (
     !root ||
@@ -359,7 +333,7 @@ function requestDirectoryEntries(hermesHome: string): RequestDirectoryEntries | 
 function filenameAttemptId(name: string): string | null {
   const attemptId = name.slice(REQUEST_PREFIX.length, -REQUEST_SUFFIX.length)
 
-  return CAPABILITY_PATTERN.test(attemptId) ? attemptId : null
+  return hasHandoffCapabilitySyntax(attemptId) ? attemptId : null
 }
 
 function scanRequestNames(
@@ -425,8 +399,8 @@ export function hasHandoffRelaunchRequest(
   }
 
   const nowMs = now()
-  const root = canonicalPath(currentRoot)
-  const executable = canonicalPath(currentExecutable)
+  const root = resolveCanonicalAbsolutePath(currentRoot)
+  const executable = resolveCanonicalAbsolutePath(currentExecutable)
 
   if (!Number.isFinite(nowMs) || !root || !executable) {
     return true
@@ -466,7 +440,7 @@ function exactResultAuthorizes(
     return false
   }
 
-  const executable = canonicalPath(result.relaunch.executable)
+  const executable = resolveCanonicalAbsolutePath(result.relaunch.executable)
 
   return Boolean(executable && sameCanonicalPath(executable, currentExecutable))
 }
@@ -607,8 +581,8 @@ export async function inspectHandoffRelaunchExit(
     return { kind: 'blocked', reason: 'request-malformed' }
   }
 
-  const root = canonicalPath(currentRoot)
-  const executable = canonicalPath(currentExecutable)
+  const root = resolveCanonicalAbsolutePath(currentRoot)
+  const executable = resolveCanonicalAbsolutePath(currentExecutable)
 
   if (!root || !executable) {
     return { kind: 'blocked', reason: 'current-path-unverifiable' }
