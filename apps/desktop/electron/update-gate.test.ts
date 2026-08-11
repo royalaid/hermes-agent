@@ -11,7 +11,7 @@
 
 import assert from 'node:assert/strict'
 
-import { test } from 'vitest'
+import { afterEach, test, vi } from 'vitest'
 
 import {
   updateGateReason,
@@ -26,6 +26,10 @@ function deps(marker: boolean, inFlight: boolean) {
     isUpdateInFlight: () => inFlight
   }
 }
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 // ---------------------------------------------------------------------------
 // updateGateReason
@@ -70,7 +74,10 @@ test('one transaction gate covers normal update and bootstrap recovery handoffs'
     updateGateReason({ hasLiveMarker: () => false, isUpdateInFlight: transaction.isActive }),
     'update-in-flight'
   )
-  await assert.rejects(transaction.run(async () => 'normal-update'), /already in progress/)
+  await assert.rejects(
+    transaction.run(async () => 'normal-update'),
+    /already in progress/
+  )
 
   releaseRecovery()
   assert.equal(await recovery, 'recovery-complete')
@@ -122,8 +129,11 @@ test('primary and pool starts remain parked across recovery preflight into marke
       }
     )
 
-    if (kind === 'primary') {primarySpawned = true}
-    else {poolSpawned = true}
+    if (kind === 'primary') {
+      primarySpawned = true
+    } else {
+      poolSpawned = true
+    }
   }
 
   await Promise.all([waitForStart('primary'), waitForStart('pool'), recovery])
@@ -290,4 +300,28 @@ test('pool backend remains parked after an unreadable-marker timeout until the m
 
   assert.equal(outcome, 'finished')
   assert.deepEqual(blockedReasons, ['pool:marker'])
+})
+
+test('aborting an unbounded local clearance wait rejects promptly and clears its sleep timer', async () => {
+  vi.useFakeTimers()
+
+  const controller = new AbortController()
+
+  const wait = waitForLocalBackendClearance(deps(true, false), {
+    pollMs: 1_000,
+    signal: controller.signal,
+    timeoutMs: 20 * 60 * 1_000
+  })
+
+  await vi.advanceTimersByTimeAsync(0)
+  assert.equal(vi.getTimerCount(), 1)
+
+  controller.abort()
+
+  await assert.rejects(wait, error => {
+    assert.equal((error as Error).name, 'AbortError')
+
+    return true
+  })
+  assert.equal(vi.getTimerCount(), 0)
 })
