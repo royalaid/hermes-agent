@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
 
 import hermes_mcp_update_gate as gate
 from hermes_cli import (
@@ -70,6 +70,33 @@ def _bridge(pid: int = 41, *, owner: str = "codex", role: str = "mcp_bridge_work
     }
 
 
+def _process(pid: int = 51):
+    return {
+        "pid": pid,
+        "name": "python.exe",
+        "cmdline": "python.exe -m hermes_cli.main",
+        "owner": "unknown",
+        "role": "other",
+        "actionable": False,
+        "actionability": "hard_block",
+        "action": "refuse",
+    }
+
+
+def _gateway_process(pid: int = 61):
+    return {
+        "pid": pid,
+        "name": "python.exe",
+        "cmdline": "python.exe -m hermes_cli.main gateway run",
+        "created_at": 100.5 + pid,
+        "owner": "gateway",
+        "role": "gateway_run",
+        "actionable": False,
+        "actionability": "downstream_drainable",
+        "action": "pause_downstream",
+    }
+
+
 def _lease(root: Path):
     return {
         "schema_version": 1,
@@ -116,6 +143,40 @@ def test_schema_and_runtime_validator_pin_exact_17_key_contract(tmp_path: Path):
     drain = _payload(tmp_path, mode="drain")
     validator.validate(drain)
     assert update_cmd.validate_update_readiness(drain) is drain
+
+
+def test_schema_keeps_blockers_and_pausable_gateways_in_separate_arrays(
+    tmp_path: Path,
+):
+    schema_path = Path(update_cmd.__file__).with_name("update_readiness.schema.v1.json")
+    validator = Draft202012Validator(
+        json.loads(schema_path.read_text(encoding="utf-8"))
+    )
+
+    gateway_in_processes = _payload(
+        tmp_path, ready=False, reason="processes-running"
+    )
+    gateway_in_processes["processes"] = [_gateway_process()]
+    with pytest.raises(ValidationError):
+        validator.validate(gateway_in_processes)
+    with pytest.raises(ValueError):
+        update_cmd.validate_update_readiness(gateway_in_processes)
+
+    process_in_gateways = _payload(
+        tmp_path, ready=False, reason="processes-running"
+    )
+    process_in_gateways["pausable_gateways"] = 1
+    process_in_gateways["pausable_gateway_processes"] = [_process()]
+    with pytest.raises(ValidationError):
+        validator.validate(process_in_gateways)
+    with pytest.raises(ValueError):
+        update_cmd.validate_update_readiness(process_in_gateways)
+
+    valid_gateway = _payload(tmp_path)
+    valid_gateway["pausable_gateways"] = 1
+    valid_gateway["pausable_gateway_processes"] = [_gateway_process()]
+    validator.validate(valid_gateway)
+    assert update_cmd.validate_update_readiness(valid_gateway) is valid_gateway
 
 
 @pytest.mark.parametrize(
@@ -1154,6 +1215,62 @@ def test_hardened_git_commands_do_not_load_global_executable_filters(
 
     assert result.returncode == 0, result.stderr
     assert not sentinel.exists()
+
+
+def _successful_receipt(root: Path, *, mode: str) -> dict[str, object]:
+    git_mode = mode == "git"
+    return {
+        "schema_version": 1,
+        "invocation_id": "invocation-test-123456",
+        "lease_id": "lease-readiness-123456",
+        "mode": mode,
+        "root": os.path.normcase(os.path.realpath(root)),
+        "remote": "origin" if git_mode else None,
+        "branch": "main",
+        "target_ref": "refs/remotes/origin/main" if git_mode else None,
+        "target_sha": "a" * 40 if git_mode else None,
+        "resulting_head": "a" * 40 if git_mode else None,
+        "archive_sha": None if git_mode else "a" * 64,
+        "timestamp": 100,
+        "success": True,
+        "gateway_resume_deferred": False,
+        "health": {
+            "critical_syntax": True,
+            "critical_imports": True,
+            "dependencies": True,
+            "node_dependencies": True,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "invalid_length"),
+    [("git", 39), ("git", 41), ("archive", 63), ("archive", 65)],
+)
+def test_receipt_sha_lengths_are_exact_negative_boundaries(
+    tmp_path: Path,
+    mode: str,
+    invalid_length: int,
+):
+    receipt = _successful_receipt(tmp_path, mode=mode)
+    if mode == "git":
+        receipt["target_sha"] = "a" * invalid_length
+        receipt["resulting_head"] = "a" * invalid_length
+    else:
+        receipt["archive_sha"] = "a" * invalid_length
+
+    assert update_receipt._sanitize_update_receipt(receipt, tmp_path) is None
+
+    payload = _payload(tmp_path)
+    payload["last_update_receipt"] = receipt
+    schema_path = Path(update_cmd.__file__).with_name("update_readiness.schema.v1.json")
+    validator = Draft202012Validator(
+        json.loads(schema_path.read_text(encoding="utf-8"))
+    )
+    with pytest.raises(ValidationError):
+        validator.validate(payload)
+    with pytest.raises(ValueError):
+        update_cmd.validate_update_readiness(payload)
 
 
 def test_receipt_is_profile_global_and_requires_current_live_lease(
