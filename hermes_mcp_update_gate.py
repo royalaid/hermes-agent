@@ -660,7 +660,12 @@ def _pending_lease_recovery(path: Path, *, now: float) -> bool:
     return pending
 
 
-def _write_unpublished_exclusive(path: Path, raw: str) -> None:
+def _write_unpublished_exclusive(
+    path: Path,
+    raw: str,
+    *,
+    short_write_message: str = "short write while claiming bridge lease",
+) -> None:
     """Write and fsync a unique path that no lease reader enumerates."""
     descriptor = None
     try:
@@ -674,7 +679,7 @@ def _write_unpublished_exclusive(path: Path, raw: str) -> None:
         while offset < len(encoded):
             written = os.write(descriptor, encoded[offset:])
             if written <= 0:
-                raise OSError("short write while claiming bridge lease")
+                raise OSError(short_write_message)
             offset += written
         os.fsync(descriptor)
     finally:
@@ -682,11 +687,21 @@ def _write_unpublished_exclusive(path: Path, raw: str) -> None:
             os.close(descriptor)
 
 
-def _write_exclusive(path: Path, raw: str) -> None:
-    """Atomically publish complete bytes without overwriting existing state."""
-    temporary = path.parent / f".hermes-lease-pending-{secrets.token_hex(16)}"
-    _write_unpublished_exclusive(temporary, raw)
+def _publish_exclusive_atomic(
+    path: Path,
+    raw: str,
+    *,
+    temporary_prefix: str = ".hermes-lease-pending-",
+    short_write_message: str = "short write while claiming bridge lease",
+) -> None:
+    """Atomically publish complete private bytes without overwriting state."""
+    temporary = path.parent / f"{temporary_prefix}{secrets.token_hex(16)}"
     try:
+        _write_unpublished_exclusive(
+            temporary,
+            raw,
+            short_write_message=short_write_message,
+        )
         os.link(temporary, path)
     finally:
         try:
@@ -695,9 +710,9 @@ def _write_exclusive(path: Path, raw: str) -> None:
             pass
 
 
-def _publish_exclusive_atomic(path: Path, raw: str) -> None:
-    """Compatibility name for atomic exclusive publication."""
-    _write_exclusive(path, raw)
+def _write_exclusive(path: Path, raw: str) -> None:
+    """Lease-specific compatibility wrapper for exclusive publication."""
+    _publish_exclusive_atomic(path, raw)
 
 
 def _restore_lease_tombstone(tombstone: Path, path: Path) -> bool:

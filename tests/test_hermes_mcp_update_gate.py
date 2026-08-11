@@ -376,8 +376,8 @@ def test_renewal_temp_write_never_exposes_partial_recovery_artifact(
     release = threading.Event()
     original = gate._write_unpublished_exclusive
 
-    def pause_after_temp(path: Path, raw: str) -> None:
-        original(path, raw)
+    def pause_after_temp(path: Path, raw: str, **kwargs) -> None:
+        original(path, raw, **kwargs)
         if path.name.startswith(".hermes-lease-pending-") and not wrote_temp.is_set():
             wrote_temp.set()
             assert release.wait(timeout=5)
@@ -413,6 +413,38 @@ def test_renewal_temp_write_never_exposes_partial_recovery_artifact(
         thread.join(timeout=5)
 
     assert len(result) == 1 and isinstance(result[0], dict)
+
+
+def test_custom_atomic_publication_cleans_failed_temporary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target = tmp_path / "gateway-plan.json"
+    observed: list[tuple[Path, str]] = []
+
+    def fail_after_create(
+        path: Path,
+        _raw: str,
+        *,
+        short_write_message: str,
+    ) -> None:
+        path.touch()
+        observed.append((path, short_write_message))
+        raise OSError(short_write_message)
+
+    monkeypatch.setattr(gate, "_write_unpublished_exclusive", fail_after_create)
+
+    with pytest.raises(OSError, match="short write while publishing gateway resume plan"):
+        gate._publish_exclusive_atomic(
+            target,
+            "payload",
+            temporary_prefix=".hermes-gateway-plan-",
+            short_write_message="short write while publishing gateway resume plan",
+        )
+
+    assert len(observed) == 1
+    assert observed[0][0].name.startswith(".hermes-gateway-plan-")
+    assert not target.exists()
+    assert not list(tmp_path.glob(".hermes-gateway-plan-*"))
 
 
 def test_clear_cas_preserves_foreign_replacement(tmp_path: Path, monkeypatch) -> None:

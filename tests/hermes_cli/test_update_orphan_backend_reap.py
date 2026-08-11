@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hermes_cli import main as cli_main
+from hermes_cli.update_transaction import _UpdateTransaction
 
 
 class _FakeNoSuchProcess(Exception):
@@ -309,7 +310,11 @@ def _run_guard(detect_side_effect, orphan_return):
         "time.sleep"
     ):
         try:
-            cli_main._cmd_update_impl(_update_args(), gateway_mode=False)
+            cli_main._cmd_update_impl(
+                _update_args(),
+                gateway_mode=False,
+                transaction=_UpdateTransaction(),
+            )
         except _PastGuard:
             return "past_guard", killed
         except SystemExit as exc:

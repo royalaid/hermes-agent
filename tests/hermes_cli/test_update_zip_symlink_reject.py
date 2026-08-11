@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 import pytest
 
+from hermes_cli.update_transaction import _UpdateTransaction
+
 
 def _build_zip_with_symlink_member(zip_path: str, link_name: str, target: str) -> None:
     """Write a ZIP containing a single member with S_IFLNK mode bits set."""
@@ -68,7 +70,7 @@ def test_update_via_zip_rejects_symlink_member(tmp_path, monkeypatch):
         # That's the contract: a malicious ZIP must fail the update, not
         # silently materialize a symlink.
         with pytest.raises(SystemExit) as exc_info:
-            _update_via_zip(args)
+            _update_via_zip(args, transaction=_UpdateTransaction())
         assert exc_info.value.code == 1
 
     # Belt: confirm extractall never produced the link.
@@ -118,7 +120,9 @@ def test_update_via_zip_accepts_normal_member(tmp_path, monkeypatch, capsys):
          patch("subprocess.check_call"):
         fake_run.return_value = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         try:
-            hermes_main._update_via_zip(args)
+                hermes_main._update_via_zip(
+                    args, transaction=_UpdateTransaction()
+                )
         except SystemExit:
             pass
 

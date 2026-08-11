@@ -17,6 +17,7 @@ from hermes_cli.update_readiness import (
     _readiness_payload,
 )
 from hermes_cli.update_receipt import _IDENTIFIER_RE, _load_update_receipt
+from hermes_cli.update_transaction import _UpdateTransaction
 
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,13 @@ def _drain_under_update_lease(
 
 
 def _cmd_update_drain(args, *, root: Path) -> NoReturn:
+    """Create a bounded standalone pause, never a later update handoff.
+
+    A successful command intentionally leaves its owner-bound lease active
+    only for the dead-owner handoff grace.  The public response omits the raw
+    capability, so an independent update must refuse until that grace expires
+    instead of claiming an unauthenticated transition is race-free.
+    """
     if not bool(getattr(args, "yes", False)):
         payload = _readiness_payload(
             mode="drain",
@@ -651,7 +659,12 @@ class _WindowsMutationJob:
         self._close_handle(handle)
 
 
-def _prepare_atomic_windows_update(args, *, root: Path) -> tuple[dict, str]:
+def _prepare_atomic_windows_update(
+    args,
+    *,
+    root: Path,
+    transaction: _UpdateTransaction,
+) -> None:
     """Acquire consent+lease, then drain before any update mutation occurs."""
     handoff_id = getattr(args, "bridge_lease_id", None)
     handoff_owner_pid: int | None = None
@@ -749,10 +762,9 @@ def _prepare_atomic_windows_update(args, *, root: Path) -> tuple[dict, str]:
         ):
             raise RuntimeError("invalid update invocation identity")
         invocation_id = requested_invocation or secrets.token_urlsafe(24)
-        setattr(args, "_update_quiesce_lease", lease)
-        setattr(args, "_update_invocation_id", invocation_id)
-        setattr(args, "_update_handoff_owner_pid", handoff_owner_pid)
-        return lease, invocation_id
+        transaction.lease = lease
+        transaction.invocation_id = invocation_id
+        transaction.handoff_owner_pid = handoff_owner_pid
     except BaseException:
         _return_or_release_on_failure(lease)
         raise
