@@ -4192,6 +4192,10 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
             desktop_build_ok=desktop_build_ok,
             pre_update_version=pre_update_version,
         )
+        # _print_update_summary already explains the mixed dashboard/TUI state
+        # for node_failures; a partial update must still exit non-zero and
+        # write no success receipt.
+        _m().sys.exit(1)
     elif not all(
         value is True
         for value in (syntax_ok, import_ok, dependencies_ok, node_dependencies_ok)
@@ -4200,6 +4204,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
             "⚠ Update did not pass the final runtime health proof; "
             "no success receipt was written."
         )
+        _m().sys.exit(1)
     else:
         print()
         _record_update_success(
@@ -9757,7 +9762,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "⚠ Update did not pass the final runtime health proof; "
                     "no success receipt was written."
                 )
-                return
+                sys.exit(1)
 
             resulting_head = installed_target_head
             if resulting_head is None or target_sha != resulting_head:
@@ -9765,6 +9770,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "⚠ Installed Git identity could not be proven; "
                     "no success receipt was written."
                 )
+                sys.exit(1)
             else:
                 _record_update_success(
                     args,
@@ -10670,6 +10676,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 desktop_build_ok=desktop_build_ok,
                 pre_update_version=pre_update_version,
             )
+            # _print_update_summary already explains the mixed dashboard/TUI
+            # state for node_failures; a partial update must still exit
+            # non-zero and write no success receipt.
+            sys.exit(1)
         elif not all(
             value is True
             for value in (syntax_ok, import_ok, dependencies_ok, node_dependencies_ok)
@@ -10679,6 +10689,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 "⚠ Update did not pass the final runtime health proof; "
                 "no success receipt was written."
             )
+            sys.exit(1)
         else:
             print()
             if not import_ok or not dependencies_ok:
@@ -10686,6 +10697,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "⚠ Update did not pass the final runtime health proof; "
                     "no success receipt was written."
                 )
+                sys.exit(1)
             else:
                 resulting_head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
                 if resulting_head is None or target_sha != resulting_head:
