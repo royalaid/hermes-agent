@@ -191,6 +191,11 @@ export async function runHandoffResultLifecycle(
 
   if (result.state !== 'pending') {return consumeTerminal(0)}
 
+  // Do not start the pending terminal wait with an identity that can never
+  // authenticate this Desktop generation. Returning null gives the outer
+  // lifecycle retry a chance to repeat an inconclusive OS creation-time probe.
+  if (!isPositiveExactTimestamp(currentProcessStartedAt)) {return null}
+
   // Start the terminal watcher immediately. It catches updater failure/timeout
   // while Electron is still proving its backend, instead of serially adding
   // two independent deadline windows.
