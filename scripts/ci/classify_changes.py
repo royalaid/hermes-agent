@@ -113,6 +113,7 @@ _INSTALLER_FILES = {
     "apps/desktop/electron/updater-process.test.ts",
     "apps/desktop/electron/updater-process.ts",
     "apps/desktop/electron/windows-child-options.ts",
+    "apps/desktop/electron/windows-process-identity.test.ts",
     "apps/desktop/electron/windows-process-identity.ts",
     "scripts/desktop-update.ps1",
     "scripts/install.cmd",
