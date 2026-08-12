@@ -55,6 +55,73 @@ def test_gate_accepts_live_owner_for_the_canonical_target_root(tmp_path: Path) -
     assert active["lease_id"] == "lease-test-123456"
 
 
+@pytest.mark.parametrize("now", [50.0, 300.0])
+def test_exact_live_owner_survives_wall_clock_steps(
+    tmp_path: Path, now: float
+) -> None:
+    root = tmp_path / "install"
+    root.mkdir()
+    marker = tmp_path / ".hermes-venv-quiesce"
+    marker.write_text(json.dumps(_lease(root)), encoding="utf-8")
+
+    active = gate.live_quiesce_lease(
+        marker,
+        install_root=root,
+        now=now,
+        pid_alive=lambda pid: pid == 42,
+        pid_create_time=lambda pid: 99.0 if pid == 42 else None,
+    )
+
+    assert active is not None
+    assert active["lease_id"] == "lease-test-123456"
+
+
+@pytest.mark.parametrize(
+    ("now", "pid_alive", "pid_create_time"),
+    [
+        (300.0, lambda _pid: False, lambda _pid: None),
+        (50.0, lambda _pid: True, lambda _pid: 101.0),
+    ],
+    ids=["dead-owner-after-forward-step", "reused-owner-after-backward-step"],
+)
+def test_wall_clock_steps_do_not_extend_dead_or_reused_owner_lease(
+    tmp_path: Path,
+    now: float,
+    pid_alive,
+    pid_create_time,
+) -> None:
+    root = tmp_path / "install"
+    root.mkdir()
+    marker = tmp_path / ".hermes-venv-quiesce"
+    marker.write_text(json.dumps(_lease(root)), encoding="utf-8")
+
+    assert gate.live_quiesce_lease(
+        marker,
+        install_root=root,
+        now=now,
+        pid_alive=pid_alive,
+        pid_create_time=pid_create_time,
+    ) is None
+
+
+def test_expired_emergency_shadow_still_has_a_hard_wall_clock_bound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "install"
+    root.mkdir()
+    marker = tmp_path / ".hermes-venv-quiesce"
+    shadow = tmp_path / f"{marker.name}.cas-emergency-test"
+    shadow.write_text(json.dumps(_lease(root)), encoding="utf-8")
+
+    assert gate.live_quiesce_lease(
+        marker,
+        install_root=root,
+        now=300.0,
+        pid_alive=lambda pid: pid == 42,
+        pid_create_time=lambda pid: 99.0 if pid == 42 else None,
+    ) is None
+
+
 def test_gate_rejects_a_valid_lease_for_another_install(tmp_path: Path) -> None:
     root = tmp_path / "install"
     other = tmp_path / "other"
@@ -150,6 +217,25 @@ def test_legacy_marker_is_accepted_only_for_default_install_root(tmp_path: Path)
         now=110.0,
         pid_alive=lambda _pid: True,
     ) is None
+
+
+@pytest.mark.parametrize("now", [50.0, 1400.0])
+def test_legacy_exact_live_owner_survives_wall_clock_steps(
+    tmp_path: Path, now: float
+) -> None:
+    home = tmp_path / ".hermes"
+    root = home / "hermes-agent"
+    root.mkdir(parents=True)
+    marker = home / ".hermes-venv-quiesce"
+    marker.write_text("42\n100\n", encoding="utf-8")
+
+    assert gate.live_quiesce_lease(
+        marker,
+        install_root=root,
+        now=now,
+        pid_alive=lambda pid: pid == 42,
+        pid_create_time=lambda pid: 99.0 if pid == 42 else None,
+    ) is not None
 
 
 def test_clear_requires_matching_lease_and_current_owner(tmp_path: Path) -> None:
@@ -773,3 +859,32 @@ def test_expired_emergency_shadow_does_not_wedge_retry_for_twenty_minutes(
 
     assert not shadow.exists()
     assert lease["owner_pid"] == os.getpid()
+
+
+@pytest.mark.parametrize(
+    ("pid_alive", "pid_create_time", "expected_pending"),
+    [
+        (lambda _pid: True, lambda _pid: 99.0, True),
+        (lambda _pid: False, lambda _pid: None, False),
+        (lambda _pid: True, lambda _pid: 101.0, False),
+    ],
+    ids=["exact-live-owner", "dead-owner", "reused-owner"],
+)
+def test_expired_recovery_cleanup_checks_exact_owner_before_wall_clock(
+    tmp_path: Path,
+    monkeypatch,
+    pid_alive,
+    pid_create_time,
+    expected_pending: bool,
+) -> None:
+    root = tmp_path / "install"
+    root.mkdir()
+    marker = tmp_path / gate.MARKER_NAME
+    shadow = tmp_path / f"{gate.MARKER_NAME}.cas-shadow-test"
+    shadow.write_text(json.dumps(_lease(root)), encoding="utf-8")
+    os.utime(shadow, (100.0, 100.0))
+    monkeypatch.setattr(gate, "_pid_alive", pid_alive)
+    monkeypatch.setattr(gate, "_pid_create_time", pid_create_time)
+
+    assert gate._pending_lease_recovery(marker, now=1400.0) is expected_pending
+    assert shadow.exists() is expected_pending
