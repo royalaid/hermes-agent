@@ -96,7 +96,6 @@ export type McpBridgeQuiesceRevocationResult = 'revoked' | 'unproven'
 
 export type StagedMcpBridgeLeaseHandoff =
   | { kind: 'adopted'; lease: McpBridgeQuiesceLease }
-  | { kind: 'legacy-transfer'; lease: McpBridgeQuiesceLease }
   | { kind: 'failed' }
 
 interface LegacyLease {
@@ -1053,51 +1052,9 @@ export async function handOffMcpBridgeLeaseToStagedUpdater(
       return { kind: 'adopted', lease: bindLeaseGeneration(current, currentSnapshot.raw) }
     }
 
-    if (currentSnapshot.raw.equals(expectedRaw)) {
-      if (!(await verifyRequiredOwnerGeneration(deps))) {
-        return { kind: 'failed' }
-      }
-
-      const transferred = transferMcpBridgeQuiesceLease(hermesHome, expected, updaterPid, {
-        isPidAlive: deps.isPidAlive,
-        now: deps.now,
-        getProcessCreatedAt: () => processCreatedAt
-      })
-
-      if (transferred) {
-        const transferredRaw = leaseGeneration(transferred)
-        const postTransferGenerationMatches = await verifyRequiredOwnerGeneration(deps)
-        const postTransferOwner = readUpdateOwnerClaim(deps.readUpdateOwner)
-        const postTransferCreatedAt = await resolveProcessCreatedAt(updaterPid, deps)
-
-        if (
-          transferredRaw &&
-          postTransferGenerationMatches &&
-          postTransferOwner?.pid === updaterPid &&
-          postTransferCreatedAt === deps.requiredOwnerStartedAt &&
-          resolvedPidIdentity(updaterPid, transferred.createdAt, postTransferCreatedAt, deps) ===
-            'matching' &&
-          resolvedPidIdentity(
-            updaterPid,
-            postTransferOwner.startedAt,
-            postTransferCreatedAt,
-            deps
-          ) === 'matching'
-        ) {
-          return { kind: 'legacy-transfer', lease: transferred }
-        }
-
-        // The native PID-generation observation used before the CAS is only a
-        // point-in-time proof. If the child exits or its PID is reused while
-        // the exact-byte replacement runs, restore only the generation we
-        // replaced. A racing foreign writer wins and remains fail-closed.
-        if (transferredRaw) {
-          replaceMarkerIfExact(marker, transferredRaw, expectedRaw)
-        }
-
-        return { kind: 'failed' }
-      }
-    } else {
+    // The staged updater must publish its own exact lease adoption. Its update
+    // marker proves process identity, not possession of the one-shot lease.
+    if (!currentSnapshot.raw.equals(expectedRaw)) {
       return { kind: 'failed' }
     }
 
