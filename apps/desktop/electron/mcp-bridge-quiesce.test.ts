@@ -773,7 +773,7 @@ describe('MCP bridge quiesce lease', () => {
     }
   })
 
-  it('brackets the legacy PID transfer with exact staged process-generation probes', async () => {
+  it('refuses marker-only staged ownership and leaves the lease with Desktop', async () => {
     const { home, root } = sandbox()
 
     try {
@@ -785,22 +785,16 @@ describe('MCP bridge quiesce lease', () => {
 
       assert.ok(lease)
       let nowMs = 0
-      let updateOwnerClaim: { pid: number; startedAt: number } | null = null
-      let processStartQueries = 0
       let generationChecks = 0
 
       const handoff = await handOffMcpBridgeLeaseToStagedUpdater(home, lease, 555, {
-        getProcessCreatedAt: () => {
-          processStartQueries += 1
-
-          return 99_999
-        },
+        getProcessCreatedAt: () => 99_999,
         handoffTimeoutMs: 100,
         isPidAlive: pid => pid === 555,
         now: () => 100_000,
         nowMs: () => nowMs,
-        pollMs: 10,
-        readUpdateOwner: () => updateOwnerClaim,
+        pollMs: 250,
+        readUpdateOwner: () => updateOwner(555),
         requiredOwnerStartedAt: 99_999,
         verifyRequiredOwnerGeneration: () => {
           generationChecks += 1
@@ -809,31 +803,20 @@ describe('MCP bridge quiesce lease', () => {
         },
         wait: async delay => {
           nowMs += delay
-
-          if (nowMs === 20) {
-            updateOwnerClaim = updateOwner(555)
-          }
         }
       })
 
-      assert.equal(handoff.kind, 'legacy-transfer')
-
-      if (handoff.kind === 'legacy-transfer') {
-        assert.equal(handoff.lease.ownerPid, 555)
-      }
-
-      assert.equal(nowMs, 20)
-      assert.equal(processStartQueries, 2)
-      assert.equal(generationChecks, 2)
+      assert.equal(handoff.kind, 'failed')
+      assert.equal(readMcpBridgeQuiesceLease(home)?.ownerPid, 321)
+      assert.ok(nowMs >= 1_000)
+      assert.equal(generationChecks, 0)
     } finally {
       cleanupSandbox(home)
     }
   })
 
-  it('rolls back a legacy transfer when the staged PID generation changes during the CAS', async () => {
+  it('waits for the staged updater to adopt the exact lease before succeeding', async () => {
     const { home, root } = sandbox()
-    const marker = mcpBridgeQuiesceMarkerPath(home)
-    const originalRename = fs.renameSync
 
     try {
       const lease = acquireMcpBridgeQuiesceLease(home, root, {
@@ -843,48 +826,88 @@ describe('MCP bridge quiesce lease', () => {
       })
 
       assert.ok(lease)
-      let generationChanged = false
-      let processStartQueries = 0
+      let nowMs = 0
       let generationChecks = 0
 
-      fs.renameSync = ((source, destination) => {
-        if (
-          !generationChanged &&
-          source === marker &&
-          String(destination).includes('.cas-previous-')
-        ) {
-          generationChanged = true
-        }
-
-        return originalRename(source, destination)
-      }) as typeof fs.renameSync
-
       const handoff = await handOffMcpBridgeLeaseToStagedUpdater(home, lease, 555, {
-        getProcessCreatedAt: () => {
-          processStartQueries += 1
-
-          return generationChanged ? 100_001 : 99_999
-        },
+        getProcessCreatedAt: () => 99_999,
+        handoffTimeoutMs: 100,
         isPidAlive: pid => pid === 555,
         now: () => 100_000,
-        nowMs: () => 0,
+        nowMs: () => nowMs,
+        pollMs: 100,
         readUpdateOwner: () => updateOwner(555),
         requiredOwnerStartedAt: 99_999,
         verifyRequiredOwnerGeneration: () => {
           generationChecks += 1
 
-          return !generationChanged
+          return true
         },
-        wait: async () => {}
+        wait: async delay => {
+          nowMs += delay
+
+          if (nowMs === 200) {
+            writeLeaseRecord(home, { ...lease, ownerPid: 555 })
+          }
+        }
+      })
+
+      assert.equal(handoff.kind, 'adopted')
+
+      if (handoff.kind === 'adopted') {
+        assert.equal(handoff.lease.ownerPid, 555)
+      }
+
+      assert.equal(nowMs, 200)
+      assert.equal(generationChecks, 1)
+    } finally {
+      cleanupSandbox(home)
+    }
+  })
+
+  it('keeps the Desktop lease when the staged PID generation changes before adoption', async () => {
+    const { home, root } = sandbox()
+
+    try {
+      const lease = acquireMcpBridgeQuiesceLease(home, root, {
+        now: () => 100_000,
+        ownerPid: 321,
+        randomId: () => 'lease-a-unguessable'
+      })
+
+      assert.ok(lease)
+      let nowMs = 0
+      let processStartQueries = 0
+      let generationChecks = 0
+
+      const handoff = await handOffMcpBridgeLeaseToStagedUpdater(home, lease, 555, {
+        getProcessCreatedAt: () => {
+          processStartQueries += 1
+
+          return processStartQueries === 1 ? 99_999 : 100_001
+        },
+        isPidAlive: pid => pid === 555,
+        now: () => 100_000,
+        nowMs: () => nowMs,
+        pollMs: 10,
+        readUpdateOwner: () => updateOwner(555),
+        requiredOwnerStartedAt: 99_999,
+        verifyRequiredOwnerGeneration: () => {
+          generationChecks += 1
+
+          return true
+        },
+        wait: async delay => {
+          nowMs += delay
+        }
       })
 
       assert.equal(handoff.kind, 'failed')
       assert.equal(processStartQueries, 2)
-      assert.equal(generationChecks, 2)
+      assert.equal(generationChecks, 0)
       assert.equal(readMcpBridgeQuiesceLease(home)?.ownerPid, 321)
       assert.deepEqual(markerCasArtifacts(home), [])
     } finally {
-      fs.renameSync = originalRename
       cleanupSandbox(home)
     }
   })
