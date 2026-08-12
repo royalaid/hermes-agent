@@ -95,12 +95,7 @@ function resolveUpdateRemote({ branchRemote, branchRemoteUrl, originUrl }) {
 
 /** Refresh the exact tracking ref read by the subsequent update comparison. */
 function updateBranchFetchArgs(remote: string, branch: string): string[] {
-  return [
-    'fetch',
-    '--quiet',
-    remote,
-    `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`
-  ]
+  return ['fetch', '--quiet', remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`]
 }
 
 export {
