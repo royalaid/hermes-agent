@@ -413,9 +413,7 @@ class TestCmdUpdateBranchFallback:
         from hermes_cli.update_cmd import _git_cmd
 
         expected_git_cmd = _git_cmd()
-        sync_mock.assert_called_once_with(
-            expected_git_cmd, PROJECT_ROOT, fork_remote="origin"
-        )
+        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -1153,19 +1151,47 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_uses_configured_tracking_remote(
+    def test_check_default_main_prefers_upstream(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch uses the branch's configured tracking remote."""
+        """No --branch retains the existing upstream-first main policy."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
         args = SimpleNamespace(check=True, branch=None)
 
-        cmd_update(args)
+        with patch("hermes_cli.update_cmd._has_upstream_remote", return_value=True):
+            cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Fetch and compare must use the same configured origin tracking ref.
+        assert any(
+            "fetch" in c
+            and "upstream" in c
+            and "+refs/heads/main:refs/remotes/upstream/main" in c
+            for c in commands
+        ), commands
+        assert not any("fetch" in c and "origin" in c for c in commands), commands
+        rev_list_cmds = [c for c in commands if "rev-list" in c]
+        assert any("refs/remotes/upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
+    def test_check_default_main_falls_back_to_origin(
+        self, mock_run, _mock_method, capsys
+    ):
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="main",
+            verify_ok=True,
+            commit_count="0",
+            upstream_fetch_ok=False,
+        )
+        args = SimpleNamespace(check=True, branch=None)
+
+        with patch("hermes_cli.update_cmd._has_upstream_remote", return_value=True):
+            cmd_update(args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert any("fetch" in c and "upstream" in c for c in commands), commands
         assert any(
             "fetch" in c
             and "origin" in c
