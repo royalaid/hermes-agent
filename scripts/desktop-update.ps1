@@ -220,6 +220,7 @@ $script:BridgeLeaseNextRefreshAt = [DateTime]::MinValue
 $script:BridgeLeaseTransferredPid = 0
 $script:HandoffStartedAt = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $script:VerifiedUpdateReceipt = $null
+$script:ReceiptVerifiedAt = 0L
 $script:UpdateMarkerOwned = $false
 $script:UpdateMarkerStartedAt = 0
 $script:RelaunchRequired = -not [string]::IsNullOrWhiteSpace($RelaunchExe)
@@ -823,13 +824,27 @@ function Claim-UpdateMarkerAtomically {
             return $true
         }
         $snapshot = Read-UpdateMarkerSnapshot
-        if (-not $snapshot) { return $false }
-        if ($snapshot.Parsed -and $snapshot.Pid -gt 0 -and $snapshot.Pid -ne $PID -and
-            $snapshot.StartedAt -gt 0 -and
-            (Get-ProcessClaimState $snapshot.Pid $snapshot.StartedAt) -ne 'dead-or-reused') {
-            # A live PID is authoritative regardless of marker age. Long
-            # updates must not become stealable solely because they crossed a
-            # dead-marker pruning ceiling.
+        if (-not $snapshot -or -not $snapshot.Parsed -or
+            $snapshot.Pid -le 0 -or $snapshot.Pid -gt [int]::MaxValue -or
+            $snapshot.StartedAt -le 0 -or $snapshot.StartedAt -gt ($now + 5)) {
+            # Readable partial/malformed/future bytes are still an unknown
+            # owner. Never turn parse failure into permission to overwrite.
+            return $false
+        }
+        $ownerState = Get-ProcessClaimState $snapshot.Pid $snapshot.StartedAt
+        if ($snapshot.Pid -eq $PID) {
+            if ($ownerState -ne 'live') { return $false }
+            # A valid preclaim by this exact PowerShell process is already the
+            # authoritative marker. Adopt its original timestamp and bytes so
+            # cleanup proves the same claim; do not rewrite it.
+            $script:UpdateMarkerStartedAt = [int64]$snapshot.StartedAt
+            $script:UpdateMarkerOwned = $true
+            return $true
+        }
+        if ($ownerState -ne 'dead-or-reused') {
+            # A live or unreadable foreign PID is authoritative regardless of
+            # marker age. Long updates must not become stealable solely
+            # because they crossed a dead-marker pruning ceiling.
             return $false
         }
         Publish-HandoffFileNoGap $MarkerPath $snapshot.Raw $newRaw 'update marker'
@@ -905,6 +920,16 @@ function New-HandoffResultJson(
     $complete = $State -eq 'complete'
     $relaunchState = if ($complete) { 'acknowledged' } elseif ($script:RelaunchStarted) { 'failed' } else { 'failed' }
     if ($State -eq 'pending') { $relaunchState = 'pending' }
+    $requestedAt = if ($script:RelaunchStarted) {
+        [int64]$script:RelaunchRequestedAt
+    } elseif ($hasReceipt -and $script:ReceiptVerifiedAt -gt 0) {
+        [int64]$script:ReceiptVerifiedAt
+    } else {
+        [int64]$script:HandoffStartedAt
+    }
+    $finishedAt = if ($State -eq 'pending') { $null } else {
+        [int64][Math]::Max((Get-UnixTimeSeconds), $requestedAt)
+    }
     $obj = [ordered]@{
         schema_version = 2
         attempt_id = $script:AttemptId
@@ -930,7 +955,7 @@ function New-HandoffResultJson(
             # Strict v2 failed results still carry a positive attempt baseline
             # even when relaunch never started. The PID/start/executable triple
             # remains all-null in that pre-spawn state.
-            requested_at = if ($script:RelaunchStarted) { [int64]$script:RelaunchRequestedAt } else { [int64]$script:HandoffStartedAt }
+            requested_at = $requestedAt
             acknowledged_at = if ($complete) { [int64]$DesktopProof.acknowledged_at } else { $null }
         }
         desktop = [ordered]@{
@@ -940,7 +965,7 @@ function New-HandoffResultJson(
             backend_ready = [bool]($DesktopProof -and $DesktopProof.backend_ready -eq $true)
             backend_mode = if ($DesktopProof) { [string]$DesktopProof.backend_mode } else { $null }
         }
-        finished_at = if ($State -eq 'pending') { $null } else { Get-UnixTimeSeconds }
+        finished_at = $finishedAt
     }
     return $obj | ConvertTo-Json -Compress -Depth 12
 }
@@ -2190,7 +2215,7 @@ function Read-UpdatePreflightPayload([object]$Result) {
     }
 }
 
-function Test-VerifiedUpdateReceipt([object]$Receipt, [int64]$NotBefore) {
+function Test-VerifiedUpdateReceipt([object]$Receipt) {
     try {
         if ($Receipt -isnot [pscustomobject]) { return $false }
         $expected = @(
@@ -2227,7 +2252,7 @@ function Test-VerifiedUpdateReceipt([object]$Receipt, [int64]$NotBefore) {
             return $false
         }
         if ($Receipt.branch -isnot [string] -or $Receipt.branch -ne $Branch) { return $false }
-        if (-not (Test-JsonInteger $Receipt.timestamp) -or [int64]$Receipt.timestamp -lt $NotBefore) {
+        if (-not (Test-JsonInteger $Receipt.timestamp) -or [int64]$Receipt.timestamp -le 0) {
             return $false
         }
         if ($Receipt.success -isnot [bool] -or $Receipt.success -ne $true) { return $false }
@@ -2439,12 +2464,16 @@ try {
                 $candidateReceipt = $receiptRaw | ConvertFrom-Json -ErrorAction Stop
             }
         } catch {}
-        if (-not (Test-VerifiedUpdateReceipt $candidateReceipt $script:HandoffStartedAt)) {
+        if (-not (Test-VerifiedUpdateReceipt $candidateReceipt)) {
             $res.Code = 9
             $res.Output += "`nHermes did not produce a matching healthy update receipt."
             Write-HandoffLog 'update receipt verification failed; refusing to report success'
         } else {
             $script:VerifiedUpdateReceipt = $candidateReceipt
+            $script:ReceiptVerifiedAt = [int64][Math]::Max(
+                (Get-UnixTimeSeconds),
+                [int64]$candidateReceipt.timestamp
+            )
             Write-HandoffLog 'private update receipt verified'
         }
     }
