@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
 $handoffScript = Join-Path $repoRoot 'scripts\desktop-update.ps1'
 $leaseFixture = Join-Path $repoRoot 'scripts\tests\fixtures\desktop-update-bridge-lease.json'
+$receiptFailureFixture = Join-Path $repoRoot 'scripts\tests\fixtures\desktop-update-receipt-failure.json'
 $powershellExe = (Get-Process -Id $PID).Path
 $failures = 0
 
@@ -115,7 +116,7 @@ public static class FakeHermes {
         Console.WriteLine(frame);
         Console.Out.Flush();
         if (mode == "resume-duplicate-frame") Console.WriteLine(frame);
-        if (mode == "resume-fail") {
+        if (mode == "resume-fail" || mode == "receipt-clock-rollback-resume-fail") {
             if (parentPid > 0 && File.Exists(leasePath)) {
                 var returned = Regex.Replace(File.ReadAllText(leasePath), "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + parentPid);
                 ReplaceLease(leasePath, returned, "resume-return");
@@ -150,6 +151,10 @@ public static class FakeHermes {
             if (!String.IsNullOrEmpty(preflightLeasePath) && !String.IsNullOrEmpty(capture) &&
                 File.Exists(preflightLeasePath) && !File.Exists(capture)) File.Copy(preflightLeasePath, capture, true);
             var home = String.IsNullOrEmpty(preflightLeasePath) ? null : Path.GetDirectoryName(preflightLeasePath);
+            var markerCapture = Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_MARKER_CAPTURE");
+            var marker = String.IsNullOrEmpty(home) ? null : Path.Combine(home, ".hermes-update-in-progress");
+            if (!String.IsNullOrEmpty(marker) && !String.IsNullOrEmpty(markerCapture) && File.Exists(marker))
+                File.Copy(marker, markerCapture, true);
             var receipt = String.IsNullOrEmpty(home) ? null : Path.Combine(home, ".hermes-update-receipt.json");
             if (!String.IsNullOrEmpty(receipt) && File.Exists(receipt))
                 output = output.Replace("\"last_update_receipt\":null", "\"last_update_receipt\":" + File.ReadAllText(receipt));
@@ -252,10 +257,13 @@ public static class FakeHermes {
             var identity = archive
                 ? "\"mode\":\"archive\",\"remote\":null,\"target_ref\":null,\"target_sha\":null,\"resulting_head\":null,\"archive_sha\":\"" + archiveSha + "\""
                 : "\"mode\":\"git\",\"remote\":\"origin\",\"target_ref\":\"refs/remotes/origin/" + branch + "\",\"target_sha\":\"" + sha + "\",\"resulting_head\":\"" + sha + "\",\"archive_sha\":null";
+            var receiptTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (mode == "receipt-clock-rollback" || mode == "receipt-clock-rollback-resume-fail")
+                receiptTimestamp -= 60;
             var receipt = "{\"schema_version\":1,\"invocation_id\":\"" + invocationId +
                 "\",\"lease_id\":\"" + leaseId + "\"," + identity + ",\"root\":\"" + root +
                 "\",\"branch\":\"" + branch + "\",\"timestamp\":" +
-                DateTimeOffset.UtcNow.ToUnixTimeSeconds() +
+                receiptTimestamp +
                 ",\"success\":true,\"gateway_resume_deferred\":true,\"health\":{\"critical_syntax\":true,\"critical_imports\":true,\"dependencies\":true,\"node_dependencies\":true}}";
             File.WriteAllText(Path.Combine(home, ".hermes-update-receipt.json"), receipt);
             if (File.Exists(leasePath) && parentLeaseOwnerPid > 0) {
@@ -386,6 +394,7 @@ function New-TestInstall([string]$Tag, [string]$FakeHermes) {
         Lease = Join-Path $testHome '.hermes-venv-quiesce'
         LeaseCapture = Join-Path $testHome 'lease-during-mutation.json'
         PreflightLeaseCapture = Join-Path $testHome 'lease-before-mutation.json'
+        PreflightMarkerCapture = Join-Path $testHome 'marker-before-mutation.txt'
         PreflightArgsCapture = Join-Path $testHome 'preflight-args.txt'
         TopologyCapture = Join-Path $testHome 'contained-process-topology.txt'
         ResumeCapture = Join-Path $testHome 'deferred-resume-args.txt'
@@ -460,7 +469,8 @@ function Invoke-TestHandoff(
     [string]$PreflightStderr = '',
     [string]$BridgeLeaseId = '',
     [string]$UpdateMode = 'normal',
-    [string]$RelaunchExe = ''
+    [string]$RelaunchExe = '',
+    [AllowNull()][object]$SelfPreclaimAgeSeconds = $null
 ) {
     $oldOutput = $env:HERMES_TEST_PREFLIGHT_OUTPUT
     $oldCode = $env:HERMES_TEST_PREFLIGHT_CODE
@@ -469,6 +479,7 @@ function Invoke-TestHandoff(
     $oldLeasePath = $env:HERMES_TEST_LEASE_PATH
     $oldLeaseCapture = $env:HERMES_TEST_LEASE_CAPTURE
     $oldPreflightLeaseCapture = $env:HERMES_TEST_PREFLIGHT_LEASE_CAPTURE
+    $oldPreflightMarkerCapture = $env:HERMES_TEST_PREFLIGHT_MARKER_CAPTURE
     $oldPreflightArgsCapture = $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE
     $oldTopologyCapture = $env:HERMES_TEST_TOPOLOGY_CAPTURE
     $oldResumeCapture = $env:HERMES_TEST_RESUME_CAPTURE
@@ -477,6 +488,9 @@ function Invoke-TestHandoff(
     $oldUpdateMode = $env:HERMES_TEST_UPDATE_MODE
     $oldTestMode = $env:HERMES_DESKTOP_UPDATE_TEST
     $oldPublishFail = $env:HERMES_TEST_RESULT_PUBLISH_FAIL
+    $oldMarkerPath = $env:HERMES_TEST_UPDATE_MARKER_PATH
+    $oldMarkerAge = $env:HERMES_TEST_UPDATE_MARKER_AGE_SECONDS
+    $oldHandoffScript = $env:HERMES_TEST_HANDOFF_SCRIPT
     try {
         $env:HERMES_TEST_PREFLIGHT_OUTPUT = $PreflightOutput
         $env:HERMES_TEST_PREFLIGHT_CODE = "$PreflightCode"
@@ -485,6 +499,7 @@ function Invoke-TestHandoff(
         $env:HERMES_TEST_LEASE_PATH = $Install.Lease
         $env:HERMES_TEST_LEASE_CAPTURE = $Install.LeaseCapture
         $env:HERMES_TEST_PREFLIGHT_LEASE_CAPTURE = $Install.PreflightLeaseCapture
+        $env:HERMES_TEST_PREFLIGHT_MARKER_CAPTURE = $Install.PreflightMarkerCapture
         $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE = $Install.PreflightArgsCapture
         $env:HERMES_TEST_TOPOLOGY_CAPTURE = $Install.TopologyCapture
         $env:HERMES_TEST_RESUME_CAPTURE = $Install.ResumeCapture
@@ -497,8 +512,32 @@ function Invoke-TestHandoff(
         } else {
             Remove-Item Env:HERMES_TEST_RESULT_PUBLISH_FAIL -ErrorAction SilentlyContinue
         }
+        $scriptToRun = $handoffScript
+        if ($null -ne $SelfPreclaimAgeSeconds) {
+            $scriptToRun = Join-Path $Install.Home 'self-preclaim-wrapper.ps1'
+            $wrapper = @'
+$startedAt = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + [int64]$env:HERMES_TEST_UPDATE_MARKER_AGE_SECONDS
+$raw = "$PID`n$startedAt`n"
+[System.IO.File]::WriteAllText(
+    $env:HERMES_TEST_UPDATE_MARKER_PATH,
+    $raw,
+    (New-Object System.Text.UTF8Encoding($false))
+)
+[System.IO.File]::WriteAllText(
+    ($env:HERMES_TEST_UPDATE_MARKER_PATH + '.original'),
+    $raw,
+    (New-Object System.Text.UTF8Encoding($false))
+)
+& $env:HERMES_TEST_HANDOFF_SCRIPT @args
+exit $LASTEXITCODE
+'@
+            [System.IO.File]::WriteAllText($scriptToRun, $wrapper, (New-Object System.Text.UTF8Encoding($false)))
+            $env:HERMES_TEST_UPDATE_MARKER_PATH = $Install.UpdateMarker
+            $env:HERMES_TEST_UPDATE_MARKER_AGE_SECONDS = "$SelfPreclaimAgeSeconds"
+            $env:HERMES_TEST_HANDOFF_SCRIPT = $handoffScript
+        }
         $arguments = @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $handoffScript,
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptToRun,
             '-InstallRoot', $Install.Root, '-DesktopPid', '0', '-NoUi'
         )
         if ($BridgeLeaseId) { $arguments += @('-BridgeLeaseId', $BridgeLeaseId) }
@@ -513,6 +552,7 @@ function Invoke-TestHandoff(
         $env:HERMES_TEST_LEASE_PATH = $oldLeasePath
         $env:HERMES_TEST_LEASE_CAPTURE = $oldLeaseCapture
         $env:HERMES_TEST_PREFLIGHT_LEASE_CAPTURE = $oldPreflightLeaseCapture
+        $env:HERMES_TEST_PREFLIGHT_MARKER_CAPTURE = $oldPreflightMarkerCapture
         $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE = $oldPreflightArgsCapture
         $env:HERMES_TEST_TOPOLOGY_CAPTURE = $oldTopologyCapture
         $env:HERMES_TEST_RESUME_CAPTURE = $oldResumeCapture
@@ -521,6 +561,9 @@ function Invoke-TestHandoff(
         $env:HERMES_TEST_UPDATE_MODE = $oldUpdateMode
         $env:HERMES_DESKTOP_UPDATE_TEST = $oldTestMode
         $env:HERMES_TEST_RESULT_PUBLISH_FAIL = $oldPublishFail
+        $env:HERMES_TEST_UPDATE_MARKER_PATH = $oldMarkerPath
+        $env:HERMES_TEST_UPDATE_MARKER_AGE_SECONDS = $oldMarkerAge
+        $env:HERMES_TEST_HANDOFF_SCRIPT = $oldHandoffScript
     }
 }
 
@@ -605,6 +648,37 @@ try {
     Assert-Equal 7 $code 'unknown --json alone is not mistaken for legacy preflight absence'
     Assert-True (-not (Test-Path -LiteralPath $partial.Sentinel)) 'partial preflight support fails before mutation'
 
+    $markerNow = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $selfPreclaim = New-TestInstall 'self-update-marker' $fakeHermes
+    $selfPreclaimLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $selfPreclaim $selfPreclaimLeaseId
+    $code = Invoke-TestHandoff $selfPreclaim (New-PreflightJson $selfPreclaim $true $true) 0 '' $selfPreclaimLeaseId 'pre-plan-fail' '' 2
+    Assert-Equal 13 $code 'exact live self preclaim is adopted before the bounded failure'
+    $selfPreclaimOriginal = [System.IO.File]::ReadAllText($selfPreclaim.UpdateMarker + '.original')
+    Assert-Equal $selfPreclaimOriginal ([System.IO.File]::ReadAllText($selfPreclaim.PreflightMarkerCapture)) 'self preclaim is adopted without rewriting its exact bytes'
+    Assert-True (-not (Test-Path -LiteralPath $selfPreclaim.UpdateMarker)) 'adopted self preclaim is released by its original timestamp'
+
+    $impossibleSelfPreclaim = New-TestInstall 'impossible-self-update-marker' $fakeHermes
+    $impossibleSelfLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $impossibleSelfPreclaim $impossibleSelfLeaseId
+    $code = Invoke-TestHandoff $impossibleSelfPreclaim (New-PreflightJson $impossibleSelfPreclaim $true $true) 0 '' $impossibleSelfLeaseId 'normal' '' -120
+    Assert-Equal 8 $code 'self PID with an impossible process generation is refused'
+    $impossibleOriginal = [System.IO.File]::ReadAllText($impossibleSelfPreclaim.UpdateMarker + '.original')
+    Assert-Equal $impossibleOriginal ([System.IO.File]::ReadAllText($impossibleSelfPreclaim.UpdateMarker)) 'impossible self claim remains byte-for-byte unchanged'
+
+    foreach ($malformedMarkerRaw in @("$PID`n", "not-a-pid`n$markerNow`n")) {
+        $malformedMarker = New-TestInstall 'malformed-update-marker' $fakeHermes
+        [System.IO.File]::WriteAllText($malformedMarker.UpdateMarker, $malformedMarkerRaw)
+        $malformedBefore = [System.IO.File]::ReadAllText($malformedMarker.UpdateMarker)
+        $malformedLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $malformedMarker $malformedLeaseId
+        $code = Invoke-TestHandoff $malformedMarker (New-PreflightJson $malformedMarker $true $true) 0 '' $malformedLeaseId
+        Assert-Equal 8 $code 'readable malformed update marker blocks atomic claim'
+        Assert-True (-not (Test-Path -LiteralPath $malformedMarker.Sentinel)) 'readable malformed marker never reaches mutation'
+        Assert-Equal $malformedBefore ([System.IO.File]::ReadAllText($malformedMarker.UpdateMarker)) 'readable malformed marker bytes remain unchanged'
+        $invalidVenvHomes += $malformedMarker.Home
+    }
+
     $missingLease = New-TestInstall 'missing-lease' $fakeHermes
     $missingLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     $code = Invoke-TestHandoff $missingLease (New-PreflightJson $missingLease $true $true) 0 '' $missingLeaseId
@@ -612,7 +686,6 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $missingLease.Sentinel)) 'missing expected lease never reaches mutation'
 
     $unreadableMarker = New-TestInstall 'unreadable-update-marker' $fakeHermes
-    $markerNow = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     [System.IO.File]::WriteAllText($unreadableMarker.UpdateMarker, "$PID`n$markerNow`n")
     $unreadableMarkerLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $unreadableMarker $unreadableMarkerLeaseId
@@ -654,6 +727,15 @@ try {
     Assert-Equal 8 $code 'live update marker remains authoritative past the age ceiling'
     Assert-True (-not (Test-Path -LiteralPath $oldLiveMarker.Sentinel)) 'long-running live owner still blocks mutation'
     Assert-Equal $oldMarkerBefore ([System.IO.File]::ReadAllText($oldLiveMarker.UpdateMarker)) 'old live marker is preserved rather than stolen'
+
+    $deadMarker = New-TestInstall 'dead-update-marker' $fakeHermes
+    $deadMarkerRaw = "2147483647`n$markerNow`n"
+    [System.IO.File]::WriteAllText($deadMarker.UpdateMarker, $deadMarkerRaw)
+    $deadMarkerLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $deadMarker $deadMarkerLeaseId
+    $code = Invoke-TestHandoff $deadMarker (New-PreflightJson $deadMarker $true $true) 0 '' $deadMarkerLeaseId 'pre-plan-fail'
+    Assert-Equal 13 $code 'valid proven-dead update marker may be reclaimed before the bounded failure'
+    Assert-True (-not (Test-Path -LiteralPath $deadMarker.UpdateMarker)) 'reclaimed dead marker is removed only after exact ownership proof'
 
     $leased = New-TestInstall 'lease-adoption' $fakeHermes
     $leasedDesktop = Join-Path $leased.Home 'fake-desktop.exe'
@@ -922,6 +1004,32 @@ try {
     Assert-Equal 0 $code 'stderr-heavy update child is drained concurrently without deadlock'
     Assert-True (-not (Test-Path -LiteralPath $stderrHeavy.Lease)) 'stderr-heavy child cleans its exact adopted lease'
 
+    $rollbackReceipt = New-TestInstall 'receipt-clock-rollback' $fakeHermes
+    $rollbackLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $rollbackReceipt $rollbackLeaseId
+    $code = Invoke-TestHandoff $rollbackReceipt (New-PreflightJson $rollbackReceipt $true $true) 0 '' $rollbackLeaseId 'receipt-clock-rollback-resume-fail'
+    Assert-Equal 13 $code 'a capability-correlated receipt survives a bounded backward wall-clock step'
+    if (Test-Path -LiteralPath $rollbackReceipt.Result) {
+        $rollbackResult = [System.IO.File]::ReadAllText($rollbackReceipt.Result) | ConvertFrom-Json
+        Assert-True ($null -ne $rollbackResult.receipt) 'rollback failure preserves the verified receipt for Desktop'
+        Assert-True ([int64]$rollbackResult.relaunch.requested_at -ge [int64]$rollbackResult.receipt.timestamp) 'receipt-bearing pre-spawn failure uses a post-receipt attempt baseline'
+        Assert-True ([int64]$rollbackResult.finished_at -ge [int64]$rollbackResult.relaunch.requested_at) 'rollback failure retains monotonic result ordering'
+        $fixtureResult = [System.IO.File]::ReadAllText($receiptFailureFixture) | ConvertFrom-Json
+        $rollbackResult.attempt_id = $fixtureResult.attempt_id
+        $rollbackResult.invocation_id = $fixtureResult.invocation_id
+        $rollbackResult.lease_id = $fixtureResult.lease_id
+        $rollbackResult.root = $fixtureResult.root
+        $rollbackResult.receipt.invocation_id = $fixtureResult.receipt.invocation_id
+        $rollbackResult.receipt.lease_id = $fixtureResult.receipt.lease_id
+        $rollbackResult.receipt.root = $fixtureResult.receipt.root
+        $rollbackResult.receipt.timestamp = $fixtureResult.receipt.timestamp
+        $rollbackResult.relaunch.requested_at = $fixtureResult.relaunch.requested_at
+        $rollbackResult.finished_at = $fixtureResult.finished_at
+        Assert-Equal ($fixtureResult | ConvertTo-Json -Compress -Depth 12) ($rollbackResult | ConvertTo-Json -Compress -Depth 12) 'PowerShell emits the exact receipt-bearing failure fixture consumed by Desktop'
+    } else {
+        Assert-True $false 'rollback failure publishes a strict receipt-bearing terminal result'
+    }
+
     $prePlanFailure = New-TestInstall 'pre-plan-failure' $fakeHermes
     $prePlanLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $prePlanFailure $prePlanLeaseId
@@ -987,7 +1095,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $foreign.Sentinel)) 'foreign lease is never followed by mutation'
     Assert-Equal $before ([System.IO.File]::ReadAllText($foreign.Lease)) 'foreign live lease is neither rewritten nor deleted'
 } finally {
-    $cleanupPaths = @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $leased.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $prePlanFailure.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
+    $cleanupPaths = @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $selfPreclaim.Home, $impossibleSelfPreclaim.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $deadMarker.Home, $leased.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $rollbackReceipt.Home, $prePlanFailure.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
     foreach ($path in $cleanupPaths) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
