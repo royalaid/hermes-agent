@@ -398,7 +398,9 @@ export async function captureSpawnedUpdaterCreatedAt(
   pid: number,
   { queryCreatedAt = queryWindowsProcessCreatedAt }: ExactUpdaterProcessDeps = {}
 ): Promise<number | null> {
-  if (!Number.isSafeInteger(pid) || pid <= 0) {return null}
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return null
+  }
   let createdAt: number | null
 
   try {
@@ -441,7 +443,9 @@ export async function terminateSpawnedUpdaterIfExact(
 
   const currentCreatedAt = await captureSpawnedUpdaterCreatedAt(Number(pid), { queryCreatedAt })
 
-  if (currentCreatedAt !== expectedCreatedAt) {return false}
+  if (currentCreatedAt !== expectedCreatedAt) {
+    return false
+  }
 
   try {
     // ChildProcess.kill routes through libuv's retained process handle on
