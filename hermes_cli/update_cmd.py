@@ -1449,6 +1449,7 @@ def _update_via_zip(
         )
         print("  Code and Python deps are updated, but the dashboard/TUI may")
         print("  be in a mixed state until the Node deps are rebuilt.")
+        _m().sys.exit(1)
     elif not all(
         value is True
         for value in (syntax_ok, import_ok, dependencies_ok, node_dependencies_ok)
@@ -1457,6 +1458,7 @@ def _update_via_zip(
             "⚠ Update did not pass the final runtime health proof; "
             "no success receipt was written."
         )
+        _m().sys.exit(1)
     else:
         _record_update_success(
             args,
@@ -6223,7 +6225,7 @@ def _cmd_update_impl(
                     "⚠ Update did not pass the final runtime health proof; "
                     "no success receipt was written."
                 )
-                return
+                sys.exit(1)
 
             resulting_head = installed_target_head
             if resulting_head is None or target_sha != resulting_head:
@@ -6231,6 +6233,7 @@ def _cmd_update_impl(
                     "⚠ Installed Git identity could not be proven; "
                     "no success receipt was written."
                 )
+                sys.exit(1)
             else:
                 _record_update_success(
                     args,
@@ -6984,6 +6987,7 @@ def _cmd_update_impl(
             )
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
+            sys.exit(1)
         elif not all(
             value is True
             for value in (syntax_ok, import_ok, dependencies_ok, node_dependencies_ok)
@@ -6992,6 +6996,7 @@ def _cmd_update_impl(
                 "⚠ Update did not pass the final runtime health proof; "
                 "no success receipt was written."
             )
+            sys.exit(1)
         else:
             resulting_head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             if resulting_head is None or target_sha != resulting_head:
@@ -6999,6 +7004,7 @@ def _cmd_update_impl(
                     "⚠ Installed Git identity could not be proven; "
                     "no success receipt was written."
                 )
+                sys.exit(1)
             else:
                 _record_update_success(
                     args,
