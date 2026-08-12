@@ -545,30 +545,29 @@ def _validate_active_lease(
         return None
     if handoff_until - created_at > MAX_HANDOFF_GRACE_SECONDS:
         return None
-    if not force_until_expiry:
-        owner_live = _lease_owner_is_live(
-            owner_pid,
-            created_at,
-            pid_alive=pid_alive,
-            pid_create_time=pid_create_time,
-        )
-        if owner_live:
-            # Wall-clock corrections and suspend/resume can move ``now``
-            # outside the serialized lease interval while the exact updater
-            # still owns the mutation. Process identity is the stronger proof:
-            # keep MCP gated until that owner exits or its PID is reused.
-            return lease
+    if force_until_expiry:
+        if expires_at - created_at > EMERGENCY_LEASE_SECONDS:
+            return None
+        # Emergency shadows are recovery gates, not adoptable ownership. A
+        # backward clock correction cannot make an unwinding child safe, so
+        # only the forward hard-expiry boundary retires this fail-stop gate.
+        return lease if current_time <= expires_at else None
+    owner_live = _lease_owner_is_live(
+        owner_pid,
+        created_at,
+        pid_alive=pid_alive,
+        pid_create_time=pid_create_time,
+    )
+    if owner_live:
+        # Wall-clock corrections and suspend/resume can move ``now`` outside
+        # the serialized lease interval while the exact updater still owns the
+        # mutation. Process identity is the stronger proof: keep MCP gated
+        # until that owner exits or its PID is reused.
+        return lease
     if created_at > current_time + _CLOCK_SKEW_SECONDS:
         return None
     if current_time > expires_at:
         return None
-    if force_until_expiry:
-        if expires_at - created_at > EMERGENCY_LEASE_SECONDS:
-            return None
-        # Emergency shadows are recovery gates, not adoptable ownership.
-        # They remain active for their full bounded expiry even after the
-        # failed updater dies, giving contained children time to unwind.
-        return lease
     if current_time > handoff_until:
         return None
     return lease
