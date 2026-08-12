@@ -389,9 +389,10 @@ def live_quiesce_lease(
 ) -> dict | None:
     """Return a validated active lease, otherwise ``None``.
 
-    A schema-v1 lease is scoped to one canonical install root and bounded to
-    twenty minutes.  It remains active while its owner lives, or briefly after
-    owner exit during the explicit handoff grace window.  The grace closes the
+    A schema-v1 lease is scoped to one canonical install root and carries a
+    horizon of at most twenty minutes. Exact live ownership outranks wall-clock
+    corrections or suspend/resume jumps; after owner exit or PID reuse, the
+    explicit handoff/expiry bounds retire it. The grace closes the
     drain-to-updater race without turning a crashed updater into a permanent
     bridge outage.
     """
@@ -511,10 +512,7 @@ def _validate_active_lease(
         # The old format carried no root. It is safe only for the historical
         # default layout where the marker's home owns ``hermes-agent``.
         legacy_root = marker.parent / "hermes-agent"
-        age = current_time - created_at
         if _canonical(root) != _canonical(legacy_root):
-            return None
-        if age < -_CLOCK_SKEW_SECONDS or age > MAX_LEASE_SECONDS:
             return None
         return (
             lease
@@ -541,13 +539,26 @@ def _validate_active_lease(
         return None
     if _canonical(install_value) != _canonical(root):
         return None
-    if created_at > current_time + _CLOCK_SKEW_SECONDS:
-        return None
     if not (created_at <= handoff_until <= expires_at):
         return None
     if expires_at - created_at > MAX_LEASE_SECONDS:
         return None
     if handoff_until - created_at > MAX_HANDOFF_GRACE_SECONDS:
+        return None
+    if not force_until_expiry:
+        owner_live = _lease_owner_is_live(
+            owner_pid,
+            created_at,
+            pid_alive=pid_alive,
+            pid_create_time=pid_create_time,
+        )
+        if owner_live:
+            # Wall-clock corrections and suspend/resume can move ``now``
+            # outside the serialized lease interval while the exact updater
+            # still owns the mutation. Process identity is the stronger proof:
+            # keep MCP gated until that owner exits or its PID is reused.
+            return lease
+    if created_at > current_time + _CLOCK_SKEW_SECONDS:
         return None
     if current_time > expires_at:
         return None
@@ -558,13 +569,7 @@ def _validate_active_lease(
         # They remain active for their full bounded expiry even after the
         # failed updater dies, giving contained children time to unwind.
         return lease
-    owner_live = _lease_owner_is_live(
-        owner_pid,
-        created_at,
-        pid_alive=pid_alive,
-        pid_create_time=pid_create_time,
-    )
-    if not owner_live and current_time > handoff_until:
+    if current_time > handoff_until:
         return None
     return lease
 
@@ -625,17 +630,21 @@ def _pending_lease_recovery(path: Path, *, now: float) -> bool:
                 and bool(lease["install_root"])
             )
             emergency = candidate.name.startswith(f"{path.name}.cas-emergency-")
-            retired = bool(
-                well_formed
-                and (
-                    now > expires
-                    or (
-                        not emergency
-                        and now > handoff
-                        and not _pid_alive(owner_pid)
+            retired = False
+            if well_formed:
+                assert created is not None
+                assert expires is not None
+                assert handoff is not None
+                if emergency:
+                    retired = now > expires
+                else:
+                    owner_live = _lease_owner_is_live(
+                        owner_pid,
+                        created,
+                        pid_alive=_pid_alive,
+                        pid_create_time=_pid_create_time,
                     )
-                )
-            )
+                    retired = not owner_live and now > handoff
             if retired:
                 tombstone = _move_lease_if_unchanged(candidate, raw)
                 if tombstone is not None:
@@ -644,6 +653,9 @@ def _pending_lease_recovery(path: Path, *, now: float) -> bool:
                     except OSError:
                         pending = True
                     continue
+                pending = True
+                continue
+            if well_formed:
                 pending = True
                 continue
         try:
