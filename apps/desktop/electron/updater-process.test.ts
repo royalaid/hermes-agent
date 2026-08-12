@@ -5,14 +5,17 @@ import path from 'node:path'
 import { test, vi } from 'vitest'
 
 import {
-  collectRelaunchArgs,
   MARKER_SELF_ADOPT_EPOCH_MS,
   observeUpdaterHandoff,
-  resolvePosixScriptHandoff,
   captureSpawnedUpdaterCreatedAt,
+  collectRelaunchArgs,
+  formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
+  launchWindowsUpdateTransport,
+  resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
+  resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
   STAGED_UPDATER_BRIDGE_LEASE_ENV,
@@ -300,7 +303,7 @@ test('resolveUpdateScriptHandoff returns null when the checkout predates the scr
   assert.equal(handoff, null)
 })
 
-test('resolveUpdateScriptHandoff is Windows-only (POSIX updates in place)', () => {
+test('resolveUpdateScriptHandoff is Windows-only (POSIX has a separate detached handoff)', () => {
   const handoff = resolveUpdateScriptHandoff('/home/hermes/.hermes/hermes-agent', {
     isWindows: false,
     fileExists: () => true
@@ -309,37 +312,185 @@ test('resolveUpdateScriptHandoff is Windows-only (POSIX updates in place)', () =
   assert.equal(handoff, null)
 })
 
-test('wrapHandoffForDetachedConsole routes through cmd start with own console', () => {
-  const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
+test('Windows flat handoff keeps branch, paths, and bridge capability out of cmd-parsed arguments', () => {
+  const root = String.raw`C:\Hermes & 100%\agent`
   const expected = path.join(root, 'scripts', 'desktop-update.ps1')
+  const branch = 'fork/&|%integration'
+  const bridgeLeaseId = 'unguessable-bridge-lease-id'
+  const relaunchExe = String.raw`C:\Program Files\Hermes & 100%\Hermes.exe`
 
-  const handoff = resolveUpdateScriptHandoff(root, {
+  const transport = resolveWindowsUpdateTransport(root, {
     isWindows: true,
     fileExists: candidate => candidate === expected
   })
 
-  assert.ok(handoff)
-  const wrapped = wrapHandoffForDetachedConsole(handoff, ['-InstallRoot', root, '-Branch', 'main'])
+  assert.equal(transport.kind, 'script')
+
+  if (transport.kind !== 'script') {
+    assert.fail('expected the hardened flat script transport')
+  }
+
+  const wrapped = wrapHandoffForDetachedConsole(transport.handoff, {
+    bridgeLeaseId,
+    branch,
+    desktopPid: 4242,
+    installRoot: root,
+    relaunchExe
+  })
 
   assert.equal(wrapped.command, 'cmd.exe')
-  assert.deepEqual(wrapped.args, [
-    '/d',
-    '/s',
-    '/c',
-    'start',
-    '',
-    '/min',
-    'powershell',
-    '-NoProfile',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-File',
-    expected,
-    '-InstallRoot',
-    root,
-    '-Branch',
-    'main'
+  assert.deepEqual(wrapped.args.slice(0, -1), [
+    '/d', '/s', '/c', 'start', '', '/min', 'powershell',
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'
   ])
+  assert.match(wrapped.args.at(-1) ?? '', /^[A-Za-z0-9+/=]+$/)
+  const launcher = Buffer.from(wrapped.args.at(-1) ?? '', 'base64').toString('utf16le')
+
+  assert.match(launcher, /Test-Path -LiteralPath \$scriptPath -PathType Leaf/)
+  assert.match(launcher, /& \$scriptPath @scriptArgs/)
+  assert.match(launcher, /HERMES_UPDATE_BRIDGE_LEASE_ID -notmatch/)
+  assert.deepEqual(wrapped.env, {
+    HERMES_UPDATE_BRIDGE_LEASE_ID: bridgeLeaseId,
+    HERMES_UPDATE_HANDOFF_BRANCH: branch,
+    HERMES_UPDATE_HANDOFF_DESKTOP_PID: '4242',
+    HERMES_UPDATE_HANDOFF_INSTALL_ROOT: root,
+    HERMES_UPDATE_HANDOFF_RELAUNCH_EXE: relaunchExe,
+    HERMES_UPDATE_HANDOFF_SCRIPT: expected
+  })
+
+  const cmdParsed = wrapped.args.join(' ')
+
+  for (const value of [expected, root, branch, bridgeLeaseId, relaunchExe]) {
+    assert.equal(cmdParsed.includes(value), false, `${value} must not reach cmd.exe arguments`)
+  }
+
+  const alternate = wrapHandoffForDetachedConsole(transport.handoff, {
+    bridgeLeaseId: 'another-valid-lease-id',
+    branch: 'another/&|%branch',
+    desktopPid: 9001,
+    installRoot: String.raw`C:\Another & 100%\agent`,
+    relaunchExe: String.raw`C:\Another & 100%\Hermes.exe`
+  })
+
+  assert.deepEqual(alternate.args, wrapped.args)
+})
+
+test('Windows flat handoff rejects invalid private payload values before spawn', () => {
+  const root = String.raw`C:\Hermes\agent`
+  const flat = path.join(root, 'scripts', 'desktop-update.ps1')
+
+  const transport = resolveWindowsUpdateTransport(root, {
+    isWindows: true,
+    fileExists: candidate => candidate === flat
+  })
+
+  assert.equal(transport.kind, 'script')
+
+  if (transport.kind !== 'script') {
+    assert.fail('expected the hardened flat script transport')
+  }
+
+  const valid = {
+    bridgeLeaseId: 'valid-bridge-lease-id',
+    branch: 'fork/integration',
+    desktopPid: 4242,
+    installRoot: root,
+    relaunchExe: String.raw`C:\Program Files\Hermes\Hermes.exe`
+  }
+
+  assert.throws(
+    () => wrapHandoffForDetachedConsole(transport.handoff, { ...valid, bridgeLeaseId: 'too-short' }),
+    /valid bridge lease ID/
+  )
+  assert.throws(
+    () => wrapHandoffForDetachedConsole(transport.handoff, { ...valid, desktopPid: 0 }),
+    /positive desktop PID/
+  )
+  assert.throws(
+    () => wrapHandoffForDetachedConsole(transport.handoff, { ...valid, branch: '' }),
+    /every environment value/
+  )
+})
+
+test('ordinary Windows updates refuse staged and nested fallbacks when the flat script is absent', () => {
+  const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
+  const nested = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
+  const staged = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-setup.exe`
+
+  const transport = resolveWindowsUpdateTransport(root, {
+    isWindows: true,
+    fileExists: candidate => candidate === nested || candidate === staged
+  })
+
+  const spawnProcess = vi.fn(() => ({ kill: () => true, unref: () => {} }))
+
+  const launch = launchWindowsUpdateTransport(
+    transport,
+    {
+      bridgeLeaseId: 'unguessable-bridge-lease-id',
+      branch: 'fork/&|%integration',
+      desktopPid: 4242,
+      installRoot: root,
+      relaunchExe: String.raw`C:\Program Files\Hermes\Hermes.exe`
+    },
+    { env: { PATH: String.raw`C:\Windows` } },
+    { isWindows: true, spawnProcess }
+  )
+
+  assert.deepEqual(transport, { kind: 'manual' })
+  assert.deepEqual(launch, { kind: 'manual' })
+  assert.equal(spawnProcess.mock.calls.length, 0)
+})
+
+test('production Windows transport composes flat script, non-main branch, and BridgeLeaseId at spawn', () => {
+  const root = String.raw`C:\Hermes & 100%\agent`
+  const flat = path.join(root, 'scripts', 'desktop-update.ps1')
+  const bridgeLeaseId = 'unguessable-bridge-lease-id'
+  const branch = 'fork/&|%integration'
+  let captured: { args: string[]; command: string; options: SpawnOptions } | undefined
+
+  const transport = resolveWindowsUpdateTransport(root, {
+    isWindows: true,
+    fileExists: candidate => candidate === flat
+  })
+
+  const launch = launchWindowsUpdateTransport(
+    transport,
+    {
+      bridgeLeaseId,
+      branch,
+      desktopPid: 4242,
+      installRoot: root,
+      relaunchExe: String.raw`C:\Program Files\Hermes & 100%\Hermes.exe`
+    },
+    { cwd: root, env: { PATH: String.raw`C:\Windows` }, detached: true, stdio: 'ignore' },
+    {
+      isWindows: true,
+      spawnProcess: (command, args, options) => {
+        captured = { args, command, options }
+
+        return { pid: 55, kill: () => true, unref: () => {} }
+      }
+    }
+  )
+
+  assert.equal(launch.kind, 'spawned')
+  assert.ok(captured)
+  assert.equal(captured.command, 'cmd.exe')
+  assert.equal(captured.options.env?.PATH, String.raw`C:\Windows`)
+  assert.equal(captured.options.env?.HERMES_UPDATE_HANDOFF_SCRIPT, flat)
+  assert.equal(captured.options.env?.HERMES_UPDATE_HANDOFF_BRANCH, branch)
+  assert.equal(captured.options.env?.HERMES_UPDATE_BRIDGE_LEASE_ID, bridgeLeaseId)
+  assert.equal(captured.args.join(' ').includes(branch), false)
+  assert.equal(captured.args.join(' ').includes(bridgeLeaseId), false)
+})
+
+test('formatPowerShellArgvForDisplay quotes a non-main git ref with shell metacharacters', () => {
+  assert.equal(
+    formatPowerShellArgvForDisplay(['hermes', 'update', '--branch', 'fork/&|%integration']),
+    "hermes update --branch 'fork/&|%integration'"
+  )
+  assert.equal(formatPowerShellArgvForDisplay(['hermes', 'update', '--branch', "fork/o'hare"]), "hermes update --branch 'fork/o''hare'")
 })
 
 test('resolvePosixScriptHandoff returns the bash recipe when the script exists', () => {
