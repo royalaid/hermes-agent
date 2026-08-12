@@ -19,7 +19,7 @@ from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 from hermes_mcp_update_gate import MCP_MAIN_MODULE, is_exact_mcp_module_argv
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _CREATE_TIME_TOLERANCE_SECONDS = 0.01
 
 # Long CLI flags whose argument value must be redacted from the cmdline.
@@ -114,6 +114,7 @@ def _base_result(
         "venv": venv,
         "processes": [],
         "mcp_bridges": [],
+        "desktop_plugin_services": [],
         "pausable_gateways": 0,
         "pausable_gateway_processes": [],
         "error": error,
@@ -379,6 +380,122 @@ def _mcp_record(
     return record
 
 
+def _desktop_plugin_script(argv: Sequence[str], root: Path) -> Path | None:
+    """Return a desktop-plugin ``.py`` entrypoint from an exact argv shape.
+
+    Desktop plugins that need a persistent helper use the installation venv to
+    execute their own absolute ``service.py`` directly.  Do not infer ownership
+    from an arbitrary mention of a plugin path later in a command line: that
+    would turn a user's one-off Python invocation into an updater kill target.
+    """
+    if len(argv) < 2:
+        return None
+    candidate = argv[1].strip('"')
+    if not candidate or candidate.startswith("-"):
+        return None
+    script = Path(candidate)
+    plugins_root = root.parent / "desktop-plugins"
+    if (
+        not script.is_absolute()
+        or script.suffix.casefold() != ".py"
+        or not _within(script, plugins_root)
+    ):
+        return None
+    return Path(_canonical(script))
+
+
+def _desktop_plugin_role(
+    snapshot: _ProcessSnapshot,
+    root: Path,
+    wrappers: Mapping[int, Path],
+    snapshots: Mapping[int, _ProcessSnapshot],
+) -> tuple[str, int | None, Path] | None:
+    """Classify an exact Desktop-plugin wrapper or managed-runtime child."""
+    script = _desktop_plugin_script(snapshot.argv, root)
+    if script is None:
+        return None
+    venv = _venv_dir(root)
+    managed = root / ".hermes-runtime" / "python"
+    if _within(snapshot.exe, venv):
+        return "desktop_plugin_wrapper", snapshot.pid, script
+    if not _within(snapshot.exe, managed):
+        return None
+
+    ancestor = snapshot.ppid
+    seen: set[int] = set()
+    while ancestor and ancestor not in seen:
+        wrapper_script = wrappers.get(ancestor)
+        if wrapper_script is not None and _canonical(wrapper_script) == _canonical(script):
+            return "desktop_plugin_worker", ancestor, script
+        seen.add(ancestor)
+        parent = snapshots.get(ancestor)
+        if parent is None:
+            break
+        ancestor = parent.ppid
+    return None
+
+
+def _desktop_plugin_service_host(
+    wrapper: _ProcessSnapshot,
+    script: Path,
+) -> Any | None:
+    """Prove the service's exact Windows Script Host supervisor is still live."""
+    expected_host = script.parent / "service-host.vbs"
+    try:
+        parents = wrapper.process.parents()
+    except Exception:
+        return None
+    descendant_created_at = wrapper.created_at
+    for parent in parents:
+        try:
+            created_at = float(parent.create_time())
+            name = str(parent.name() or "")
+            exe = str(parent.exe() or "")
+            argv = [str(value) for value in (parent.cmdline() or [])]
+            if (
+                not math.isfinite(created_at)
+                or created_at <= 0
+                or created_at > descendant_created_at
+                or not _process_generation_matches(int(parent.pid), created_at)
+            ):
+                return None
+        except Exception:
+            return None
+        descendant_created_at = created_at
+        basenames = {Path(name).stem.casefold(), Path(exe).stem.casefold()}
+        if not (basenames & {"wscript", "cscript"}):
+            continue
+        if any(
+            _canonical(value.strip('"')) == _canonical(expected_host)
+            for value in argv[1:]
+            if value.strip('"')
+        ):
+            return parent
+    return None
+
+
+def _desktop_plugin_record(
+    snapshot: _ProcessSnapshot,
+    *,
+    role: str,
+    wrapper_pid: int | None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "pid": snapshot.pid,
+        "name": snapshot.name,
+        "cmdline": _redact_sensitive_cmdline(" ".join(snapshot.argv))[:120],
+        "created_at": snapshot.created_at,
+        "owner": "desktop",
+        "role": role,
+        "actionable": True,
+        "actionability": "exact_desktop_plugin_service",
+        "action": "terminate_desktop_plugin_service",
+    }
+    if wrapper_pid is not None and wrapper_pid != snapshot.pid:
+        record["wrapper_pid"] = wrapper_pid
+    return record
+
+
 def _owner_from_ancestry(
     snapshot: _ProcessSnapshot,
     *,
@@ -574,9 +691,17 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
         and _within(snapshot.exe, venv)
     }
     mcp_bridges: list[dict[str, Any]] = []
+    desktop_plugin_services: list[dict[str, Any]] = []
     processes: list[dict[str, Any]] = []
     gateways: list[dict[str, Any]] = []
     owner_by_anchor_generation: dict[tuple[int, float, int], str] = {}
+    desktop_plugin_host_verified: dict[tuple[int, float, str], bool] = {}
+    desktop_plugin_wrappers = {
+        pid: script
+        for pid, snapshot in snapshots.items()
+        if _within(snapshot.exe, venv)
+        and (script := _desktop_plugin_script(snapshot.argv, target_root)) is not None
+    }
     for pid, (scanned_name, scanned_cmdline) in by_pid.items():
         snapshot = snapshots.get(pid)
         if snapshot is None and pid not in unreadable:
@@ -616,6 +741,35 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
                     )
                 )
                 continue
+            desktop_plugin = _desktop_plugin_role(
+                snapshot,
+                target_root,
+                desktop_plugin_wrappers,
+                snapshots,
+            )
+            if desktop_plugin is not None:
+                role, wrapper_pid, script = desktop_plugin
+                wrapper = snapshots.get(wrapper_pid) if wrapper_pid is not None else None
+                host_key = (
+                    wrapper.pid,
+                    wrapper.created_at,
+                    _canonical(script),
+                ) if wrapper is not None else None
+                host_verified = False
+                if host_key is not None:
+                    host_verified = desktop_plugin_host_verified.get(host_key)
+                    if host_verified is None:
+                        host_verified = _desktop_plugin_service_host(wrapper, script) is not None
+                        desktop_plugin_host_verified[host_key] = host_verified
+                if host_verified:
+                    desktop_plugin_services.append(
+                        _desktop_plugin_record(
+                            snapshot,
+                            role=role,
+                            wrapper_pid=wrapper_pid,
+                        )
+                    )
+                    continue
             live_argv = snapshot.argv
             live_cmdline = " ".join(live_argv)
         else:
@@ -648,9 +802,12 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
     mcp_bridges.sort(
         key=lambda item: (item.get("role") != "mcp_bridge_worker", item["pid"])
     )
+    desktop_plugin_services.sort(
+        key=lambda item: (item.get("role") != "desktop_plugin_worker", item["pid"])
+    )
     processes.sort(key=lambda item: item["pid"])
     gateways.sort(key=lambda item: item["pid"])
-    blocked = bool(processes or mcp_bridges)
+    blocked = bool(processes or mcp_bridges or desktop_plugin_services)
     result = _base_result(
         root=str(target_root),
         venv=str(venv),
@@ -662,6 +819,7 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
         {
             "processes": processes,
             "mcp_bridges": mcp_bridges,
+            "desktop_plugin_services": desktop_plugin_services,
             "pausable_gateways": len(gateways),
             "pausable_gateway_processes": gateways,
         }
@@ -747,10 +905,142 @@ def terminate_mcp_bridge(
     return True
 
 
+def _live_desktop_plugin_service_process(
+    root: Path,
+    pid: int,
+) -> tuple[Any, dict[str, Any], Any | None] | None:
+    """Re-prove one exact plugin service and its visible host before killing."""
+    snapshot = _snapshot_for_pid(pid)
+    if snapshot is None:
+        return None
+    snapshots = {snapshot.pid: snapshot}
+    try:
+        parents = snapshot.process.parents()
+    except Exception:
+        return None
+    for parent_process in parents:
+        try:
+            parent = _snapshot_for_pid(int(parent_process.pid))
+        except Exception:
+            return None
+        if parent is not None:
+            snapshots[parent.pid] = parent
+    wrappers = {
+        current_pid: script
+        for current_pid, current in snapshots.items()
+        if _within(current.exe, _venv_dir(root))
+        and (script := _desktop_plugin_script(current.argv, root)) is not None
+    }
+    classified = _desktop_plugin_role(snapshot, root, wrappers, snapshots)
+    if classified is None:
+        return None
+    role, wrapper_pid, script = classified
+    wrapper = snapshots.get(wrapper_pid) if wrapper_pid is not None else None
+    if wrapper is None:
+        return None
+    host = _desktop_plugin_service_host(wrapper, script)
+    if host is None:
+        return None
+    return snapshot.process, _desktop_plugin_record(
+        snapshot,
+        role=role,
+        wrapper_pid=wrapper_pid,
+    ), host
+
+
+def terminate_desktop_plugin_service(
+    root: str | Path,
+    *,
+    pid: int,
+    created_at: float,
+) -> bool:
+    """Stop one exact plugin helper, never an arbitrary process tree.
+
+    The managed-runtime child is drained before its venv wrapper by the
+    Electron preflight.  The wrapper call then stops its exact VBS/cscript
+    supervisor first, which prevents the service host from recreating the
+    helper while the updater has the installation open.
+    """
+    target_root, _venv = _validated_root(root)
+    try:
+        expected_created_at = float(created_at)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(expected_created_at) or expected_created_at <= 0:
+        return False
+    try:
+        live = _live_desktop_plugin_service_process(target_root, int(pid))
+    except Exception:
+        return False
+    if live is None:
+        return False
+    process, record, host = live
+    if (
+        record.get("owner") != "desktop"
+        or record.get("role")
+        not in {"desktop_plugin_wrapper", "desktop_plugin_worker"}
+        or record.get("actionable") is not True
+        or record.get("action") != "terminate_desktop_plugin_service"
+        or abs(float(record["created_at"]) - expected_created_at)
+        > _CREATE_TIME_TOLERANCE_SECONDS
+    ):
+        return False
+    try:
+        # Stopping the host only when we drain the wrapper preserves the
+        # worker-before-wrapper proof/order and prevents its 10-second restart
+        # loop from reopening the venv during the actual update.
+        if record["role"] == "desktop_plugin_wrapper":
+            host.kill()
+        process.kill()
+    except Exception:
+        return False
+    return True
+
+
+def terminate_venv_holder(
+    root: str | Path,
+    *,
+    pid: int,
+    created_at: float,
+) -> bool:
+    """Force-stop one freshly revalidated target-install holder.
+
+    The Desktop's explicit Update action authorizes this force path.  This is
+    intentionally broader than MCP/plugin ownership: every process returned by
+    the target-root holder detector can be stopped.  PID creation-time matching
+    only prevents a recycled PID from being targeted after the scan.
+    """
+    target_root, _venv = _validated_root(root)
+    try:
+        expected_created_at = float(created_at)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(expected_created_at) or expected_created_at <= 0:
+        return False
+    try:
+        from hermes_cli.update_cmd import _detect_venv_python_processes
+
+        matches = _detect_venv_python_processes(root=target_root, strict=True)
+        if int(pid) not in {int(found_pid) for found_pid, _name, _cmdline in matches}:
+            return False
+        snapshot = _snapshot_for_pid(int(pid))
+    except Exception:
+        return False
+    if snapshot is None or abs(snapshot.created_at - expected_created_at) > _CREATE_TIME_TOLERANCE_SECONDS:
+        return False
+    try:
+        snapshot.process.kill()
+    except Exception:
+        return False
+    return True
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(add_help=True)
     parser.add_argument("--root", required=True)
     parser.add_argument("--terminate-mcp-bridge", type=int)
+    parser.add_argument("--terminate-desktop-plugin-service", type=int)
+    parser.add_argument("--terminate-venv-holder", type=int)
     parser.add_argument("--created-at", type=float)
     return parser
 
@@ -764,9 +1054,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         _emit_probe_fail(str(exc), code="invalid_arguments")
 
     root_text = str(args.root)
-    terminate_requested = args.terminate_mcp_bridge is not None
+    mcp_terminate_requested = args.terminate_mcp_bridge is not None
+    desktop_plugin_terminate_requested = (
+        args.terminate_desktop_plugin_service is not None
+    )
+    venv_holder_terminate_requested = args.terminate_venv_holder is not None
+    terminate_requested = (
+        mcp_terminate_requested
+        or desktop_plugin_terminate_requested
+        or venv_holder_terminate_requested
+    )
     created_requested = args.created_at is not None
-    if terminate_requested != created_requested:
+    if terminate_requested != created_requested or (
+        sum(
+            (
+                mcp_terminate_requested,
+                desktop_plugin_terminate_requested,
+                venv_holder_terminate_requested,
+            )
+        )
+        > 1
+    ):
         _emit_probe_fail(
             "--terminate-mcp-bridge and --created-at must be supplied together",
             root=root_text,
@@ -776,21 +1084,40 @@ def main(argv: Sequence[str] | None = None) -> None:
     if terminate_requested:
         try:
             target_root, venv = _validated_root(root_text)
-            terminated = terminate_mcp_bridge(
-                target_root,
-                pid=args.terminate_mcp_bridge,
-                created_at=args.created_at,
-            )
+            if mcp_terminate_requested:
+                pid = args.terminate_mcp_bridge
+                terminated = terminate_mcp_bridge(
+                    target_root,
+                    pid=pid,
+                    created_at=args.created_at,
+                )
+                mode = "terminate_mcp_bridge"
+            elif desktop_plugin_terminate_requested:
+                pid = args.terminate_desktop_plugin_service
+                terminated = terminate_desktop_plugin_service(
+                    target_root,
+                    pid=pid,
+                    created_at=args.created_at,
+                )
+                mode = "terminate_desktop_plugin_service"
+            else:
+                pid = args.terminate_venv_holder
+                terminated = terminate_venv_holder(
+                    target_root,
+                    pid=pid,
+                    created_at=args.created_at,
+                )
+                mode = "terminate_venv_holder"
         except Exception as exc:
             _emit_probe_fail(str(exc), root=root_text, code="probe_failed")
         print(
             json.dumps(
                 {
                     "schema_version": SCHEMA_VERSION,
-                    "mode": "terminate_mcp_bridge",
+                    "mode": mode,
                     "ok": True,
                     "terminated": terminated,
-                    "pid": args.terminate_mcp_bridge,
+                    "pid": pid,
                     "created_at": args.created_at,
                     "root": str(target_root),
                     "venv": str(venv),
