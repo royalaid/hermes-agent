@@ -2123,16 +2123,14 @@ def _mark_skip_upstream_prompt():
     except Exception:
         pass
 
-def _sync_fork_with_upstream(
-    git_cmd: list[str], cwd: Path, fork_remote: str = "origin"
-) -> bool:
-    """Attempt to push updated main to the selected fork remote.
+def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
+    """Attempt to push updated main to origin (sync fork).
 
     Returns True if push succeeded, False otherwise.
     """
     try:
         result = subprocess.run(
-            git_cmd + ["push", fork_remote, "main", "--force-with-lease"],
+            git_cmd + ["push", "origin", "main", "--force-with-lease"],
             cwd=cwd,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -2141,9 +2139,7 @@ def _sync_fork_with_upstream(
     except Exception:
         return False
 
-def _sync_with_upstream_if_needed(
-    git_cmd: list[str], cwd: Path, fork_remote: str = "origin"
-) -> None:
+def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     """Check if fork is behind upstream and sync if safe.
 
     This implements the fork upstream sync logic:
@@ -2241,9 +2237,9 @@ def _sync_with_upstream_if_needed(
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
         return
 
-    fork_ref = f"refs/remotes/{fork_remote}/main"
+    fork_ref = "refs/remotes/origin/main"
     upstream_ref = "refs/remotes/upstream/main"
-    # Compare the selected fork target with upstream/main.
+    # Compare origin/main with upstream/main.
     origin_ahead = _count_commits_between(git_cmd, cwd, upstream_ref, fork_ref)
     upstream_ahead = _count_commits_between(
         git_cmd, cwd, fork_ref, upstream_ref
@@ -2288,7 +2284,7 @@ def _sync_with_upstream_if_needed(
 
     # Try to sync fork back to origin
     print("→ Syncing fork...")
-    if _sync_fork_with_upstream(git_cmd, cwd, fork_remote=fork_remote):
+    if _sync_fork_with_upstream(git_cmd, cwd):
         print("  ✓ Fork synced with upstream")
     else:
         print(
@@ -3024,7 +3020,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
 
     ``branch`` selects which branch the check compares against. Default is
     "main"; callers can pass another branch to ask "are there new commits
-    on the branch's authoritative remote?" without performing the update.
+    on origin/<branch>?" without performing the update.
 
     ``branch_explicit`` is True iff the caller passed --branch on the CLI.
     Installs that can't honor non-default branches (e.g. Docker) surface a
@@ -3067,10 +3063,10 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     for lock_path in cleared:
         print(f"  (removed stale git lock: {lock_path})")
 
-    # Resolve the selected branch's configured tracking remote once. Fetch an
-    # explicit forced refspec into the exact ref every later operation reads;
-    # a source-only fetch can leave a stale remote-tracking ref after a force
-    # push, and hard-coding origin updates the wrong fork.
+    # Fetch only the branch we compare against; prefer upstream as the canonical
+    # reference for main and use origin for non-main branches. Use an explicit
+    # forced refspec so every later operation reads the exact ref refreshed by
+    # this fetch, including after a force push.
     # Installer checkouts are shallow (`git clone --depth 1`). A plain
     # `git fetch` would unshallow the repo (dragging in the whole history —
     # the exact cost the shallow clone avoided) and the rev-list count below
@@ -3088,9 +3084,17 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     )
     depth_args = ["--depth", "1"] if is_shallow else []
     try:
-        target = _resolve_update_target(
-            git_cmd, _m().PROJECT_ROOT, branch, env=git_env
+        branch_check = subprocess.run(
+            git_cmd + ["check-ref-format", "--branch", branch],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=git_env,
         )
+        if branch_check.returncode != 0:
+            raise ValueError(f"invalid update branch: {branch}")
         _assert_safe_git_configuration(
             git_cmd, _m().PROJECT_ROOT, env=git_env
         )
@@ -3100,14 +3104,47 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     except RuntimeError as exc:
         print(f"✗ Unsafe Git configuration: {exc}")
         sys.exit(1)
-    print(f"→ Fetching from {target.remote}...")
-    fetch_result = subprocess.run(
-        git_cmd + ["fetch"] + depth_args + ["--", target.remote, target.refspec],
-        cwd=_m().PROJECT_ROOT,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-        env=git_env,
-    )
+    target: _UpdateTarget | None = None
+    fetch_result = None
+    if branch == "main" and _has_upstream_remote(git_cmd, _m().PROJECT_ROOT):
+        tracking_ref = "refs/remotes/upstream/main"
+        target = _UpdateTarget(
+            branch=branch,
+            remote="upstream",
+            tracking_ref=tracking_ref,
+            refspec=f"+refs/heads/{branch}:{tracking_ref}",
+        )
+        print("→ Fetching from upstream...")
+        fetch_result = subprocess.run(
+            git_cmd + ["fetch"] + depth_args + ["--", target.remote, target.refspec],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=git_env,
+        )
+
+    if fetch_result is None or fetch_result.returncode != 0:
+        try:
+            target = _resolve_update_target(
+                git_cmd, _m().PROJECT_ROOT, branch, env=git_env
+            )
+        except ValueError as exc:
+            print(f"✗ {exc}")
+            sys.exit(1)
+        print("→ Fetching from origin...")
+        fetch_result = subprocess.run(
+            git_cmd + ["fetch"] + depth_args + ["--", target.remote, target.refspec],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=git_env,
+        )
+
+    assert target is not None
     compare_branch = target.tracking_ref
 
     if fetch_result.returncode != 0:
@@ -5925,12 +5962,8 @@ def _cmd_update_impl(
     # the stash/branch logic rather than autostashing the entire tree.
     _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
-    # Detect a fork from the same configured remote selected for this update.
-    update_remote_url = (
-        _get_remote_url(git_cmd, _m().PROJECT_ROOT, update_target.remote)
-        if update_target is not None
-        else None
-    )
+    # The apply path retains the upstream updater's fixed origin policy.
+    update_remote_url = _get_origin_url(git_cmd, _m().PROJECT_ROOT)
     is_fork = _is_fork(update_remote_url)
 
     if is_fork:
@@ -6158,22 +6191,13 @@ def _cmd_update_impl(
         fork_sync_performed = False
         fork_sync_requires_full_update = False
         fork_synced_head: str | None = None
-        if (
-            commit_count == 0
-            and is_fork
-            and branch == "main"
-            and update_target.remote == "origin"
-        ):
+        if commit_count == 0 and is_fork and branch == "main":
             # A fork can be current relative to origin while upstream/main is
             # newer.  Sync first, then compare the checked-out identity.  If
             # it changed (or cannot be proven unchanged), continue through the
             # same dependency/build/health pipeline as any fetched update.
             before_fork_sync = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                fork_remote=update_target.remote,
-            )
+            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
             fork_sync_performed = True
             fork_synced_head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             target_sha = _refresh_update_target_sha(
@@ -6647,19 +6671,10 @@ def _cmd_update_impl(
         _m()._record_bytecode_fingerprint()
         _m()._refresh_bootstrap_cache_scripts(branch)
 
-        # Keep the legacy upstream reconciliation origin-specific. A main
-        # branch explicitly owned by another remote remains isolated.
-        if (
-            is_fork
-            and branch == "main"
-            and update_target.remote == "origin"
-        ):
+        # Preserve the legacy origin/upstream reconciliation for forks on main.
+        if is_fork and branch == "main":
             if not fork_sync_performed:
-                _m()._sync_with_upstream_if_needed(
-                    git_cmd,
-                    _m().PROJECT_ROOT,
-                    fork_remote=update_target.remote,
-                )
+                _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
             target_sha = _refresh_update_target_sha(
                 git_cmd,
                 _m().PROJECT_ROOT,
