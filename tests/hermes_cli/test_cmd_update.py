@@ -1187,13 +1187,32 @@ class TestCmdUpdateCheckBranchFlag:
         cmd_update(args)
 
         commands = [[str(a) for a in c.args[0]] for c in mock_run.call_args_list]
-        assert any(cmd[-3:] == ["fetch", "fork", "main"] for cmd in commands)
         assert any(
-            cmd[-4:] == ["rev-parse", "--verify", "--quiet", "fork/main"]
+            cmd[-3:]
+            == [
+                "--",
+                "fork",
+                "+refs/heads/main:refs/remotes/fork/main",
+            ]
             for cmd in commands
         )
         assert any(
-            cmd[-3:] == ["rev-list", "HEAD..fork/main", "--count"]
+            cmd[-4:]
+            == [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/fork/main",
+            ]
+            for cmd in commands
+        )
+        assert any(
+            cmd[-3:]
+            == [
+                "rev-list",
+                "HEAD..refs/remotes/fork/main",
+                "--count",
+            ]
             for cmd in commands
         )
         assert not any(
