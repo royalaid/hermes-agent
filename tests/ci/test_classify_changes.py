@@ -131,6 +131,26 @@ CASES = {
         ["scripts/tests/test-install-ps1-longpath.ps1"],
         _lanes(python=True, installer=True),
     ),
+    "desktop updater script → Windows lane": (
+        ["scripts/desktop-update.ps1"],
+        _lanes(python=True, installer=True),
+    ),
+    "updater process source → frontend + Windows lane": (
+        ["apps/desktop/electron/updater-process.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "updater process test → frontend + Windows lane": (
+        ["apps/desktop/electron/updater-process.test.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "handoff source → frontend + Windows lane": (
+        ["apps/desktop/electron/handoff-result.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "handoff test → frontend + Windows lane": (
+        ["apps/desktop/electron/handoff-result.test.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
     "python source alone → no installer lane": (["run_agent.py"], _lanes(python=True, scan=True)),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
