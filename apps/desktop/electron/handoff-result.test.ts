@@ -7,6 +7,7 @@ import { test, vi } from 'vitest'
 
 import {
   consumeLegacyHandoffResult,
+  consumePosixHandoffResult,
   handoffAckPath,
   handoffResultPath,
   readHandoffResult,
@@ -173,6 +174,18 @@ function legacyResult(over: Record<string, unknown> = {}): Record<string, unknow
     ok: false,
     exit_code: 6,
     message: 'legacy update failed',
+    branch: 'main',
+    finished_at: NOW_SECONDS,
+    ...over
+  }
+}
+
+function posixResult(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ok: true,
+    exit_code: 0,
+    manual: false,
+    message: 'POSIX update complete',
     branch: 'main',
     finished_at: NOW_SECONDS,
     ...over
@@ -529,7 +542,10 @@ test('ACK publication is atomic and exclusive instead of overwriting a prior pro
   assert.ok(first)
   assert.equal(second, null)
   assert.deepEqual(fs.readFileSync(ackPath), firstBytes)
-  assert.equal(fs.readdirSync(where.home).some(name => name.includes('.ack-tmp-')), false)
+  assert.equal(
+    fs.readdirSync(where.home).some(name => name.includes('.ack-tmp-')),
+    false
+  )
 })
 
 test('bounded poll preserves pending, then consumes only its delayed correlated terminal result', async () => {
@@ -591,11 +607,17 @@ test('terminal polling leaves malformed and differently correlated records untou
     const normalized: any = clone(body)
     normalized.root = where.root
 
-    if (normalized.receipt && typeof normalized.receipt === 'object') {normalized.receipt.root = where.root}
+    if (normalized.receipt && typeof normalized.receipt === 'object') {
+      normalized.receipt.root = where.root
+    }
 
-    if (normalized.relaunch && typeof normalized.relaunch === 'object') {normalized.relaunch.executable = where.executable}
+    if (normalized.relaunch && typeof normalized.relaunch === 'object') {
+      normalized.relaunch.executable = where.executable
+    }
 
-    if (normalized.desktop && typeof normalized.desktop === 'object') {normalized.desktop.root = where.root}
+    if (normalized.desktop && typeof normalized.desktop === 'object') {
+      normalized.desktop.root = where.root
+    }
     writeResult(where.home, normalized)
 
     const terminal = await waitForTerminalHandoffResult(where.home, {
@@ -699,55 +721,114 @@ test('legacy v0 consumer restores an exact foreign replacement raced before isol
   }
 
   assert.deepEqual(fs.readFileSync(handoffResultPath(where.home)), foreign)
-  assert.equal(fs.readdirSync(where.home).some(name => name.includes('.consume-')), false)
-})
-
-test('manual flag survives the round trip and defaults false', () => {
-  const home = tempHome()
-  write(home, {
-    ok: true,
-    exit_code: 0,
-    manual: true,
-    message: 'Update complete. Reopen Hermes to finish (it could not restart itself).',
-    branch: 'main',
-    finished_at: Math.floor(Date.now() / 1000)
-  })
-
-  const result = readAndConsumeHandoffResult(home)
-
-  assert.ok(result)
-  assert.equal(result.ok, true)
-  assert.equal(result.manual, true)
-
-  write(home, { ok: true, exit_code: 0, message: 'done', branch: 'main', finished_at: Math.floor(Date.now() / 1000) })
   assert.equal(
-    readAndConsumeHandoffResult(home)?.manual,
-    false,
-    'older writers without the field parse as manual:false'
+    fs.readdirSync(where.home).some(name => name.includes('.consume-')),
+    false
   )
 })
 
-test('an old manual result survives the freshness window but an old ordinary one does not', () => {
-  const stale = Math.floor(Date.now() / 1000) - 3600
+test('exact fresh POSIX success is returned and consumed once without becoming v2', () => {
+  const where = fixture()
+  writeLegacy(where.home, posixResult())
 
-  const ordinary = tempHome()
-  write(ordinary, { ok: true, exit_code: 0, manual: false, message: 'done', branch: 'main', finished_at: stale })
-  assert.equal(readAndConsumeHandoffResult(ordinary), null, 'a stale ordinary result is discarded')
-  assert.equal(fs.existsSync(handoffResultPath(ordinary)), false, 'and still consumed')
-
-  const home = tempHome()
-  write(home, {
+  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), {
     ok: true,
-    exit_code: 0,
+    exitCode: 0,
+    manual: false,
+    message: 'POSIX update complete',
+    branch: 'main'
+  })
+  assert.equal(readHandoffResult(where.home, { now: () => NOW_MS }), null)
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+})
+
+test('exact fresh POSIX failure is returned and consumed once', () => {
+  const where = fixture()
+  writeLegacy(where.home, posixResult({ ok: false, exit_code: 7, message: 'POSIX update failed' }))
+
+  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), {
+    ok: false,
+    exitCode: 7,
+    manual: false,
+    message: 'POSIX update failed',
+    branch: 'main'
+  })
+  assert.equal(fs.existsSync(handoffResultPath(where.home)), false)
+})
+
+test('stale ordinary POSIX result is retired without surfacing', () => {
+  const where = fixture()
+  writeLegacy(where.home, posixResult({ finished_at: NOW_SECONDS - 3_600 }))
+
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+  assert.equal(fs.existsSync(handoffResultPath(where.home)), false)
+})
+
+test('stale POSIX manual result remains actionable and is consumed once', () => {
+  const where = fixture()
+  writeLegacy(
+    where.home,
+    posixResult({
+      manual: true,
+      message: 'Reopen Hermes to finish',
+      finished_at: NOW_SECONDS - 3_600
+    })
+  )
+
+  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), {
+    ok: true,
+    exitCode: 0,
     manual: true,
-    message: 'Update complete. Reopen Hermes to finish (it could not restart itself).',
-    branch: 'main',
-    finished_at: stale
+    message: 'Reopen Hermes to finish',
+    branch: 'main'
+  })
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+})
+
+test('invalid or extended POSIX-shaped bytes remain for another consumer', () => {
+  const v2Shaped = completeResult(fixture())
+
+  for (const body of [
+    posixResult({ manual: 'true' }),
+    posixResult({ ok: false, exit_code: 7, manual: true }),
+    posixResult({ extra: true }),
+    { ...v2Shaped, manual: false }
+  ]) {
+    const where = fixture()
+    const original = writeLegacy(where.home, body)
+
+    assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+    assert.deepEqual(fs.readFileSync(handoffResultPath(where.home)), original)
+  }
+})
+
+test('future POSIX result outside clock skew is consumed without surfacing', () => {
+  const where = fixture()
+  writeLegacy(where.home, posixResult({ manual: true, finished_at: NOW_SECONDS + 6 }))
+
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+  assert.equal(fs.existsSync(handoffResultPath(where.home)), false)
+})
+
+test('POSIX consumer restores a foreign replacement raced before isolation', () => {
+  const where = fixture()
+  writeLegacy(where.home, posixResult())
+  const foreign = Buffer.from('{"foreign":"replacement"}', 'utf8')
+  const originalRename = fs.renameSync.bind(fs)
+  const rename = vi.spyOn(fs, 'renameSync').mockImplementationOnce((source, destination) => {
+    fs.writeFileSync(source, foreign)
+    originalRename(source, destination)
   })
 
-  const result = readAndConsumeHandoffResult(home)
+  try {
+    assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+  } finally {
+    rename.mockRestore()
+  }
 
-  assert.ok(result, 'a stale manual result is still surfaced — it is the last-resort channel')
-  assert.equal(result.manual, true)
-  assert.equal(readAndConsumeHandoffResult(home), null, 'but only once')
+  assert.deepEqual(fs.readFileSync(handoffResultPath(where.home)), foreign)
+  assert.equal(
+    fs.readdirSync(where.home).some(name => name.includes('.consume-')),
+    false
+  )
 })
