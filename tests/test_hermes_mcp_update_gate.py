@@ -122,6 +122,24 @@ def test_expired_emergency_shadow_still_has_a_hard_wall_clock_bound(
     ) is None
 
 
+def test_emergency_shadow_survives_backward_wall_clock_step(tmp_path: Path) -> None:
+    root = tmp_path / "install"
+    root.mkdir()
+    marker = tmp_path / ".hermes-venv-quiesce"
+    shadow = tmp_path / f"{marker.name}.cas-emergency-test"
+    shadow.write_text(json.dumps(_lease(root)), encoding="utf-8")
+
+    active = gate.live_quiesce_lease(
+        marker,
+        install_root=root,
+        now=50.0,
+        pid_alive=lambda _pid: False,
+    )
+
+    assert active is not None
+    assert active["lease_id"] == "lease-test-123456"
+
+
 def test_gate_rejects_a_valid_lease_for_another_install(tmp_path: Path) -> None:
     root = tmp_path / "install"
     other = tmp_path / "other"
