@@ -49,6 +49,10 @@ function unref(timer: ReturnType<typeof setTimeout>): void {
   handle.unref?.()
 }
 
+function isPositiveExactTimestamp(value: number | null): value is number {
+  return Number.isSafeInteger(value) && value > 0
+}
+
 export function createHandoffRelaunchExitWatch(options: HandoffRelaunchExitWatchOptions): HandoffRelaunchExitWatch {
   let identity: HandoffRelaunchExitWatchIdentity | null = null
   let inspectionRunning = false
@@ -104,6 +108,21 @@ export function createHandoffRelaunchExitWatch(options: HandoffRelaunchExitWatch
     let disposition: HandoffRelaunchExitWatchDisposition
 
     try {
+      if (!isPositiveExactTimestamp(identity.currentProcessStartedAt)) {
+        let resolvedProcessStartedAt: number | null = null
+
+        try {
+          resolvedProcessStartedAt = await options.resolveCurrentProcessStartedAt(options.currentPid)
+        } catch {
+          // An inconclusive identity probe must fail closed for this inspection,
+          // but a later poll can retry it.
+        }
+
+        if (isPositiveExactTimestamp(resolvedProcessStartedAt)) {
+          identity.currentProcessStartedAt = resolvedProcessStartedAt
+        }
+      }
+
       disposition = await options.inspect(identity)
     } finally {
       inspectionRunning = false
@@ -147,12 +166,11 @@ export function createHandoffRelaunchExitWatch(options: HandoffRelaunchExitWatch
     started = true
 
     const currentRoot = options.resolveCurrentRoot()
-    const currentProcessStartedAt = await options.resolveCurrentProcessStartedAt(options.currentPid)
 
     identity = {
       currentExecutable: options.currentExecutable,
       currentPid: options.currentPid,
-      currentProcessStartedAt,
+      currentProcessStartedAt: null,
       currentRoot
     }
 

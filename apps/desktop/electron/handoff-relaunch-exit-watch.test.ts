@@ -8,7 +8,7 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-test('idle relaunch watch caches process identity and does not repeatedly probe', async () => {
+test('idle relaunch watch pins a positive process identity and does not repeatedly probe', async () => {
   vi.useFakeTimers()
 
   let inspectCalls = 0
@@ -74,6 +74,53 @@ test('idle relaunch watch caches process identity and does not repeatedly probe'
   watch.stop()
   assert.equal(watchClosed, true)
   assert.equal(vi.getTimerCount(), 0)
+})
+
+test('idle relaunch watch retries an unknown process identity until it becomes exact', async () => {
+  vi.useFakeTimers()
+
+  const inspectedProcessStarts: Array<number | null> = []
+  const resolvedProcessStarts: Array<number | null> = [null, 1_725_000_000]
+  let processIdentityCalls = 0
+  let watchedChange: ((filename: string | Uint8Array | null) => void) | null = null
+
+  const watch = createHandoffRelaunchExitWatch({
+    activePollMs: 250,
+    debounceMs: 50,
+    hermesHome: 'C:\\Users\\hermes\\.hermes',
+    idlePollMs: 30_000,
+    inspect: async identity => {
+      inspectedProcessStarts.push(identity.currentProcessStartedAt)
+
+      return 'idle' as const
+    },
+    currentExecutable: 'C:\\Program Files\\Hermes\\Hermes.exe',
+    currentPid: 4321,
+    resolveCurrentProcessStartedAt: async () =>
+      resolvedProcessStarts[Math.min(processIdentityCalls++, resolvedProcessStarts.length - 1)],
+    resolveCurrentRoot: () => 'C:\\Users\\hermes\\hermes-agent',
+    watchDirectory: (_directory, onChange) => {
+      watchedChange = onChange
+
+      return { close: () => {} }
+    }
+  })
+
+  assert.equal(await watch.start(), true)
+  assert.deepEqual(inspectedProcessStarts, [null])
+  assert.equal(processIdentityCalls, 1)
+
+  watchedChange?.('.hermes-update-relaunch-request-attempt-123456.json')
+  await vi.advanceTimersByTimeAsync(50)
+  assert.deepEqual(inspectedProcessStarts, [null, 1_725_000_000])
+  assert.equal(processIdentityCalls, 2)
+
+  watchedChange?.('.hermes-update-relaunch-request-attempt-123456.json')
+  await vi.advanceTimersByTimeAsync(50)
+  assert.deepEqual(inspectedProcessStarts, [null, 1_725_000_000, 1_725_000_000])
+  assert.equal(processIdentityCalls, 2, 'a positive exact timestamp stays pinned')
+
+  watch.stop()
 })
 
 test('active relaunch requests use the short poll only until inspection becomes idle', async () => {
