@@ -8,6 +8,9 @@ import { test, vi } from 'vitest'
 import {
   consumeLegacyHandoffResult,
   consumePosixHandoffResult,
+  HANDOFF_RECEIPT_TO_RELAUNCH_MAX_AGE_MS,
+  HANDOFF_RESULT_CLOCK_SKEW_MS,
+  HANDOFF_RESULT_MAX_AGE_MS,
   handoffAckPath,
   handoffResultPath,
   readHandoffResult,
@@ -263,6 +266,44 @@ test('accepts archive receipt identity and exposes its immutable archive digest'
   assert.equal(parsed.receipt?.mode, 'archive')
   assert.equal(parsed.receipt?.resultingHead, null)
   assert.equal(parsed.receipt?.archiveSha, archiveSha)
+})
+
+test('accepts a receipt that spans the supported rebuild and recovery budgets', () => {
+  const where = fixture()
+  const value = pendingResult(where)
+
+  // The receipt is published before a rebuild that may take 30 minutes,
+  // followed by a five-minute gateway recovery and one-minute relaunch handoff.
+  value.receipt.timestamp = REQUESTED_AT - 36 * 60
+  writeResult(where.home, value)
+
+  assert.ok(read(where.home, where.root))
+})
+
+test('rejects genuinely stale or future receipts while result freshness stays independent', () => {
+  const invalidReceiptTimestamps = [
+    REQUESTED_AT - HANDOFF_RECEIPT_TO_RELAUNCH_MAX_AGE_MS / 1_000 - 1,
+    REQUESTED_AT + HANDOFF_RESULT_CLOCK_SKEW_MS / 1_000 + 1
+  ]
+
+  for (const timestamp of invalidReceiptTimestamps) {
+    const where = fixture()
+    const value = pendingResult(where)
+    value.receipt.timestamp = timestamp
+    writeResult(where.home, value)
+
+    assert.equal(read(where.home, where.root), null)
+  }
+
+  const staleResult = fixture()
+  const staleRequestedAt = NOW_SECONDS - HANDOFF_RESULT_MAX_AGE_MS / 1_000 - 1
+  const value = pendingResult(staleResult)
+  value.relaunch.requested_at = staleRequestedAt
+  value.relaunch.process_started_at = staleRequestedAt - 1
+  value.receipt.timestamp = staleRequestedAt
+  writeResult(staleResult.home, value)
+
+  assert.equal(read(staleResult.home, staleResult.root), null)
 })
 
 test('rejects missing, extra, and wrongly typed result or nested keys without consuming', () => {
