@@ -27,6 +27,7 @@ export interface HandoffResultLifecycleOptions {
 }
 
 export interface HandoffResultRetryOptions {
+  resolveCurrentProcessStartedAt: () => number | null | Promise<number | null>
   retryDelayMs?: number
   shouldRetryAfterNull: () => boolean
   wait?: (delayMs: number) => Promise<void>
@@ -52,14 +53,19 @@ const DEFAULT_DEPS: HandoffLifecycleDeps = {
 
 const defaultWait = (delayMs: number) => new Promise<void>(resolve => setTimeout(resolve, delayMs))
 
+function isPositiveExactTimestamp(value: number | null): value is number {
+  return Number.isSafeInteger(value) && value > 0
+}
+
 /**
  * Repeat bounded discovery windows while a caller can still prove that an
  * updater result is expected. This keeps a Desktop opened mid-update (remote
  * or local) from permanently exhausting one early ten-second poll.
  */
 export async function retryHandoffResultLifecycle(
-  runOnce: () => Promise<HandoffResult | null>,
+  runOnce: (currentProcessStartedAt: number | null) => Promise<HandoffResult | null>,
   {
+    resolveCurrentProcessStartedAt,
     retryDelayMs = 1_000,
     shouldRetryAfterNull,
     wait = defaultWait
@@ -67,8 +73,25 @@ export async function retryHandoffResultLifecycle(
 ): Promise<HandoffResult | null> {
   if (!Number.isFinite(retryDelayMs) || retryDelayMs <= 0) {return null}
 
+  let currentProcessStartedAt: number | null = null
+
   while (true) {
-    const result = await runOnce()
+    if (!isPositiveExactTimestamp(currentProcessStartedAt)) {
+      let resolvedProcessStartedAt: number | null = null
+
+      try {
+        resolvedProcessStartedAt = await resolveCurrentProcessStartedAt()
+      } catch {
+        // Keep identity unknown for this bounded discovery window. A later
+        // lifecycle retry can make a fresh OS query.
+      }
+
+      if (isPositiveExactTimestamp(resolvedProcessStartedAt)) {
+        currentProcessStartedAt = resolvedProcessStartedAt
+      }
+    }
+
+    const result = await runOnce(currentProcessStartedAt)
 
     if (result || !shouldRetryAfterNull()) {return result}
     await wait(retryDelayMs)
