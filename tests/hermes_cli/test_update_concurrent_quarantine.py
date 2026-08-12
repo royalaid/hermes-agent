@@ -1,8 +1,9 @@
 """Tests for issue #26670 — concurrent hermes.exe detection and improved
 quarantine retry / reboot-deferred fallback during `hermes update` on Windows.
 
-These tests force ``_is_windows`` to return ``True`` via patching so the
-Windows-specific code paths can be exercised on any host.
+These tests patch ``_is_windows`` only around deterministic updater control
+flow. Process tables and native operations are replaced with explicit fakes;
+tests of the host-independent identity helpers do not fake the platform.
 """
 
 from __future__ import annotations
@@ -345,9 +346,7 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     assert "Restart manually after update" not in captured
 
 
-@patch.object(cli_main, "_is_windows", return_value=True)
 def test_capture_gateway_identity_accepts_target_venv_redirector_ancestor(
-    _winp,
     monkeypatch,
     tmp_path,
 ):
@@ -357,7 +356,7 @@ def test_capture_gateway_identity_accepts_target_venv_redirector_ancestor(
     shared_home.mkdir()
     worker_pid = 202
     launcher_pid = 201
-    worker_exe = r"C:\Python311\python.exe"
+    worker_exe = str(tmp_path / "base-python" / "python.exe")
     launcher_exe = str(install_root / "venv" / "Scripts" / "python.exe")
     records = {
         worker_pid: _gateway_record(
@@ -395,9 +394,7 @@ def test_capture_gateway_identity_accepts_target_venv_redirector_ancestor(
     )
 
 
-@patch.object(cli_main, "_is_windows", return_value=True)
 def test_gateway_worker_revalidates_target_venv_ancestor_identity(
-    _winp,
     monkeypatch,
     tmp_path,
 ):
@@ -410,7 +407,7 @@ def test_gateway_worker_revalidates_target_venv_ancestor_identity(
     records = {
         worker_pid: _gateway_record(
             worker_pid,
-            exe=r"C:\Python311\python.exe",
+            exe=str(tmp_path / "base-python" / "python.exe"),
             cwd=str(shared_home),
         ),
         launcher_pid: _gateway_record(
@@ -467,7 +464,7 @@ def test_pause_refuses_foreign_gateway_from_checkout_sharing_global_home(
     records = {
         worker_pid: _gateway_record(
             worker_pid,
-            exe=r"C:\Python311\python.exe",
+            exe=str(tmp_path / "base-python" / "python.exe"),
             cwd=str(shared_home),
         ),
         launcher_pid: _gateway_record(
@@ -696,7 +693,7 @@ def test_pause_ignores_unmapped_gateway_from_another_install(
     records = {
         pid: _gateway_record(
             pid,
-            exe=r"C:\Python311\python.exe",
+            exe=str(tmp_path / "base-python" / "python.exe"),
             cwd=str(foreign_home),
         )
     }
@@ -753,7 +750,7 @@ def test_pause_keeps_target_gateway_when_foreign_gateway_is_also_discovered(
         target_pid: _gateway_record(target_pid),
         foreign_pid: _gateway_record(
             foreign_pid,
-            exe=r"C:\Python311\python.exe",
+            exe=str(tmp_path / "base-python" / "python.exe"),
             cwd=str(tmp_path / "foreign-home"),
         ),
     }
@@ -814,7 +811,7 @@ def test_pause_refuses_foreign_process_named_by_target_profile_state(
     records = {
         pid: _gateway_record(
             pid,
-            exe=r"C:\Python311\python.exe",
+            exe=str(tmp_path / "base-python" / "python.exe"),
             cwd=str(foreign_home),
         )
     }
@@ -1078,7 +1075,7 @@ def _fake_psutil_tree(tree, venv_exe, worker_exe, dead=None):
 def test_venv_launcher_ancestors_returns_venv_side_parent(_winp, monkeypatch):
     """The worker's venv-side parent is reported so the guard set is covered."""
     venv_exe = str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe")
-    worker_exe = r"C:\Users\x\AppData\Roaming\uv\python\cpython-3.11\python.exe"
+    worker_exe = str(cli_main.PROJECT_ROOT.parent / "uv-runtime" / "python.exe")
 
     # worker 200 -> launcher 100 (even == venv-side)
     fake = _fake_psutil_tree({200: 100}, venv_exe, worker_exe)
@@ -1095,11 +1092,10 @@ def test_venv_launcher_ancestors_returns_venv_side_parent(_winp, monkeypatch):
     ]
 
 
-@patch.object(cli_main, "_is_windows", return_value=True)
-def test_capture_refuses_worker_with_only_non_venv_parents(_winp, monkeypatch):
+def test_capture_refuses_worker_with_only_non_venv_parents(monkeypatch):
     """A shared cwd plus an unrelated shell ancestor cannot authorize a stop."""
     venv_exe = str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe")
-    worker_exe = r"C:\Windows\System32\cmd.exe"
+    worker_exe = str(cli_main.PROJECT_ROOT.parent / "shell" / "cmd.exe")
 
     # worker 200 -> parent 101 (odd == NOT venv-side)
     fake = _fake_psutil_tree({200: 101}, venv_exe, worker_exe)
@@ -1134,7 +1130,7 @@ def test_pause_kill_set_covers_venv_guard_abort_set(
     import gateway.status as status_mod
 
     venv_exe = str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe")
-    worker_exe = r"C:\Users\x\AppData\Roaming\uv\python\cpython-3.11\python.exe"
+    worker_exe = str(cli_main.PROJECT_ROOT.parent / "uv-runtime" / "python.exe")
 
     profile_home = tmp_path / "profiles" / "default"
     profile_home.mkdir(parents=True)
