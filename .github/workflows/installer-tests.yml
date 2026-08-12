@@ -1,10 +1,8 @@
-name: Installer tests
+name: Windows installer and updater tests
 
-# scripts/install.ps1's PowerShell tests. They exercise the installer as a real
-# subprocess, and every path contract they assert (8.3 short-name aliases,
-# Git Bash layouts, provider-cmdlet behavior) is Windows-specific — so they need
-# a Windows runner. Before this workflow existed the files were in the tree but
-# nothing ever ran them.
+# Real Windows coverage for scripts/install.ps1 and the Desktop updater
+# handoff. The updater-process suite contains a win32-only detached PowerShell
+# child test, and the PowerShell contract runs the production handoff script.
 
 on:
   workflow_call:
@@ -18,12 +16,31 @@ concurrency:
 
 jobs:
   powershell:
-    name: PowerShell installer tests
+    name: PowerShell installer and Desktop updater tests
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Install npm 12
+        shell: pwsh
+        run: npm install --global npm@12
+
+      - name: Install JavaScript dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: npm ci --ignore-scripts
+
+      - name: Desktop updater process (real Windows child)
+        working-directory: apps/desktop
+        shell: pwsh
+        run: npm run test:desktop:platforms -- electron/updater-process.test.ts
 
       # Windows PowerShell 5.1 as well as pwsh 7: install.ps1 is delivered via
       # `irm | iex` into whatever shell the user already has, and 5.1 is what
@@ -36,3 +53,14 @@ jobs:
       - name: 8.3 short-path normalization (Windows PowerShell 5.1)
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-install-ps1-longpath.ps1
+
+      # This executes scripts/desktop-update.ps1 against an isolated fake
+      # install. Running it under both engines catches syntax and runtime
+      # differences between inbox Windows PowerShell and modern pwsh.
+      - name: Desktop update handoff (pwsh 7)
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-desktop-update-handoff.ps1
+
+      - name: Desktop update handoff (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-desktop-update-handoff.ps1
