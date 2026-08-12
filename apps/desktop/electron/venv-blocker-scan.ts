@@ -25,14 +25,23 @@ export interface VenvBlockerIdentity {
   pid: number
   name: string
   cmdline: string
+  createdAt?: number
 }
 
+// The preview classification is optional so every identity record — including
+// an MCP bridge or a Desktop plugin service — remains a legal force-drain
+// target.  classifyVenvBlocker always fills both fields for a generic blocker.
 export interface VenvBlockerProcess extends VenvBlockerIdentity {
-  kind: VenvBlockerKind
-  safeToStop: boolean
+  kind?: VenvBlockerKind
+  safeToStop?: boolean
   label?: string
   port?: number
   createTime?: number
+}
+
+export type ClassifiedVenvBlocker = VenvBlockerProcess & {
+  kind: VenvBlockerKind
+  safeToStop: boolean
 }
 
 // An MCP bridge is never "safe to stop" through the local-preview path: it is
@@ -48,10 +57,29 @@ export interface McpBridgeProcess extends VenvBlockerIdentity {
   wrapperPid?: number
 }
 
+/**
+ * A persistent service launched by a Hermes Desktop plugin.  The scanner only
+ * emits this record when it can prove the executable, script, and Windows
+ * Script Host supervisor all belong to this specific Hermes installation.
+ *
+ * Like an MCP bridge, it is never reached through the local-preview path, so it
+ * carries the shared identity without the preview classification.
+ */
+export interface DesktopPluginServiceProcess extends VenvBlockerIdentity {
+  action: 'terminate_desktop_plugin_service'
+  actionable: boolean
+  actionability: 'exact_desktop_plugin_service' | 'hard_block'
+  createdAt: number
+  owner: 'desktop' | 'unknown'
+  role: 'desktop_plugin_worker' | 'desktop_plugin_wrapper'
+  wrapperPid?: number
+}
+
 export interface VenvBlockerScanResult {
   blocked: boolean
   processes: VenvBlockerProcess[]
   mcpBridges: McpBridgeProcess[]
+  desktopPluginServices: DesktopPluginServiceProcess[]
   pausableGateways: number
 }
 
@@ -74,6 +102,22 @@ export function isExactActionableMcpBridge(bridge: McpBridgeProcess): boolean {
   )
 }
 
+export function isExactActionableDesktopPluginService(
+  service: DesktopPluginServiceProcess
+): boolean {
+  return (
+    service.owner === 'desktop' &&
+    (service.role === 'desktop_plugin_wrapper' || service.role === 'desktop_plugin_worker') &&
+    service.actionable === true &&
+    service.actionability === 'exact_desktop_plugin_service' &&
+    service.action === 'terminate_desktop_plugin_service' &&
+    Number.isInteger(service.pid) &&
+    service.pid > 0 &&
+    Number.isFinite(service.createdAt) &&
+    service.createdAt > 0
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -91,7 +135,7 @@ const LOCAL_PREVIEW_HINT_KEYS = ['kind', 'safeToStop', 'label', 'port', 'createT
 function classifyVenvBlocker(
   process: Pick<VenvBlockerProcess, 'pid' | 'name' | 'cmdline'>,
   hints?: Record<string, unknown>
-): VenvBlockerProcess {
+): ClassifiedVenvBlocker {
   const moduleMatch = process.cmdline.match(/(?:^|\s)-m\s+http\.server(?:\s+(\d{1,5}))?(?:\s|$)/i)
   const isPython = /^python(?:w)?(?:\.exe)?$/i.test(process.name)
   const hintedCreateTime = typeof hints?.createTime === 'number' ? hints.createTime : undefined
@@ -252,7 +296,25 @@ function parseIdentityRecord(
 
   // classifyVenvBlocker re-validates every hint itself, so an absent, partial,
   // or malformed hint set degrades to a plain unstoppable 'other' blocker.
-  return classifyVenvBlocker({ pid, name, cmdline }, entry)
+  // The scanner's own create time rides along beside that classification so a
+  // force-drain can re-prove this exact PID before it stops anything.
+  return {
+    ...classifyVenvBlocker({ pid, name, cmdline }, entry),
+    ...(createdAt === undefined ? {} : { createdAt })
+  }
+}
+
+// Identity-typed: the preflight force-drain asks this of generic blockers, MCP
+// bridges, and Desktop plugin services alike, and only PID/create-time matter.
+export function isExactVenvHolder(
+  process: VenvBlockerIdentity
+): process is VenvBlockerIdentity & { createdAt: number } {
+  return (
+    Number.isInteger(process.pid) &&
+    process.pid > 0 &&
+    Number.isFinite(process.createdAt) &&
+    (process.createdAt ?? 0) > 0
+  )
 }
 
 export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdentity): ScanOutcome {
@@ -275,6 +337,7 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
     'venv',
     'processes',
     'mcp_bridges',
+    'desktop_plugin_services',
     'pausable_gateways',
     'pausable_gateway_processes',
     'error'
@@ -283,7 +346,7 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
   if (!hasExactKeys(parsed, fields)) {return { kind: 'probe-failure', error: 'scanner envelope fields are invalid' }}
 
   if (
-    parsed.schema_version !== 1 ||
+    parsed.schema_version !== 2 ||
     parsed.mode !== 'scan' ||
     parsed.ok !== true ||
     typeof parsed.ready !== 'boolean' ||
@@ -309,7 +372,11 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
     return { kind: 'probe-failure', error: 'scanner target identity does not match the requested root and venv' }
   }
 
-  if (!Array.isArray(parsed.processes) || !Array.isArray(parsed.mcp_bridges)) {
+  if (
+    !Array.isArray(parsed.processes) ||
+    !Array.isArray(parsed.mcp_bridges) ||
+    !Array.isArray(parsed.desktop_plugin_services)
+  ) {
     return { kind: 'probe-failure', error: 'scanner process fields must be arrays' }
   }
 
@@ -445,6 +512,89 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
 
   const mcpBridges = parsedMcpBridges.map(({ bridge }) => bridge)
 
+  const parsedDesktopPluginServices: DesktopPluginServiceProcess[] = []
+
+  for (const entry of parsed.desktop_plugin_services) {
+    const required = [
+      'pid',
+      'name',
+      'cmdline',
+      'created_at',
+      'owner',
+      'role',
+      'actionable',
+      'actionability',
+      'action'
+    ]
+
+    if (!hasExactKeys(entry, required, ['wrapper_pid'])) {
+      return { kind: 'probe-failure', error: 'desktop plugin service entry must be an object' }
+    }
+
+    const {
+      pid,
+      name,
+      cmdline,
+      created_at: createdAt,
+      owner,
+      role,
+      actionable,
+      actionability,
+      action,
+      wrapper_pid: wrapperPid
+    } = entry
+
+    if (
+      !Number.isInteger(pid) ||
+      pid <= 0 ||
+      typeof name !== 'string' ||
+      name.length === 0 ||
+      typeof cmdline !== 'string' ||
+      cmdline.length > 120 ||
+      typeof createdAt !== 'number' ||
+      !Number.isFinite(createdAt) ||
+      createdAt <= 0 ||
+      owner !== 'desktop' ||
+      !['desktop_plugin_worker', 'desktop_plugin_wrapper'].includes(role) ||
+      actionable !== true ||
+      actionability !== 'exact_desktop_plugin_service' ||
+      action !== 'terminate_desktop_plugin_service' ||
+      (wrapperPid !== undefined &&
+        (!Number.isInteger(wrapperPid) || wrapperPid <= 0 || wrapperPid === pid)) ||
+      (wrapperPid !== undefined && role !== 'desktop_plugin_worker') ||
+      seenPids.has(pid)
+    ) {
+      return { kind: 'probe-failure', error: 'desktop plugin service identity is invalid' }
+    }
+
+    seenPids.add(pid)
+    parsedDesktopPluginServices.push({
+      pid,
+      name,
+      cmdline,
+      createdAt,
+      owner,
+      role,
+      actionable,
+      actionability,
+      action,
+      ...(wrapperPid === undefined ? {} : { wrapperPid })
+    })
+  }
+
+  const desktopPluginRolesByPid = new Map(
+    parsedDesktopPluginServices.map(service => [service.pid, service.role] as const)
+  )
+
+  for (const service of parsedDesktopPluginServices) {
+    if (
+      service.wrapperPid !== undefined &&
+      desktopPluginRolesByPid.get(service.wrapperPid) !== 'desktop_plugin_wrapper'
+    ) {
+      return { kind: 'probe-failure', error: 'desktop plugin service wrapper_pid is invalid' }
+    }
+  }
+
   const pausableGateways = parsed.pausable_gateways
 
   if (
@@ -462,7 +612,7 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
   }
 
   // Reject inconsistent combinations.
-  const blocked = processes.length + mcpBridges.length > 0
+  const blocked = processes.length + mcpBridges.length + parsedDesktopPluginServices.length > 0
 
   if (
     parsed.blocked !== blocked ||
@@ -475,11 +625,23 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
   return parsed.blocked
     ? {
         kind: 'blocked',
-        result: { blocked: true, processes, mcpBridges, pausableGateways }
+        result: {
+          blocked: true,
+          processes,
+          mcpBridges,
+          desktopPluginServices: parsedDesktopPluginServices,
+          pausableGateways
+        }
       }
     : {
         kind: 'clear',
-        result: { blocked: false, processes, mcpBridges, pausableGateways }
+        result: {
+          blocked: false,
+          processes,
+          mcpBridges,
+          desktopPluginServices: parsedDesktopPluginServices,
+          pausableGateways
+        }
       }
 }
 
@@ -554,10 +716,11 @@ export async function scanVenvBlockers(
   })
 }
 
-function parseTerminateMcpBridgeOutput(
+function parseTerminateOutput(
   raw: string,
   target: ScanTargetIdentity,
-  bridge: McpBridgeProcess
+  holder: VenvBlockerIdentity & { createdAt: number },
+  mode: 'terminate_mcp_bridge' | 'terminate_desktop_plugin_service' | 'terminate_venv_holder'
 ): boolean {
   let parsed: any
 
@@ -587,12 +750,12 @@ function parseTerminateMcpBridgeOutput(
   const expectedVenv = comparableCanonicalPath(target.expectedVenv)
 
   if (
-    parsed.schema_version !== 1 ||
-    parsed.mode !== 'terminate_mcp_bridge' ||
+    parsed.schema_version !== 2 ||
+    parsed.mode !== mode ||
     parsed.ok !== true ||
     typeof parsed.terminated !== 'boolean' ||
-    parsed.pid !== bridge.pid ||
-    parsed.created_at !== bridge.createdAt ||
+    parsed.pid !== holder.pid ||
+    parsed.created_at !== holder.createdAt ||
     parsed.error !== null ||
     actualRoot === null ||
     actualVenv === null ||
@@ -605,6 +768,63 @@ function parseTerminateMcpBridgeOutput(
   }
 
   return parsed.terminated
+}
+
+async function terminateScannedHolder(
+  updateRoot: string,
+  holder: VenvBlockerIdentity & { createdAt: number },
+  actionFlag: '--terminate-mcp-bridge' | '--terminate-desktop-plugin-service' | '--terminate-venv-holder',
+  mode: 'terminate_mcp_bridge' | 'terminate_desktop_plugin_service' | 'terminate_venv_holder',
+  execOverride?: typeof execFileAsync,
+  resolveOverride?: typeof resolveVenvPython,
+  canonicalizeOverride?: (root: string) => string
+): Promise<boolean> {
+  const execFn = execOverride || execFileAsync
+  const resolveFn = resolveOverride || resolveVenvPython
+  const canonicalizeFn =
+    canonicalizeOverride ?? ((target: string) => fs.realpathSync.native(target))
+
+  let scanRoot: string
+  try {
+    scanRoot = canonicalizeFn(updateRoot)
+  } catch {
+    return false
+  }
+  const venvPython = resolveFn(scanRoot)
+  if (!venvPython) {return false}
+  let scanVenv: string
+  try {
+    scanVenv = canonicalizeFn(path.dirname(path.dirname(venvPython)))
+  } catch {
+    return false
+  }
+  const env = { ...process.env }
+  delete env.PYTHONPATH
+
+  try {
+    const proc = await execFn(
+      venvPython,
+      [
+        '-m',
+        SCAN_MODULE,
+        '--root',
+        scanRoot,
+        actionFlag,
+        String(holder.pid),
+        '--created-at',
+        String(holder.createdAt)
+      ],
+      { cwd: scanRoot, encoding: 'utf-8', timeout: SCAN_TIMEOUT_MS, windowsHide: true, env } as any
+    )
+    return parseTerminateOutput(
+      String((proc as any).stdout ?? ''),
+      { expectedRoot: scanRoot, expectedVenv: scanVenv },
+      holder,
+      mode
+    )
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -625,64 +845,119 @@ export async function terminateMcpBridge(
     return false
   }
 
-  const execFn = execOverride || execFileAsync
-  const resolveFn = resolveOverride || resolveVenvPython
+  return terminateScannedHolder(
+    updateRoot,
+    bridge,
+    '--terminate-mcp-bridge',
+    'terminate_mcp_bridge',
+    execOverride,
+    resolveOverride,
+    canonicalizeOverride
+  )
+}
 
-  const canonicalizeFn =
-    canonicalizeOverride ?? ((target: string) => fs.realpathSync.native(target))
+/**
+ * Stop one exact Desktop-plugin service after consent.  The scanner
+ * revalidates the target PID/create-time, its plugin script, and (for a
+ * wrapper) the exact Windows Script Host supervisor before either is stopped.
+ */
+export async function terminateDesktopPluginService(
+  updateRoot: string,
+  service: DesktopPluginServiceProcess,
+  execOverride?: typeof execFileAsync,
+  resolveOverride?: typeof resolveVenvPython,
+  canonicalizeOverride?: (root: string) => string
+): Promise<boolean> {
+  if (!isExactActionableDesktopPluginService(service)) {
+    return false
+  }
 
-  let scanRoot: string
+  return terminateScannedHolder(
+    updateRoot,
+    service,
+    '--terminate-desktop-plugin-service',
+    'terminate_desktop_plugin_service',
+    execOverride,
+    resolveOverride,
+    canonicalizeOverride
+  )
+}
+
+function parseTerminateVenvHolderOutput(
+  raw: string,
+  target: ScanTargetIdentity,
+  process: VenvBlockerProcess
+): boolean {
+  let parsed: any
 
   try {
-    scanRoot = canonicalizeFn(updateRoot)
+    parsed = JSON.parse(raw)
   } catch {
     return false
   }
 
-  const venvPython = resolveFn(scanRoot)
+  const fields = [
+    'schema_version',
+    'mode',
+    'ok',
+    'terminated',
+    'pid',
+    'created_at',
+    'root',
+    'venv',
+    'error'
+  ]
 
-  if (!venvPython) {
+  if (!hasExactKeys(parsed, fields)) {return false}
+
+  const actualRoot = comparableCanonicalPath(parsed.root)
+  const actualVenv = comparableCanonicalPath(parsed.venv)
+  const expectedRoot = comparableCanonicalPath(target.expectedRoot)
+  const expectedVenv = comparableCanonicalPath(target.expectedVenv)
+
+  return (
+    parsed.schema_version === 2 &&
+    parsed.mode === 'terminate_venv_holder' &&
+    parsed.ok === true &&
+    parsed.terminated === true &&
+    parsed.pid === process.pid &&
+    parsed.created_at === process.createdAt &&
+    parsed.error === null &&
+    actualRoot !== null &&
+    actualVenv !== null &&
+    expectedRoot !== null &&
+    expectedVenv !== null &&
+    actualRoot === expectedRoot &&
+    actualVenv === expectedVenv
+  )
+}
+
+/**
+ * Force-stop one process from the target install's current blocker scan.
+ * Selecting Update is the user's authorization for this path.  The Python
+ * side re-scans the target install and checks PID/create-time immediately
+ * before killing this one process; it never terminates an ancestor tree.
+ */
+export async function terminateVenvHolder(
+  updateRoot: string,
+  holder: VenvBlockerProcess,
+  execOverride?: typeof execFileAsync,
+  resolveOverride?: typeof resolveVenvPython,
+  canonicalizeOverride?: (root: string) => string
+): Promise<boolean> {
+  if (!isExactVenvHolder(holder)) {
     return false
   }
 
-  let scanVenv: string
-
-  try {
-    scanVenv = canonicalizeFn(path.dirname(path.dirname(venvPython)))
-  } catch {
-    return false
-  }
-
-  const env = { ...process.env }
-  delete env.PYTHONPATH
-
-  try {
-    const proc = await execFn(
-      venvPython,
-      [
-        '-m',
-        SCAN_MODULE,
-        '--root',
-        scanRoot,
-        '--terminate-mcp-bridge',
-        String(bridge.pid),
-        '--created-at',
-        String(bridge.createdAt)
-      ],
-      { cwd: scanRoot, encoding: 'utf-8', timeout: SCAN_TIMEOUT_MS, windowsHide: true, env } as any
-    )
-
-    return parseTerminateMcpBridgeOutput(
-      String((proc as any).stdout ?? ''),
-      {
-        expectedRoot: scanRoot,
-        expectedVenv: scanVenv
-      },
-      bridge
-    )
-  } catch {
-    return false
-  }
+  return terminateScannedHolder(
+    updateRoot,
+    holder,
+    '--terminate-venv-holder',
+    'terminate_venv_holder',
+    execOverride,
+    resolveOverride,
+    canonicalizeOverride
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +1015,15 @@ export function formatBlockerMessage(result: VenvBlockerScanResult): string {
               : 'another agent'
 
       lines.push(`  PID ${bridge.pid}  ${owner}  ${bridge.name}`)
+    }
+  }
+
+  if (result.desktopPluginServices.length > 0) {
+    lines.push('')
+    lines.push('Hermes Desktop plugin services still using this installation:')
+
+    for (const service of result.desktopPluginServices.slice(0, 10)) {
+      lines.push(`  PID ${service.pid}  Hermes Desktop plugin  ${service.name}`)
     }
   }
 
