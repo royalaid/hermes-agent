@@ -3733,10 +3733,15 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean } = {}
       const manualArgv = ['hermes', 'update']
 
       try {
-        const branch = await resolveDesktopUpdateBranch(updateRoot)
+        const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
+        const current = (head.stdout || '').trim()
 
-        if (branch !== 'main') {
-          manualArgv.push('--branch', branch)
+        if (head.code === 0 && current && current !== 'HEAD') {
+          const branch = await resolveHealedBranch(updateRoot, current)
+
+          if (branch !== 'main') {
+            manualArgv.push('--branch', branch)
+          }
         }
       } catch {
         // Best-effort: fall back to bare `hermes update` if branch detection fails.
@@ -3769,7 +3774,8 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean } = {}
         'Updating Hermes — this window will close and the updater will open. Don’t reopen Hermes yourself; it restarts automatically when the update finishes.',
       percent: 100
     })
-    const branch = await resolveDesktopUpdateBranch(updateRoot)
+    const { branch: configuredBranch } = readDesktopUpdateConfig()
+    const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
     const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
 
     // ── Pre-flight state.db integrity guard (#68474) ─────────────────
