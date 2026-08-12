@@ -17,11 +17,13 @@ import { describe, it } from 'vitest'
 import {
   formatBlockerMessage,
   formatProbeFailedMessage,
+  type DesktopPluginServiceProcess,
   type McpBridgeProcess,
   parseVenvBlockerScanOutput,
   resolveVenvPython,
   scanVenvBlockers,
   stopSafeVenvBlockers,
+  terminateDesktopPluginService,
   terminateMcpBridge
 } from './venv-blocker-scan'
 
@@ -57,6 +59,21 @@ function mcpBridge(overrides: Record<string, unknown> = {}): Record<string, unkn
   }
 }
 
+function desktopPluginService(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    pid: 24,
+    name: 'python.exe',
+    cmdline: 'python.exe C:\\Users\\u\\AppData\\Local\\hermes\\desktop-plugins\\tracker\\service.py',
+    created_at: 204.5,
+    owner: 'desktop',
+    role: 'desktop_plugin_wrapper',
+    actionable: true,
+    actionability: 'exact_desktop_plugin_service',
+    action: 'terminate_desktop_plugin_service',
+    ...overrides
+  }
+}
+
 function pausableGateway(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     pid: 33,
@@ -78,7 +95,7 @@ function scanEnvelope(
   overrides: Record<string, unknown> = {}
 ): Record<string, unknown> {
   return {
-    schema_version: 1,
+    schema_version: 2,
     mode: 'scan',
     ok: true,
     ready: true,
@@ -88,6 +105,7 @@ function scanEnvelope(
     venv,
     processes: [],
     mcp_bridges: [],
+    desktop_plugin_services: [],
     pausable_gateways: 0,
     pausable_gateway_processes: [],
     error: null,
@@ -161,6 +179,7 @@ describe('formatBlockerMessage', () => {
         { pid: 101, name: 'python.exe', cmdline: 'serve --host 10.0.0.1', kind: 'other', safeToStop: false }
       ],
       mcpBridges: [],
+      desktopPluginServices: [],
       pausableGateways: 0
     })
 
@@ -191,11 +210,17 @@ describe('parseVenvBlockerScanOutput', () => {
   const target = { expectedRoot, expectedVenv }
   const parseObject = (value: unknown) => parseVenvBlockerScanOutput(JSON.stringify(value), target)
 
-  it('accepts the exact clear v1 scan envelope', () => {
+  it('accepts the exact clear v2 scan envelope', () => {
     const outcome = parseObject(scanEnvelope(expectedRoot, expectedVenv))
     assert.deepEqual(outcome, {
       kind: 'clear',
-      result: { blocked: false, processes: [], mcpBridges: [], pausableGateways: 0 }
+      result: {
+        blocked: false,
+        processes: [],
+        mcpBridges: [],
+        desktopPluginServices: [],
+        pausableGateways: 0
+      }
     })
   })
 
@@ -214,10 +239,12 @@ describe('parseVenvBlockerScanOutput', () => {
             name: 'python.exe',
             cmdline: 'python.exe -m hermes_cli.main serve',
             kind: 'other',
-            safeToStop: false
+            safeToStop: false,
+            createdAt: 101.25
           }
         ],
         mcpBridges: [],
+        desktopPluginServices: [],
         pausableGateways: 0
       }
     })
@@ -267,6 +294,45 @@ describe('parseVenvBlockerScanOutput', () => {
           action: 'refuse'
         }
       ])
+    }
+  })
+
+  it('accepts only an exact actionable Desktop plugin service pair', () => {
+    const outcome = parseObject(
+      blockedScanEnvelope(expectedRoot, expectedVenv, {
+        desktop_plugin_services: [
+          desktopPluginService({ pid: 25, role: 'desktop_plugin_worker', wrapper_pid: 24 }),
+          desktopPluginService()
+        ]
+      })
+    )
+
+    assert.equal(outcome.kind, 'blocked')
+    if (outcome.kind === 'blocked') {
+      assert.equal(outcome.result.desktopPluginServices[0]?.role, 'desktop_plugin_worker')
+      assert.equal(outcome.result.desktopPluginServices[0]?.wrapperPid, 24)
+      assert.equal(outcome.result.desktopPluginServices[1]?.role, 'desktop_plugin_wrapper')
+    }
+  })
+
+  it('rejects unproven or malformed Desktop plugin service records', () => {
+    const invalid = [
+      desktopPluginService({ owner: 'unknown' }),
+      desktopPluginService({ actionable: false }),
+      desktopPluginService({ actionability: 'hard_block' }),
+      desktopPluginService({ action: 'refuse' }),
+      desktopPluginService({ role: 'other' }),
+      desktopPluginService({ wrapper_pid: 99 }),
+      desktopPluginService({ extra: true })
+    ]
+
+    for (const service of invalid) {
+      assert.equal(
+        parseObject(
+          blockedScanEnvelope(expectedRoot, expectedVenv, { desktop_plugin_services: [service] })
+        ).kind,
+        'probe-failure'
+      )
     }
   })
 
@@ -321,7 +387,8 @@ describe('parseVenvBlockerScanOutput', () => {
       safeToStop: true,
       label: 'Example Preview',
       port: 8766,
-      createTime: 1722798000.25
+      createTime: 1722798000.25,
+      createdAt: 101.25
     })
   })
 
@@ -383,7 +450,13 @@ describe('parseVenvBlockerScanOutput', () => {
 
     assert.deepEqual(outcome, {
       kind: 'clear',
-      result: { blocked: false, processes: [], mcpBridges: [], pausableGateways: 1 }
+      result: {
+        blocked: false,
+        processes: [],
+        mcpBridges: [],
+        desktopPluginServices: [],
+        pausableGateways: 1
+      }
     })
   })
 
@@ -403,9 +476,9 @@ describe('parseVenvBlockerScanOutput', () => {
     assert.equal(parseObject({ ...exact, legacy: true }).kind, 'probe-failure')
   })
 
-  it('requires v1 scan success metadata and null error', () => {
+  it('requires v2 scan success metadata and null error', () => {
     const invalidMetadata: Record<string, unknown>[] = [
-      { schema_version: 2 },
+      { schema_version: 1 },
       { mode: 'preflight' },
       { ok: false },
       { ok: 1 },
@@ -440,7 +513,7 @@ describe('parseVenvBlockerScanOutput', () => {
     )
   })
 
-  it('enforces ready, blocked, and reason from generic plus MCP blockers only', () => {
+  it('enforces ready, blocked, and reason from generic, MCP, and Desktop-plugin blockers', () => {
     const invalid = [
       scanEnvelope(expectedRoot, expectedVenv, { ready: false }),
       scanEnvelope(expectedRoot, expectedVenv, { blocked: true }),
@@ -468,6 +541,7 @@ describe('parseVenvBlockerScanOutput', () => {
     for (const override of [
       { processes: null },
       { mcp_bridges: null },
+      { desktop_plugin_services: null },
       { pausable_gateway_processes: null }
     ]) {
       assert.equal(
@@ -656,6 +730,10 @@ describe('parseVenvBlockerScanOutput', () => {
     const invalid = [
       blockedScanEnvelope(expectedRoot, expectedVenv, {
         processes: [genericProcess(), genericProcess()]
+      }),
+      blockedScanEnvelope(expectedRoot, expectedVenv, {
+        processes: [genericProcess()],
+        desktop_plugin_services: [desktopPluginService({ pid: 11 })]
       }),
       blockedScanEnvelope(expectedRoot, expectedVenv, {
         mcp_bridges: [mcpBridge(), mcpBridge()]
@@ -864,7 +942,7 @@ describe('terminateMcpBridge', () => {
   }
 
   const terminationEnvelope = (overrides: Record<string, unknown> = {}) => ({
-    schema_version: 1,
+    schema_version: 2,
     mode: 'terminate_mcp_bridge',
     ok: true,
     terminated: true,
@@ -964,7 +1042,7 @@ describe('terminateMcpBridge', () => {
     const invalid: unknown[] = [
       { ok: true, terminated: true },
       'not json',
-      terminationEnvelope({ schema_version: 2 }),
+      terminationEnvelope({ schema_version: 1 }),
       terminationEnvelope({ mode: 'scan' }),
       terminationEnvelope({ ok: false }),
       terminationEnvelope({ terminated: 1 }),
@@ -1092,6 +1170,7 @@ describe('stopSafeVenvBlockers', () => {
           }
         ],
         mcpBridges: [],
+        desktopPluginServices: [],
         pausableGateways: 0
       },
       exec,
@@ -1105,5 +1184,95 @@ describe('stopSafeVenvBlockers', () => {
       }
     ])
     assert.deepEqual(outcome, { stopped: [47484], failed: [] })
+  })
+})
+
+describe('terminateDesktopPluginService', () => {
+  const requestedRoot = path.join(volumeRoot, 'requested', 'install')
+  const canonicalRoot = path.join(volumeRoot, 'canonical', 'install')
+  const venvPython = path.join(canonicalRoot, '.venv', 'Scripts', 'python.exe')
+  const unresolvedVenv = path.dirname(path.dirname(venvPython))
+  const expectedVenv = path.join(canonicalRoot, 'resolved-venv')
+  const resolveVenv = () => venvPython
+  const service: DesktopPluginServiceProcess = {
+    pid: 45,
+    name: 'python.exe',
+    cmdline: 'python.exe C:\\Users\\u\\AppData\\Local\\hermes\\desktop-plugins\\tracker\\service.py',
+    createdAt: 124.75,
+    owner: 'desktop',
+    role: 'desktop_plugin_wrapper',
+    actionable: true,
+    actionability: 'exact_desktop_plugin_service',
+    action: 'terminate_desktop_plugin_service'
+  }
+  const canonicalize = (value: string) => {
+    if (value === requestedRoot) {return canonicalRoot}
+    if (value === unresolvedVenv) {return expectedVenv}
+    throw new Error(`unexpected canonicalization target: ${value}`)
+  }
+  const envelope = (overrides: Record<string, unknown> = {}) => ({
+    schema_version: 2,
+    mode: 'terminate_desktop_plugin_service',
+    ok: true,
+    terminated: true,
+    pid: service.pid,
+    created_at: service.createdAt,
+    root: canonicalRoot,
+    venv: expectedVenv,
+    error: null,
+    ...overrides
+  })
+
+  it('requests an exact PID/create-time service termination and accepts only its matching response', async () => {
+    const calls: any[] = []
+    const exec = (async (command: string, args: string[]) => {
+      calls.push({ command, args })
+      return { stdout: JSON.stringify(envelope()), stderr: '' }
+    }) as any
+
+    assert.equal(
+      await terminateDesktopPluginService(requestedRoot, service, exec, resolveVenv, canonicalize),
+      true
+    )
+    assert.deepEqual(calls[0].args, [
+      '-m',
+      'hermes_cli._scan_venv_blockers',
+      '--root',
+      canonicalRoot,
+      '--terminate-desktop-plugin-service',
+      '45',
+      '--created-at',
+      '124.75'
+    ])
+  })
+
+  it('fails closed without invoking Python for an unproven service or mismatched response', async () => {
+    let calls = 0
+    const exec = (async () => {
+      calls += 1
+      return { stdout: JSON.stringify(envelope()), stderr: '' }
+    }) as any
+
+    assert.equal(
+      await terminateDesktopPluginService(
+        requestedRoot,
+        { ...service, owner: 'unknown' },
+        exec,
+        resolveVenv,
+        canonicalize
+      ),
+      false
+    )
+    assert.equal(
+      await terminateDesktopPluginService(
+        requestedRoot,
+        service,
+        execReturn(envelope({ mode: 'terminate_mcp_bridge' })),
+        resolveVenv,
+        canonicalize
+      ),
+      false
+    )
+    assert.equal(calls, 0)
   })
 })
