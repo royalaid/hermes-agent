@@ -154,14 +154,23 @@ describe('runHandoffResultLifecycle', () => {
 })
 
 describe('retryHandoffResultLifecycle', () => {
-  it('starts a new bounded discovery window after an early null result', async () => {
-    const results = [null, complete]
+  it('retries an unknown process identity and pins the first positive timestamp', async () => {
+    const results = [null, null, complete]
+    const resolvedProcessStarts: Array<number | null> = [null, 1_723_330_000, 1_800_000_000]
+    const lifecycleProcessStarts: Array<number | null> = []
     const waits: number[] = []
+    let processIdentityCalls = 0
 
     const result = await retryHandoffResultLifecycle(
-      async () => results.shift() ?? null,
+      async currentProcessStartedAt => {
+        lifecycleProcessStarts.push(currentProcessStartedAt)
+
+        return results.shift() ?? null
+      },
       {
         retryDelayMs: 25,
+        resolveCurrentProcessStartedAt: async () =>
+          resolvedProcessStarts[Math.min(processIdentityCalls++, resolvedProcessStarts.length - 1)],
         shouldRetryAfterNull: () => true,
         wait: async delay => {
           waits.push(delay)
@@ -170,7 +179,9 @@ describe('retryHandoffResultLifecycle', () => {
     )
 
     assert.equal(result, complete)
-    assert.deepEqual(waits, [25])
+    assert.deepEqual(lifecycleProcessStarts, [null, 1_723_330_000, 1_723_330_000])
+    assert.equal(processIdentityCalls, 2, 'the first positive exact timestamp stays pinned')
+    assert.deepEqual(waits, [25, 25])
   })
 
   it('stops without spinning when no updater evidence remains', async () => {
@@ -182,7 +193,10 @@ describe('retryHandoffResultLifecycle', () => {
 
         return null
       },
-      { shouldRetryAfterNull: () => false }
+      {
+        resolveCurrentProcessStartedAt: async () => 1_723_330_000,
+        shouldRetryAfterNull: () => false
+      }
     )
 
     assert.equal(result, null)
