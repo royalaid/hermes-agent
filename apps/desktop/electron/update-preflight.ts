@@ -2,9 +2,11 @@ import type { McpBridgeQuiesceLease } from './mcp-bridge-quiesce'
 import {
   formatBlockerMessage,
   formatProbeFailedMessage,
-  isExactActionableMcpBridge,
+  isExactVenvHolder,
+  type DesktopPluginServiceProcess,
   type McpBridgeProcess,
   type ScanOutcome,
+  type VenvBlockerProcess,
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
 
@@ -23,9 +25,9 @@ export interface UpdatePreflightDeps {
   clearMcpBridgeLease: (lease: McpBridgeQuiesceLease) => void
   now?: () => number
   releaseTrackedBackendTrees: () => Promise<{ unlocked: boolean }>
-  requestMcpBridgeConsent: (request: McpBridgeConsentRequest) => Promise<boolean>
   scan: () => Promise<ScanOutcome>
-  terminateMcpBridge: (bridge: McpBridgeProcess) => Promise<boolean>
+  terminateDesktopPluginService: (service: DesktopPluginServiceProcess) => Promise<boolean>
+  terminateVenvHolder: (holder: VenvBlockerProcess) => Promise<boolean>
   wait?: (delayMs: number) => Promise<void>
 }
 
@@ -42,7 +44,7 @@ export type UpdatePreflightOutcome =
   | {
       kind: 'blocked'
       message: string
-      reason: 'unlock-failed' | 'holders' | 'consent-declined' | 'lease-unavailable' | 'quiesce-incomplete'
+      reason: 'unlock-failed' | 'holders' | 'lease-unavailable' | 'quiesce-incomplete'
       result?: VenvBlockerScanResult
     }
   | { kind: 'probe-failure'; error: string; message: string }
@@ -63,16 +65,21 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function exactMcpOnly(result: VenvBlockerScanResult): boolean {
-  return result.processes.length === 0 && exactActionableMcpBridges(result)
-}
-
-function exactActionableMcpBridges(result: VenvBlockerScanResult): boolean {
-  return result.mcpBridges.length > 0 && result.mcpBridges.every(isExactActionableMcpBridge)
+function exactDrainableOnly(result: VenvBlockerScanResult): boolean {
+  return (
+    result.processes.every(isExactVenvHolder) &&
+    result.mcpBridges.every(bridge => isExactVenvHolder(bridge)) &&
+    result.desktopPluginServices.every(service => isExactVenvHolder(service)) &&
+    result.processes.length + result.mcpBridges.length + result.desktopPluginServices.length > 0
+  )
 }
 
 function logicalMcpBridgeGroupCount(result: VenvBlockerScanResult): number {
   return new Set(result.mcpBridges.map(bridge => bridge.wrapperPid ?? bridge.pid)).size
+}
+
+function logicalDesktopPluginServiceGroupCount(result: VenvBlockerScanResult): number {
+  return new Set(result.desktopPluginServices.map(service => service.wrapperPid ?? service.pid)).size
 }
 
 function genericHoldersOnly(result: VenvBlockerScanResult): boolean {
@@ -143,13 +150,10 @@ export function buildMcpBridgeConsentRequest(bridges: McpBridgeProcess[]): McpBr
   }
 }
 
-function quiesceIncompleteMessage(result?: VenvBlockerScanResult): string {
-  const owners = result?.mcpBridges ?? []
-  const ownerLabel = buildMcpBridgeConsentRequest(owners).ownerLabel
-
+function quiesceIncompleteMessage(): string {
   return (
-    `Update aborted: ${ownerLabel} Hermes MCP tool bridges did not remain stopped. ` +
-    'Finish or cancel active tool calls, close the owning agent session if needed, then retry.'
+    'Update aborted: processes from this Hermes installation did not remain stopped. ' +
+    'Close or stop the restarting service, then retry.'
   )
 }
 
@@ -185,8 +189,8 @@ export async function runWindowsUpdatePreflight(
   }
 
   // Observe before activating the prevention lease. Existing bridge watchers
-  // exit when they see that lease; scanning first is what guarantees the user
-  // sees the proven owner and consents before active tool calls are interrupted.
+  // exit when they see that lease, while this first scan defines the exact
+  // current holder set authorized by the user's Update action.
   const scanFailClosed = async (): Promise<ScanOutcome> => {
     try {
       return await deps.scan()
@@ -218,34 +222,12 @@ export async function runWindowsUpdatePreflight(
     return { kind: 'probe-failure', error: observed.error, message: formatProbeFailedMessage() }
   }
 
-  if (observed.kind === 'blocked' && !exactMcpOnly(observed.result)) {
+  if (observed.kind === 'blocked' && !exactDrainableOnly(observed.result)) {
     return {
       kind: 'blocked',
       reason: 'holders',
       result: observed.result,
       message: formatBlockerMessage(observed.result)
-    }
-  }
-
-  let accepted = false
-
-  try {
-    accepted = await deps.requestMcpBridgeConsent(
-      buildMcpBridgeConsentRequest(observed.kind === 'blocked' ? observed.result.mcpBridges : [])
-    )
-  } catch {
-    accepted = false
-  }
-
-  if (!accepted) {
-    return {
-      kind: 'blocked',
-      reason: 'consent-declined',
-      ...(observed.kind === 'blocked' ? { result: observed.result } : {}),
-      message:
-        observed.kind === 'blocked'
-          ? 'Update cancelled. Hermes MCP tool bridges are still running.'
-          : 'Update cancelled. Hermes did not pause new MCP bridge launches.'
     }
   }
 
@@ -278,10 +260,7 @@ export async function runWindowsUpdatePreflight(
       return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
     }
 
-    // The cooperative lease may already have drained every MCP bridge while a
-    // scheduled status/presence helper briefly holds the venv. It was never
-    // consented for termination, so only wait boundedly for its natural exit.
-    if (firstClear.kind === 'blocked' && genericHoldersOnly(firstClear.result)) {
+    if (firstClear.kind === 'blocked' && genericHoldersOnly(firstClear.result) && !exactDrainableOnly(firstClear.result)) {
       genericHolderDeadline = now() + genericHolderTimeoutMs
       firstClear = await pollGenericHoldersUntil(firstClear, genericHolderDeadline)
 
@@ -300,27 +279,41 @@ export async function runWindowsUpdatePreflight(
     }
 
     if (firstClear.kind === 'blocked') {
-      const exactCurrentBridges = exactActionableMcpBridges(firstClear.result)
-      const logicalBridgeGroups = logicalMcpBridgeGroupCount(firstClear.result)
+      const forceableMcpAndDesktopServices =
+        firstClear.result.mcpBridges.every(bridge => isExactVenvHolder(bridge)) &&
+        firstClear.result.desktopPluginServices.every(service => isExactVenvHolder(service))
+      const naturallyExitingGenericHolders =
+        firstClear.result.processes.length > 0 &&
+        firstClear.result.processes.every(holder => !isExactVenvHolder(holder))
+      const exactCurrentHolders =
+        exactDrainableOnly(firstClear.result) ||
+        (forceableMcpAndDesktopServices && naturallyExitingGenericHolders)
+      const logicalDrainGroups =
+        logicalMcpBridgeGroupCount(firstClear.result) +
+        logicalDesktopPluginServiceGroupCount(firstClear.result)
+      const drainRecordCount =
+        firstClear.result.processes.length +
+        firstClear.result.mcpBridges.length +
+        firstClear.result.desktopPluginServices.length
 
       if (
-        !exactCurrentBridges ||
-        logicalBridgeGroups > MAX_FALLBACK_BRIDGE_GROUPS ||
-        firstClear.result.mcpBridges.length > MAX_FALLBACK_BRIDGE_RECORDS
+        !exactCurrentHolders ||
+        logicalDrainGroups > MAX_FALLBACK_BRIDGE_GROUPS ||
+        drainRecordCount > MAX_FALLBACK_BRIDGE_RECORDS
       ) {
         return {
           kind: 'blocked',
           reason: 'quiesce-incomplete',
           result: firstClear.result,
-          message: exactMcpOnly(firstClear.result)
-            ? quiesceIncompleteMessage(firstClear.result)
+          message: exactDrainableOnly(firstClear.result)
+            ? quiesceIncompleteMessage()
             : formatBlockerMessage(firstClear.result)
         }
       }
 
-      // One bounded fallback pass. Each call delegates to the scanner, which
-      // revalidates exact argv, executable, PID, and create time before killing
-      // only that bridge process. There is deliberately no process-tree kill.
+      // One bounded force-stop pass. The user already chose Update. Each call
+      // re-scans the target installation and verifies PID/create-time before
+      // stopping that single holder; there is deliberately no process-tree kill.
       const terminationOrder = [...firstClear.result.mcpBridges].sort(
         (left, right) => Number(right.role === 'mcp_bridge_worker') - Number(left.role === 'mcp_bridge_worker')
       )
@@ -330,20 +323,46 @@ export async function runWindowsUpdatePreflight(
       // the wrapper cannot disappear before the scanner revalidates a worker.
       for (const bridge of terminationOrder) {
         try {
-          await deps.terminateMcpBridge(bridge)
+          await deps.terminateVenvHolder(bridge)
         } catch {
           // The mandatory rescan below is the authority. One failed request
-          // must not skip revalidation of the remaining consented entries.
+          // must not skip revalidation of the remaining current entries.
+          void 0
+        }
+      }
+
+      const desktopPluginTerminationOrder = [...firstClear.result.desktopPluginServices].sort(
+        (left, right) =>
+          Number(right.role === 'desktop_plugin_worker') - Number(left.role === 'desktop_plugin_worker')
+      )
+
+      // A plugin's managed-runtime worker must stop before its venv wrapper.
+      // The wrapper termination then stops its proven service host, preventing
+      // that host from recreating either child during the update handoff.
+      for (const service of desktopPluginTerminationOrder) {
+        try {
+          await deps.terminateDesktopPluginService(service)
+        } catch {
+          void 0
+        }
+      }
+
+      for (const holder of firstClear.result.processes) {
+        if (!isExactVenvHolder(holder)) {
+          continue
+        }
+        try {
+          await deps.terminateVenvHolder(holder)
+        } catch {
           void 0
         }
       }
 
       // A scheduled gateway-status or presence probe can start after the
-      // consent scan and briefly share this venv with an exact MCP bridge. It
-      // is never part of the consented termination set. Give such generic
-      // holders one bounded window to exit on their own after the exact bridge
-      // fallback, then refuse if they remain. The deadline includes the first
-      // post-termination settle scan so repeated probes cannot extend it.
+      // first scan and briefly share this venv with an exact MCP bridge. A
+      // holder without an identity timestamp cannot be force-stopped, so give
+      // it one bounded chance to exit before refusing. The deadline includes
+      // the first post-termination settle scan.
       genericHolderDeadline ??= now() + genericHolderTimeoutMs
 
       await sleep(terminationSettleMs)
@@ -366,7 +385,7 @@ export async function runWindowsUpdatePreflight(
           result: firstClear.result,
           message:
             firstClear.result.mcpBridges.length > 0
-              ? quiesceIncompleteMessage(firstClear.result)
+              ? quiesceIncompleteMessage()
               : formatBlockerMessage(firstClear.result)
         }
       }
@@ -400,8 +419,8 @@ export async function runWindowsUpdatePreflight(
           kind: 'blocked',
           reason: 'quiesce-incomplete',
           result: secondClear.result,
-          message: exactMcpOnly(secondClear.result)
-            ? quiesceIncompleteMessage(secondClear.result)
+          message: exactDrainableOnly(secondClear.result)
+            ? quiesceIncompleteMessage()
             : formatBlockerMessage(secondClear.result)
         }
       }
