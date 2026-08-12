@@ -128,6 +128,14 @@ CASES = {
         ["apps/desktop/electron/updater-process.test.ts"],
         _lanes(frontend=True, installer=True),
     ),
+    "updater child options dependency → frontend + Windows lane": (
+        ["apps/desktop/electron/windows-child-options.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "updater process identity dependency → frontend + Windows lane": (
+        ["apps/desktop/electron/windows-process-identity.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
     "handoff source → frontend + Windows lane": (
         ["apps/desktop/electron/handoff-result.ts"],
         _lanes(frontend=True, installer=True),
