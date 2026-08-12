@@ -96,9 +96,9 @@ def _sanitized_git_env(*, read_only: bool = False) -> dict[str, str]:
         if not key.upper().startswith("GIT_")
     }
     # A privileged updater must not execute helpers or filters injected by a
-    # user's system/global Git configuration.  Repository-local remote and
-    # branch configuration remains available; executable local selectors are
-    # rejected by `_assert_safe_git_configuration` before status/mutation.
+    # user's system/global Git configuration. Repository-local remote
+    # configuration remains available; executable local selectors are rejected
+    # by `_assert_safe_git_configuration` before status/mutation.
     env.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",

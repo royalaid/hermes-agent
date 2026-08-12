@@ -1274,7 +1274,7 @@ def test_update_help_discloses_windows_mcp_interruption_consent():
     assert "exact, verified" in help_text
 
 
-def test_real_parser_to_check_path_uses_selected_remote_and_forced_refspec(
+def test_real_parser_to_check_path_uses_origin_and_forced_refspec(
     tmp_path: Path, monkeypatch
 ):
     root = tmp_path / "repo"
@@ -1287,10 +1287,8 @@ def test_real_parser_to_check_path_uses_selected_remote_and_forced_refspec(
     def run(command, **_kwargs):
         commands.append([str(part) for part in command])
         joined = " ".join(str(part) for part in command)
-        if "config --get branch.feature.remote" in joined:
-            return subprocess.CompletedProcess(command, 0, "fork\n", "")
-        if "remote get-url -- fork" in joined:
-            return subprocess.CompletedProcess(command, 0, "file:///fork\n", "")
+        if "remote get-url -- origin" in joined:
+            return subprocess.CompletedProcess(command, 0, "file:///origin\n", "")
         if "config --includes --show-origin --show-scope --name-only --get-regexp" in joined:
             return subprocess.CompletedProcess(command, 1, "", "")
         if "rev-parse --is-shallow-repository" in joined:
@@ -1315,29 +1313,31 @@ def test_real_parser_to_check_path_uses_selected_remote_and_forced_refspec(
     fetch = next(command for command in commands if "fetch" in command)
     assert fetch[-3:] == [
         "--",
-        "fork",
-        "+refs/heads/feature:refs/remotes/fork/feature",
+        "origin",
+        "+refs/heads/feature:refs/remotes/origin/feature",
     ]
-    assert any("HEAD..refs/remotes/fork/feature" in command for command in commands)
+    assert any("HEAD..refs/remotes/origin/feature" in command for command in commands)
+    assert not any("branch.feature.remote" in command for command in commands)
 
 
-def test_malicious_tracking_remote_is_rejected_before_git_uses_it(
+def test_branch_tracking_remote_is_not_update_authority(
     tmp_path: Path, monkeypatch
 ):
     seen = []
 
     def run(command, **_kwargs):
         seen.append(command)
-        if "config" in command:
-            return subprocess.CompletedProcess(command, 0, "--upload-pack=evil\n", "")
+        if "remote" in command and "get-url" in command:
+            return subprocess.CompletedProcess(command, 0, "file:///origin\n", "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(update_cmd.subprocess, "run", run)
 
-    with pytest.raises(ValueError, match="invalid update remote"):
-        update_readiness._resolve_update_target(["git"], tmp_path, "main")
+    target = update_readiness._resolve_update_target(["git"], tmp_path, "main")
 
-    assert not any("remote" in command for command in seen)
+    assert target.remote == "origin"
+    assert target.tracking_ref == "refs/remotes/origin/main"
+    assert not any("branch.main.remote" in command for command in seen)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -1354,7 +1354,7 @@ def _git(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def test_divergent_fork_uses_same_remote_ref_for_fetch_compare_and_reset(tmp_path: Path):
+def test_configured_fork_does_not_override_origin_update_target(tmp_path: Path):
     origin = tmp_path / "origin.git"
     fork = tmp_path / "fork.git"
     repo = tmp_path / "repo"
@@ -1384,9 +1384,8 @@ def test_divergent_fork_uses_same_remote_ref_for_fetch_compare_and_reset(tmp_pat
     (repo / "fork.txt").write_text("fork", encoding="utf-8")
     _git(repo, "add", "fork.txt")
     _git(repo, "commit", "-m", "fork")
-    fork_sha = _git(repo, "rev-parse", "HEAD")
     _git(repo, "push", "--force", "fork", "main")
-    _git(repo, "reset", "--hard", origin_sha)
+    _git(repo, "reset", "--hard", base)
     _git(repo, "config", "branch.main.remote", "fork")
 
     target = update_readiness._resolve_update_target(["git"], repo, "main")
@@ -1397,12 +1396,11 @@ def test_divergent_fork_uses_same_remote_ref_for_fetch_compare_and_reset(tmp_pat
         capture_output=True,
         env=update_readiness._sanitized_git_env(),
     )
-    assert merge.returncode != 0
-    _git(repo, "reset", "--hard", target.tracking_ref)
+    assert merge.returncode == 0
 
-    assert target.remote == "fork"
-    assert target.refspec == "+refs/heads/main:refs/remotes/fork/main"
-    assert _git(repo, "rev-parse", "HEAD") == fork_sha
+    assert target.remote == "origin"
+    assert target.refspec == "+refs/heads/main:refs/remotes/origin/main"
+    assert _git(repo, "rev-parse", "HEAD") == origin_sha
     assert _git(repo, "rev-parse", "refs/remotes/origin/main") == origin_sha
 
 
