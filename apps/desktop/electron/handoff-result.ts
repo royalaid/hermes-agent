@@ -199,6 +199,7 @@ export interface PosixHandoffResult {
 export interface ConsumeLegacyHandoffResultOptions {
   maxAgeMs?: number
   now?: () => number
+  platform?: NodeJS.Platform
 }
 
 interface ResultSnapshot {
@@ -795,8 +796,19 @@ function parsePosixHandoffResult(raw: Buffer): ParsedPosixHandoffResult | null {
  */
 export function consumePosixHandoffResult(
   hermesHome: string,
-  { maxAgeMs = HANDOFF_RESULT_MAX_AGE_MS, now = Date.now }: ConsumeLegacyHandoffResultOptions = {}
+  {
+    maxAgeMs = HANDOFF_RESULT_MAX_AGE_MS,
+    now = Date.now,
+    platform = process.platform
+  }: ConsumeLegacyHandoffResultOptions = {}
 ): PosixHandoffResult | null {
+  // The retired Windows handoff wrote this same six-key shape without the
+  // correlated v2 receipt. Leave it for the fail-closed legacy consumer,
+  // which can surface a fresh failure but never promote its success.
+  if (platform === 'win32') {
+    return null
+  }
+
   const nowMs = now()
 
   if (!Number.isFinite(nowMs) || !Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
@@ -867,9 +879,10 @@ export function consumePosixHandoffResult(
 }
 
 /**
- * Retire the exact five-key result written by Desktop builds before the v2
+ * Retire the exact five-key result written by early Desktop builds, or the
+ * exact six-key result written by the retired Windows handoff, before the v2
  * transaction existed. Only a fresh strict failure may surface as a legacy
- * diagnostic; a legacy success is deliberately never promoted to v2 success.
+ * diagnostic; legacy success/manual results are never promoted to v2 success.
  * Unrecognized bytes remain at the fixed path for a newer consumer.
  */
 export function consumeLegacyHandoffResult(
@@ -891,7 +904,7 @@ export function consumeLegacyHandoffResult(
     return null
   }
 
-  const legacy = parseLegacyHandoffResult(preview)
+  const legacy = parseLegacyHandoffResult(preview) ?? parsePosixHandoffResult(preview)
 
   if (!legacy) {
     return null
