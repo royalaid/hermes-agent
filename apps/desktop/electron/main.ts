@@ -241,20 +241,21 @@ import {
   type UpdatePreflightOutcome,
   type UpdatePreflightPurpose
 } from './update-preflight'
+import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
-  collectRelaunchArgs,
-  resolvePosixScriptHandoff,
   captureSpawnedUpdaterCreatedAt,
+  collectRelaunchArgs,
+  formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
+  launchWindowsUpdateTransport,
+  resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
-  resolveUpdateScriptHandoff,
+  resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
   stagedUpdaterEnvironment,
-  terminateSpawnedUpdaterIfExact,
-  wrapHandoffForDetachedConsole
+  terminateSpawnedUpdaterIfExact
 } from './updater-process'
-import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { scanVenvBlockers, terminateMcpBridge } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
@@ -2153,8 +2154,9 @@ async function waitForUpdateToFinish() {
     timeoutMs: UPDATE_WAIT_TIMEOUT_MS
   })
 
-  // The detached hand-off script (scripts/desktop-update/windows.ps1) runs hidden;
-  // its result file is the ONLY way the user learns a detached update
+  // The detached hand-off scripts run hidden; on Windows the authenticated
+  // schema-v2 implementation is scripts/desktop-update.ps1. The result file
+  // is the ONLY way the user learns a detached update
   // failed. Consume it exactly once, here, right where boot passes the
   // update gate — success gets a log line, failure gets a real dialog
   // (previously a failed detached update was indistinguishable from
@@ -2978,12 +2980,11 @@ let isQuittingForHandoff = false
 let quitPromptOpen = false
 let quitConfirmedWithActiveWork = false
 
-// Resolve the staged updater binary the desktop may hand an update to. On
-// Windows that binary owns ALL repo mutation — running `hermes update` +
-// rebuilding the desktop — so the desktop never touches its own bits while
-// running. macOS/Linux stage the same binary but deliberately do not use it;
-// see resolveStagedUpdaterBinary for the policy and for #74836. Returns null
-// whenever no hand-off applies; callers degrade gracefully.
+// Resolve the staged updater used only for packaged Windows bootstrap
+// recovery. Ordinary updates require the repo-owned schema-v2 flat script;
+// legacy staged binaries have no proven bridge-lease protocol. macOS/Linux
+// stage the same binary but deliberately do not use it; see
+// resolveStagedUpdaterBinary for the policy and #74836.
 function resolveUpdaterBinary() {
   return resolveStagedUpdaterBinary(HERMES_HOME, { fileExists, isWindows: IS_WINDOWS })
 }
@@ -3222,16 +3223,11 @@ async function releaseBackendLock(updateRoot, tag) {
   return { unlocked: false }
 }
 
-// applyUpdates — hand off to the installer's --update flow, then exit.
-//
-// The desktop is a pure consumer: it does NOT git pull / pip install / rebuild
-// itself (the old open-coded git dance lived here and drifted from
-// `hermes update`). Instead we spawn the staged Hermes-Setup binary with
-// --update and quit, so it can run `hermes update` (which refuses while we
-// hold the venv shim) and rebuild the desktop with our exe already gone.
-//
-// Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
-// only this apply action changed.
+// applyUpdates — hand off to a repo-owned detached orchestrator, then exit.
+// Windows requires the authenticated schema-v2 flat script. A staged installer
+// remains available only to the separately bounded bootstrap-recovery path;
+// ordinary updates fail closed to a manual command when the script is absent.
+// POSIX uses its own detached script contract.
 async function applyUpdates(opts = {}) {
   return updateInFlightTransaction.run(() => applyUpdatesTransaction(opts))
 }
@@ -3241,9 +3237,7 @@ async function applyUpdatesTransaction(opts = {}) {
   let bridgeLeaseHandedOff = false
 
   try {
-    const updater = resolveUpdaterBinary()
-
-    if (!updater && !IS_WINDOWS) {
+    if (!IS_WINDOWS) {
       // macOS/Linux: hand off to the repo-owned posix script — same shape as
       // Windows (quit → detached orchestrator → `hermes update` → relaunch),
       // minus the venv-lock gauntlet POSIX doesn't need. The old in-app
@@ -3256,48 +3250,32 @@ async function applyUpdatesTransaction(opts = {}) {
       return await applyUpdatesPosixHandoff(opts)
     }
 
-    if (!updater) {
-      // No staged updater binary — this is a CLI-installed user (they ran
-      // `hermes desktop`, never the Tauri installer that self-copies
-      // hermes-setup.exe into HERMES_HOME). On Windows the repo hand-off
-      // script serves them just as well as installer users — it only needs
-      // PowerShell and the checkout — so fall through to the normal hand-off
-      // when the script exists. Only when the checkout predates the script do
-      // we surface the manual one-liner.
-      const updateRoot = resolveUpdateRoot()
+    const updateRoot = resolveUpdateRoot()
+    const windowsTransport = resolveWindowsUpdateTransport(updateRoot)
 
-      if (!resolveUpdateScriptHandoff(updateRoot)) {
-        // They DO have a working `hermes` on PATH / in the venv, so the
-        // correct path is the one-liner in their native medium. We show the
-        // EXACT command, branch-pinned to the checkout they're on — bare
-        // `hermes update` defaults to main and would silently switch a
-        // bb/gui (or any non-main) install off-branch. Mirror the GUI
-        // button's contract: append --branch <current> for non-main
-        // checkouts, keep it bare for main so the card stays clean.
-        let command = 'hermes update'
+    if (windowsTransport.kind === 'manual') {
+      // The checkout does not contain the authenticated flat hand-off. Do not
+      // substitute a staged binary or the incompatible nested Edge script:
+      // neither proves the schema-v2 bridge lease. Render a copyable
+      // PowerShell command with the resolved branch as one quoted argv value.
+      const manualArgv = ['hermes', 'update']
 
-        try {
-          const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-          const current = (head.stdout || '').trim()
+      try {
+        const branch = await resolveDesktopUpdateBranch(updateRoot)
 
-          if (head.code === 0 && current && current !== 'HEAD') {
-            const branch = await resolveHealedBranch(updateRoot, current)
-
-            if (branch !== 'main') {
-              command = `hermes update --branch ${branch}`
-            }
-          }
-        } catch {
-          // Best-effort: fall back to bare `hermes update` if branch detection fails.
+        if (branch !== 'main') {
+          manualArgv.push('--branch', branch)
         }
-
-        rememberLog(`[updates] no staged updater; surfacing manual \`${command}\` for CLI install at ${updateRoot}`)
-        emitUpdateProgress({ stage: 'manual', message: command, percent: null })
-
-        return { ok: true, manual: true, command, hermesRoot: updateRoot }
+      } catch {
+        // Best-effort: fall back to bare `hermes update` if branch detection fails.
       }
 
-      rememberLog('[updates] no staged updater; using repo hand-off script for CLI install')
+      const command = formatPowerShellArgvForDisplay(manualArgv)
+
+      rememberLog(`[updates] compatible repo hand-off absent; surfacing manual \`${command}\` at ${updateRoot}`)
+      emitUpdateProgress({ stage: 'manual', message: command, percent: null })
+
+      return { ok: true, manual: true, command, hermesRoot: updateRoot }
     }
 
     const handoffConflict = updateHandoffConflict(HERMES_HOME)
@@ -3319,18 +3297,7 @@ async function applyUpdatesTransaction(opts = {}) {
         'Updating Hermes — this window will close and the updater will open. Don’t reopen Hermes yourself; it restarts automatically when the update finishes.',
       percent: 100
     })
-    repairMacUpdaterHelper(updater)
-
-    const updateRoot = resolveUpdateRoot()
-    const { branch: configuredBranch } = readDesktopUpdateConfig()
-    const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
-    const updaterArgs = ['--update', '--branch', branch]
-    const targetApp = IS_MAC ? runningAppBundle() : null
-
-    if (targetApp) {
-      updaterArgs.push('--target-app', targetApp)
-    }
-
+    const branch = await resolveDesktopUpdateBranch(updateRoot)
     const venvBin = path.join(updateRoot, 'venv', IS_WINDOWS ? 'Scripts' : 'bin')
 
     // ── Pre-flight state.db integrity guard (#68474) ─────────────────
@@ -3360,17 +3327,6 @@ async function applyUpdatesTransaction(opts = {}) {
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
     //
-    // Prefer the repo-owned hand-off script over the staged Tauri binary.
-    // The staged binary is frozen (no self-update path) and historically runs
-    // months-stale updater logic — pre-#67369 cache resolver, pre-#74782
-    // marker adoption — producing failures that were fixed on main long ago
-    // (2026-08-09 incident). scripts/desktop-update/windows.ps1 ships WITH the
-    // checkout, so each `hermes update` refreshes the code that drives the
-    // next one. Checkouts that predate the script fall back to the binary
-    // path unchanged.
-    const scriptHandoff = resolveUpdateScriptHandoff(updateRoot)
-    let child
-
     if (!bridgeLease) {
       const message = 'Update aborted: the MCP bridge prevention lease was lost before handoff.'
       rememberLog('[updates] bridge lease missing after a clear preflight')
@@ -3393,28 +3349,20 @@ async function applyUpdatesTransaction(opts = {}) {
 
     bridgeLease = handoffLease
 
-    if (scriptHandoff) {
-      // A bare detached+hidden powershell spawn silently dies before -File
-      // processing (console-subsystem init failure — see
-      // wrapHandoffForDetachedConsole). Route through `cmd start` so the
-      // script gets its own minimized console and survives our exit. The
-      // wrapper cmd.exe exits immediately, so child.pid is NOT the script's
-      // pid — the script claims the update marker itself with its own $PID
-      // as its first action, and a relaunched Desktop parks on that.
-      const wrapped = wrapHandoffForDetachedConsole(scriptHandoff, [
-        '-InstallRoot',
-        updateRoot,
-        '-Branch',
+    // A bare detached+hidden powershell spawn silently dies before -File
+    // processing. The production composer routes through `cmd start` with a
+    // constant encoded launcher; script path, branch, install root, relaunch
+    // path, and the one-shot lease travel only through the child environment.
+    const launch = launchWindowsUpdateTransport(
+      windowsTransport,
+      {
+        bridgeLeaseId: bridgeLease.leaseId,
         branch,
-        '-DesktopPid',
-        String(process.pid),
-        '-RelaunchExe',
-        process.execPath,
-        '-BridgeLeaseId',
-        bridgeLease.leaseId
-      ])
-
-      child = spawnUpdaterProcess(wrapped.command, wrapped.args, {
+        desktopPid: process.pid,
+        installRoot: updateRoot,
+        relaunchExe: process.execPath
+      },
+      {
         cwd: HERMES_HOME,
         env: {
           ...process.env,
@@ -3423,104 +3371,64 @@ async function applyUpdatesTransaction(opts = {}) {
         },
         detached: true,
         stdio: 'ignore'
-      })
-
-      // cmd.exe is only a transient wrapper and must never own either marker.
-      // The script receives the unguessable lease ID, adopts that exact lease
-      // with its own PID, and writes the shared update marker with the same PID
-      // before mutation. Wait for both proofs; a successful wrapper spawn alone
-      // is not a successful updater handoff.
-      const wrapperPid = Number.isInteger(child.pid) ? Number(child.pid) : null
-
-      const adoptedLease = await waitForMcpBridgeQuiesceLeaseAdoption(HERMES_HOME, bridgeLease, {
-        excludedOwnerPids: wrapperPid ? [wrapperPid] : [],
-        readUpdateOwner: readProvenUpdateOwnerClaim
-      })
-
-      if (!adoptedLease) {
-        updateHandoffRevocationPending = true
-        const revocation = revokeMcpBridgeQuiesceLease(HERMES_HOME, bridgeLease)
-
-        if (revocation !== 'revoked') {
-          const message =
-            'Update aborted: Hermes could not prove that the unacknowledged updater handoff was revoked. Local backends remain parked; close Hermes fully before retrying.'
-          rememberLog('[updates] repo hand-off timed out and exact lease revocation was unproven')
-          emitUpdateProgress({ stage: 'error', message, percent: null })
-
-          return { ok: false, error: 'update-handoff-revocation-unproven', message }
-        }
-
-        // Keep the release artifact as durable cancellation evidence. The
-        // detached script may already have won its adoption CAS; its next
-        // mandatory lease refresh now fails before mutation. The live update
-        // marker keeps backend starts parked until that script exits and
-        // performs its ownership-bound cleanup.
-        bridgeLease = null
-        updateHandoffRevocationPending = false
-
-        const message = 'Update aborted: the repo updater did not acknowledge the protected handoff.'
-        rememberLog('[updates] repo hand-off script did not adopt matching bridge and update markers')
-        emitUpdateProgress({ stage: 'error', message, percent: null })
-        startHermes().catch(() => {})
-
-        return { ok: false, error: 'update-handoff-unacknowledged', message }
       }
+    )
 
-      bridgeLease = adoptedLease
-      bridgeLeaseHandedOff = true
-
-      rememberLog(
-        `[updates] launched repo hand-off script: ${scriptHandoff.scriptPath} (branch ${branch}); exiting desktop to release venv shim`
-      )
-    } else {
-      child = spawnUpdaterProcess(updater, updaterArgs, {
-        cwd: HERMES_HOME,
-        env: stagedUpdaterEnvironment(
-          {
-            ...process.env,
-            HERMES_HOME,
-            PATH: pathWithHermesManagedNode(venvBin)
-          },
-          bridgeLease.leaseId
-        ),
-        detached: true,
-        stdio: 'ignore'
-      })
-
-      const updaterPid = Number.isInteger(child.pid) ? Number(child.pid) : null
-      const updaterStartedAt = updaterPid ? await captureSpawnedUpdaterCreatedAt(updaterPid) : null
-
-      const stagedLeaseHandoff =
-        updaterPid && updaterStartedAt
-          ? await handOffMcpBridgeLeaseToStagedUpdater(HERMES_HOME, bridgeLease, updaterPid, {
-              readUpdateOwner: readProvenUpdateOwnerClaim,
-              requiredOwnerStartedAt: updaterStartedAt,
-              verifyRequiredOwnerGeneration: () => isSpawnedUpdaterGenerationActive(child)
-            })
-          : { kind: 'failed' as const }
-
-      if (stagedLeaseHandoff.kind === 'failed') {
-        // This is the exact updater generation, not an MCP bridge or its
-        // owning Codex/Claude process. Revalidate PID + OS creation time
-        // immediately before termination; never taskkill a tree or guess
-        // after the PID has been reused.
-        if (updaterPid && updaterStartedAt) {
-          await terminateSpawnedUpdaterIfExact(child, updaterStartedAt)
-        }
-
-        const message = 'Update aborted: Hermes could not transfer the MCP bridge pause to the updater.'
-        rememberLog('[updates] staged updater bridge lease adoption failed')
-        emitUpdateProgress({ stage: 'error', message, percent: null })
-        startHermes().catch(() => {})
-
-        return { ok: false, error: 'mcp-bridge-quiesce-handoff-failed', message }
-      }
-
-      bridgeLease = stagedLeaseHandoff.lease
-      bridgeLeaseHandedOff = true
-
-      rememberLog(`[updates] launched staged updater for branch ${branch}; exiting desktop to release venv shim`)
+    if (launch.kind !== 'spawned') {
+      throw new Error('Windows update transport changed after preflight')
     }
+
+    const child = launch.child
+    const scriptHandoff = launch.handoff
+
+    // cmd.exe is only a transient wrapper and must never own either marker.
+    // The script receives the unguessable lease ID, adopts that exact lease
+    // with its own PID, and writes the shared update marker with the same PID
+    // before mutation. Wait for both proofs; a successful wrapper spawn alone
+    // is not a successful updater handoff.
+    const wrapperPid = Number.isInteger(child.pid) ? Number(child.pid) : null
+
+    const adoptedLease = await waitForMcpBridgeQuiesceLeaseAdoption(HERMES_HOME, bridgeLease, {
+      excludedOwnerPids: wrapperPid ? [wrapperPid] : [],
+      readUpdateOwner: readProvenUpdateOwnerClaim
+    })
+
+    if (!adoptedLease) {
+      updateHandoffRevocationPending = true
+      const revocation = revokeMcpBridgeQuiesceLease(HERMES_HOME, bridgeLease)
+
+      if (revocation !== 'revoked') {
+        const message =
+          'Update aborted: Hermes could not prove that the unacknowledged updater handoff was revoked. Local backends remain parked; close Hermes fully before retrying.'
+
+        rememberLog('[updates] repo hand-off timed out and exact lease revocation was unproven')
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+
+        return { ok: false, error: 'update-handoff-revocation-unproven', message }
+      }
+
+      // Keep the release artifact as durable cancellation evidence. The
+      // detached script may already have won its adoption CAS; its next
+      // mandatory lease refresh now fails before mutation. The live update
+      // marker keeps backend starts parked until that script exits and
+      // performs its ownership-bound cleanup.
+      bridgeLease = null
+      updateHandoffRevocationPending = false
+
+      const message = 'Update aborted: the repo updater did not acknowledge the protected handoff.'
+      rememberLog('[updates] repo hand-off script did not adopt matching bridge and update markers')
+      emitUpdateProgress({ stage: 'error', message, percent: null })
+      startHermes().catch(() => {})
+
+      return { ok: false, error: 'update-handoff-unacknowledged', message }
+    }
+
+    bridgeLease = adoptedLease
+    bridgeLeaseHandedOff = true
+
+    rememberLog(
+      `[updates] launched repo hand-off script: ${scriptHandoff.scriptPath} (branch ${branch}); exiting desktop to release venv shim`
+    )
 
     // Linger on the "updating — don't reopen" overlay long enough for the user
     // to actually read it (and to bridge the gap until the updater's own window
@@ -3532,7 +3440,7 @@ async function applyUpdatesTransaction(opts = {}) {
       app.quit()
     }, UPDATE_HANDOFF_DWELL_MS)
 
-    return { ok: true, handedOff: true, updater }
+    return { ok: true, handedOff: true, updater: scriptHandoff.scriptPath }
   } finally {
     if (bridgeLease && !bridgeLeaseHandedOff) {
       clearMcpBridgeQuiesceLease(HERMES_HOME, bridgeLease)
