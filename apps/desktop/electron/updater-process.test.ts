@@ -6,7 +6,6 @@ import { test, vi } from 'vitest'
 
 import {
   collectRelaunchArgs,
-  MARKER_SELF_ADOPT_EPOCH_MS,
   resolvePosixScriptHandoff,
   captureSpawnedUpdaterCreatedAt,
   isSpawnedUpdaterGenerationActive,
@@ -112,10 +111,7 @@ test('captures and terminates only the exact spawned updater PID generation', as
   }
 
   assert.equal(await captureSpawnedUpdaterCreatedAt(42, { queryCreatedAt: query }), 1_723_330_000)
-  assert.equal(
-    await terminateSpawnedUpdaterIfExact(child, 1_723_330_000, { queryCreatedAt: query }),
-    true
-  )
+  assert.equal(await terminateSpawnedUpdaterIfExact(child, 1_723_330_000, { queryCreatedAt: query }), true)
   assert.deepEqual(terminated, [42])
 })
 
@@ -137,10 +133,7 @@ test('probes liveness through the retained updater handle', () => {
 })
 
 test('treats a false or throwing retained-handle liveness probe as inactive', () => {
-  assert.equal(
-    isSpawnedUpdaterGenerationActive({ pid: 42, unref: () => {}, kill: () => false }),
-    false
-  )
+  assert.equal(isSpawnedUpdaterGenerationActive({ pid: 42, unref: () => {}, kill: () => false }), false)
   assert.equal(
     isSpawnedUpdaterGenerationActive({
       pid: 42,
