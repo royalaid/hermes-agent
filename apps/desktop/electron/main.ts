@@ -2092,27 +2092,25 @@ function startHandoffResultPoll() {
   // the exact relaunched PID. Node uptime is close but not authoritative
   // enough for an attempt capability; an unavailable probe leaves identity
   // unproven, so no ACK is emitted and the updater remains terminal authority.
-  void queryWindowsProcessCreatedAt(process.pid)
-    .then(currentProcessStartedAt =>
-      retryHandoffResultLifecycle(
-        () =>
-          runHandoffResultLifecycle(HERMES_HOME, {
-            currentPid: process.pid,
-            currentProcessStartedAt: currentProcessStartedAt ?? 0,
-            currentExecutable: process.execPath,
-            expectedRoot: resolveUpdateRoot(),
-            resourcesPath: process.resourcesPath,
-            getBackendReadiness: () => handoffBackendReadiness,
-            pollMs: HANDOFF_RESULT_WAIT_POLL_MS,
-            discoveryTimeoutMs: HANDOFF_RESULT_WAIT_TIMEOUT_MS,
-            onStatus: status => rememberLog(`[updates] ${status}`)
-          }),
-        {
-          retryDelayMs: HANDOFF_RESULT_RETRY_MS,
-          shouldRetryAfterNull: shouldRetryHandoffResultDiscovery
-        }
-      )
-    )
+  void retryHandoffResultLifecycle(
+    currentProcessStartedAt =>
+      runHandoffResultLifecycle(HERMES_HOME, {
+        currentPid: process.pid,
+        currentProcessStartedAt: currentProcessStartedAt ?? 0,
+        currentExecutable: process.execPath,
+        expectedRoot: resolveUpdateRoot(),
+        resourcesPath: process.resourcesPath,
+        getBackendReadiness: () => handoffBackendReadiness,
+        pollMs: HANDOFF_RESULT_WAIT_POLL_MS,
+        discoveryTimeoutMs: HANDOFF_RESULT_WAIT_TIMEOUT_MS,
+        onStatus: status => rememberLog(`[updates] ${status}`)
+      }),
+    {
+      resolveCurrentProcessStartedAt: () => queryWindowsProcessCreatedAt(process.pid),
+      retryDelayMs: HANDOFF_RESULT_RETRY_MS,
+      shouldRetryAfterNull: shouldRetryHandoffResultDiscovery
+    }
+  )
     .then(result => {
       reportHandoffResult(result)
       handoffResultExpected = false
