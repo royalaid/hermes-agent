@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import type { SpawnOptions } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 import { test, vi } from 'vitest'
@@ -482,6 +484,86 @@ test('production Windows transport composes flat script, non-main branch, and Br
   assert.equal(captured.args.join(' ').includes(branch), false)
   assert.equal(captured.args.join(' ').includes(bridgeLeaseId), false)
 })
+
+test.runIf(process.platform === 'win32')(
+  'production Windows transport binds named PowerShell script parameters in a real child',
+  async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-windows-handoff-'))
+    const scriptPath = path.join(directory, 'probe.ps1')
+    const sentinel = path.join(directory, 'result.json')
+    const branch = 'fork/&|%integration'
+    const installRoot = String.raw`C:\Hermes & 100%\agent`
+    const relaunchExe = String.raw`C:\Hermes & 100%\Hermes.exe`
+    const bridgeLeaseId = 'unguessable-bridge-lease-id'
+
+    fs.writeFileSync(
+      scriptPath,
+      String.raw`param(
+  [Parameter(Mandatory = $true)][string]$InstallRoot,
+  [Parameter(Mandatory = $true)][string]$Branch,
+  [Parameter(Mandatory = $true)][int]$DesktopPid,
+  [Parameter(Mandatory = $true)][string]$RelaunchExe,
+  [Parameter(Mandatory = $true)][string]$BridgeLeaseId
+)
+$payload = [ordered]@{
+  branch = $Branch
+  desktop_pid = $DesktopPid
+  install_root = $InstallRoot
+  lease_id = $BridgeLeaseId
+  relaunch_exe = $RelaunchExe
+}
+[IO.File]::WriteAllText(
+  $env:HERMES_TRANSPORT_TEST_SENTINEL,
+  ($payload | ConvertTo-Json -Compress),
+  [Text.UTF8Encoding]::new($false)
+)
+exit 0
+`,
+      'utf8'
+    )
+
+    try {
+      const launch = launchWindowsUpdateTransport(
+        {
+          kind: 'script',
+          handoff: {
+            command: 'powershell',
+            args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+            scriptPath
+          }
+        },
+        { bridgeLeaseId, branch, desktopPid: 4242, installRoot, relaunchExe },
+        {
+          cwd: os.tmpdir(),
+          detached: true,
+          env: { ...process.env, HERMES_TRANSPORT_TEST_SENTINEL: sentinel },
+          stdio: 'ignore'
+        },
+        { isWindows: true }
+      )
+
+      assert.equal(launch.kind, 'spawned')
+
+      const deadline = Date.now() + 10_000
+
+      while (!fs.existsSync(sentinel) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+
+      assert.equal(fs.existsSync(sentinel), true, 'detached PowerShell script did not run')
+      assert.deepEqual(JSON.parse(fs.readFileSync(sentinel, 'utf8')), {
+        branch,
+        desktop_pid: 4242,
+        install_root: installRoot,
+        lease_id: bridgeLeaseId,
+        relaunch_exe: relaunchExe
+      })
+    } finally {
+      fs.rmSync(directory, { force: true, maxRetries: 5, recursive: true, retryDelay: 50 })
+    }
+  },
+  15_000
+)
 
 test('formatPowerShellArgvForDisplay quotes a non-main git ref with shell metacharacters', () => {
   assert.equal(
