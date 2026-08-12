@@ -107,6 +107,9 @@ _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 # their own lane rather than riding along with ``python`` / ``frontend``.
 _INSTALLER_PATHS = ("scripts/tests/",)
 _INSTALLER_FILES = {
+    "apps/bootstrap-installer/src-tauri/Cargo.lock",
+    "apps/bootstrap-installer/src-tauri/Cargo.toml",
+    "apps/bootstrap-installer/src-tauri/build.rs",
     "apps/desktop/electron/updater-process.test.ts",
     "apps/desktop/electron/updater-process.ts",
     "apps/desktop/electron/windows-child-options.ts",
@@ -115,7 +118,10 @@ _INSTALLER_FILES = {
     "scripts/install.cmd",
     "scripts/install.ps1",
 }
-_INSTALLER_PREFIXES = ("apps/desktop/electron/handoff-",)
+_INSTALLER_PREFIXES = (
+    "apps/bootstrap-installer/src-tauri/src/",
+    "apps/desktop/electron/handoff-",
+)
 
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
