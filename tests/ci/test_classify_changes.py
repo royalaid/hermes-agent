@@ -123,6 +123,10 @@ CASES = {
         ["apps/desktop/electron/windows-process-identity.ts"],
         _lanes(frontend=True, installer=True),
     ),
+    "updater process identity test → frontend + Windows lane": (
+        ["apps/desktop/electron/windows-process-identity.test.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
     "handoff source → frontend + Windows lane": (
         ["apps/desktop/electron/handoff-result.ts"],
         _lanes(frontend=True, installer=True),
