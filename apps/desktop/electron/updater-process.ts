@@ -49,13 +49,13 @@ if ($env:HERMES_UPDATE_BRIDGE_LEASE_ID -notmatch '^[A-Za-z0-9._-]{16,128}$') {
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
   throw 'Update handoff script is missing'
 }
-$scriptArgs = @(
-  '-InstallRoot', $env:HERMES_UPDATE_HANDOFF_INSTALL_ROOT,
-  '-Branch', $env:HERMES_UPDATE_HANDOFF_BRANCH,
-  '-DesktopPid', [string]$desktopPid,
-  '-RelaunchExe', $env:HERMES_UPDATE_HANDOFF_RELAUNCH_EXE,
-  '-BridgeLeaseId', $env:HERMES_UPDATE_BRIDGE_LEASE_ID
-)
+$scriptArgs = @{
+  InstallRoot = $env:HERMES_UPDATE_HANDOFF_INSTALL_ROOT
+  Branch = $env:HERMES_UPDATE_HANDOFF_BRANCH
+  DesktopPid = $desktopPid
+  RelaunchExe = $env:HERMES_UPDATE_HANDOFF_RELAUNCH_EXE
+  BridgeLeaseId = $env:HERMES_UPDATE_BRIDGE_LEASE_ID
+}
 & $scriptPath @scriptArgs
 if ($null -eq $LASTEXITCODE) { exit 1 }
 exit $LASTEXITCODE
