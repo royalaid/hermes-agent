@@ -15,6 +15,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust:
+    name: Rust bootstrap updater contracts
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Show preinstalled Rust toolchain
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Restore Cargo cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            apps/bootstrap-installer/src-tauri/target
+          key: windows-bootstrap-cargo-${{ hashFiles('apps/bootstrap-installer/src-tauri/Cargo.toml', 'apps/bootstrap-installer/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            windows-bootstrap-cargo-
+
+      # Cargo.lock is intentionally ignored for this application crate. Fetch
+      # once with retries, then compile and run the updater tests offline.
+      - name: Fetch Rust dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: cargo fetch --manifest-path apps/bootstrap-installer/src-tauri/Cargo.toml
+
+      - name: Run focused Rust updater tests
+        shell: pwsh
+        run: cargo test --offline --manifest-path apps/bootstrap-installer/src-tauri/Cargo.toml update::tests --lib
+
   powershell:
     name: PowerShell installer and Desktop updater tests
     runs-on: windows-latest
