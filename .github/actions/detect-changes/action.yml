@@ -46,7 +46,7 @@ outputs:
     description: Post/update the semantic package-lock.json diff PR comment.
     value: ${{ steps.classify.outputs.npm_lock }}
   installer:
-    description: Run the PowerShell installer tests on a Windows runner.
+    description: Run PowerShell installer and Desktop updater tests on Windows.
     value: ${{ steps.classify.outputs.installer }}
   mcp_catalog:
     description: Require MCP catalog security review label.
