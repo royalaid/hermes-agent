@@ -54,6 +54,7 @@ const CLEANUP_KEYS = ['update_marker_released', 'bridge_lease_released']
 const RELAUNCH_KEYS = ['state', 'pid', 'process_started_at', 'executable', 'requested_at', 'acknowledged_at']
 const DESKTOP_KEYS = ['build_id', 'build_source', 'root', 'backend_ready', 'backend_mode']
 const LEGACY_RESULT_KEYS = ['ok', 'exit_code', 'message', 'branch', 'finished_at']
+const POSIX_RESULT_KEYS = ['ok', 'exit_code', 'manual', 'message', 'branch', 'finished_at']
 
 export interface RuntimeHealth {
   criticalSyntax: true
@@ -171,6 +172,19 @@ export interface LegacyHandoffFailureDiagnostic {
   branch: string
 }
 
+/**
+ * Exact result emitted by scripts/desktop-update/posix.sh. This record is a
+ * compatibility diagnostic only: it is never promoted to authenticated v2
+ * Windows transaction success.
+ */
+export interface PosixHandoffResult {
+  ok: boolean
+  exitCode: number
+  manual: boolean
+  message: string
+  branch: string
+}
+
 export interface ConsumeLegacyHandoffResultOptions {
   maxAgeMs?: number
   now?: () => number
@@ -190,13 +204,12 @@ interface ResultCorrelation {
 interface LegacyHandoffResult {
   ok: boolean
   exitCode: number
-  /** Update succeeded but the user must act (reopen the app, reinstall the
-   * GUI package, fix the sandbox helper). The consumer must SURFACE these —
-   * an ok:true manual result that only gets logged never reaches the user
-   * on exactly the machines where no shim/notifier could show it live. */
-  manual: boolean
   message: string
   branch: string
+  finishedAt: number
+}
+
+interface ParsedPosixHandoffResult extends PosixHandoffResult {
   finishedAt: number
 }
 
@@ -213,7 +226,9 @@ export function handoffAckPath(hermesHome: string, attemptId: string): string {
 }
 
 function exactKeys(value: unknown, expected: string[]): value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {return false}
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
   const actual = Object.keys(value).sort()
   const sortedExpected = [...expected].sort()
 
@@ -225,7 +240,9 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 function canonicalPath(candidate: unknown): string | null {
-  if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) {return null}
+  if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) {
+    return null
+  }
 
   try {
     return fs.realpathSync.native(candidate)
@@ -243,7 +260,9 @@ function sameCanonicalPath(left: string, right: string): boolean {
 }
 
 function parseHealth(value: unknown): RuntimeHealth | null {
-  if (!exactKeys(value, HEALTH_KEYS)) {return null}
+  if (!exactKeys(value, HEALTH_KEYS)) {
+    return null
+  }
 
   if (
     value.critical_syntax !== true ||
@@ -269,7 +288,9 @@ function parseReceipt(
   requestedAt: number,
   maxAgeMs: number
 ): HandoffReceipt | null {
-  if (!exactKeys(value, RECEIPT_KEYS)) {return null}
+  if (!exactKeys(value, RECEIPT_KEYS)) {
+    return null
+  }
 
   if (
     value.schema_version !== 1 ||
@@ -288,7 +309,9 @@ function parseReceipt(
   const receiptRoot = canonicalPath(value.root)
   const health = parseHealth(value.health)
 
-  if (!receiptRoot || !sameCanonicalPath(receiptRoot, root) || !health) {return null}
+  if (!receiptRoot || !sameCanonicalPath(receiptRoot, root) || !health) {
+    return null
+  }
 
   if (
     value.timestamp > requestedAt + HANDOFF_RESULT_CLOCK_SKEW_MS / 1_000 ||
@@ -346,7 +369,9 @@ function parseReceipt(
 }
 
 function parseCleanup(value: unknown): HandoffCleanup | null {
-  if (!exactKeys(value, CLEANUP_KEYS)) {return null}
+  if (!exactKeys(value, CLEANUP_KEYS)) {
+    return null
+  }
 
   if (typeof value.update_marker_released !== 'boolean' || typeof value.bridge_lease_released !== 'boolean') {
     return null
@@ -359,7 +384,9 @@ function parseCleanup(value: unknown): HandoffCleanup | null {
 }
 
 function parseRelaunch(value: unknown): HandoffRelaunch | null {
-  if (!exactKeys(value, RELAUNCH_KEYS)) {return null}
+  if (!exactKeys(value, RELAUNCH_KEYS)) {
+    return null
+  }
 
   if (!['pending', 'acknowledged', 'failed'].includes(String(value.state)) || !isPositiveInteger(value.requested_at)) {
     return null
@@ -391,16 +418,17 @@ function parseRelaunch(value: unknown): HandoffRelaunch | null {
 
   const identityCount = [pid, processStartedAt, executable].filter(item => item !== null).length
 
-  if (identityCount !== 0 && identityCount !== 3) {return null}
-
-  if (
-    processStartedAt !== null &&
-    processStartedAt > value.requested_at + HANDOFF_RESULT_CLOCK_SKEW_MS / 1_000
-  ) {
+  if (identityCount !== 0 && identityCount !== 3) {
     return null
   }
 
-  if (acknowledgedAt !== null && acknowledgedAt < value.requested_at) {return null}
+  if (processStartedAt !== null && processStartedAt > value.requested_at + HANDOFF_RESULT_CLOCK_SKEW_MS / 1_000) {
+    return null
+  }
+
+  if (acknowledgedAt !== null && acknowledgedAt < value.requested_at) {
+    return null
+  }
 
   return {
     state: value.state as HandoffRelaunch['state'],
@@ -413,21 +441,25 @@ function parseRelaunch(value: unknown): HandoffRelaunch | null {
 }
 
 function parseDesktop(value: unknown): HandoffDesktopProof | null {
-  if (!exactKeys(value, DESKTOP_KEYS) || typeof value.backend_ready !== 'boolean') {return null}
-
-  if (
-    !(
-      value.build_id === null ||
-      (typeof value.build_id === 'string' &&
-        (GIT_SHA_PATTERN.test(value.build_id) || ARCHIVE_SHA_PATTERN.test(value.build_id)))
-    )
-  ) {
+  if (!exactKeys(value, DESKTOP_KEYS) || typeof value.backend_ready !== 'boolean') {
     return null
   }
 
-  if (!(value.build_source === null || value.build_source === 'install-stamp')) {return null}
+  if (!(
+    value.build_id === null ||
+    (typeof value.build_id === 'string' &&
+      (GIT_SHA_PATTERN.test(value.build_id) || ARCHIVE_SHA_PATTERN.test(value.build_id)))
+  )) {
+    return null
+  }
 
-  if (!(value.backend_mode === null || value.backend_mode === 'local' || value.backend_mode === 'remote')) {return null}
+  if (!(value.build_source === null || value.build_source === 'install-stamp')) {
+    return null
+  }
+
+  if (!(value.backend_mode === null || value.backend_mode === 'local' || value.backend_mode === 'remote')) {
+    return null
+  }
 
   let root: string | null
 
@@ -436,7 +468,9 @@ function parseDesktop(value: unknown): HandoffDesktopProof | null {
   } else {
     const canonical = canonicalPath(value.root)
 
-    if (!canonical) {return null}
+    if (!canonical) {
+      return null
+    }
     root = canonical
   }
 
@@ -470,23 +504,27 @@ function isCorrelatedDesktopObservation(
   receiptPresent: boolean,
   relaunchIdentityPresent: boolean
 ): boolean {
-  if (isEmptyDesktopProof(desktop)) {return true}
+  if (isEmptyDesktopProof(desktop)) {
+    return true
+  }
 
   return Boolean(
     receiptPresent &&
-      relaunchIdentityPresent &&
-      expectedBuildId &&
-      desktop.buildId &&
-      desktop.buildId.toLowerCase() === expectedBuildId.toLowerCase() &&
-      desktop.buildSource === 'install-stamp' &&
-      desktop.root &&
-      sameCanonicalPath(desktop.root, root) &&
-      (desktop.backendMode === 'local' || desktop.backendMode === 'remote')
+    relaunchIdentityPresent &&
+    expectedBuildId &&
+    desktop.buildId &&
+    desktop.buildId.toLowerCase() === expectedBuildId.toLowerCase() &&
+    desktop.buildSource === 'install-stamp' &&
+    desktop.root &&
+    sameCanonicalPath(desktop.root, root) &&
+    (desktop.backendMode === 'local' || desktop.backendMode === 'remote')
   )
 }
 
 export function expectedHandoffBuildId(result: HandoffResult): string | null {
-  if (!result.receipt) {return null}
+  if (!result.receipt) {
+    return null
+  }
 
   return result.receipt.mode === 'git' ? result.receipt.resultingHead : result.receipt.archiveSha
 }
@@ -495,7 +533,9 @@ function parseHandoffResultValue(
   value: unknown,
   { expectedRoot, now = Date.now, maxAgeMs = HANDOFF_RESULT_MAX_AGE_MS }: ReadHandoffResultOptions = {}
 ): HandoffResult | null {
-  if (!exactKeys(value, RESULT_KEYS)) {return null}
+  if (!exactKeys(value, RESULT_KEYS)) {
+    return null
+  }
 
   if (
     value.schema_version !== 2 ||
@@ -517,30 +557,42 @@ function parseHandoffResultValue(
 
   const nowMs = now()
 
-  if (!Number.isFinite(nowMs)) {return null}
+  if (!Number.isFinite(nowMs)) {
+    return null
+  }
 
   const root = canonicalPath(value.root)
 
-  if (!root) {return null}
+  if (!root) {
+    return null
+  }
 
   if (expectedRoot !== undefined) {
     const canonicalExpectedRoot = canonicalPath(expectedRoot)
 
-    if (!canonicalExpectedRoot || !sameCanonicalPath(root, canonicalExpectedRoot)) {return null}
+    if (!canonicalExpectedRoot || !sameCanonicalPath(root, canonicalExpectedRoot)) {
+      return null
+    }
   }
 
   const cleanup = parseCleanup(value.cleanup)
   const relaunch = parseRelaunch(value.relaunch)
   const desktop = parseDesktop(value.desktop)
 
-  if (!cleanup || !relaunch || !desktop) {return null}
+  if (!cleanup || !relaunch || !desktop) {
+    return null
+  }
 
   const referenceSeconds = value.state === 'pending' ? relaunch.requestedAt : value.finished_at
 
-  if (!isPositiveInteger(referenceSeconds)) {return null}
+  if (!isPositiveInteger(referenceSeconds)) {
+    return null
+  }
   const ageMs = nowMs - referenceSeconds * 1_000
 
-  if (ageMs < -HANDOFF_RESULT_CLOCK_SKEW_MS || ageMs > maxAgeMs) {return null}
+  if (ageMs < -HANDOFF_RESULT_CLOCK_SKEW_MS || ageMs > maxAgeMs) {
+    return null
+  }
 
   let receipt: HandoffReceipt | null = null
   let runtimeHealth: RuntimeHealth | null = null
@@ -548,7 +600,9 @@ function parseHandoffResultValue(
   let leaseId: string | null = null
 
   if (value.receipt === null) {
-    if (value.invocation_id !== null || value.lease_id !== null || value.runtime_health !== null) {return null}
+    if (value.invocation_id !== null || value.lease_id !== null || value.runtime_health !== null) {
+      return null
+    }
   } else {
     receipt = parseReceipt(value.receipt, value.branch, root, relaunch.requestedAt, maxAgeMs)
     runtimeHealth = parseHealth(value.runtime_health)
@@ -569,7 +623,9 @@ function parseHandoffResultValue(
   const identityPresent = relaunch.pid !== null && relaunch.processStartedAt !== null && relaunch.executable !== null
   const identityAbsent = relaunch.pid === null && relaunch.processStartedAt === null && relaunch.executable === null
 
-  if (!identityPresent && !identityAbsent) {return null}
+  if (!identityPresent && !identityAbsent) {
+    return null
+  }
 
   if (value.state === 'pending') {
     if (
@@ -614,7 +670,7 @@ function parseHandoffResultValue(
       return null
     }
   } else {
-    const expectedBuildId = receipt?.mode === 'git' ? receipt.resultingHead : receipt?.archiveSha ?? null
+    const expectedBuildId = receipt?.mode === 'git' ? receipt.resultingHead : (receipt?.archiveSha ?? null)
 
     if (
       value.ok !== false ||
@@ -672,10 +728,7 @@ function readResultSnapshot(file: string, options: ReadHandoffResultOptions): Re
   return result ? { raw, result } : null
 }
 
-export function readHandoffResult(
-  hermesHome: string,
-  options: ReadHandoffResultOptions = {}
-): HandoffResult | null {
+export function readHandoffResult(hermesHome: string, options: ReadHandoffResultOptions = {}): HandoffResult | null {
   return readResultSnapshot(handoffResultPath(hermesHome), options)?.result ?? null
 }
 
@@ -721,6 +774,130 @@ function parseLegacyHandoffResult(raw: Buffer): LegacyHandoffResult | null {
   }
 }
 
+function parsePosixHandoffResult(raw: Buffer): ParsedPosixHandoffResult | null {
+  let decoded: string
+
+  try {
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(raw)
+  } catch {
+    return null
+  }
+
+  let value: unknown
+
+  try {
+    value = JSON.parse(decoded)
+  } catch {
+    return null
+  }
+
+  if (!exactKeys(value, POSIX_RESULT_KEYS)) {
+    return null
+  }
+
+  if (
+    typeof value.ok !== 'boolean' ||
+    !Number.isSafeInteger(value.exit_code) ||
+    typeof value.manual !== 'boolean' ||
+    typeof value.message !== 'string' ||
+    typeof value.branch !== 'string' ||
+    !Number.isSafeInteger(value.finished_at) ||
+    (value.finished_at as number) <= 0 ||
+    (value.ok ? value.exit_code !== 0 : value.exit_code === 0) ||
+    (value.manual && !value.ok)
+  ) {
+    return null
+  }
+
+  return {
+    ok: value.ok,
+    exitCode: value.exit_code as number,
+    manual: value.manual,
+    message: value.message,
+    branch: value.branch,
+    finishedAt: value.finished_at as number
+  }
+}
+
+/**
+ * Consume one exact six-key POSIX result using the same rename/byte-compare
+ * one-shot protocol as v2. Unknown or raced bytes remain available to a newer
+ * consumer. Manual outcomes do not expire, but future-dated records never
+ * surface outside the bounded clock-skew allowance.
+ */
+export function consumePosixHandoffResult(
+  hermesHome: string,
+  { maxAgeMs = HANDOFF_RESULT_MAX_AGE_MS, now = Date.now }: ConsumeLegacyHandoffResultOptions = {}
+): PosixHandoffResult | null {
+  const nowMs = now()
+
+  if (!Number.isFinite(nowMs) || !Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+    return null
+  }
+
+  const file = handoffResultPath(hermesHome)
+  let preview: Buffer
+
+  try {
+    preview = fs.readFileSync(file)
+  } catch {
+    return null
+  }
+
+  const parsed = parsePosixHandoffResult(preview)
+
+  if (!parsed) {
+    return null
+  }
+
+  const isolated = `${file}.consume-${process.pid}-${randomUUID()}`
+
+  try {
+    fs.renameSync(file, isolated)
+  } catch {
+    return null
+  }
+
+  let isolatedRaw: Buffer
+
+  try {
+    isolatedRaw = fs.readFileSync(isolated)
+  } catch {
+    restoreIsolatedResult(isolated, file)
+
+    return null
+  }
+
+  if (!isolatedRaw.equals(preview)) {
+    restoreIsolatedResult(isolated, file)
+
+    return null
+  }
+
+  try {
+    fs.unlinkSync(isolated)
+  } catch {
+    // The recognized record is detached from the fixed path. A delayed delete
+    // of the unique one-shot name cannot replay it.
+  }
+
+  const ageMs = nowMs - parsed.finishedAt * 1_000
+  const notFromFuture = ageMs >= -HANDOFF_RESULT_CLOCK_SKEW_MS
+  const fresh = notFromFuture && ageMs <= maxAgeMs
+
+  if (!notFromFuture || (!parsed.manual && !fresh)) {
+    return null
+  }
+
+  return {
+    ok: parsed.ok,
+    exitCode: parsed.exitCode,
+    manual: parsed.manual,
+    message: parsed.message,
+    branch: parsed.branch
+  }
+}
+
 /**
  * Retire the exact five-key result written by Desktop builds before the v2
  * transaction existed. Only a fresh strict failure may surface as a legacy
@@ -729,10 +906,7 @@ function parseLegacyHandoffResult(raw: Buffer): LegacyHandoffResult | null {
  */
 export function consumeLegacyHandoffResult(
   hermesHome: string,
-  {
-    maxAgeMs = HANDOFF_RESULT_MAX_AGE_MS,
-    now = Date.now
-  }: ConsumeLegacyHandoffResultOptions = {}
+  { maxAgeMs = HANDOFF_RESULT_MAX_AGE_MS, now = Date.now }: ConsumeLegacyHandoffResultOptions = {}
 ): LegacyHandoffFailureDiagnostic | null {
   const nowMs = now()
 
@@ -1046,20 +1220,30 @@ export async function waitForTerminalHandoffResult(
     const snapshot = readResultSnapshot(file, readOptions)
 
     if (snapshot && matchesCorrelation(snapshot.result, correlation)) {
-      if (correlation.attemptId === undefined) {correlation.attemptId = snapshot.result.attemptId}
+      if (correlation.attemptId === undefined) {
+        correlation.attemptId = snapshot.result.attemptId
+      }
 
-      if (correlation.invocationId === undefined) {correlation.invocationId = snapshot.result.invocationId}
+      if (correlation.invocationId === undefined) {
+        correlation.invocationId = snapshot.result.invocationId
+      }
 
-      if (correlation.leaseId === undefined) {correlation.leaseId = snapshot.result.leaseId}
+      if (correlation.leaseId === undefined) {
+        correlation.leaseId = snapshot.result.leaseId
+      }
 
       if (snapshot.result.state !== 'pending') {
         const terminal = consumeTerminalSnapshot(file, snapshot, readOptions, correlation)
 
-        if (terminal) {return terminal}
+        if (terminal) {
+          return terminal
+        }
       }
     }
 
-    if (elapsedMs >= timeoutMs) {return null}
+    if (elapsedMs >= timeoutMs) {
+      return null
+    }
     const delayMs = Math.min(pollMs, timeoutMs - elapsedMs)
     await wait(delayMs)
     elapsedMs += delayMs
