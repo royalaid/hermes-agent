@@ -768,11 +768,40 @@ test('legacy v0 consumer restores an exact foreign replacement raced before isol
   )
 })
 
+test('Windows leaves six-key success and manual results for fail-closed legacy retirement', () => {
+  for (const manual of [false, true]) {
+    const where = fixture()
+    writeLegacy(where.home, posixResult({ manual, message: manual ? 'Reopen Hermes to finish' : 'done' }))
+
+    assert.equal(
+      consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'win32' }),
+      null
+    )
+    assert.equal(fs.existsSync(handoffResultPath(where.home)), true)
+    assert.equal(consumeLegacyHandoffResult(where.home, { now: () => NOW_MS }), null)
+    assert.equal(fs.existsSync(handoffResultPath(where.home)), false)
+  }
+})
+
+test('Windows surfaces only a fresh six-key failure as a legacy diagnostic', () => {
+  const where = fixture()
+  writeLegacy(where.home, posixResult({ ok: false, exit_code: 7, message: 'old Windows update failed' }))
+
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'win32' }), null)
+  assert.equal(fs.existsSync(handoffResultPath(where.home)), true)
+  assert.deepEqual(consumeLegacyHandoffResult(where.home, { now: () => NOW_MS }), {
+    exitCode: 7,
+    message: 'old Windows update failed',
+    branch: 'main'
+  })
+  assert.equal(fs.existsSync(handoffResultPath(where.home)), false)
+})
+
 test('exact fresh POSIX success is returned and consumed once without becoming v2', () => {
   const where = fixture()
   writeLegacy(where.home, posixResult())
 
-  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), {
+  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), {
     ok: true,
     exitCode: 0,
     manual: false,
@@ -780,14 +809,14 @@ test('exact fresh POSIX success is returned and consumed once without becoming v
     branch: 'main'
   })
   assert.equal(readHandoffResult(where.home, { now: () => NOW_MS }), null)
-  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), null)
 })
 
 test('exact fresh POSIX failure is returned and consumed once', () => {
   const where = fixture()
   writeLegacy(where.home, posixResult({ ok: false, exit_code: 7, message: 'POSIX update failed' }))
 
-  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), {
+  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), {
     ok: false,
     exitCode: 7,
     manual: false,
@@ -801,7 +830,7 @@ test('stale ordinary POSIX result is retired without surfacing', () => {
   const where = fixture()
   writeLegacy(where.home, posixResult({ finished_at: NOW_SECONDS - 3_600 }))
 
-  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), null)
   assert.equal(fs.existsSync(handoffResultPath(where.home)), false)
 })
 
@@ -816,14 +845,14 @@ test('stale POSIX manual result remains actionable and is consumed once', () => 
     })
   )
 
-  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), {
+  assert.deepEqual(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), {
     ok: true,
     exitCode: 0,
     manual: true,
     message: 'Reopen Hermes to finish',
     branch: 'main'
   })
-  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), null)
 })
 
 test('invalid or extended POSIX-shaped bytes remain for another consumer', () => {
@@ -838,7 +867,7 @@ test('invalid or extended POSIX-shaped bytes remain for another consumer', () =>
     const where = fixture()
     const original = writeLegacy(where.home, body)
 
-    assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+    assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), null)
     assert.deepEqual(fs.readFileSync(handoffResultPath(where.home)), original)
   }
 })
@@ -847,7 +876,7 @@ test('future POSIX result outside clock skew is consumed without surfacing', () 
   const where = fixture()
   writeLegacy(where.home, posixResult({ manual: true, finished_at: NOW_SECONDS + 6 }))
 
-  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+  assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), null)
   assert.equal(fs.existsSync(handoffResultPath(where.home)), false)
 })
 
@@ -862,7 +891,7 @@ test('POSIX consumer restores a foreign replacement raced before isolation', () 
   })
 
   try {
-    assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS }), null)
+    assert.equal(consumePosixHandoffResult(where.home, { now: () => NOW_MS, platform: 'linux' }), null)
   } finally {
     rename.mockRestore()
   }
