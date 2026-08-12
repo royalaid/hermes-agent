@@ -14,6 +14,11 @@ import {
 
 export const HANDOFF_RESULT_MAX_AGE_MS = 30 * 60 * 1000
 export const HANDOFF_RESULT_CLOCK_SKEW_MS = 5 * 1000
+// The updater publishes its receipt before a bounded 30-minute Desktop
+// rebuild, five-minute gateway recovery, and one-minute single-instance
+// handoff. Keep that protocol relation separate from result freshness and
+// leave four minutes for stage-boundary and process-start coordination.
+export const HANDOFF_RECEIPT_TO_RELAUNCH_MAX_AGE_MS = 40 * 60 * 1000
 
 const GIT_SHA_PATTERN = /^[0-9a-fA-F]{40}$/
 const ARCHIVE_SHA_PATTERN = /^[0-9a-fA-F]{64}$/
@@ -259,8 +264,7 @@ function parseReceipt(
   value: unknown,
   branch: string,
   root: string,
-  requestedAt: number,
-  maxAgeMs: number
+  requestedAt: number
 ): HandoffReceipt | null {
   if (!hasExactKeys(value, RECEIPT_KEYS)) {return null}
 
@@ -287,7 +291,7 @@ function parseReceipt(
 
   if (
     value.timestamp > requestedAt + HANDOFF_RESULT_CLOCK_SKEW_MS / 1_000 ||
-    requestedAt - value.timestamp > maxAgeMs / 1_000
+    requestedAt - value.timestamp > HANDOFF_RECEIPT_TO_RELAUNCH_MAX_AGE_MS / 1_000
   ) {
     return null
   }
@@ -568,7 +572,7 @@ function parseHandoffResultValue(
       return null
     }
   } else {
-    receipt = parseReceipt(value.receipt, value.branch, root, relaunch.requestedAt, maxAgeMs)
+    receipt = parseReceipt(value.receipt, value.branch, root, relaunch.requestedAt)
     runtimeHealth = parseHealth(value.runtime_health)
 
     if (
