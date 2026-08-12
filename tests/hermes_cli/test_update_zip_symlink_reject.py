@@ -133,3 +133,96 @@ def test_update_via_zip_accepts_normal_member(tmp_path, monkeypatch, capsys):
     # confirming the extraction + copy phases ran past the validation gate.
     assert (fake_root / "README.md").exists()
     assert (fake_root / "README.md").read_text() == "ok\n"
+
+
+@pytest.mark.parametrize(
+    ("node_failures", "node_health", "expected_message"),
+    [
+        pytest.param(["repo root"], True, "partially complete", id="node-repair-failed"),
+        pytest.param([], None, "health proof", id="health-unknown"),
+    ],
+)
+def test_update_via_zip_failed_health_exits_nonzero(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    node_failures,
+    node_health,
+    expected_message,
+):
+    """Archive updates must not return success without a success receipt."""
+    zip_path = tmp_path / "normal.zip"
+    _build_normal_zip(str(zip_path))
+    fake_root = tmp_path / "install_dir"
+    fake_root.mkdir()
+
+    from hermes_cli import main as hermes_main
+    from hermes_cli import update_cmd
+
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", fake_root)
+    monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda _root: 0)
+    monkeypatch.setattr(hermes_main, "_record_bytecode_fingerprint", lambda: None)
+    monkeypatch.setattr(hermes_main, "_refresh_bootstrap_cache_scripts", lambda _branch: None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_install_python_dependencies_with_optional_fallback",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        hermes_main, "_refresh_active_memory_provider_dependencies", lambda: None
+    )
+    monkeypatch.setattr(hermes_main, "_build_web_ui", lambda _root: None)
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path / "hermes-home")
+    monkeypatch.setattr(
+        update_cmd, "_venv_core_imports_healthy", lambda: (True, "")
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_critical_files_syntax",
+        lambda _root: (True, None, None),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_critical_modules_import",
+        lambda _root: (True, None, None),
+    )
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: node_failures)
+    monkeypatch.setattr(
+        update_cmd, "_node_dependencies_healthy_read_only", lambda: node_health
+    )
+    monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
+    monkeypatch.setattr(update_cmd, "_print_curator_recent_run_notice", lambda: None)
+    monkeypatch.setattr(
+        update_cmd, "_finish_dashboard_update_cleanup", lambda _failures: None
+    )
+    monkeypatch.setattr("hermes_cli.managed_uv.update_managed_uv", lambda: None)
+    monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda: None)
+    monkeypatch.setattr(
+        "tools.skills_sync.sync_skills",
+        lambda quiet: {"copied": [], "updated": [], "user_modified": [], "cleaned": []},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_catalog.seed_cache_from_checkout", lambda _root: False
+    )
+
+    def fake_urlretrieve(_url, dest):
+        with open(zip_path, "rb") as src, open(dest, "wb") as dst:
+            dst.write(src.read())
+        return dest, None
+
+    args = type("Args", (), {})()
+    with (
+        patch("urllib.request.urlretrieve", side_effect=fake_urlretrieve),
+        patch("subprocess.run") as fake_run,
+        patch("subprocess.check_call"),
+        patch.object(update_cmd, "_record_update_success") as record,
+        pytest.raises(SystemExit) as exit_info,
+    ):
+        fake_run.return_value = type(
+            "R", (), {"returncode": 0, "stdout": "", "stderr": ""}
+        )()
+        hermes_main._update_via_zip(args, transaction=_UpdateTransaction())
+
+    assert exit_info.value.code == 1
+    record.assert_not_called()
+    assert expected_message in capsys.readouterr().out
