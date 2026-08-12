@@ -258,6 +258,8 @@ def _drain_under_update_lease(
             # The scanner supplies worker-first ordering. Preserve it so an
             # external base worker's live wrapper ancestry remains provable.
             for entry in actionable:
+                if _time.monotonic() >= deadline:
+                    return _drain_timeout_payload()
                 terminated = terminate_mcp_bridge(
                     root,
                     pid=int(entry["pid"]),
