@@ -920,6 +920,70 @@ def test_drain_scan_crossing_deadline_cannot_authorize_success(
     assert clock.now == 1.5
 
 
+def test_atomic_prepare_stops_terminating_bridges_after_drain_deadline(
+    tmp_path: Path, monkeypatch, capsys
+):
+    import hermes_cli._scan_venv_blockers as scanner
+
+    root = tmp_path / "install"
+    root.mkdir()
+    initial = _lease(root)
+    bridges = [_bridge(41), _bridge(42)]
+    clock = _FakeClock()
+    terminated: list[int] = []
+    released: list[dict] = []
+
+    def terminate(_root: Path, *, pid: int, created_at: float) -> bool:
+        assert created_at == bridges[len(terminated)]["created_at"]
+        terminated.append(pid)
+        if len(terminated) == 1:
+            clock.now += 30.0
+        return True
+
+    monkeypatch.setattr(
+        update_quiesce,
+        "_claim_update_quiesce_lease",
+        lambda *_args, **_kwargs: initial,
+    )
+    monkeypatch.setattr(
+        scanner,
+        "scan_venv_blockers",
+        lambda _root: _scan(bridges=bridges),
+    )
+    monkeypatch.setattr(scanner, "terminate_mcp_bridge", terminate)
+    monkeypatch.setattr(update_quiesce, "_git_preflight_metadata", lambda *_args: None)
+    monkeypatch.setattr(update_quiesce, "_load_update_receipt", lambda _root: None)
+    monkeypatch.setattr(update_quiesce._time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(update_quiesce._time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        update_quiesce,
+        "_release_update_quiesce_lease",
+        lambda _root, lease: released.append(lease) or True,
+    )
+    args = SimpleNamespace(
+        yes=True,
+        bridge_lease_id=None,
+        branch="main",
+        timeout_seconds=1.0,
+        force_venv=False,
+        invocation_id=None,
+    )
+    transaction = update_transaction._UpdateTransaction()
+
+    with pytest.raises(SystemExit) as exit_info:
+        update_quiesce._prepare_atomic_windows_update(
+            args,
+            root=root,
+            transaction=transaction,
+        )
+
+    assert exit_info.value.code == 2
+    assert terminated == [bridges[0]["pid"]]
+    assert released == [initial]
+    assert transaction.lease is None
+    assert "not ready to update: drain-timeout" in capsys.readouterr().out
+
+
 def test_standalone_drain_still_refuses_hard_holder_immediately(
     tmp_path: Path, monkeypatch
 ):
