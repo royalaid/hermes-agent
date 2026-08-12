@@ -690,6 +690,33 @@ test('valid terminal failure is consumed once without fabricating success', asyn
   assert.equal(fs.existsSync(handoffResultPath(where.home)), false)
 })
 
+test('consumes the exact PowerShell receipt-bearing pre-spawn failure fixture', () => {
+  const where = fixture()
+  const fixturePath = path.resolve(
+    import.meta.dirname,
+    '..',
+    '..',
+    '..',
+    'scripts',
+    'tests',
+    'fixtures',
+    'desktop-update-receipt-failure.json'
+  )
+  const value = JSON.parse(fs.readFileSync(fixturePath, 'utf8'))
+  value.root = where.root
+  value.receipt.root = where.root
+  writeResult(where.home, value)
+
+  const parsed = read(where.home, where.root)
+
+  assert.ok(parsed)
+  assert.equal(parsed.state, 'failed')
+  assert.equal(parsed.receipt?.timestamp, value.receipt.timestamp)
+  assert.ok(parsed.relaunch.requestedAt >= (parsed.receipt?.timestamp ?? 0))
+  assert.equal(parsed.relaunch.pid, null)
+  assert.equal(parsed.finishedAt, parsed.relaunch.requestedAt)
+})
+
 test('legacy v0 fresh failure is returned as a diagnostic and consumed exactly once', () => {
   const where = fixture()
   writeLegacy(where.home, legacyResult())
