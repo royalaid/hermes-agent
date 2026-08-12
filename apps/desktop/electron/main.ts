@@ -241,7 +241,6 @@ import { resolveDefaultUpdateBranch } from './update-branch'
 import { UpdateInFlightTransaction, waitForLocalBackendClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import {
-  type McpBridgeConsentRequest,
   runWindowsUpdatePreflight,
   type UpdatePreflightOutcome,
   type UpdatePreflightPurpose
@@ -261,7 +260,11 @@ import {
   stagedUpdaterEnvironment,
   terminateSpawnedUpdaterIfExact
 } from './updater-process'
-import { scanVenvBlockers, terminateMcpBridge } from './venv-blocker-scan'
+import {
+  scanVenvBlockers,
+  terminateDesktopPluginService,
+  terminateVenvHolder
+} from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { readWindowBelow } from './window-below'
@@ -3157,21 +3160,6 @@ async function releaseBackendLockForUpdate(updateRoot, tag = 'updates') {
   return releaseBackendLock(updateRoot, tag)
 }
 
-async function confirmMcpBridgeShutdown(request: McpBridgeConsentRequest): Promise<boolean> {
-  const result = await dialog.showMessageBox(mainWindow || undefined, {
-    type: 'warning',
-    title: request.title,
-    buttons: ['Cancel update', request.continueLabel],
-    cancelId: 0,
-    defaultId: 0,
-    noLink: true,
-    message: request.message,
-    detail: request.detail
-  })
-
-  return result.response === 1
-}
-
 function windowsPreflightErrorCode(outcome: Exclude<UpdatePreflightOutcome, { kind: 'clear' }>): string {
   if (outcome.kind === 'probe-failure') {
     return 'venv-probe-failed'
@@ -3180,9 +3168,6 @@ function windowsPreflightErrorCode(outcome: Exclude<UpdatePreflightOutcome, { ki
   switch (outcome.reason) {
     case 'holders':
       return 'venv-blocked'
-
-    case 'consent-declined':
-      return 'mcp-bridge-shutdown-declined'
 
     case 'lease-unavailable':
       return 'mcp-bridge-quiesce-failed'
@@ -3200,12 +3185,12 @@ function runWindowsHandoffPreflight(updateRoot: string, purpose: UpdatePreflight
     releaseTrackedBackendTrees: () =>
       releaseBackendLockForUpdate(updateRoot, purpose === 'bootstrap-recovery' ? 'bootstrap' : 'updates'),
     scan: () => scanVenvBlockers(updateRoot),
-    requestMcpBridgeConsent: confirmMcpBridgeShutdown,
     acquireMcpBridgeLease: () => acquireMcpBridgeQuiesceLease(HERMES_HOME, updateRoot),
     clearMcpBridgeLease: lease => {
       clearMcpBridgeQuiesceLease(HERMES_HOME, lease)
     },
-    terminateMcpBridge: bridge => terminateMcpBridge(updateRoot, bridge)
+    terminateDesktopPluginService: service => terminateDesktopPluginService(updateRoot, service),
+    terminateVenvHolder: holder => terminateVenvHolder(updateRoot, holder)
   })
 }
 
