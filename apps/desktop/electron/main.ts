@@ -186,7 +186,7 @@ import {
   hasHandoffRelaunchRequest,
   inspectHandoffRelaunchExit
 } from './handoff-relaunch-exit'
-import { consumeLegacyHandoffResult, type HandoffResult } from './handoff-result'
+import { consumeLegacyHandoffResult, consumePosixHandoffResult, type HandoffResult } from './handoff-result'
 import { retryHandoffResultLifecycle, runHandoffResultLifecycle } from './handoff-result-orchestration'
 import {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
@@ -2040,8 +2040,7 @@ function handoffRelaunchRequestBlocksBackend(): boolean {
 
 function updateGateDeps() {
   return {
-    hasLiveMarker: () =>
-      Boolean(readLiveUpdateMarker(HERMES_HOME)) || handoffRelaunchRequestBlocksBackend(),
+    hasLiveMarker: () => Boolean(readLiveUpdateMarker(HERMES_HOME)) || handoffRelaunchRequestBlocksBackend(),
     isUpdateInFlight: updateInFlightTransaction.isActive
   }
 }
@@ -2096,9 +2095,37 @@ function reportHandoffResult(result: HandoffResult | null) {
 }
 
 function consumeAndReportLegacyHandoffResult() {
+  const posixResult = consumePosixHandoffResult(HERMES_HOME)
+
+  if (posixResult) {
+    if (posixResult.ok && posixResult.manual) {
+      rememberLog(
+        `[updates] detached POSIX update finished with manual action (branch ${posixResult.branch}): ${posixResult.message}`
+      )
+      void dialog.showMessageBox({
+        type: 'warning',
+        title: 'Hermes update',
+        message: 'The update finished, but needs one more step',
+        detail: posixResult.message
+      })
+    } else if (posixResult.ok) {
+      rememberLog(`[updates] detached POSIX update finished OK (branch ${posixResult.branch})`)
+    } else {
+      rememberLog(`[updates] detached POSIX update FAILED (exit ${posixResult.exitCode}): ${posixResult.message}`)
+      dialog.showErrorBox(
+        'Hermes update did not finish',
+        `${posixResult.message}\n\nDetails: ${path.join(HERMES_HOME, 'logs', 'desktop-update-handoff.log')}`
+      )
+    }
+
+    return
+  }
+
   const legacyFailure = consumeLegacyHandoffResult(HERMES_HOME)
 
-  if (!legacyFailure) {return}
+  if (!legacyFailure) {
+    return
+  }
 
   rememberLog(
     `[updates] previous updater reported a legacy failure (exit ${legacyFailure.exitCode}, branch ${legacyFailure.branch}): ${legacyFailure.message}`
@@ -2114,7 +2141,9 @@ let handoffRelaunchExitWatchStarted = false
 let handoffRelaunchExitWatchStatus = ''
 
 function logHandoffRelaunchExitWatchStatus(status: string) {
-  if (status === handoffRelaunchExitWatchStatus) {return}
+  if (status === handoffRelaunchExitWatchStatus) {
+    return
+  }
   handoffRelaunchExitWatchStatus = status
   rememberLog(`[updates] ${status}`)
 }
@@ -2177,7 +2206,9 @@ async function inspectHandoffRelaunchExitOnce(): Promise<boolean> {
 }
 
 async function startHandoffRelaunchExitWatch(): Promise<boolean> {
-  if (handoffRelaunchExitWatchStarted) {return true}
+  if (handoffRelaunchExitWatchStarted) {
+    return true
+  }
   handoffRelaunchExitWatchStarted = true
 
   return inspectHandoffRelaunchExitOnce()
@@ -2191,9 +2222,13 @@ function shouldRetryHandoffResultDiscovery(): boolean {
     return true
   }
 
-  if (!handoffResultExpected) {return false}
+  if (!handoffResultExpected) {
+    return false
+  }
 
-  if (handoffResultMarkerClearedAt === 0) {handoffResultMarkerClearedAt = Date.now()}
+  if (handoffResultMarkerClearedAt === 0) {
+    handoffResultMarkerClearedAt = Date.now()
+  }
 
   return Date.now() - handoffResultMarkerClearedAt <= HANDOFF_RESULT_POST_MARKER_GRACE_MS
 }
@@ -2209,7 +2244,9 @@ function startHandoffResultPoll() {
     handoffResultMarkerClearedAt = 0
   }
 
-  if (handoffResultPollRunning) {return}
+  if (handoffResultPollRunning) {
+    return
+  }
   handoffResultPollRunning = true
 
   // Do not delay ordinary Desktop startup. Poll in the background so a
@@ -3984,13 +4021,14 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean } = {}
       const updaterPid = Number.isInteger(child.pid) ? Number(child.pid) : null
       const updaterStartedAt = updaterPid ? await captureSpawnedUpdaterCreatedAt(updaterPid) : null
 
-      const stagedLeaseHandoff = updaterPid && updaterStartedAt
-        ? await handOffMcpBridgeLeaseToStagedUpdater(HERMES_HOME, bridgeLease, updaterPid, {
-            readUpdateOwner: readProvenUpdateOwnerClaim,
-            requiredOwnerStartedAt: updaterStartedAt,
-            verifyRequiredOwnerGeneration: () => isSpawnedUpdaterGenerationActive(child)
-          })
-        : { kind: 'failed' as const }
+      const stagedLeaseHandoff =
+        updaterPid && updaterStartedAt
+          ? await handOffMcpBridgeLeaseToStagedUpdater(HERMES_HOME, bridgeLease, updaterPid, {
+              readUpdateOwner: readProvenUpdateOwnerClaim,
+              requiredOwnerStartedAt: updaterStartedAt,
+              verifyRequiredOwnerGeneration: () => isSpawnedUpdaterGenerationActive(child)
+            })
+          : { kind: 'failed' as const }
 
       if (stagedLeaseHandoff.kind === 'failed') {
         // This is the exact updater generation, not an MCP bridge or its
@@ -4071,7 +4109,6 @@ async function handOffWindowsBootstrapRecovery(reason) {
 }
 
 async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
-
   const handoffConflict = updateHandoffConflict(HERMES_HOME)
 
   if (handoffConflict) {
@@ -4148,13 +4185,14 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
     const updaterPid = Number.isInteger(child.pid) ? Number(child.pid) : null
     const updaterStartedAt = updaterPid ? await captureSpawnedUpdaterCreatedAt(updaterPid) : null
 
-    const stagedLeaseHandoff = updaterPid && updaterStartedAt
-      ? await handOffMcpBridgeLeaseToStagedUpdater(HERMES_HOME, bridgeLease, updaterPid, {
-          readUpdateOwner: readProvenUpdateOwnerClaim,
-          requiredOwnerStartedAt: updaterStartedAt,
-          verifyRequiredOwnerGeneration: () => isSpawnedUpdaterGenerationActive(child)
-        })
-      : { kind: 'failed' as const }
+    const stagedLeaseHandoff =
+      updaterPid && updaterStartedAt
+        ? await handOffMcpBridgeLeaseToStagedUpdater(HERMES_HOME, bridgeLease, updaterPid, {
+            readUpdateOwner: readProvenUpdateOwnerClaim,
+            requiredOwnerStartedAt: updaterStartedAt,
+            verifyRequiredOwnerGeneration: () => isSpawnedUpdaterGenerationActive(child)
+          })
+        : { kind: 'failed' as const }
 
     if (stagedLeaseHandoff.kind === 'failed') {
       if (updaterPid && updaterStartedAt) {
