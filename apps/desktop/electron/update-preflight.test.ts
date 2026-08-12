@@ -9,7 +9,12 @@ import {
   type UpdatePreflightDeps,
   type UpdatePreflightPurpose
 } from './update-preflight'
-import type { McpBridgeProcess, ScanOutcome, VenvBlockerScanResult } from './venv-blocker-scan'
+import type {
+  DesktopPluginServiceProcess,
+  McpBridgeProcess,
+  ScanOutcome,
+  VenvBlockerScanResult
+} from './venv-blocker-scan'
 
 const PURPOSES: UpdatePreflightPurpose[] = ['normal-update', 'bootstrap-recovery']
 
@@ -36,6 +41,21 @@ const bridge = (overrides: Partial<McpBridgeProcess> = {}): McpBridgeProcess => 
   ...overrides
 })
 
+const desktopPluginService = (
+  overrides: Partial<DesktopPluginServiceProcess> = {}
+): DesktopPluginServiceProcess => ({
+  pid: 301,
+  name: 'python.exe',
+  cmdline: 'python.exe C:\\Users\\u\\AppData\\Local\\hermes\\desktop-plugins\\tracker\\service.py',
+  createdAt: 333.5,
+  owner: 'desktop',
+  role: 'desktop_plugin_wrapper',
+  actionable: true,
+  actionability: 'exact_desktop_plugin_service',
+  action: 'terminate_desktop_plugin_service',
+  ...overrides
+})
+
 function pairedBridgeGroups(count: number): McpBridgeProcess[] {
   return Array.from({ length: count }, (_, index) => {
     const wrapperPid = 1_000 + index
@@ -56,6 +76,7 @@ const result = (overrides: Partial<VenvBlockerScanResult> = {}): VenvBlockerScan
   blocked: false,
   processes: [],
   mcpBridges: [],
+  desktopPluginServices: [],
   pausableGateways: 0,
   ...overrides
 })
@@ -85,11 +106,6 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
 
       return next
     },
-    requestMcpBridgeConsent: async () => {
-      calls.push('consent')
-
-      return true
-    },
     acquireMcpBridgeLease: () => {
       calls.push('lease')
 
@@ -99,8 +115,16 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
       calls.push(`clear-lease:${current.leaseId}`)
     },
     now: () => currentTime,
-    terminateMcpBridge: async current => {
-      calls.push(`terminate:${current.pid}:${current.createdAt}`)
+    terminateDesktopPluginService: async current => {
+      calls.push(`terminate-desktop-plugin:${current.pid}:${current.createdAt}`)
+
+      return true
+    },
+    terminateVenvHolder: async current => {
+      const isMcpBridge =
+        'role' in current &&
+        (current.role === 'mcp_bridge_worker' || current.role === 'mcp_bridge_wrapper')
+      calls.push(`${isMcpBridge ? 'terminate' : 'terminate-holder'}:${current.pid}:${current.createdAt}`)
 
       return true
     },
@@ -172,46 +196,54 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     assert.deepEqual(calls, ['release', 'scan'])
   })
 
-  it('refuses MCP entries without proven agent ownership and exact actionability', async () => {
-    const unproven = blockedByBridges([bridge({ owner: 'unknown' })])
-    const { calls, deps } = makeDeps([unproven])
+  it('force-stops every current target-install holder after Update is chosen', async () => {
+    const holder = {
+      pid: 202,
+      name: 'python.exe',
+      cmdline: 'python.exe user-script.py',
+      createdAt: 456.5
+    }
+    const blocked: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [holder] })
+    }
+    const { calls, deps } = makeDeps([blocked, blocked, clear(), clear()])
 
-    const outcome = await runWindowsUpdatePreflight(purpose, deps)
-
-    assert.equal(outcome.kind, 'blocked')
-    assert.equal(outcome.reason, 'holders')
-    assert.deepEqual(calls, ['release', 'scan'])
-  })
-
-  it('never consents to or terminates an MCP entry missing scanner actionability proof', async () => {
-    const unproven = bridge()
-    delete (unproven as Partial<McpBridgeProcess>).actionable
-    delete (unproven as Partial<McpBridgeProcess>).actionability
-    delete (unproven as Partial<McpBridgeProcess>).action
-    const { calls, deps } = makeDeps([blockedByBridges([unproven])])
-
-    const outcome = await runWindowsUpdatePreflight(purpose, deps)
-
-    assert.equal(outcome.kind, 'blocked')
-    assert.equal(outcome.reason, 'holders')
-    assert.deepEqual(calls, ['release', 'scan'])
-  })
-
-  it('does not activate the prevention lease when the user declines bridge interruption', async () => {
-    const { calls, deps } = makeDeps([blockedByBridges()], {
-      requestMcpBridgeConsent: async request => {
-        calls.push(`consent:${request.ownerLabel}`)
-
-        return false
-      }
+    const outcome = await runWindowsUpdatePreflight(purpose, deps, {
+      cooperativeExitMs: 0,
+      respawnIntervalMs: 0,
+      terminationSettleMs: 0
     })
 
-    const outcome = await runWindowsUpdatePreflight(purpose, deps)
-
-    assert.equal(outcome.kind, 'blocked')
-    assert.equal(outcome.reason, 'consent-declined')
-    assert.deepEqual(calls, ['release', 'scan', 'consent:Codex'])
+    assert.equal(outcome.kind, 'clear')
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'lease',
+      'wait:0',
+      'scan',
+      'terminate-holder:202:456.5',
+      'wait:0',
+      'scan',
+      'wait:0',
+      'scan'
+    ])
   })
+
+  it('force-stops a scanned MCP bridge even when it has no agent ownership attribution', async () => {
+    const unproven = blockedByBridges([bridge({ owner: 'unknown' })])
+    const { calls, deps } = makeDeps([unproven, unproven, clear(), clear()])
+
+    const outcome = await runWindowsUpdatePreflight(purpose, deps, {
+      cooperativeExitMs: 0,
+      respawnIntervalMs: 0,
+      terminationSettleMs: 0
+    })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.ok(calls.includes('terminate:101:123.5'))
+  })
+
 })
 
 describe('MCP bridge drain', () => {
@@ -226,7 +258,7 @@ describe('MCP bridge drain', () => {
 
     assert.equal(outcome.kind, 'clear')
     assert.equal(outcome.lease?.leaseId, lease.leaseId)
-    assert.deepEqual(calls, ['release', 'scan', 'consent', 'lease', 'wait:900', 'scan', 'wait:1100', 'scan'])
+    assert.deepEqual(calls, ['release', 'scan', 'lease', 'wait:900', 'scan', 'wait:1100', 'scan'])
   })
 
   it('waits for a generic holder first seen on the stability scan, then proves a fresh stable interval', async () => {
@@ -250,7 +282,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:0',
       'scan',
@@ -279,7 +310,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:900',
       'scan',
@@ -288,6 +318,42 @@ describe('MCP bridge drain', () => {
       'wait:700',
       'scan',
       'wait:1100',
+      'scan'
+    ])
+  })
+
+  it('drains an exact Desktop plugin worker before its wrapper after explicit consent', async () => {
+    const wrapper = desktopPluginService()
+    const worker = desktopPluginService({
+      pid: 302,
+      createdAt: 334.5,
+      role: 'desktop_plugin_worker',
+      wrapperPid: wrapper.pid
+    })
+    const stillRunning: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, desktopPluginServices: [wrapper, worker] })
+    }
+    const { calls, deps } = makeDeps([stillRunning, stillRunning, clear(), clear()])
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 0,
+      respawnIntervalMs: 0,
+      terminationSettleMs: 0
+    })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'lease',
+      'wait:0',
+      'scan',
+      'terminate-desktop-plugin:302:334.5',
+      'terminate-desktop-plugin:301:333.5',
+      'wait:0',
+      'scan',
+      'wait:0',
       'scan'
     ])
   })
@@ -314,7 +380,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:0',
       'scan',
@@ -352,7 +417,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:900',
       'scan',
@@ -394,7 +458,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:0',
       'scan',
@@ -423,7 +486,7 @@ describe('MCP bridge drain', () => {
         },
         { kind: 'probe-failure', error: 'poll probe failed' }
       ],
-      expectedCalls: ['release', 'scan', 'consent', 'lease', 'wait:0', 'scan', 'wait:5', 'scan']
+      expectedCalls: ['release', 'scan', 'lease', 'wait:0', 'scan', 'wait:5', 'scan']
     },
     {
       phase: 'fallback termination',
@@ -442,7 +505,6 @@ describe('MCP bridge drain', () => {
       expectedCalls: [
         'release',
         'scan',
-        'consent',
         'lease',
         'wait:0',
         'scan',
@@ -471,7 +533,7 @@ describe('MCP bridge drain', () => {
     }
   )
 
-  it('fails closed without terminating when any current MCP record is unproven', async () => {
+  it('force-stops an unproven current MCP record after Update is chosen', async () => {
     const transient = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
 
     const unproven = bridge({
@@ -487,17 +549,22 @@ describe('MCP bridge drain', () => {
       result: result({ blocked: true, processes: [transient], mcpBridges: [unproven] })
     }
 
-    const { calls, deps } = makeDeps([blockedByBridges(), mixed])
+    const genericOnly: ScanOutcome = {
+      kind: 'blocked',
+      result: result({ blocked: true, processes: [transient] })
+    }
+    const { calls, deps } = makeDeps([blockedByBridges(), mixed, genericOnly, clear(), clear()])
 
-    const outcome = await runWindowsUpdatePreflight('normal-update', deps, { cooperativeExitMs: 0 })
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
+      cooperativeExitMs: 0,
+      genericHolderPollMs: 0,
+      genericHolderTimeoutMs: 1,
+      respawnIntervalMs: 0,
+      terminationSettleMs: 0
+    })
 
-    assert.equal(outcome.kind, 'blocked')
-    assert.equal(outcome.reason, 'quiesce-incomplete')
-    assert.equal(
-      calls.some(call => call.startsWith('terminate:')),
-      false
-    )
-    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
+    assert.equal(outcome.kind, 'clear')
+    assert.ok(calls.includes('terminate:103:123.5'))
   })
 
   it('fails closed without terminating when the current exact bridge set exceeds the fallback cap', async () => {
@@ -520,8 +587,8 @@ describe('MCP bridge drain', () => {
     const terminated: McpBridgeProcess[] = []
 
     const { deps } = makeDeps([blockedByBridges(), blockedByBridges(bridges), clear(), clear()], {
-      terminateMcpBridge: async current => {
-        terminated.push(current)
+      terminateVenvHolder: async current => {
+        terminated.push(current as McpBridgeProcess)
 
         return true
       }
@@ -598,12 +665,13 @@ describe('MCP bridge drain', () => {
     let maximumConcurrentTerminations = 0
 
     const { calls, deps } = makeDeps([stillRunning, stillRunning, clear(), clear()], {
-      terminateMcpBridge: async current => {
+      terminateVenvHolder: async current => {
+        const bridge = current as McpBridgeProcess
         activeTerminations += 1
         maximumConcurrentTerminations = Math.max(maximumConcurrentTerminations, activeTerminations)
-        calls.push(`terminate-start:${current.pid}`)
+        calls.push(`terminate-start:${bridge.pid}`)
 
-        if (current.role === 'mcp_bridge_worker') {
+        if (bridge.role === 'mcp_bridge_worker') {
           workerStarted()
           await workerRelease
         }
@@ -686,7 +754,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:0',
       'scan',
@@ -724,7 +791,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:0',
       'scan',
@@ -759,7 +825,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:0',
       'scan',
@@ -786,7 +851,6 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
-      'consent',
       'lease',
       'wait:900',
       'scan',

@@ -1373,6 +1373,118 @@ def test_scan_reports_worker_before_wrapper_and_keeps_relationship(
     assert parent_maps.call_count == 2
 
 
+def test_scan_reports_only_host_proven_desktop_plugin_service_pairs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A detached Desktop plugin service is drainable only with its exact host.
+
+    This is the real Desktop updater failure shape: the plugin's venv wrapper
+    re-execs a managed-runtime worker, and the VBS service host would recreate
+    both unless the updater drains the proven pair after consent.
+    """
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    service = root.parent / "desktop-plugins" / "tracker" / "service.py"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=5,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), str(service)),
+        created_at=100.0,
+    )
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=root / ".hermes-runtime" / "python" / "generation" / "python.exe",
+        argv=(
+            str(root / ".hermes-runtime" / "python" / "generation" / "python.exe"),
+            str(service),
+        ),
+        created_at=101.0,
+    )
+    parent_maps = MagicMock(return_value={5: 1, 10: 5, 20: 10})
+    live_created_at = {10: 100.0, 20: 101.0}
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(
+            _ppid_map=parent_maps,
+            Process=lambda pid: types.SimpleNamespace(
+                create_time=lambda: live_created_at[int(pid)]
+            ),
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        ),
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (10, "python.exe", " ".join(wrapper.argv)),
+            (20, "python.exe", " ".join(worker.argv)),
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid, **_kwargs: {10: wrapper, 20: worker}[pid],
+    )
+    host_probe = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(scanner, "_desktop_plugin_service_host", host_probe)
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["processes"] == []
+    assert [entry["pid"] for entry in result["desktop_plugin_services"]] == [20, 10]
+    assert result["desktop_plugin_services"][0]["role"] == "desktop_plugin_worker"
+    assert result["desktop_plugin_services"][0]["wrapper_pid"] == 10
+    assert result["desktop_plugin_services"][1]["action"] == "terminate_desktop_plugin_service"
+    assert host_probe.call_count == 1
+
+
+def test_scan_keeps_desktop_plugin_script_without_proven_service_host_blocked(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    service = root.parent / "desktop-plugins" / "tracker" / "service.py"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=5,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), str(service)),
+        created_at=100.0,
+    )
+    parent_maps = MagicMock(return_value={5: 1, 10: 5})
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(
+            _ppid_map=parent_maps,
+            Process=lambda _pid: types.SimpleNamespace(create_time=lambda: 100.0),
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        ),
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [(10, "python.exe", " ".join(wrapper.argv))],
+    )
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda _pid, **_kwargs: wrapper)
+    monkeypatch.setattr(scanner, "_desktop_plugin_service_host", lambda *_args: None)
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["desktop_plugin_services"] == []
+    assert [entry["pid"] for entry in result["processes"]] == [10]
+    assert result["processes"][0]["action"] == "refuse"
+
+
 def test_scan_owner_cache_is_bound_to_anchor_generation(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -1930,6 +2042,104 @@ def test_terminate_rereads_and_refuses_changed_live_argv(
     monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda pid: changed)
 
     assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=101.0)
+    assert process.kills == 0
+
+
+def test_terminate_desktop_plugin_service_drains_worker_before_wrapper_host(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    worker_process = _FakeProcess()
+    wrapper_process = _FakeProcess()
+    host_process = _FakeProcess()
+    worker_record = {
+        "created_at": 101.0,
+        "owner": "desktop",
+        "role": "desktop_plugin_worker",
+        "actionable": True,
+        "action": "terminate_desktop_plugin_service",
+    }
+    wrapper_record = {
+        "created_at": 100.0,
+        "owner": "desktop",
+        "role": "desktop_plugin_wrapper",
+        "actionable": True,
+        "action": "terminate_desktop_plugin_service",
+    }
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_live_desktop_plugin_service_process",
+        lambda _root, pid: (
+            (worker_process, worker_record, host_process)
+            if int(pid) == 20
+            else (wrapper_process, wrapper_record, host_process)
+        ),
+    )
+
+    assert scanner.terminate_desktop_plugin_service(root, pid=20, created_at=101.0)
+    assert worker_process.kills == 1
+    assert host_process.kills == 0
+
+    assert scanner.terminate_desktop_plugin_service(root, pid=10, created_at=100.0)
+    assert wrapper_process.kills == 1
+    assert host_process.kills == 1
+
+
+def test_terminate_venv_holder_stops_any_fresh_target_scan_match(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    process = _FakeProcess()
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "user-script.py"),
+        created_at=101.0,
+        process=process,
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict: [(20, "python.exe", "python.exe user-script.py")],
+    )
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda _pid: snapshot)
+
+    assert scanner.terminate_venv_holder(root, pid=20, created_at=101.0)
+    assert process.kills == 1
+
+
+def test_terminate_venv_holder_refuses_a_recycled_or_no_longer_scanned_pid(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    process = _FakeProcess()
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "user-script.py"),
+        created_at=102.0,
+        process=process,
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict: [(20, "python.exe", "python.exe user-script.py")],
+    )
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda _pid: snapshot)
+
+    assert not scanner.terminate_venv_holder(root, pid=20, created_at=101.0)
     assert process.kills == 0
 
 
