@@ -698,11 +698,23 @@ class TestCmdUpdateBranchFlag:
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
         """
 
+        installed_sha = "a" * 40
+
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
+
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{installed_sha}\n", stderr=""
+                )
+
+            if "rev-parse" in joined and "HEAD" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{installed_sha}\n", stderr=""
+                )
 
             if "checkout" in joined and "-B" in joined:
                 rc = 128 if track_fails else 0
@@ -858,7 +870,7 @@ class TestCmdUpdateBranchFlag:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_fork_push_stale_tracking_ref_suppresses_success_receipt(
+    def test_no_update_identity_mismatch_exits_nonzero(
         self, mock_run, _mock_which, capsys
     ):
         from hermes_cli import main as hm
@@ -877,9 +889,11 @@ class TestCmdUpdateBranchFlag:
                 update_cmd, "_refresh_update_target_sha", return_value="b" * 40
             ) as refresh,
             patch.object(update_cmd, "_record_update_success") as record,
+            pytest.raises(SystemExit) as exit_info,
         ):
             cmd_update(args)
 
+        assert exit_info.value.code == 1
         refresh.assert_called_once()
         refreshed_target = refresh.call_args.args[2]
         assert refreshed_target.remote == "origin"
@@ -954,7 +968,7 @@ class TestCmdUpdateBranchFlag:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_no_update_unknown_import_health_suppresses_success_receipt(
+    def test_no_update_unknown_import_health_exits_nonzero(
         self, mock_run, _mock_which, capsys
     ):
         from hermes_cli import update_cmd
@@ -996,11 +1010,145 @@ class TestCmdUpdateBranchFlag:
                 update_cmd, "_capture_head_sha", return_value=installed_sha
             ),
             patch.object(update_cmd, "_record_update_success") as record,
+            pytest.raises(SystemExit) as exit_info,
         ):
             cmd_update(args)
 
+        assert exit_info.value.code == 1
         record.assert_not_called()
         assert "health proof" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_updated_checkout_failed_import_health_exits_nonzero(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="1"
+        )
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(
+                update_cmd,
+                "_validate_critical_files_syntax",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_modules_import",
+                return_value=(False, "hermes_cli.main", "injected import failure"),
+            ),
+            patch.object(
+                update_cmd, "_venv_core_imports_healthy", return_value=(True, "")
+            ),
+            patch.object(
+                update_cmd, "_node_dependencies_healthy_read_only", return_value=True
+            ),
+            patch.object(update_cmd, "_record_update_success") as record,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cmd_update(args)
+
+        assert exit_info.value.code == 1
+        record.assert_not_called()
+        assert "health proof" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_updated_checkout_failed_node_repair_exits_nonzero(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="1"
+        )
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(
+                update_cmd,
+                "_validate_critical_files_syntax",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_modules_import",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd, "_venv_core_imports_healthy", return_value=(True, "")
+            ),
+            patch.object(
+                update_cmd, "_node_dependencies_healthy_read_only", return_value=False
+            ),
+            patch.object(
+                update_cmd, "_update_node_dependencies", return_value=["repo root"]
+            ),
+            patch.object(update_cmd, "_record_update_success") as record,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cmd_update(args)
+
+        assert exit_info.value.code == 1
+        record.assert_not_called()
+        assert "partially complete" in capsys.readouterr().out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_updated_checkout_identity_mismatch_exits_nonzero(
+        self, mock_run, _mock_which, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        target_sha = "a" * 40
+        installed_sha = "b" * 40
+        base = self._branch_side_effect(
+            current_branch="main", target_branch="main", commit_count="1"
+        )
+
+        def side_effect(command, **kwargs):
+            joined = " ".join(str(value) for value in command)
+            if "rev-parse" in joined and "--verify" in joined:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=f"{target_sha}\n", stderr=""
+                )
+            return base(command, **kwargs)
+
+        mock_run.side_effect = side_effect
+        args = SimpleNamespace(branch="main")
+
+        with (
+            patch.object(
+                update_cmd,
+                "_validate_critical_files_syntax",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd,
+                "_validate_critical_modules_import",
+                return_value=(True, None, None),
+            ),
+            patch.object(
+                update_cmd, "_venv_core_imports_healthy", return_value=(True, "")
+            ),
+            patch.object(
+                update_cmd, "_node_dependencies_healthy_read_only", return_value=True
+            ),
+            patch.object(
+                update_cmd, "_capture_head_sha", return_value=installed_sha
+            ),
+            patch.object(update_cmd, "_record_update_success") as record,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            cmd_update(args)
+
+        assert exit_info.value.code == 1
+        record.assert_not_called()
+        assert "identity could not be proven" in capsys.readouterr().out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
