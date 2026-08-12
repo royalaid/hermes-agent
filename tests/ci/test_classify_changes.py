@@ -120,6 +120,26 @@ CASES = {
         ["scripts/desktop-update.ps1"],
         _lanes(python=True, installer=True),
     ),
+    "bootstrap updater Rust source → frontend + Windows lane": (
+        ["apps/bootstrap-installer/src-tauri/src/update.rs"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "bootstrap updater Rust dependency → frontend + Windows lane": (
+        ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "bootstrap updater Cargo manifest → frontend + Windows lane": (
+        ["apps/bootstrap-installer/src-tauri/Cargo.toml"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "bootstrap updater Cargo lock → frontend + Windows lane": (
+        ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "bootstrap updater build script → frontend + Windows lane": (
+        ["apps/bootstrap-installer/src-tauri/build.rs"],
+        _lanes(frontend=True, installer=True),
+    ),
     "updater process source → frontend + Windows lane": (
         ["apps/desktop/electron/updater-process.ts"],
         _lanes(frontend=True, installer=True),
