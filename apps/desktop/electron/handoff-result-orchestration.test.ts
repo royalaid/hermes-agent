@@ -154,6 +154,57 @@ describe('runHandoffResultLifecycle', () => {
 })
 
 describe('retryHandoffResultLifecycle', () => {
+  it('retries an unknown identity before a pending lifecycle can wait for updater failure', async () => {
+    const resolvedProcessStarts: Array<number | null> = [null, 1_723_330_000]
+    let processIdentityCalls = 0
+    let resolveTerminal!: (result: HandoffResult) => void
+
+    const terminal = new Promise<HandoffResult>(resolve => {
+      resolveTerminal = resolve
+    })
+    const validateDesktopIdentity = vi.fn((input: { currentProcessStartedAt: number }) =>
+      Number.isSafeInteger(input.currentProcessStartedAt) && input.currentProcessStartedAt > 0
+        ? { root: 'C:/Hermes', executable: 'C:/Hermes/Hermes.exe' }
+        : null
+    )
+    const writeAck = vi.fn(() => {
+      resolveTerminal(complete)
+
+      return { attemptId: pending.attemptId }
+    })
+    const waitForTerminal = vi.fn(() => terminal)
+
+    const result = await retryHandoffResultLifecycle(
+      currentProcessStartedAt =>
+        runHandoffResultLifecycle(
+          'C:/Hermes',
+          options({
+            currentProcessStartedAt: currentProcessStartedAt ?? 0,
+            onStatus: status => {
+              if (status.includes('could not be proven')) {
+                resolveTerminal(failed)
+              }
+            }
+          }),
+          deps({ validateDesktopIdentity, waitForTerminal, writeAck })
+        ),
+      {
+        retryDelayMs: 25,
+        resolveCurrentProcessStartedAt: async () =>
+          resolvedProcessStarts[Math.min(processIdentityCalls++, resolvedProcessStarts.length - 1)],
+        shouldRetryAfterNull: () => true,
+        wait: async () => {}
+      }
+    )
+
+    assert.equal(result, complete)
+    assert.equal(processIdentityCalls, 2)
+    assert.equal(validateDesktopIdentity.mock.calls.length, 1)
+    assert.equal(validateDesktopIdentity.mock.calls.at(0)?.[0].currentProcessStartedAt, 1_723_330_000)
+    assert.equal(waitForTerminal.mock.calls.length, 1)
+    assert.equal(writeAck.mock.calls.length, 1)
+  })
+
   it('retries an unknown process identity and pins the first positive timestamp', async () => {
     const results = [null, null, complete]
     const resolvedProcessStarts: Array<number | null> = [null, 1_723_330_000, 1_800_000_000]
