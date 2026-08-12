@@ -281,6 +281,15 @@ impl UpdateMarkerGuard {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(UpdateMarkerAcquireError::Publish(err)),
         };
+        if prior
+            .as_deref()
+            .is_some_and(|raw| update_marker_identity_from_raw(raw).is_none())
+        {
+            return Err(UpdateMarkerAcquireError::Publish(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the existing update marker is malformed or incomplete",
+            )));
+        }
         if let Some(owner) = prior.as_deref().and_then(live_marker_owner_from_raw) {
             return Err(UpdateMarkerAcquireError::ForeignOwner(owner));
         }
@@ -4176,6 +4185,37 @@ mod tests {
 
         assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acquire_refuses_and_preserves_malformed_or_partial_marker_bytes() {
+        for (case, raw) in [
+            ("partial", b"424242\n".as_slice()),
+            ("malformed", b"not-a-pid\n1700000000\n".as_slice()),
+        ] {
+            let dir = unique_tmp_dir(&format!("marker-{case}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker = dir.join(".hermes-update-in-progress");
+            std::fs::write(&marker, raw).unwrap();
+
+            let error = UpdateMarkerGuard::acquire(marker.clone())
+                .err()
+                .expect("an existing marker with invalid bytes must fail closed");
+            match error {
+                UpdateMarkerAcquireError::Publish(err) => {
+                    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+                }
+                UpdateMarkerAcquireError::ForeignOwner(owner) => {
+                    panic!("invalid marker unexpectedly named live owner {}", owner.pid)
+                }
+            }
+            assert_eq!(
+                std::fs::read(&marker).unwrap(),
+                raw,
+                "{case} marker bytes must remain unchanged"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Spawn a short-lived sibling process whose pid stands in for a foreign
