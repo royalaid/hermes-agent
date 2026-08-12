@@ -99,9 +99,10 @@ jobs:
     uses: ./.github/workflows/js-tests.yml
 
   installer-tests:
-    name: Installer tests
+    name: Windows installer and updater tests
     needs: detect
-    # Windows-only, and only for PRs that touch install.ps1 or its tests.
+    # Required Windows lane for the PowerShell installer, Desktop updater
+    # handoff, and the real-child updater-process test (skipped on Linux).
     if: needs.detect.outputs.installer == 'true'
     uses: ./.github/workflows/installer-tests.yml
 
