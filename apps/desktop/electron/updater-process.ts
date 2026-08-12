@@ -7,6 +7,62 @@ import { queryWindowsProcessCreatedAt } from './windows-process-identity'
 
 export const STAGED_UPDATER_BRIDGE_LEASE_ENV = 'HERMES_UPDATE_BRIDGE_LEASE_ID'
 
+const WINDOWS_HANDOFF_ENV = {
+  branch: 'HERMES_UPDATE_HANDOFF_BRANCH',
+  desktopPid: 'HERMES_UPDATE_HANDOFF_DESKTOP_PID',
+  installRoot: 'HERMES_UPDATE_HANDOFF_INSTALL_ROOT',
+  relaunchExe: 'HERMES_UPDATE_HANDOFF_RELAUNCH_EXE',
+  script: 'HERMES_UPDATE_HANDOFF_SCRIPT'
+} as const
+
+const BRIDGE_LEASE_ID_PATTERN = /^[A-Za-z0-9._-]{16,128}$/
+
+// cmd.exe parses every token after `start`, even when Node spawns it without a
+// shell. Keep that surface byte-stable: all dynamic values travel in the
+// private child environment and this fixed PowerShell program reads them back
+// as values, never source text. Windows PowerShell expects UTF-16LE for
+// -EncodedCommand.
+const WINDOWS_HANDOFF_LAUNCHER = String.raw`
+$ErrorActionPreference = 'Stop'
+$required = @(
+  'HERMES_UPDATE_HANDOFF_SCRIPT',
+  'HERMES_UPDATE_HANDOFF_INSTALL_ROOT',
+  'HERMES_UPDATE_HANDOFF_BRANCH',
+  'HERMES_UPDATE_HANDOFF_DESKTOP_PID',
+  'HERMES_UPDATE_HANDOFF_RELAUNCH_EXE',
+  'HERMES_UPDATE_BRIDGE_LEASE_ID'
+)
+foreach ($name in $required) {
+  $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+  if ([string]::IsNullOrWhiteSpace($value)) {
+    throw "Missing required update handoff value: $name"
+  }
+}
+$scriptPath = $env:HERMES_UPDATE_HANDOFF_SCRIPT
+$desktopPid = 0
+if (-not [int]::TryParse($env:HERMES_UPDATE_HANDOFF_DESKTOP_PID, [ref]$desktopPid) -or $desktopPid -le 0) {
+  throw 'Invalid update handoff desktop PID'
+}
+if ($env:HERMES_UPDATE_BRIDGE_LEASE_ID -notmatch '^[A-Za-z0-9._-]{16,128}$') {
+  throw 'Invalid update handoff bridge lease ID'
+}
+if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+  throw 'Update handoff script is missing'
+}
+$scriptArgs = @(
+  '-InstallRoot', $env:HERMES_UPDATE_HANDOFF_INSTALL_ROOT,
+  '-Branch', $env:HERMES_UPDATE_HANDOFF_BRANCH,
+  '-DesktopPid', [string]$desktopPid,
+  '-RelaunchExe', $env:HERMES_UPDATE_HANDOFF_RELAUNCH_EXE,
+  '-BridgeLeaseId', $env:HERMES_UPDATE_BRIDGE_LEASE_ID
+)
+& $scriptPath @scriptArgs
+if ($null -eq $LASTEXITCODE) { exit 1 }
+exit $LASTEXITCODE
+`.trim()
+
+const WINDOWS_HANDOFF_ENCODED_COMMAND = Buffer.from(WINDOWS_HANDOFF_LAUNCHER, 'utf16le').toString('base64')
+
 export interface UpdaterChild {
   pid?: number
   kill: (signal?: NodeJS.Signals | number) => boolean
@@ -24,6 +80,26 @@ export interface UpdateScriptHandoff {
   scriptPath: string
 }
 
+export type WindowsUpdateTransport = { kind: 'script'; handoff: UpdateScriptHandoff } | { kind: 'manual' }
+
+export interface WindowsUpdateHandoffValues {
+  bridgeLeaseId: string
+  branch: string
+  desktopPid: number
+  installRoot: string
+  relaunchExe: string
+}
+
+export interface DetachedWindowsHandoff {
+  command: string
+  args: string[]
+  env: Record<string, string>
+}
+
+export type WindowsUpdateLaunchResult =
+  | { kind: 'manual' }
+  | { kind: 'spawned'; child: UpdaterChild; handoff: UpdateScriptHandoff }
+
 /**
  * Repo-owned Windows update hand-off (frozen-binary escape hatch).
  *
@@ -35,11 +111,10 @@ export interface UpdateScriptHandoff {
  * checkout instead: every `hermes update` refreshes the code that drives the
  * NEXT update, and only PowerShell itself is frozen.
  *
- * Returns the spawn recipe when the script exists in the checkout, or null
- * (caller falls back to the staged binary — old checkouts that predate the
- * script keep working unchanged). Windows-only by the same policy as
- * resolveStagedUpdaterBinary: POSIX updates in place via
- * applyUpdatesPosixInApp and needs no hand-off at all.
+ * Returns the spawn recipe when the script exists in the checkout, or null.
+ * Ordinary Windows updates fail closed to a manual command when it is absent;
+ * a staged installer is reserved for bootstrap recovery and is not a protocol
+ * fallback. POSIX uses its own detached hand-off resolver below.
  */
 export function resolveUpdateScriptHandoff(
   updateRoot: string,
@@ -69,6 +144,16 @@ export function resolveUpdateScriptHandoff(
   }
 
   return null
+}
+
+/** Resolve the only transport allowed for an ordinary Windows update. */
+export function resolveWindowsUpdateTransport(
+  updateRoot: string,
+  deps: ResolveUpdateScriptHandoffDeps = {}
+): WindowsUpdateTransport {
+  const handoff = resolveUpdateScriptHandoff(updateRoot, deps)
+
+  return handoff ? { kind: 'script', handoff } : { kind: 'manual' }
 }
 
 /**
@@ -129,15 +214,88 @@ export function resolvePosixScriptHandoff(
  */
 export function wrapHandoffForDetachedConsole(
   handoff: UpdateScriptHandoff,
-  extraArgs: string[]
-): {
-  command: string
-  args: string[]
-} {
+  values: WindowsUpdateHandoffValues
+): DetachedWindowsHandoff {
+  if (!Number.isSafeInteger(values.desktopPid) || values.desktopPid <= 0) {
+    throw new Error('Windows update handoff requires a positive desktop PID')
+  }
+
+  const requiredValues = [
+    handoff.scriptPath,
+    values.installRoot,
+    values.branch,
+    values.relaunchExe,
+    values.bridgeLeaseId
+  ]
+
+  if (requiredValues.some(value => typeof value !== 'string' || value.trim().length === 0)) {
+    throw new Error('Windows update handoff requires every environment value')
+  }
+
+  if (!BRIDGE_LEASE_ID_PATTERN.test(values.bridgeLeaseId)) {
+    throw new Error('Windows update handoff requires a valid bridge lease ID')
+  }
+
   return {
     command: 'cmd.exe',
-    args: ['/d', '/s', '/c', 'start', '', '/min', handoff.command, ...handoff.args, ...extraArgs]
+    args: [
+      '/d',
+      '/s',
+      '/c',
+      'start',
+      '',
+      '/min',
+      'powershell',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-EncodedCommand',
+      WINDOWS_HANDOFF_ENCODED_COMMAND
+    ],
+    env: {
+      [STAGED_UPDATER_BRIDGE_LEASE_ENV]: values.bridgeLeaseId,
+      [WINDOWS_HANDOFF_ENV.branch]: values.branch,
+      [WINDOWS_HANDOFF_ENV.desktopPid]: String(values.desktopPid),
+      [WINDOWS_HANDOFF_ENV.installRoot]: values.installRoot,
+      [WINDOWS_HANDOFF_ENV.relaunchExe]: values.relaunchExe,
+      [WINDOWS_HANDOFF_ENV.script]: handoff.scriptPath
+    }
   }
+}
+
+/** Render argv for a PowerShell-facing manual instruction without creating
+ * executable source from unquoted values. Single quotes are literal in
+ * PowerShell; an embedded quote is represented by two single quotes. */
+export function formatPowerShellArgvForDisplay(argv: string[]): string {
+  return argv
+    .map(value => (/^[A-Za-z0-9._/:-]+$/.test(value) ? value : `'${value.replaceAll("'", "''")}'`))
+    .join(' ')
+}
+
+/** Apply the resolved ordinary-update policy and compose the exact production
+ * spawn. A manual transport never calls spawn; a script transport merges its
+ * private payload into the child environment at the final boundary. */
+export function launchWindowsUpdateTransport(
+  transport: WindowsUpdateTransport,
+  values: WindowsUpdateHandoffValues,
+  options: SpawnOptions,
+  deps: SpawnUpdaterProcessDeps = {}
+): WindowsUpdateLaunchResult {
+  if (transport.kind === 'manual') {
+    return transport
+  }
+
+  const wrapped = wrapHandoffForDetachedConsole(transport.handoff, values)
+
+  const child = spawnUpdaterProcess(
+    wrapped.command,
+    wrapped.args,
+    { ...options, env: { ...options.env, ...wrapped.env } },
+    deps
+  )
+
+  return { kind: 'spawned', child, handoff: transport.handoff }
 }
 
 /**
@@ -215,14 +373,14 @@ function stagedFileExists(candidate: string): boolean {
  *
  * Handing an update to it is nonetheless a Windows-only policy. Windows needs
  * the quit -> hand-off -> rebuild dance because a venv shim file lock keeps the
- * running desktop from rewriting its own bits; macOS and Linux have no such
- * lock and update in place through applyUpdatesPosixInApp(). Off Windows the
- * hand-off therefore buys nothing and costs a great deal: a staged binary older
+ * running desktop from rewriting its own bits; macOS and Linux use the
+ * repo-owned detached POSIX hand-off. Off Windows the staged-binary hand-off
+ * therefore buys nothing and costs a great deal: a staged binary older
  * than the hand-off protocol holds the update marker, spawns `hermes update`,
  * and that child refuses its own parent — wedging the in-app Update button for
  * good, with no route (update, re-download, reinstall) to a newer binary
  * (#74836). Returning null off Windows is what routes those platforms to the
- * in-app updater.
+ * POSIX script hand-off.
  *
  * Null on Windows too when nothing is staged (a dev/source run, or a CLI
  * install that never went through the installer); callers degrade gracefully.
@@ -401,6 +559,7 @@ export async function captureSpawnedUpdaterCreatedAt(
   if (!Number.isSafeInteger(pid) || pid <= 0) {
     return null
   }
+
   let createdAt: number | null
 
   try {
