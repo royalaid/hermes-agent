@@ -23,6 +23,7 @@
 #     -Branch <ref>         branch to update against
 #     -DesktopPid <pid>     the Electron main process to wait out
 #     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
+#     [-RelaunchAppPath <path>] dev Electron app entry to pass to RelaunchExe
 #     [-NoUi]               headless (tests); default shows a progress window
 #     [-NoMarkerCleanup]    leave .hermes-update-in-progress in place (tests)
 #
@@ -45,6 +46,7 @@ param(
     [string]$Branch = "main",
     [int]$DesktopPid = 0,
     [string]$RelaunchExe = "",
+    [string]$RelaunchAppPath = "",
     [switch]$NoUi,
     [switch]$NoMarkerCleanup,
     [switch]$SelfTestUi
@@ -448,6 +450,18 @@ function Start-DesktopRelaunch {
     # finally block downgrades the on-screen/on-disk outcome when it didn't
     # — the sibling truth contract to posix.sh's launch acceptance.
     if (-not ($RelaunchExe -and (Test-Path -LiteralPath $RelaunchExe))) { return $false }
+    $resolvedAppPath = ""
+    if ($RelaunchAppPath) {
+        try {
+            $resolvedAppPath = (Resolve-Path -LiteralPath $RelaunchAppPath -ErrorAction Stop).Path
+            if (-not (Test-Path -LiteralPath $resolvedAppPath -PathType Leaf) -or $resolvedAppPath.Contains('"')) {
+                throw "invalid app entry"
+            }
+        } catch {
+            Write-HandoffLog "WARNING: dev app relaunch path is invalid: $($_.Exception.Message)"
+            return $false
+        }
+    }
     Write-HandoffLog "relaunching desktop: $RelaunchExe"
     # DO NOT spawn Hermes.exe as our child: Electron/Chromium calls
     # AttachConsole(ATTACH_PARENT_PROCESS) at boot, so a Desktop launched
@@ -460,8 +474,12 @@ function Start-DesktopRelaunch {
     $spawned = $false
     try {
         $workDir = Split-Path -Parent $RelaunchExe
+        $commandLine = ('"{0}"' -f $RelaunchExe)
+        if ($resolvedAppPath) {
+            $commandLine += (' "{0}"' -f $resolvedAppPath)
+        }
         $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-            CommandLine      = ('"{0}"' -f $RelaunchExe)
+            CommandLine      = $commandLine
             CurrentDirectory = $workDir
         } -ErrorAction Stop
         if ($r -and $r.ReturnValue -eq 0) {
@@ -511,7 +529,8 @@ function Start-DesktopRelaunch {
         try {
             # Fallback keeps the old behavior (console tie-in and all) --
             # a tethered Desktop beats no Desktop.
-            $p = Start-Process -FilePath $RelaunchExe -WorkingDirectory (Split-Path -Parent $RelaunchExe) -PassThru
+            $launchArgs = if ($resolvedAppPath) { @($resolvedAppPath) } else { @() }
+            $p = Start-Process -FilePath $RelaunchExe -ArgumentList $launchArgs -WorkingDirectory (Split-Path -Parent $RelaunchExe) -PassThru
             Start-Sleep -Milliseconds 1500
             if ($p -and -not $p.HasExited) { $spawned = $true }
             elseif ($p) { Write-HandoffLog "WARNING: fallback relaunch exited immediately" }
