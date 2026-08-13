@@ -231,7 +231,11 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
-import { configureWindowsTaskbarDetails, WINDOWS_APP_USER_MODEL_ID } from './windows-taskbar-details'
+import {
+  buildWindowsRelaunchCommand,
+  configureWindowsTaskbarDetails,
+  resolveWindowsAppUserModelId
+} from './windows-taskbar-details'
 import {
   cancelPoolBackendStart,
   deletePoolBackendEntryIfCurrent,
@@ -818,6 +822,7 @@ const BOOT_FAKE_STEP_MS = (() => {
 })()
 
 const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+const WINDOWS_RUNTIME_APP_USER_MODEL_ID = resolveWindowsAppUserModelId(process.defaultApp)
 const HUD_WINDOW_TITLE = `${APP_NAME} HUD`
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
@@ -1126,7 +1131,7 @@ app.setName(APP_NAME)
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID)
+  app.setAppUserModelId(WINDOWS_RUNTIME_APP_USER_MODEL_ID)
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -6094,10 +6099,14 @@ function getAppIconPath() {
 
 function configureTaskbarDetails(win, icon = getAppIconPath()) {
   configureWindowsTaskbarDetails(win, {
-    appId: WINDOWS_APP_USER_MODEL_ID,
+    appId: WINDOWS_RUNTIME_APP_USER_MODEL_ID,
     iconPath: icon,
     isWindows: IS_WINDOWS,
-    relaunchCommand: `"${process.execPath}"`,
+    relaunchCommand: buildWindowsRelaunchCommand({
+      executablePath: process.execPath,
+      appEntryPath: resolveWindowsDevRelaunchAppPath(process.defaultApp, process.argv),
+      isDefaultApp: process.defaultApp
+    }),
     relaunchDisplayName: APP_NAME
   })
 }
