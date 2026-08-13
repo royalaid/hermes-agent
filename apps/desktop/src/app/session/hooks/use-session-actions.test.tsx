@@ -116,6 +116,7 @@ function Harness({
     activeSessionIdRef: ref<string | null>(null),
     busyRef: ref(false),
     creatingSessionRef: ref(false),
+    discardQueuedStreamState: vi.fn(),
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
@@ -155,6 +156,7 @@ function StoredIdRotationHarness({
     activeSessionIdRef,
     busyRef: ref(false),
     creatingSessionRef: ref(false),
+    discardQueuedStreamState: vi.fn(),
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId,
@@ -597,6 +599,7 @@ describe('createBackendSessionForSend profile routing', () => {
 // (b) arm $resumeFailedSessionId so use-route-resume can retry. A resume that
 // succeeds must NOT leave the flag armed.
 function ResumeHarness({
+  discardQueuedStreamState = vi.fn(),
   onStateUpdate,
   onReady,
   requestGateway,
@@ -604,6 +607,7 @@ function ResumeHarness({
   selectedStoredSessionId = null,
   sessionStateByRuntimeIdRef
 }: {
+  discardQueuedStreamState?: (sessionId: string) => void
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
   onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
@@ -620,6 +624,7 @@ function ResumeHarness({
     activeSessionIdRef: ref<string | null>(null),
     busyRef: ref(false),
     creatingSessionRef: ref(false),
+    discardQueuedStreamState,
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
@@ -1138,6 +1143,7 @@ function BranchHarness({
     activeSessionIdRef,
     busyRef: ref(false),
     creatingSessionRef: ref(false),
+    discardQueuedStreamState: vi.fn(),
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
@@ -1583,9 +1589,11 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
     vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [] } as never)
 
+    const discardQueuedStreamState = vi.fn()
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
     render(
       <ResumeHarness
+        discardQueuedStreamState={discardQueuedStreamState}
         onReady={r => (resume = r)}
         requestGateway={requestGateway}
         runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
@@ -1604,6 +1612,12 @@ describe('resumeSession warm-cache mapping integrity', () => {
     // The corrupt mapping was purged so it can't mis-resolve again.
     expect(runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
     expect(sessionStateByRuntimeIdRef.current.has('rt-recycled')).toBe(false)
+    // ...and the stream buffers went with it. Deltas / tool rows / subagent
+    // progress for the discarded runtime flush on a timer up to 250ms later;
+    // one landing after the purge would re-create the state entry that was
+    // just dropped (a missing entry reads as not-interrupted) and fire tool
+    // side effects for a session nothing points at any more.
+    expect(discardQueuedStreamState).toHaveBeenCalledWith('rt-recycled')
   })
 
   it('honours a warm cache entry whose stored id matches and refreshes its persisted transcript', async () => {

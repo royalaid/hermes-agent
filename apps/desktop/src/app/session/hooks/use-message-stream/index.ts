@@ -1113,6 +1113,11 @@ export function useMessageStream({
     appendAssistantDelta,
     appendReasoningDelta,
     completeAssistantMessage,
+    // Exposed for the session actions that discard a runtime id (warm-cache
+    // purge, tile close, delete, archive): dropping the state without dropping
+    // this session's buffers lets a flush up to 250ms later re-create the entry
+    // and fire tool side effects for a session nothing points at.
+    discardQueuedStreamState,
     handleGatewayEvent,
     finalizeInterimAssistantMessage,
     upsertToolCall

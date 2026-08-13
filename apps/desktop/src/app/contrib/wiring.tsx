@@ -396,7 +396,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState]
   )
 
-  const { handleGatewayEvent } = useMessageStream({
+  const { discardQueuedStreamState, handleGatewayEvent } = useMessageStream({
     activeGatewayProfile,
     activeSessionIdRef,
     hydrateFromStoredSession,
@@ -448,6 +448,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionIdRef,
     busyRef,
     creatingSessionRef,
+    discardQueuedStreamState,
     ensureSessionState,
     getRouteToken,
     getRoutedStoredSessionId,
