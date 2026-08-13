@@ -35,7 +35,15 @@ import { closeAllOpenSessionTiles } from '@/store/session-states'
 import { $layoutEditMode } from '../../edit-mode'
 import { useWindowControlsOverlap } from '../../geometry'
 import { emptyPaneLifecycleState, reconcilePaneLifecycle } from '../../pane-lifecycle'
-import { hiddenPaneProps, PaneGroupContext, PaneLifecycleContext, PaneVisibleContext } from '../../pane-visibility'
+import {
+  hiddenPaneProps,
+  PANE_CONTENT_INTRINSIC_SIZE_CLASS,
+  PANE_CONTENT_SKIPPED_CLASS,
+  PaneGroupContext,
+  PaneLifecycleContext,
+  PaneVisibleContext,
+  useHiddenPaneContainment
+} from '../../pane-visibility'
 import {
   $workspaceMode,
   $workspaceOwnerKey,
@@ -215,6 +223,34 @@ function ZoneMenu({
   )
 }
 
+/** The pane layer's inner CONTENT wrapper — the containment boundary that keeps
+ *  an INACTIVE tab's transcript out of style/layout while the scroll box around
+ *  it (and its scroll position) stays exactly as it was. Which classes toggle,
+ *  which are permanent, and the kill switch all live in pane-visibility.ts.
+ *
+ *  `grid min-h-full`, never `h-full`: pane bodies size themselves against the
+ *  layer (`h-full` flex columns), so the wrapper has to hand its child a
+ *  definite block size WITHOUT taking one itself — an extrinsic height would
+ *  override the remembered-size placeholder the hidden state depends on. A
+ *  stretched auto row does both: it fills the layer when the content is short
+ *  and grows with the content when it isn't. */
+function PaneContent({ active, children, contained }: { active: boolean; children: ReactNode; contained: boolean }) {
+  // Kill switch: no wrapper at all, so a disabled build is the pre-containment
+  // DOM verbatim rather than a half-applied version of it.
+  if (!contained) {
+    return <>{children}</>
+  }
+
+  return (
+    <div
+      className={cn('grid min-h-full', PANE_CONTENT_INTRINSIC_SIZE_CLASS, !active && PANE_CONTENT_SKIPPED_CLASS)}
+      data-pane-content=""
+    >
+      {children}
+    </div>
+  )
+}
+
 export function TreeGroup({
   node,
   parentAxis,
@@ -238,6 +274,8 @@ export function TreeGroup({
   // missing on an inactive tile tab whose zone-active was the uncloseable
   // workspace).
   const [menuPane, setMenuPane] = useState<string | undefined>(undefined)
+  // Kill switch read once for this zone's lifetime (see pane-visibility.ts).
+  const containment = useHiddenPaneContainment()
   const panes = useContributions('panes')
   // Coarse drag flag only (set once at drag start/end). The per-frame drop
   // HINT lives in ZoneDropOverlay so a moving pointer re-renders the tiny
@@ -668,7 +706,9 @@ export function TreeGroup({
           `visibility` (not display) keeps the hidden pane's layout box, so
           scroll positions and measurements survive the round-trip — which also
           makes a hidden layer's rect identical to the visible one's, hence the
-          marker document-wide lookups filter on (see pane-visibility.ts). */}
+          marker document-wide lookups filter on (see pane-visibility.ts).
+          The layer keeps its box; its inner PaneContent wrapper is what stops
+          a hidden tab's transcript from being laid out at all. */}
       {!node.minimized && (
         <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
           {isEmpty ? (
@@ -699,9 +739,11 @@ export function TreeGroup({
                     <PaneGroupContext.Provider value={node.id}>
                       <PaneLifecycleContext.Provider value={paneLifecycle[paneId]?.lifecycle ?? 'visible'}>
                         <PaneVisibleContext.Provider value={isActive}>
-                          <ContribBoundary id={pane.id} key={paneEpochs[paneId] ?? 0}>
-                            <ContribRender render={pane.render} />
-                          </ContribBoundary>
+                          <PaneContent active={isActive} contained={containment}>
+                            <ContribBoundary id={pane.id} key={paneEpochs[paneId] ?? 0}>
+                              <ContribRender render={pane.render} />
+                            </ContribBoundary>
+                          </PaneContent>
                         </PaneVisibleContext.Provider>
                       </PaneLifecycleContext.Provider>
                     </PaneGroupContext.Provider>
