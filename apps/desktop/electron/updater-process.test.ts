@@ -12,6 +12,7 @@ import {
   formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
   launchWindowsUpdateTransport,
+  resolveWindowsDevRelaunchAppPath,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
@@ -317,6 +318,7 @@ test('Windows flat handoff keeps branch, paths, and bridge capability out of cmd
   const expected = path.join(root, 'scripts', 'desktop-update.ps1')
   const branch = 'fork/&|%integration'
   const bridgeLeaseId = 'unguessable-bridge-lease-id'
+  const relaunchAppPath = String.raw`C:\Hermes & 100%\agent\apps\desktop`
   const relaunchExe = String.raw`C:\Program Files\Hermes & 100%\Hermes.exe`
 
   const transport = resolveWindowsUpdateTransport(root, {
@@ -335,6 +337,7 @@ test('Windows flat handoff keeps branch, paths, and bridge capability out of cmd
     branch,
     desktopPid: 4242,
     installRoot: root,
+    relaunchAppPath,
     relaunchExe
   })
 
@@ -354,13 +357,14 @@ test('Windows flat handoff keeps branch, paths, and bridge capability out of cmd
     HERMES_UPDATE_HANDOFF_BRANCH: branch,
     HERMES_UPDATE_HANDOFF_DESKTOP_PID: '4242',
     HERMES_UPDATE_HANDOFF_INSTALL_ROOT: root,
+    HERMES_UPDATE_HANDOFF_RELAUNCH_APP_PATH: relaunchAppPath,
     HERMES_UPDATE_HANDOFF_RELAUNCH_EXE: relaunchExe,
     HERMES_UPDATE_HANDOFF_SCRIPT: expected
   })
 
   const cmdParsed = wrapped.args.join(' ')
 
-  for (const value of [expected, root, branch, bridgeLeaseId, relaunchExe]) {
+  for (const value of [expected, root, branch, bridgeLeaseId, relaunchAppPath, relaunchExe]) {
     assert.equal(cmdParsed.includes(value), false, `${value} must not reach cmd.exe arguments`)
   }
 
@@ -373,6 +377,15 @@ test('Windows flat handoff keeps branch, paths, and bridge capability out of cmd
   })
 
   assert.deepEqual(alternate.args, wrapped.args)
+})
+
+test('Windows development relaunch preserves the Electron app entry only for default-app launches', () => {
+  const electron = String.raw`C:\repo\apps\desktop\node_modules\electron\dist\electron.exe`
+  const appEntry = String.raw`C:\repo\apps\desktop`
+
+  assert.equal(resolveWindowsDevRelaunchAppPath(true, [electron, appEntry]), appEntry)
+  assert.equal(resolveWindowsDevRelaunchAppPath(false, [electron, appEntry]), undefined)
+  assert.equal(resolveWindowsDevRelaunchAppPath(true, [electron, '--inspect']), undefined)
 })
 
 test('Windows flat handoff rejects invalid private payload values before spawn', () => {
@@ -493,6 +506,7 @@ test.runIf(process.platform === 'win32')(
     const sentinel = path.join(directory, 'result.json')
     const branch = 'fork/&|%integration'
     const installRoot = String.raw`C:\Hermes & 100%\agent`
+    const relaunchAppPath = String.raw`C:\Hermes & 100%\agent\apps\desktop`
     const relaunchExe = String.raw`C:\Hermes & 100%\Hermes.exe`
     const bridgeLeaseId = 'unguessable-bridge-lease-id'
 
@@ -502,6 +516,7 @@ test.runIf(process.platform === 'win32')(
   [Parameter(Mandatory = $true)][string]$InstallRoot,
   [Parameter(Mandatory = $true)][string]$Branch,
   [Parameter(Mandatory = $true)][int]$DesktopPid,
+  [string]$RelaunchAppPath,
   [Parameter(Mandatory = $true)][string]$RelaunchExe,
   [Parameter(Mandatory = $true)][string]$BridgeLeaseId
 )
@@ -510,6 +525,7 @@ $payload = [ordered]@{
   desktop_pid = $DesktopPid
   install_root = $InstallRoot
   lease_id = $BridgeLeaseId
+  relaunch_app_path = $RelaunchAppPath
   relaunch_exe = $RelaunchExe
 }
 [IO.File]::WriteAllText(
@@ -532,7 +548,7 @@ exit 0
             scriptPath
           }
         },
-        { bridgeLeaseId, branch, desktopPid: 4242, installRoot, relaunchExe },
+        { bridgeLeaseId, branch, desktopPid: 4242, installRoot, relaunchAppPath, relaunchExe },
         {
           cwd: os.tmpdir(),
           detached: true,
@@ -556,6 +572,7 @@ exit 0
         desktop_pid: 4242,
         install_root: installRoot,
         lease_id: bridgeLeaseId,
+        relaunch_app_path: relaunchAppPath,
         relaunch_exe: relaunchExe
       })
     } finally {
