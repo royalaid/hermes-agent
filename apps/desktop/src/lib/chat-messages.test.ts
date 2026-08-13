@@ -708,6 +708,8 @@ describe('preserveLocalAssistantErrors', () => {
   })
 })
 
+const toolCallPart = (parts: ChatMessagePart[]) => parts[0] as Extract<ChatMessagePart, { type: 'tool-call' }>
+
 describe('upsertToolPart', () => {
   it('preserves call time through progress and records completion time', () => {
     const started = upsertToolPart([], { name: 'read_file', tool_id: 'call-1' }, 'running', 100.125)
@@ -1175,6 +1177,101 @@ describe('upsertToolPart', () => {
       data: { web: [{ title: 'Suva forecast' }] },
       summary: 'Did 1 search in 0.5s'
     })
+  })
+
+  it('reuses the accumulated args object and its serialization when a tick adds nothing new', () => {
+    const started = upsertToolPart(
+      [],
+      { args: { command: 'npm run test --workspace=apps/desktop' }, name: 'terminal', tool_id: 'tc-progress' },
+      'running'
+    )
+
+    // Progress ticks re-send the args already accumulated — as an object, and
+    // in the JSON-string form the gateway also uses.
+    const firstTick = upsertToolPart(
+      started,
+      { args: { command: 'npm run test --workspace=apps/desktop' }, name: 'terminal', tool_id: 'tc-progress' },
+      'running'
+    )
+
+    const secondTick = upsertToolPart(
+      firstTick,
+      { args: '{"command":"npm run test --workspace=apps/desktop"}', name: 'terminal', tool_id: 'tc-progress' },
+      'running'
+    )
+
+    expect(toolCallPart(secondTick).args).toBe(toolCallPart(started).args)
+    expect(toolCallPart(secondTick).argsText).toBe(toolCallPart(started).argsText)
+    // The reused text is still the exact serialization of the args it labels.
+    expect(toolCallPart(secondTick).argsText).toBe(JSON.stringify(toolCallPart(secondTick).args))
+  })
+
+  it('refreshes args and argsText when a tick grows or changes a field', () => {
+    const started = upsertToolPart([], { args: { command: 'ls' }, name: 'terminal', tool_id: 'tc-grow' }, 'running')
+
+    const grown = upsertToolPart(
+      started,
+      { args: { command: 'ls', cwd: '/repo' }, name: 'terminal', tool_id: 'tc-grow' },
+      'running'
+    )
+
+    const changed = upsertToolPart(
+      grown,
+      { args: { command: 'ls -la' }, name: 'terminal', tool_id: 'tc-grow' },
+      'running'
+    )
+
+    expect(toolCallPart(grown).args).not.toBe(toolCallPart(started).args)
+    expect(JSON.parse(toolCallPart(grown).argsText ?? '')).toEqual({ command: 'ls', cwd: '/repo' })
+    expect(JSON.parse(toolCallPart(changed).argsText ?? '')).toEqual({ command: 'ls -la', cwd: '/repo' })
+  })
+
+  it('refreshes argsText for new context and preview, then holds steady when they repeat', () => {
+    const started = upsertToolPart([], { args: { command: 'ls' }, name: 'terminal', tool_id: 'tc-ctx' }, 'running')
+
+    const withContext = upsertToolPart(
+      started,
+      { context: 'listing /repo', name: 'terminal', tool_id: 'tc-ctx' },
+      'running'
+    )
+
+    const withPreview = upsertToolPart(
+      withContext,
+      { context: 'listing /repo', name: 'terminal', preview: 'total 12', tool_id: 'tc-ctx' },
+      'running'
+    )
+
+    const repeated = upsertToolPart(
+      withPreview,
+      { context: 'listing /repo', name: 'terminal', preview: 'total 12', tool_id: 'tc-ctx' },
+      'running'
+    )
+
+    expect(JSON.parse(toolCallPart(withPreview).argsText ?? '')).toEqual({
+      command: 'ls',
+      context: 'listing /repo',
+      preview: 'total 12'
+    })
+    expect(toolCallPart(repeated).args).toBe(toolCallPart(withPreview).args)
+    expect(toolCallPart(repeated).argsText).toBe(toolCallPart(withPreview).argsText)
+  })
+
+  it('refreshes argsText when a todo tick reports new todo state', () => {
+    const started = upsertToolPart(
+      [],
+      { name: 'todo', todos: [{ content: 'Boil water', id: 'boil', status: 'in_progress' }], tool_id: 'todo-args' },
+      'running'
+    )
+
+    const updated = upsertToolPart(
+      started,
+      { name: 'todo', todos: [{ content: 'Boil water', id: 'boil', status: 'completed' }], tool_id: 'todo-args' },
+      'running'
+    )
+
+    expect(JSON.parse(toolCallPart(updated).argsText ?? '').todos).toEqual([
+      { content: 'Boil water', id: 'boil', status: 'completed' }
+    ])
   })
 })
 
