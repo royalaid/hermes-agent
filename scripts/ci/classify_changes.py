@@ -104,10 +104,16 @@ _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
 _MCP_CATALOG_PATHS = ("optional-mcps/",)
 _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 
-# Windows installer + its PowerShell tests. These only run on a Windows runner,
-# so they get their own lane rather than riding along with ``python``.
+# Windows installer/update scripts and their PowerShell tests. These only run
+# on a Windows runner, so they get their own lane rather than riding along with
+# ``python``.
 _INSTALLER_PATHS = ("scripts/tests/",)
-_INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
+_INSTALLER_FILES = {
+    "scripts/desktop-update/windows.ps1",
+    "scripts/install.cmd",
+    "scripts/install.ps1",
+    "scripts/windows-desktop-shortcuts.ps1",
+}
 
 # Rust crates — currently just the Tauri bootstrap installer (Hermes-Setup).
 # These live under ``apps/``, so before this lane existed a ``.rs`` edit matched
