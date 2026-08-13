@@ -87,8 +87,10 @@ _INSTALLER_FILES = {
     "apps/desktop/electron/windows-process-identity.test.ts",
     "apps/desktop/electron/windows-process-identity.ts",
     "scripts/desktop-update.ps1",
+    "scripts/desktop-update/windows.ps1",
     "scripts/install.cmd",
     "scripts/install.ps1",
+    "scripts/windows-desktop-shortcuts.ps1",
 }
 _INSTALLER_PREFIXES = (
     "apps/bootstrap-installer/src-tauri/src/",
