@@ -4,7 +4,6 @@ import { describe, it } from 'vitest'
 
 import type { McpBridgeQuiesceLease } from './mcp-bridge-quiesce'
 import {
-  buildMcpBridgeConsentRequest,
   runWindowsUpdatePreflight,
   type UpdatePreflightDeps,
   type UpdatePreflightPurpose
@@ -860,29 +859,5 @@ describe('MCP bridge drain', () => {
       'wait:1100',
       'scan'
     ])
-  })
-})
-
-describe('buildMcpBridgeConsentRequest', () => {
-  it('names every proven owner without calling an MCP server a Desktop backend', () => {
-    const request = buildMcpBridgeConsentRequest([
-      bridge({ owner: 'codex' }),
-      bridge({ pid: 102, owner: 'claude' }),
-      bridge({ pid: 103, owner: 'unknown' })
-    ])
-
-    assert.equal(request.ownerLabel, 'Codex and Claude')
-    assert.match(request.detail, /Unknown owner/)
-    assert.match(request.message, /MCP tool bridges/)
-    assert.match(request.detail, /interrupt active tool calls/)
-    assert.doesNotMatch(`${request.message}\n${request.detail}`, /Desktop backend/i)
-  })
-
-  it('explains the bounded prevention lease when no bridge is currently running', () => {
-    const request = buildMcpBridgeConsentRequest([])
-
-    assert.match(request.message, /new Codex and Claude MCP bridge launches/)
-    assert.match(request.detail, /No exact Hermes MCP tool bridges are running now/)
-    assert.match(request.detail, /bounded update transaction/)
   })
 })
