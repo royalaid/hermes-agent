@@ -86,10 +86,7 @@ export function isExactActionableDesktopPluginService(
     service.actionable === true &&
     service.actionability === 'exact_desktop_plugin_service' &&
     service.action === 'terminate_desktop_plugin_service' &&
-    Number.isInteger(service.pid) &&
-    service.pid > 0 &&
-    Number.isFinite(service.createdAt) &&
-    service.createdAt > 0
+    isExactVenvHolder(service)
   )
 }
 
@@ -751,55 +748,6 @@ export async function terminateDesktopPluginService(
     execOverride,
     resolveOverride,
     canonicalizeOverride
-  )
-}
-
-function parseTerminateVenvHolderOutput(
-  raw: string,
-  target: ScanTargetIdentity,
-  process: VenvBlockerProcess
-): boolean {
-  let parsed: any
-
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return false
-  }
-
-  const fields = [
-    'schema_version',
-    'mode',
-    'ok',
-    'terminated',
-    'pid',
-    'created_at',
-    'root',
-    'venv',
-    'error'
-  ]
-
-  if (!hasExactKeys(parsed, fields)) {return false}
-
-  const actualRoot = comparableCanonicalPath(parsed.root)
-  const actualVenv = comparableCanonicalPath(parsed.venv)
-  const expectedRoot = comparableCanonicalPath(target.expectedRoot)
-  const expectedVenv = comparableCanonicalPath(target.expectedVenv)
-
-  return (
-    parsed.schema_version === 2 &&
-    parsed.mode === 'terminate_venv_holder' &&
-    parsed.ok === true &&
-    parsed.terminated === true &&
-    parsed.pid === process.pid &&
-    parsed.created_at === process.createdAt &&
-    parsed.error === null &&
-    actualRoot !== null &&
-    actualVenv !== null &&
-    expectedRoot !== null &&
-    expectedVenv !== null &&
-    actualRoot === expectedRoot &&
-    actualVenv === expectedVenv
   )
 }
 
