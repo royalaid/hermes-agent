@@ -18,20 +18,25 @@ Use four explicit boundaries:
    edits out of the upstream branch.
 2. **Upstream boundary.** Rebase onto the current upstream base, run the
    focused/native gates, and open the PR against that explicit base. Record the
-   PR head and base SHAs. Do not integrate the feature into the fork branch
-   until the upstream merge SHA exists.
-3. **Integration boundary.** Start from the exact published
-   `fork-integration` SHA. Fetch explicit upstream and fork refs, verify
-   ancestry and patch identity, and merge the upstream result by commit
-   provenance. Do not recreate an equivalent fork-only patch because a title or
-   branch name looks similar.
+   PR head and base SHAs. Normally, do not integrate the feature into the fork
+   branch until the upstream merge SHA exists. The narrow exception is an
+   explicitly approved, pinned unmerged foundation: record its PR, exact head
+   SHA, approval, and reason, then use only that immutable head as the first
+   integration input. The exception does not authorize newer PR heads, related
+   PR variants, or other unmerged work.
+3. **Integration boundary.** The published `fork-integration` head is
+   canonical. Reconstruct it from the explicit upstream `main` SHA, the pinned
+   approved foundation when one exists, and the complete ordered set of fork PR
+   branches or patches. Fetch explicit upstream and fork refs, verify ancestry
+   and patch identity, and merge by commit provenance. Do not recreate an
+   equivalent fork-only patch because a title or branch name looks similar.
 4. **Release boundary.** Update the existing manifest or equivalent tracking
    record, validate the declared component scope, build from the exact
    integration head, and publish only through the sanctioned release path.
    Verify the public artifact checksum and the installed/served version's
    integration SHA before telling the user to update.
 
-## Current canonicalization record
+## Recorded canonicalization snapshot (historical)
 
 ```yaml
 repository: royalaid/hermes-agent
@@ -46,9 +51,15 @@ upstream_pr_head_sha: 45213d7f718ab4e32f0b4b6274a75a004e7604bd
 status: rebuilt_pending_release_verification
 ```
 
-The fork's ordinary `main` is not the current upstream tip. The published
-user-facing line is `fork-integration`, which is rebased onto upstream
-`upstream/main`.
+These SHAs, PR states, and status values are historical audit snapshots, not
+live scheduler or remote state. Resolve current refs and release state before
+any new integration or update decision.
+
+The fork's ordinary `main` is not the recorded upstream tip. The published
+user-facing line is `fork-integration`, which is reconstructed from upstream
+`main`, the approved pinned foundation when recorded, and the ordered fork
+patch set. Scheduler-local integration state is disposable and reconstructible;
+the published `fork-integration` head is the canonical recovery point.
 
 ## Upstream PR audit
 
@@ -69,8 +80,12 @@ Closed PRs remain in-process for this fork and are not treated as disposable.
 | [#76815](https://github.com/NousResearch/hermes-agent/pull/76815) | closed, unmerged | `dd2f89085050` | In process/superseded; its PATH change is covered by #79726. |
 
 An upstream PR being open or closed does not by itself authorize duplication or
-discarding. Use the PR head SHA, patch identity, and the readiness/exclusion
-record above.
+discarding. The current integration manifest is authoritative for any explicitly
+approved pinned unmerged foundation; at the time of writing it records #82832.
+PR #84778 is downstream fork work, not that foundation. All other unmerged work
+still follows the normal merge-wait rule unless it has its own explicit approval.
+Use the manifest's exact approved head, patch identities, and the
+readiness/exclusion record above.
 
 ## Integrated local fix record
 
