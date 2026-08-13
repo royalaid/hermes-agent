@@ -534,6 +534,42 @@ function Start-DesktopRelaunch {
     return $spawned
 }
 
+function Refresh-ManagedDesktopShortcuts {
+    # A packaged update replaces Hermes.exe in place, while Windows retains
+    # Start Menu/taskbar identity from the existing shortcut until it is
+    # rewritten. Never make a production shortcut for `electron .` dev runs.
+    if ($RelaunchAppPath) {
+        Write-HandoffLog 'skipping Hermes shortcut refresh for a dev Electron relaunch'
+        return $true
+    }
+    if (-not $RelaunchExe) {
+        Write-HandoffLog 'skipping Hermes shortcut refresh: packaged relaunch executable is unavailable'
+        return $true
+    }
+
+    try {
+        $resolvedExe = (Resolve-Path -LiteralPath $RelaunchExe -ErrorAction Stop).Path
+        $releaseRoot = [System.IO.Path]::GetFullPath((Join-Path $InstallRoot 'apps\desktop\release')).TrimEnd('\') + '\'
+        if (
+            [System.IO.Path]::GetFileName($resolvedExe) -ne 'Hermes.exe' -or
+            -not $resolvedExe.StartsWith($releaseRoot, [System.StringComparison]::OrdinalIgnoreCase)
+        ) {
+            Write-HandoffLog "skipping Hermes shortcut refresh for non-managed executable: $resolvedExe"
+            return $true
+        }
+
+        $shortcutHelper = Join-Path $InstallRoot 'scripts\windows-desktop-shortcuts.ps1'
+        . $shortcutHelper
+        foreach ($lnkPath in @(New-HermesDesktopShortcuts -TargetExe $resolvedExe)) {
+            Write-HandoffLog "refreshed Hermes shortcut: $lnkPath"
+        }
+        return $true
+    } catch {
+        Write-HandoffLog "WARNING: could not refresh Hermes shortcuts: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     # The window shows nothing live, so no line-pump: both pipes drain
     # asynchronously (no deadlock however chatty the child) while a small
@@ -584,6 +620,7 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
 
 $finalCode = 1
 $finalMsg = "update did not complete"
+$shortcutRegistrationNeedsManualRepair = $false
 
 # ── -SelfTestUi: drive the shim to both terminal states, no update ─────────
 # Manual QA for the Edge shell without a checkout or a real update. Exits
@@ -754,8 +791,14 @@ try {
     }
 
     if ($res.Code -eq 0 -and -not $desktopBuildFailed) {
+        if (-not (Refresh-ManagedDesktopShortcuts)) {
+            $shortcutRegistrationNeedsManualRepair = $true
+            $finalMsg = "Update complete, but Windows could not refresh Hermes' Start Menu shortcut. Reopen Hermes to repair it."
+        }
         $finalCode = 0
-        $finalMsg = "Update complete."
+        if (-not $shortcutRegistrationNeedsManualRepair) {
+            $finalMsg = "Update complete."
+        }
     } elseif ($desktopBuildFailed) {
         $finalCode = 6
         $finalMsg = "Code and dependencies updated, but the Desktop app REBUILD FAILED - you are running the previous build. Run `hermes desktop --force-build` from a terminal to retry."
@@ -772,7 +815,7 @@ try {
     #   3. only then the terminal UI state — done means "Hermes is back",
     #      manual means "it is not, reopen it", error is error (and still
     #      tries to bring the app back after showing itself).
-    Write-Result ($finalCode -eq 0) $finalCode $finalMsg
+    Write-Result ($finalCode -eq 0) $finalCode $finalMsg $shortcutRegistrationNeedsManualRepair
     Remove-MarkerIfOwned
     if ($finalCode -ne 0) {
         Show-ErrorFinale $finalMsg
@@ -785,6 +828,8 @@ try {
             # for the next boot, manual state held on screen now.
             $finalMsg = "Update complete. Reopen Hermes to finish (it could not restart itself)."
             Write-Result $true 0 $finalMsg $true
+            Show-ManualFinale $finalMsg
+        } elseif ($shortcutRegistrationNeedsManualRepair) {
             Show-ManualFinale $finalMsg
         }
         Close-ProgressWindow
