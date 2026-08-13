@@ -4,21 +4,12 @@ import {
   formatProbeFailedMessage,
   isExactVenvHolder,
   type DesktopPluginServiceProcess,
-  type McpBridgeProcess,
   type ScanOutcome,
   type VenvBlockerProcess,
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
 
 export type UpdatePreflightPurpose = 'normal-update' | 'bootstrap-recovery'
-
-export interface McpBridgeConsentRequest {
-  continueLabel: string
-  detail: string
-  message: string
-  ownerLabel: string
-  title: string
-}
 
 export interface UpdatePreflightDeps {
   acquireMcpBridgeLease: () => McpBridgeQuiesceLease | null
@@ -54,8 +45,8 @@ const DEFAULT_GENERIC_HOLDER_POLL_MS = 1_000
 const DEFAULT_GENERIC_HOLDER_TIMEOUT_MS = 30_000
 const DEFAULT_RESPAWN_INTERVAL_MS = 1_500
 const DEFAULT_TERMINATION_SETTLE_MS = 750
-const MAX_FALLBACK_BRIDGE_GROUPS = 32
-const MAX_FALLBACK_BRIDGE_RECORDS = 64
+const MAX_FALLBACK_DRAIN_GROUPS = 32
+const MAX_FALLBACK_DRAIN_RECORDS = 64
 
 function wait(delayMs: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, delayMs))
@@ -74,80 +65,12 @@ function exactDrainableOnly(result: VenvBlockerScanResult): boolean {
   )
 }
 
-function logicalMcpBridgeGroupCount(result: VenvBlockerScanResult): number {
-  return new Set(result.mcpBridges.map(bridge => bridge.wrapperPid ?? bridge.pid)).size
-}
-
-function logicalDesktopPluginServiceGroupCount(result: VenvBlockerScanResult): number {
-  return new Set(result.desktopPluginServices.map(service => service.wrapperPid ?? service.pid)).size
+function logicalDrainGroupCount(processes: ReadonlyArray<{ pid: number; wrapperPid?: number }>): number {
+  return new Set(processes.map(process => process.wrapperPid ?? process.pid)).size
 }
 
 function genericHoldersOnly(result: VenvBlockerScanResult): boolean {
   return result.processes.length > 0 && result.mcpBridges.length === 0
-}
-
-function normalizeOwner(owner?: string): string | null {
-  switch (owner?.trim().toLowerCase()) {
-    case 'codex':
-      return 'Codex'
-
-    case 'claude':
-      return 'Claude'
-
-    case 'desktop':
-      return 'Hermes Desktop'
-
-    case 'other':
-      return 'another agent'
-
-    default:
-      return null
-  }
-}
-
-function joinOwners(owners: string[]): string {
-  if (owners.length === 0) {return 'Another agent'}
-
-  if (owners.length === 1) {return owners[0]}
-
-  if (owners.length === 2) {return `${owners[0]} and ${owners[1]}`}
-
-  return `${owners.slice(0, -1).join(', ')}, and ${owners.at(-1)}`
-}
-
-export function buildMcpBridgeConsentRequest(bridges: McpBridgeProcess[]): McpBridgeConsentRequest {
-  if (bridges.length === 0) {
-    return {
-      ownerLabel: 'Codex and Claude',
-      title: 'Temporarily pause Hermes MCP tools to update',
-      continueLabel: 'Pause MCP bridges and continue',
-      message: 'Hermes will temporarily pause new Codex and Claude MCP bridge launches during this update.',
-      detail:
-        'No exact Hermes MCP tool bridges are running now. During this bounded update transaction, ' +
-        'any newly launched exact Hermes MCP tool bridges will pause until the update finishes. ' +
-        'No Codex or Claude parent process will be stopped.'
-    }
-  }
-
-  const owners = [...new Set(bridges.map(bridge => normalizeOwner(bridge.owner)).filter(Boolean))] as string[]
-  const ownerLabel = joinOwners(owners)
-  const processWord = bridges.length === 1 ? 'bridge' : 'bridges'
-  const verb = owners.length > 1 ? 'are' : 'is'
-
-  return {
-    ownerLabel,
-    title: 'Pause Hermes MCP tools to update',
-    continueLabel: 'Pause tool bridges and continue',
-    message: `${ownerLabel} ${verb} using ${bridges.length} Hermes MCP tool ${processWord}.`,
-    detail:
-      'Updating Hermes must pause the current exact Hermes MCP tool bridges shown below and may interrupt active tool calls. ' +
-      'Any newly launched exact Hermes MCP tool bridges will also remain paused for this bounded update transaction. ' +
-      'No Codex or Claude parent process will be stopped.\n\n' +
-      bridges
-        .slice(0, 8)
-        .map(bridge => `PID ${bridge.pid}  ${normalizeOwner(bridge.owner) || 'Unknown owner'}  ${bridge.name}`)
-        .join('\n')
-  }
 }
 
 function quiesceIncompleteMessage(): string {
@@ -289,8 +212,8 @@ export async function runWindowsUpdatePreflight(
         exactDrainableOnly(firstClear.result) ||
         (forceableMcpAndDesktopServices && naturallyExitingGenericHolders)
       const logicalDrainGroups =
-        logicalMcpBridgeGroupCount(firstClear.result) +
-        logicalDesktopPluginServiceGroupCount(firstClear.result)
+        logicalDrainGroupCount(firstClear.result.mcpBridges) +
+        logicalDrainGroupCount(firstClear.result.desktopPluginServices)
       const drainRecordCount =
         firstClear.result.processes.length +
         firstClear.result.mcpBridges.length +
@@ -298,8 +221,8 @@ export async function runWindowsUpdatePreflight(
 
       if (
         !exactCurrentHolders ||
-        logicalDrainGroups > MAX_FALLBACK_BRIDGE_GROUPS ||
-        drainRecordCount > MAX_FALLBACK_BRIDGE_RECORDS
+        logicalDrainGroups > MAX_FALLBACK_DRAIN_GROUPS ||
+        drainRecordCount > MAX_FALLBACK_DRAIN_RECORDS
       ) {
         return {
           kind: 'blocked',
