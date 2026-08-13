@@ -32,6 +32,7 @@ import type { RpcEvent } from '@/types/hermes'
 import type { ClientSessionState } from '../../../types'
 
 import { useGatewayEventHandler } from './gateway-event'
+import { useSubagentCoalescer } from './subagent-coalesce'
 import { completionErrorText, delegateTaskPayloads, MAX_STREAM_FLUSH_GAP_MS, STREAM_DELTA_FLUSH_MS } from './utils'
 
 interface MessageStreamOptions {
@@ -53,10 +54,16 @@ interface MessageStreamOptions {
   ) => ClientSessionState
 }
 
-interface QueuedStreamDeltas {
-  assistant: string
-  reasoning: Array<{ sourceId?: string; text: string }>
-}
+// One queued unit of stream state, in arrival order. Text and non-terminal
+// tool rows share ONE queue on purpose: appendStreamPart bounds a streaming
+// text segment at any tool part, so a tool upsert that jumped ahead of text
+// queued before it would permanently render that text below the tool card.
+type QueuedStreamEntry =
+  | { kind: 'assistant'; text: string }
+  | { kind: 'reasoning'; sourceId?: string; text: string }
+  | { kind: 'tool'; payload: GatewayEventPayload | undefined; sourceEventType?: string }
+
+const queuedEntryChars = (entry: QueuedStreamEntry) => (entry.kind === 'tool' ? 0 : entry.text.length)
 
 // Date.now() alone can collide when an interim seal and the next segment's
 // first delta land in the same millisecond — the new segment would then find
@@ -68,14 +75,12 @@ const nextStreamMessageId = (prefix: string) => `${prefix}-${Date.now()}-${++str
 // Diagnostics only, and only while a capture is armed: how big the flush about
 // to run is, in sessions and characters. Sizes, never the delta text — the
 // capture ring buffer must never hold message content (see src/diagnostics).
-const queuedDeltaSizes = (queue: Map<string, QueuedStreamDeltas>) => {
+const queuedDeltaSizes = (queue: Map<string, QueuedStreamEntry[]>) => {
   let queuedChars = 0
 
-  for (const queued of queue.values()) {
-    queuedChars += queued.assistant.length
-
-    for (const delta of queued.reasoning) {
-      queuedChars += delta.text.length
+  for (const entries of queue.values()) {
+    for (const entry of entries) {
+      queuedChars += queuedEntryChars(entry)
     }
   }
 
@@ -207,7 +212,7 @@ export function useMessageStream({
     []
   )
 
-  const queuedDeltasRef = useRef<Map<string, QueuedStreamDeltas>>(new Map())
+  const queuedDeltasRef = useRef<Map<string, QueuedStreamEntry[]>>(new Map())
   const flushHandleRef = useRef<number | null>(null)
   const lastFlushAtRef = useRef<number>(0)
   // What the previous flush cost on the main thread — drives the adaptive
@@ -239,10 +244,72 @@ export function useMessageStream({
     return busy
   }, [sessionStateByRuntimeIdRef])
 
+  const { discardSubagentEvents, flushSubagentEvents, queueSubagentEvent } = useSubagentCoalescer({
+    countBusySessions,
+    sessionInterrupted
+  })
+
+  // The non-transcript half of applying a tool event: the todo mirror and the
+  // delegate-tool subagent fallback. Split out of upsertToolCall so the queued
+  // (coalesced) path and the eager path apply exactly the same side effects.
+  const applyToolSideEffects = useCallback(
+    (
+      sessionId: string,
+      payload: GatewayEventPayload | undefined,
+      phase: 'running' | 'complete',
+      sourceEventType?: string
+    ) => {
+      // The composer status stack owns todo display now (no inline panel) —
+      // mirror every todo state the tool reports into its session store.
+      if (payload?.name === 'todo') {
+        const todos = parseTodos(payload.todos) ?? parseTodos(payload.result) ?? parseTodos(payload.args)
+
+        if (todos) {
+          setSessionTodos(sessionId, todos)
+        }
+      }
+
+      if (!nativeSubagentSessionsRef.current.has(sessionId)) {
+        for (const subagentPayload of delegateTaskPayloads(payload, phase, sourceEventType)) {
+          upsertSubagent(
+            sessionId,
+            subagentPayload,
+            true,
+            phase === 'complete' ? 'delegate.complete' : 'delegate.running'
+          )
+        }
+      }
+    },
+    []
+  )
+
+  // Fold a window's queued entries onto a message's parts, in arrival order.
+  const foldQueuedEntries = useCallback(
+    (parts: ChatMessagePart[], entries: QueuedStreamEntry[]) =>
+      entries.reduce<ChatMessagePart[]>((next, entry) => {
+        if (entry.kind === 'assistant') {
+          return dedupeGeneratedImageEchoesInParts(appendAssistantTextPart(next, entry.text))
+        }
+
+        if (entry.kind === 'reasoning') {
+          return appendReasoningPart(next, entry.text, entry.sourceId)
+        }
+
+        return dedupeGeneratedImageEchoesInParts(upsertToolPart(next, entry.payload, 'running'))
+      }, parts),
+    []
+  )
+
   const flushQueuedDeltas = useCallback(
     (sessionId?: string, source: 'eager' | 'timer' = 'eager') => {
       const queue = queuedDeltasRef.current
       const ids = sessionId ? [sessionId] : [...queue.keys()]
+
+      // Buffered subagent progress is pending state too: an ordering-sensitive
+      // caller (tool.complete, subagent.complete, turn boundaries) asks for
+      // "everything pending, then my event", so drain that buffer here rather
+      // than making every call site remember two flushes.
+      flushSubagentEvents(sessionId)
 
       // Ordering-sensitive events (tool rows, interim seals, completion) drain
       // the queue OUTSIDE the instrumented timer flush — under an agentic turn
@@ -256,43 +323,45 @@ export function useMessageStream({
           : null
 
       for (const id of ids) {
-        const queued = queue.get(id)
+        const entries = queue.get(id)
 
-        if (!queued) {
+        if (!entries?.length) {
+          queue.delete(id)
+
           continue
         }
 
         if (eager) {
           eager.sessions += 1
-          eager.queuedChars += queued.assistant.length
 
-          for (const delta of queued.reasoning) {
-            eager.queuedChars += delta.text.length
+          for (const entry of entries) {
+            eager.queuedChars += queuedEntryChars(entry)
           }
         }
 
         queue.delete(id)
 
-        if (queued.assistant) {
-          mutateStream(
-            id,
-            parts => dedupeGeneratedImageEchoesInParts(appendAssistantTextPart(parts, queued.assistant)),
-            () => [assistantTextPart(queued.assistant)]
-          )
+        // Re-checked HERE, not only at enqueue time: a stop can land mid-window,
+        // and buffered running state must not reach a turn the user cancelled.
+        // (mutateStream drops text on the same condition; tool rows carry store
+        // side effects that would otherwise still fire.)
+        if (sessionInterrupted(id)) {
+          continue
         }
 
-        if (queued.reasoning.length) {
-          mutateStream(
-            id,
-            parts =>
-              queued.reasoning.reduce((next, delta) => appendReasoningPart(next, delta.text, delta.sourceId), parts),
-            () =>
-              queued.reasoning.reduce<ChatMessagePart[]>(
-                (parts, delta) => appendReasoningPart(parts, delta.text, delta.sourceId),
-                []
-              )
-          )
+        for (const entry of entries) {
+          if (entry.kind === 'tool') {
+            applyToolSideEffects(id, entry.payload, 'running', entry.sourceEventType)
+          }
         }
+
+        // One commit for the whole window, applying text and tool rows in the
+        // order they arrived.
+        mutateStream(
+          id,
+          parts => foldQueuedEntries(parts, entries),
+          () => foldQueuedEntries([], entries)
+        )
 
         if (eager) {
           eager.historyMessages += sessionStateByRuntimeIdRef.current.get(id)?.messages.length ?? 0
@@ -310,7 +379,15 @@ export function useMessageStream({
         })
       }
     },
-    [countBusySessions, mutateStream, sessionStateByRuntimeIdRef]
+    [
+      applyToolSideEffects,
+      countBusySessions,
+      flushSubagentEvents,
+      foldQueuedEntries,
+      mutateStream,
+      sessionInterrupted,
+      sessionStateByRuntimeIdRef
+    ]
   )
 
   const scheduleDeltaFlush = useCallback(() => {
@@ -442,9 +519,16 @@ export function useMessageStream({
         return
       }
 
-      const queued = queuedDeltasRef.current.get(sessionId) ?? { assistant: '', reasoning: [] }
-      queued.assistant += delta
-      queuedDeltasRef.current.set(sessionId, queued)
+      const entries = queuedDeltasRef.current.get(sessionId) ?? []
+      const last = entries.at(-1)
+
+      if (last?.kind === 'assistant') {
+        last.text += delta
+      } else {
+        entries.push({ kind: 'assistant', text: delta })
+      }
+
+      queuedDeltasRef.current.set(sessionId, entries)
       scheduleDeltaFlush()
     },
     [scheduleDeltaFlush]
@@ -514,19 +598,49 @@ export function useMessageStream({
         return
       }
 
-      const queued = queuedDeltasRef.current.get(sessionId) ?? { assistant: '', reasoning: [] }
-      const previous = queued.reasoning.at(-1)
+      const entries = queuedDeltasRef.current.get(sessionId) ?? []
+      const last = entries.at(-1)
 
-      if (previous && previous.sourceId === sourceId) {
-        previous.text += text
+      if (last?.kind === 'reasoning' && last.sourceId === sourceId) {
+        last.text += text
       } else {
-        queued.reasoning.push({ sourceId, text })
+        entries.push({ kind: 'reasoning', sourceId, text })
       }
 
-      queuedDeltasRef.current.set(sessionId, queued)
+      queuedDeltasRef.current.set(sessionId, entries)
       scheduleDeltaFlush()
     },
     [scheduleDeltaFlush]
+  )
+
+  // Non-terminal tool rows ride the text queue instead of publishing per event:
+  // a `tool.progress` burst (terminal output, long edits) used to force one
+  // eager delta drain plus one commit EVERY tick. Terminal frames still go
+  // through upsertToolCall, which flushes this queue first.
+  const queueToolCall = useCallback(
+    (sessionId: string, payload: GatewayEventPayload | undefined, sourceEventType?: string) => {
+      // Same enqueue-time guard as upsertToolCall; the flush re-checks it too.
+      if (sessionInterrupted(sessionId)) {
+        return
+      }
+
+      const entries = queuedDeltasRef.current.get(sessionId) ?? []
+      entries.push({ kind: 'tool', payload, sourceEventType })
+      queuedDeltasRef.current.set(sessionId, entries)
+      scheduleDeltaFlush()
+    },
+    [scheduleDeltaFlush, sessionInterrupted]
+  )
+
+  /** A reclaimed / swapped-away session: its buffered stream state must never
+   *  land, not least because applying it would re-create the state entry that
+   *  was just dropped. */
+  const discardQueuedStreamState = useCallback(
+    (sessionId: string) => {
+      queuedDeltasRef.current.delete(sessionId)
+      discardSubagentEvents(sessionId)
+    },
+    [discardSubagentEvents]
   )
 
   const appendReasoningDelta = useCallback(
@@ -577,26 +691,7 @@ export function useMessageStream({
         return
       }
 
-      // The composer status stack owns todo display now (no inline panel) —
-      // mirror every todo state the tool reports into its session store.
-      if (payload?.name === 'todo') {
-        const todos = parseTodos(payload.todos) ?? parseTodos(payload.result) ?? parseTodos(payload.args)
-
-        if (todos) {
-          setSessionTodos(sessionId, todos)
-        }
-      }
-
-      if (!nativeSubagentSessionsRef.current.has(sessionId)) {
-        for (const subagentPayload of delegateTaskPayloads(payload, phase, sourceEventType)) {
-          upsertSubagent(
-            sessionId,
-            subagentPayload,
-            true,
-            phase === 'complete' ? 'delegate.complete' : 'delegate.running'
-          )
-        }
-      }
+      applyToolSideEffects(sessionId, payload, phase, sourceEventType)
 
       mutateStream(
         sessionId,
@@ -605,7 +700,7 @@ export function useMessageStream({
         { pending: m => phase !== 'complete' || (m.pending ?? false) }
       )
     },
-    [flushQueuedDeltas, mutateStream, sessionInterrupted]
+    [applyToolSideEffects, flushQueuedDeltas, mutateStream, sessionInterrupted]
   )
 
   const finalizeInterimAssistantMessage = useCallback(
@@ -894,13 +989,17 @@ export function useMessageStream({
     appendReasoningDelta,
     activeSessionIdRef,
     compactedTurnRef,
+    discardQueuedStreamState,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
     completeAssistantMessage,
     failAssistantMessage,
     flushQueuedDeltas,
+    flushSubagentEvents,
     finalizeInterimAssistantMessage,
     queryClient,
+    queueSubagentEvent,
+    queueToolCall,
     refreshHermesConfig,
     sessionInterrupted,
     sessionStateByRuntimeIdRef,
