@@ -288,4 +288,41 @@ describe('subagent and non-terminal tool publish coalescing', () => {
     emit('approval.request', { command: 'rm -rf /tmp/x', description: 'dangerous command' })
     expect(states.get(SID)?.needsInput).toBe(true)
   })
+
+  it('applies the queued tool row before publishing an approval request', () => {
+    // The inline approval strip binds positionally to the pending tool row. If
+    // the row is still sitting in the queue when the request is published, the
+    // floating fallback mounts instead and the strip jumps into place when the
+    // timer flush lands a window later.
+    mount()
+
+    emit('message.start', {})
+    emit('tool.start', { args: { command: 'rm -rf /tmp/x' }, name: 'terminal', tool_id: 't1' })
+    expect(toolParts()).toHaveLength(0)
+
+    emit('approval.request', { command: 'rm -rf /tmp/x', description: 'dangerous command' })
+
+    // No timer advance: the row is on screen by the time the request is.
+    const rendered = toolParts()
+    expect(rendered).toHaveLength(1)
+    expect(rendered[0].type === 'tool-call' && rendered[0].toolCallId).toBe('t1')
+  })
+
+  it('does not duplicate a queued tool row when clarify.request carries the same id', async () => {
+    // The dedup that collapses a clarify tool.start and its clarify.request into
+    // ONE card has to hold across the queue boundary too: the tool.start is
+    // buffered when the request arrives, so the request's own upsert must land
+    // behind the drained row, not beside it.
+    mount()
+
+    emit('message.start', {})
+    emit('tool.start', { args: { choices: ['yes', 'no'], question: 'Ship it?' }, name: 'clarify', tool_id: 'req-1' })
+    emit('clarify.request', { choices: ['yes', 'no'], question: 'Ship it?', request_id: 'req-1' })
+
+    await advance(STREAM_DELTA_FLUSH_MS * 4)
+
+    const rendered = toolParts()
+    expect(rendered).toHaveLength(1)
+    expect(rendered[0].type === 'tool-call' && rendered[0].toolCallId).toBe('req-1')
+  })
 })
