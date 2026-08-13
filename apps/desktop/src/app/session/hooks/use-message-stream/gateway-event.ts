@@ -1250,6 +1250,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
 
+        if (sessionId) {
+          // The inline approval strip binds POSITIONALLY to the pending tool
+          // row (terminal / execute_code), and that row now rides the queued
+          // delta pipeline. Publishing the request while its row is still
+          // queued mounts the floating fallback first and makes the strip jump
+          // when the timer flush lands — so drain the queue before the request
+          // goes out, the same ordering every other input request gets via
+          // upsertToolCall.
+          flushQueuedDeltas(sessionId)
+        }
+
         void receiveApprovalRequest($gateway.get(), {
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
