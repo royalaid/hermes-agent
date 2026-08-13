@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { ReadableAtom } from 'nanostores'
 import type * as React from 'react'
-import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { memo, startTransition, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
@@ -201,19 +201,46 @@ const NO_MESSAGES: ChatMessage[] = []
  * this gate a hidden tab re-renders its entire thread on every streaming
  * delta flush (~30×/s) — five busy tabs quintuple the per-token render cost
  * and the app crawls. Hidden tabs freeze their transcript instead (status
- * dots stay live through the separate status atoms) and catch up in one
- * commit on reveal — the subscribe fires immediately with the current value.
+ * dots stay live through the separate status atoms) and catch up on reveal —
+ * the subscribe fires immediately with the current value.
+ *
+ * That catch-up is the whole transcript a hidden tab missed, so applying it
+ * eagerly costs 80–124 ms of render+layout ON THE TAB-CLICK FRAME. It goes
+ * through a transition instead: the click paints the pane swap first, the
+ * frozen pre-hide transcript stays rendered and interactive meanwhile (React
+ * keeps the committed tree until the transition commits — no blanking, no
+ * skeleton), and the catch-up lands in place a frame or two later. Updates
+ * that arrive while the tab is ALREADY visible stay synchronous: they are one
+ * delta apiece, and deferring the live stream would show stale tokens.
  */
-function useMessagesWhileVisible($messages: ReadableAtom<ChatMessage[]>): ChatMessage[] {
+export function useMessagesWhileVisible($messages: ReadableAtom<ChatMessage[]>): ChatMessage[] {
   const visible = usePaneVisible()
   const [messages, setMessages] = useState(() => $messages.get())
 
-  // nanostores types the listener value ReadonlyIfObject; the store publishes
-  // a fresh array per flush, so the cast is safe and avoids a per-token clone.
-  useEffect(
-    () => (visible ? $messages.subscribe(value => setMessages(value as ChatMessage[])) : undefined),
-    [$messages, visible]
-  )
+  useEffect(() => {
+    if (!visible) {
+      return undefined
+    }
+
+    // The first emission after (re-)subscribing is nanostores replaying the
+    // current value — the catch-up. Everything after it is a live publish.
+    let caughtUp = false
+
+    // nanostores types the listener value ReadonlyIfObject; the store publishes
+    // a fresh array per flush, so the cast is safe and avoids a per-token clone.
+    return $messages.subscribe(value => {
+      const next = value as ChatMessage[]
+
+      if (caughtUp) {
+        setMessages(next)
+
+        return
+      }
+
+      caughtUp = true
+      startTransition(() => setMessages(next))
+    })
+  }, [$messages, visible])
 
   return messages
 }
