@@ -40,6 +40,7 @@ import { isSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
 
+import { usePaneScrollRetention } from './pane-scroll-retention'
 import { resolveShowEarlierAction, useTranscriptWindow } from './transcript-window'
 import { useMessagesBelow } from './use-messages-below'
 
@@ -614,6 +615,9 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
+  // Preserve the reader's position when a keep-alive pane hides, while the
+  // owner-scoped publisher prevents hidden panes from changing shared UI state.
+  usePaneScrollRetention({ isAtBottom, paneVisible, scrollRef, stopScroll })
   useEffect(() => publishThreadAtBottom(isAtBottom, { paneVisible }), [isAtBottom, paneVisible])
   useEffect(() => () => resetPublishedThreadScroll({ paneVisible }), [paneVisible])
 
