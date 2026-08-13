@@ -114,6 +114,12 @@ interface SessionActionsOptions {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   creatingSessionRef: MutableRefObject<boolean>
+  /** Drop the stream hook's buffered deltas / tool rows / subagent progress for
+   *  a runtime id this hook is discarding. Paired with every `dropSessionState`
+   *  below: the buffers flush on a ≤250ms timer, and a flush landing after the
+   *  drop would re-create the state entry (a missing entry reads as
+   *  not-interrupted) and fire tool side effects for a session that is gone. */
+  discardQueuedStreamState: (sessionId: string) => void
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
   getRouteToken: () => string
   getRoutedStoredSessionId: () => null | string
@@ -271,6 +277,7 @@ export function useSessionActions({
   activeSessionIdRef,
   busyRef,
   creatingSessionRef,
+  discardQueuedStreamState,
   ensureSessionState,
   getRouteToken,
   getRoutedStoredSessionId,
@@ -702,6 +709,7 @@ export function useSessionActions({
         if (state.storedSessionId !== storedSessionId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(runtimeId)
+          discardQueuedStreamState(runtimeId)
           dropSessionState(runtimeId)
 
           return null
@@ -772,6 +780,7 @@ export function useSessionActions({
         if (sessionShouldHaveTranscript(stored) && cachedViewState.messages.length === 0) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
+          discardQueuedStreamState(cachedRuntimeId)
           dropSessionState(cachedRuntimeId)
         } else {
           // Paint the warm cache immediately, but also refresh the persisted
@@ -839,6 +848,7 @@ export function useSessionActions({
             if (activated.session_key && activated.session_key !== storedSessionId) {
               runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
               sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
+              discardQueuedStreamState(cachedRuntimeId)
               dropSessionState(cachedRuntimeId)
             } else {
               const pendingApproval = restorePendingApproval(activated, cachedRuntimeId)
@@ -983,6 +993,7 @@ export function useSessionActions({
 
             runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
             sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
+            discardQueuedStreamState(cachedRuntimeId)
             dropSessionState(cachedRuntimeId)
           }
         }
@@ -1392,6 +1403,7 @@ export function useSessionActions({
       activeSessionIdRef,
       busyRef,
       copy,
+      discardQueuedStreamState,
       requestGateway,
       resetViewSync,
       runtimeIdByStoredSessionIdRef,
@@ -1686,6 +1698,7 @@ export function useSessionActions({
         if (tiledRuntimeId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
+          discardQueuedStreamState(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
         }
       } catch (err) {
@@ -1727,6 +1740,7 @@ export function useSessionActions({
       activeSessionId,
       activeSessionIdRef,
       copy,
+      discardQueuedStreamState,
       navigate,
       requestGateway,
       runtimeIdByStoredSessionIdRef,
@@ -1771,6 +1785,7 @@ export function useSessionActions({
         if (tiledRuntimeId) {
           runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
+          discardQueuedStreamState(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
         }
 
@@ -1787,7 +1802,14 @@ export function useSessionActions({
         endSessionMutation(archivedIds)
       }
     },
-    [copy, runtimeIdByStoredSessionIdRef, selectedStoredSessionId, sessionStateByRuntimeIdRef, startFreshSessionDraft]
+    [
+      copy,
+      discardQueuedStreamState,
+      runtimeIdByStoredSessionIdRef,
+      selectedStoredSessionId,
+      sessionStateByRuntimeIdRef,
+      startFreshSessionDraft
+    ]
   )
 
   return {
