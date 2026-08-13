@@ -350,6 +350,16 @@ export const UserMessage: FC<{
     const entryHeight = entries.find(entry => entry.target === inner)?.borderBoxSize?.[0]?.blockSize
     const fullHeight = Math.ceil(entryHeight ?? inner.scrollHeight)
 
+    // A zero height is an unlaid-out bubble, not a measurement: a hidden
+    // keep-alive tab skips its contents, and the resize that reports it would
+    // otherwise churn state and write `--human-msg-full: 0px` on every bubble
+    // in the transcript, every hide. Keep the last real measurement — it is
+    // still correct when the tab comes back. (Same guard as the composer
+    // metrics and terminal fit observers.)
+    if (fullHeight <= 0) {
+      return
+    }
+
     if (fullHeight === lastClampHeightRef.current) {
       return
     }
