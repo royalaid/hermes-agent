@@ -340,6 +340,7 @@ import {
   formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
   launchWindowsUpdateTransport,
+  resolveWindowsDevRelaunchAppPath,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveWindowsUpdateTransport,
@@ -4021,6 +4022,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean } = {}
         branch,
         desktopPid: process.pid,
         installRoot: updateRoot,
+        relaunchAppPath: resolveWindowsDevRelaunchAppPath(process.defaultApp, process.argv),
         relaunchExe: process.execPath
       },
       {
