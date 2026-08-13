@@ -51,6 +51,14 @@ jobs:
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-install-ps1-node-compatibility.ps1
 
+      - name: Hermes Windows shortcut registration (pwsh 7)
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-windows-desktop-shortcuts.ps1
+
+      - name: Hermes Windows shortcut registration (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-windows-desktop-shortcuts.ps1
+
       # This executes scripts/desktop-update.ps1 against an isolated fake
       # install. Running it under both engines catches syntax and runtime
       # differences between inbox Windows PowerShell and modern pwsh.
