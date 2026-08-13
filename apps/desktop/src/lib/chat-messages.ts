@@ -838,16 +838,53 @@ function carryTodos(payload: GatewayEventPayload | undefined, ...prev: unknown[]
   return undefined
 }
 
+// True only when every field this event would contribute already sits on the
+// args we hold, with the identical value. Deliberately shallow: a fresh object
+// or array value (re-parsed JSON, re-normalized todos) counts as a change even
+// if it is deep-equal, so we err toward rebuilding. Nothing is ever removed —
+// the merge always spreads `prev` first — so unmatched prev keys are irrelevant.
+function contributesNothingNew(
+  prev: Record<string, unknown>,
+  contributions: (Record<string, unknown> | undefined)[]
+): boolean {
+  for (const contribution of contributions) {
+    if (!contribution) {
+      continue
+    }
+
+    for (const key of Object.keys(contribution)) {
+      if (!Object.hasOwn(prev, key) || !Object.is(prev[key], contribution[key])) {
+        return false
+      }
+    }
+  }
+
+  return true
+}
+
+// `tool.progress` ticks re-send the same accumulated args over and over, and a
+// fresh args object forces `upsertToolPart` to re-serialize the whole thing on
+// every tick (R7). When an event contributes nothing new, hand the previous
+// args object back BY REFERENCE so the caller can reuse its `argsText`.
+// Anything that does change still produces a new object, so R8 content parity
+// is preserved.
 function toolArgs(payload: GatewayEventPayload | undefined, prevArgs?: unknown): Record<string, unknown> {
   const prev = parseMaybeJsonObject(prevArgs)
   const eventArgs = liveToolArgs(payload)
+  const context = payload?.context ? { context: payload.context } : undefined
+  const preview = payload?.preview ? { preview: payload.preview } : undefined
+  const todos = carryTodos(payload, prevArgs)
+
+  if (contributesNothingNew(prev, [eventArgs, context, preview, todos])) {
+    return prev
+  }
 
   return {
     ...prev,
     ...eventArgs,
-    ...(payload?.context ? { context: payload.context } : {}),
-    ...(payload?.preview ? { preview: payload.preview } : {}),
-    ...carryTodos(payload, prevArgs)
+    ...context,
+    ...preview,
+    ...todos
   }
 }
 
@@ -889,6 +926,13 @@ export function upsertToolPart(
   const prevResult = prev && 'result' in prev ? prev.result : undefined
   const args = toolArgs(payload, prevArgs)
 
+  // `toolArgs` returns the previous object by reference when the event added
+  // nothing, so the text we already serialized is still exact — skip the
+  // stringify. An empty stored `argsText` is not a serialization of `{}`
+  // (stored-call parts use '' for empty args), so recompute in that case.
+  const prevArgsText = prev && 'argsText' in prev && typeof prev.argsText === 'string' ? prev.argsText : ''
+  const argsText = prevArgsText && (args as unknown) === prevArgs ? prevArgsText : JSON.stringify(args)
+
   const id =
     stableId ||
     (prev && 'toolCallId' in prev && typeof prev.toolCallId === 'string' ? prev.toolCallId : '') ||
@@ -899,7 +943,7 @@ export function upsertToolPart(
     toolCallId: id,
     toolName: name,
     args: args as never,
-    argsText: JSON.stringify(args),
+    argsText,
     timestamp: prev?.timestamp ?? occurredAt,
     ...(phase === 'complete' && {
       completedAt: occurredAt,
