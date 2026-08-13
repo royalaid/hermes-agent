@@ -40,6 +40,7 @@ import { existsSync } from 'node:fs'
 
 import { rcedit } from 'rcedit'
 
+import { HERMES_EXE_VERSION_STRINGS } from './exe-identity-metadata.mjs'
 import { isMain } from './utils.mjs'
 
 // Stamp the Hermes icon + identity onto `exe`. Resolves on success, throws on
@@ -61,12 +62,7 @@ async function stampExeIdentity(exe, desktopRoot = resolve(import.meta.dirname, 
 
   await rcedit(exe, {
     icon,
-    'version-string': {
-      ProductName: 'Hermes',
-      FileDescription: 'Hermes',
-      CompanyName: 'Nous Research',
-      LegalCopyright: 'Copyright (c) 2026 Nous Research'
-    }
+    'version-string': HERMES_EXE_VERSION_STRINGS
   })
 
   console.log('[set-exe-identity] done — Hermes icon + identity stamped')
