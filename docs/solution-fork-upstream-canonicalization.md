@@ -37,24 +37,27 @@ Use four explicit boundaries:
 repository: royalaid/hermes-agent
 integration_branch: fork-integration
 upstream_repository: NousResearch/hermes-agent
-upstream_main_sha: b9aa9289a8083f2e9d248ad6837b2938f5ee92d7
+upstream_main_sha: cc389f81550180ad81bfddaa8b40dd0338d13c6d
 fork_main_sha: a8c50eb1d841563eff22bd707d80472e7f1e9c9f
-integration_base_sha: b9aa9289a8083f2e9d248ad6837b2938f5ee92d7
-integration_head_sha: cdc416a765d4f4e40cd7609e889d36541ad631e7
-status: ready_for_publish
+integration_base_sha: cc389f81550180ad81bfddaa8b40dd0338d13c6d
+integration_code_head_sha: 27b83dc8fcfee7ae437c614148a389542aa98e2a
+upstream_pr: https://github.com/NousResearch/hermes-agent/pull/84778
+upstream_pr_head_sha: 45213d7f718ab4e32f0b4b6274a75a004e7604bd
+status: rebuilt_pending_release_verification
 ```
 
 The fork's ordinary `main` is not the current upstream tip. The published
 user-facing line is `fork-integration`, which is rebased onto upstream
-`origin/main`.
+`upstream/main`.
 
 ## Upstream PR audit
 
-The audit was performed against `NousResearch/hermes-agent` on 2026-08-08.
+The audit was refreshed against `NousResearch/hermes-agent` on 2026-08-13.
 Closed PRs remain in-process for this fork and are not treated as disposable.
 
 | PR | State | Upstream head | Fork-integration disposition |
 |---:|---|---|---|
+| [#84778](https://github.com/NousResearch/hermes-agent/pull/84778) | open/draft | `45213d7f718` | Windows force-drain handoff and the first-upgrade Hermes Shell identity repair are integrated. |
 | [#80866](https://github.com/NousResearch/hermes-agent/pull/80866) | open/draft | `a38befcfa74f` | Equivalent diagnostics stack is integrated; do not duplicate the PR variant. |
 | [#80867](https://github.com/NousResearch/hermes-agent/pull/80867) | open/draft | `69779ff8b2c9` | Gateway off-loop fix is integrated by equivalent provenance. |
 | [#80870](https://github.com/NousResearch/hermes-agent/pull/80870) | open/draft | `d53bb4785545` | Multi-thread diagnostics work is represented; retain the PR as upstream-in-process. |
