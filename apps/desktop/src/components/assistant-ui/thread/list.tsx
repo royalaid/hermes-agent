@@ -32,6 +32,7 @@ import { isSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
 
+import { usePaneScrollRetention } from './pane-scroll-retention'
 import { resolveShowEarlierAction, useTranscriptWindow } from './transcript-window'
 
 type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
@@ -575,7 +576,23 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
-  useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
+  const paneVisible = paneLifecycle === 'visible'
+
+  // Save/restore the reader's position across a keep-alive tab round-trip —
+  // hiding a pane now collapses this scroller's boxes, which the library reads
+  // as a resize down to nothing and then a resize back up.
+  usePaneScrollRetention({ isAtBottom, paneVisible, scrollRef, stopScroll })
+
+  // Gated on visibility for the same reason: the hidden pane's spurious
+  // isAtBottom flips must not reach these atoms, which are window-global (the
+  // composer, status stack and jump button read them) and therefore belong to
+  // whichever tab is actually on screen. The reveal re-publishes this pane's.
+  useEffect(() => {
+    if (paneVisible) {
+      setThreadAtBottom(isAtBottom)
+    }
+  }, [isAtBottom, paneVisible])
+
   useEffect(() => () => resetThreadScroll(), [])
 
   // Floating jump button (outside this subtree) → return to the bottom.
