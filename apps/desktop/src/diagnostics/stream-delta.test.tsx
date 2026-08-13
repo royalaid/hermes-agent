@@ -141,9 +141,11 @@ describe('stream-delta diagnostics on the real flush path', () => {
     act(() => appendAssistantDelta!(SID, MARKER))
     act(() => appendAssistantDelta!(SID2, MARKER))
 
-    // Thread 2 hits a tool call: its queued text flushes eagerly, right now,
-    // and leaves the queue before the timer flush can count it.
+    // A non-terminal tool frame joins the coalesced queue. Its terminal frame
+    // then drains that queue eagerly and leaves it out of the timer sample.
     act(() => handleEvent!({ payload: { name: 'terminal' }, session_id: SID2, type: 'tool.start' }))
+    expect(streamDeltaEvents()).toHaveLength(0)
+    act(() => handleEvent!({ payload: { name: 'terminal' }, session_id: SID2, type: 'tool.complete' }))
 
     const [eagerEvent] = streamDeltaEvents()
     expect(eagerEvent).toMatchObject({ busySessions: 2, path: 'eager', queuedChars: MARKER.length, sessions: 1 })
