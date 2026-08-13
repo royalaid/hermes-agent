@@ -130,6 +130,19 @@ def test_detect_strict_keeps_target_candidate_with_unreadable_exe(_winp, tmp_pat
         ]
 
 
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_processes_strictly_fails_on_unreadable_table(_winp, tmp_path):
+    """The detached desktop scan must not call a partial process table clear."""
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: (_ for _ in ()).throw(PermissionError("access denied")),
+        Process=lambda *a, **k: MagicMock(),
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ), pytest.raises(RuntimeError, match="process enumeration failed"):
+        cli_main._detect_venv_python_processes(strict=True)
+
+
 
 
 # ---------------------------------------------------------------------------
