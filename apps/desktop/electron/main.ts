@@ -231,6 +231,7 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { configureWindowsTaskbarDetails, WINDOWS_APP_USER_MODEL_ID } from './windows-taskbar-details'
 import {
   cancelPoolBackendStart,
   deletePoolBackendEntryIfCurrent,
@@ -1125,7 +1126,7 @@ app.setName(APP_NAME)
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID)
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -6091,6 +6092,16 @@ function getAppIconPath() {
   return APP_ICON_PATHS.find(fileExists)
 }
 
+function configureTaskbarDetails(win, icon = getAppIconPath()) {
+  configureWindowsTaskbarDetails(win, {
+    appId: WINDOWS_APP_USER_MODEL_ID,
+    iconPath: icon,
+    isWindows: IS_WINDOWS,
+    relaunchCommand: `"${process.execPath}"`,
+    relaunchDisplayName: APP_NAME
+  })
+}
+
 function sendOpenUpdatesRequested() {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
@@ -6912,6 +6923,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
           webSecurity: true
         }
       })
+      configureTaskbarDetails(win)
     } catch (error) {
       finish(error instanceof Error ? error : new Error(String(error)))
 
@@ -7824,6 +7836,7 @@ function openPortalLoginWindow() {
           webSecurity: true
         }
       })
+      configureTaskbarDetails(win)
     } catch (error) {
       finish(error instanceof Error ? error : new Error(String(error)))
 
@@ -10547,6 +10560,8 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
+  configureTaskbarDetails(win, icon)
+
   if (IS_MAC) {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
   }
@@ -10640,6 +10655,8 @@ function createInstanceWindow() {
     backgroundColor: getWindowBackgroundColor(),
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
+
+  configureTaskbarDetails(win, icon)
 
   instanceWindows.add(win)
 
@@ -11511,6 +11528,8 @@ function createWindow() {
   })
 
   const createdMainWindow = mainWindow
+
+  configureTaskbarDetails(createdMainWindow, icon)
 
   if (IS_MAC) {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
