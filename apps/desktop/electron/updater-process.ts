@@ -11,6 +11,7 @@ const WINDOWS_HANDOFF_ENV = {
   branch: 'HERMES_UPDATE_HANDOFF_BRANCH',
   desktopPid: 'HERMES_UPDATE_HANDOFF_DESKTOP_PID',
   installRoot: 'HERMES_UPDATE_HANDOFF_INSTALL_ROOT',
+  relaunchAppPath: 'HERMES_UPDATE_HANDOFF_RELAUNCH_APP_PATH',
   relaunchExe: 'HERMES_UPDATE_HANDOFF_RELAUNCH_EXE',
   script: 'HERMES_UPDATE_HANDOFF_SCRIPT'
 } as const
@@ -56,6 +57,9 @@ $scriptArgs = @{
   RelaunchExe = $env:HERMES_UPDATE_HANDOFF_RELAUNCH_EXE
   BridgeLeaseId = $env:HERMES_UPDATE_BRIDGE_LEASE_ID
 }
+if (-not [string]::IsNullOrWhiteSpace($env:HERMES_UPDATE_HANDOFF_RELAUNCH_APP_PATH)) {
+  $scriptArgs.RelaunchAppPath = $env:HERMES_UPDATE_HANDOFF_RELAUNCH_APP_PATH
+}
 & $scriptPath @scriptArgs
 if ($null -eq $LASTEXITCODE) { exit 1 }
 exit $LASTEXITCODE
@@ -87,6 +91,7 @@ export interface WindowsUpdateHandoffValues {
   branch: string
   desktopPid: number
   installRoot: string
+  relaunchAppPath?: string
   relaunchExe: string
 }
 
@@ -258,10 +263,22 @@ export function wrapHandoffForDetachedConsole(
       [WINDOWS_HANDOFF_ENV.branch]: values.branch,
       [WINDOWS_HANDOFF_ENV.desktopPid]: String(values.desktopPid),
       [WINDOWS_HANDOFF_ENV.installRoot]: values.installRoot,
+      [WINDOWS_HANDOFF_ENV.relaunchAppPath]: values.relaunchAppPath ?? '',
       [WINDOWS_HANDOFF_ENV.relaunchExe]: values.relaunchExe,
       [WINDOWS_HANDOFF_ENV.script]: handoff.scriptPath
     }
   }
+}
+
+/** Dev Electron starts `electron.exe <app-entry>`; preserve that entry for a
+ * detached updater relaunch. Packaged Hermes.exe takes no app argument. */
+export function resolveWindowsDevRelaunchAppPath(
+  defaultApp: boolean,
+  argv: readonly string[]
+): string | undefined {
+  const appEntry = argv[1]
+  if (!defaultApp || !appEntry || appEntry.startsWith('-')) return undefined
+  return path.resolve(appEntry)
 }
 
 /** Render argv for a PowerShell-facing manual instruction without creating
