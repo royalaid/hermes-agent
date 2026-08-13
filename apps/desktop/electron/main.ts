@@ -6862,6 +6862,35 @@ async function showPluginCompatNoticeOnce() {
     } catch (err) {
       rememberLog(`[plugins] could not persist compat notice dismissal: ${err.message}`)
     }
+function repairPackagedWindowsShortcutsAfterLaunch() {
+  // The updater PowerShell process is already loaded before it pulls this
+  // helper. Run the same repair from the newly built/relaunched Hermes process
+  // so the first update that delivers it repairs an older Electron shortcut.
+  if (!IS_WINDOWS || !app.isPackaged) {
+    return
+  }
+
+  const installRoot = path.resolve(process.resourcesPath, '..', '..', '..', '..', '..')
+  const helper = path.join(installRoot, 'scripts', 'windows-desktop-shortcuts.ps1')
+
+  if (!fs.existsSync(helper)) {
+    rememberLog(`[windows-shortcut] helper missing: ${helper}`)
+
+    return
+  }
+
+  try {
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper, '-Repair', '-RepairTargetExe', process.execPath],
+      hiddenWindowsChildOptions({ stdio: 'ignore' })
+    )
+
+    child.once('error', error => rememberLog(`[windows-shortcut] repair launch failed: ${error.message}`))
+
+    child.unref()
+  } catch (error) {
+    rememberLog(`[windows-shortcut] repair launch failed: ${error.message}`)
   }
 }
 
@@ -18110,6 +18139,7 @@ app.whenReady().then(() => {
 
   installMediaPermissions()
   installDownloadHandling()
+  repairPackagedWindowsShortcutsAfterLaunch()
   registerMediaProtocol()
   installEmbedReferer()
   installRemoteHeaderRules()
