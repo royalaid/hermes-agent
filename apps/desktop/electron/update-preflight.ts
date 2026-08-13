@@ -8,6 +8,9 @@ import {
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
 
+// Canonical Desktop handoff canary: forces a packaged-build refresh for the
+// end-to-end update verification on 2026-08-13.
+
 export interface ForceDrainDeps {
   releaseTrackedBackendTrees: () => Promise<{ unlocked: boolean }>
   scan: () => Promise<ScanOutcome>
