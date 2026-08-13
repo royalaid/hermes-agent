@@ -20,7 +20,6 @@ import { test } from 'vitest'
 
 import { normalizeHermesHomeRoot } from './backend-env'
 import { handoffResultPath } from './handoff-result'
-import { mcpBridgeQuiesceMarkerPath } from './mcp-bridge-quiesce'
 import { waitForUpdateClearance } from './update-gate'
 import {
   isPidAlive,
@@ -59,7 +58,6 @@ test('profile homes resolve every install lifecycle marker under the global Herm
 
   assert.equal(canonicalHome, globalHome)
   assert.equal(markerPath(canonicalHome), markerPath(globalHome))
-  assert.equal(mcpBridgeQuiesceMarkerPath(canonicalHome), mcpBridgeQuiesceMarkerPath(globalHome))
   assert.equal(handoffResultPath(canonicalHome), handoffResultPath(globalHome))
 })
 
