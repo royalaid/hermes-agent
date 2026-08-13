@@ -22,7 +22,8 @@
 #     -InstallRoot <path>   repo checkout (HERMES_HOME\hermes-agent)
 #     -Branch <ref>         branch to update against
 #     -DesktopPid <pid>     the Electron main process to wait out
-#     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
+#     [-RelaunchExe <path>] Hermes.exe/Electron executable to start when done
+#     [-RelaunchAppPath <path>] optional Electron development app entry
 #     [-BridgeLeaseId <id>] unguessable bridge-quiesce handoff capability
 #     [-NoUi]               headless (tests); default shows a progress window
 #     [-NoMarkerCleanup]    leave .hermes-update-in-progress in place (tests)
@@ -46,6 +47,7 @@ param(
     [string]$Branch = "main",
     [int]$DesktopPid = 0,
     [string]$RelaunchExe = "",
+    [string]$RelaunchAppPath = "",
     [string]$BridgeLeaseId = "",
     [switch]$NoUi,
     [switch]$NoMarkerCleanup
@@ -230,6 +232,7 @@ $script:RelaunchProcessStartedAt = 0L
 $script:RelaunchRequestedAt = 0L
 $script:RelaunchRequestStartedAt = 0L
 $script:CanonicalRelaunchExe = $null
+$script:CanonicalRelaunchAppPath = $null
 $script:AttemptId = "attempt-$([Guid]::NewGuid().ToString('N'))"
 $script:InvocationId = "invocation-$([Guid]::NewGuid().ToString('N'))"
 $script:AckPath = Join-Path $HermesHome (".hermes-update-ack-{0}.json" -f $script:AttemptId)
@@ -1140,8 +1143,26 @@ function Start-DesktopRelaunch {
             Write-HandoffLog 'WARNING: requested Desktop relaunch executable could not be canonicalized'
             return
         }
+        if (-not [string]::IsNullOrWhiteSpace($RelaunchAppPath)) {
+            try {
+                $script:CanonicalRelaunchAppPath = [System.IO.Path]::GetFullPath(
+                    (Resolve-Path -LiteralPath $RelaunchAppPath -ErrorAction Stop).ProviderPath
+                )
+                if ($script:CanonicalRelaunchAppPath.Contains('"')) {
+                    throw 'development app entry contains an unsupported quote'
+                }
+            } catch {
+                Write-HandoffLog 'WARNING: requested Desktop relaunch app entry could not be canonicalized'
+                return
+            }
+        }
         $script:RelaunchRequestedAt = Get-UnixTimeSeconds
-        Write-HandoffLog "relaunching desktop: $RelaunchExe"
+        $relaunchDescription = if ($script:CanonicalRelaunchAppPath) {
+            "$RelaunchExe $script:CanonicalRelaunchAppPath"
+        } else {
+            $RelaunchExe
+        }
+        Write-HandoffLog "relaunching desktop: $relaunchDescription"
         # DO NOT spawn Hermes.exe as our child: Electron/Chromium calls
         # AttachConsole(ATTACH_PARENT_PROCESS) at boot, so a Desktop launched
         # directly from this console PowerShell latches onto OUR console --
@@ -1153,8 +1174,12 @@ function Start-DesktopRelaunch {
         $spawned = $false
         try {
             $workDir = Split-Path -Parent $RelaunchExe
+            $commandLine = ('"{0}"' -f $RelaunchExe)
+            if ($script:CanonicalRelaunchAppPath) {
+                $commandLine += (' "{0}"' -f $script:CanonicalRelaunchAppPath)
+            }
             $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-                CommandLine      = ('"{0}"' -f $RelaunchExe)
+                CommandLine      = $commandLine
                 CurrentDirectory = $workDir
             } -ErrorAction Stop
             if ($r -and $r.ReturnValue -eq 0) {
@@ -1173,7 +1198,15 @@ function Start-DesktopRelaunch {
             try {
                 # Fallback keeps the old behavior (console tie-in and all) --
                 # a tethered Desktop beats no Desktop.
-                $fallback = Start-Process -FilePath $RelaunchExe -WorkingDirectory (Split-Path -Parent $RelaunchExe) -PassThru
+                $fallbackArgs = @{
+                    FilePath = $RelaunchExe
+                    WorkingDirectory = (Split-Path -Parent $RelaunchExe)
+                    PassThru = $true
+                }
+                if ($script:CanonicalRelaunchAppPath) {
+                    $fallbackArgs.ArgumentList = @($script:CanonicalRelaunchAppPath)
+                }
+                $fallback = Start-Process @fallbackArgs
                 if (-not (Set-RelaunchIdentity ([int]$fallback.Id))) {
                     Write-HandoffLog 'WARNING: fallback Desktop relaunch process identity could not be proved'
                 }
