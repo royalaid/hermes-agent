@@ -687,9 +687,13 @@ try {
     }
 
     # -- 3. Run the update from the CURRENT checkout ------------------------
-    # --force skips only the hermes.exe shim guard, which step 2 just PROVED
-    # is unlocked; the venv-python holder guard (orphan reap included) stays
-    # active. Our marker claim is adopted by the child via update_lock.py's
+    # The Desktop completed a target-root, PID-generation-checked force drain
+    # before this script was launched, then this worker waited for its shim to
+    # unlock. Pass --force-venv only for that explicitly authorized path: the
+    # legacy Python quiescence gate otherwise waits on this updater's own
+    # launcher chain and cannot distinguish it from a post-drain holder. A
+    # normal terminal `hermes update` retains its upstream venv-holder guard.
+    # Our marker claim is adopted by the child via update_lock.py's
     # process-ancestry rule.
     $hermesExe = Join-Path $InstallRoot "venv\Scripts\hermes.exe"
     if (-not (Test-Path -LiteralPath $hermesExe)) {
@@ -698,7 +702,7 @@ try {
         Write-HandoffLog $finalMsg
         exit $finalCode
     }
-    $updateArgs = @("update", "--yes", "--gateway", "--force", "--branch", $Branch)
+    $updateArgs = @("update", "--yes", "--gateway", "--force", "--force-venv", "--branch", $Branch)
     Write-HandoffLog ("running: hermes " + ($updateArgs -join " "))
     $res = Invoke-HermesStep $hermesExe $updateArgs "update"
     Write-HandoffLog "hermes update exit code: $($res.Code)"
