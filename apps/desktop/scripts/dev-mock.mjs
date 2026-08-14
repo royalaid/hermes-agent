@@ -175,7 +175,8 @@ providers:
 // ── Electron launch ────────────────────────────────────────────────────
 
 function findElectron() {
-  const local = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron')
+  const executableName = process.platform === 'win32' ? 'electron.exe' : 'electron'
+  const local = path.join(DESKTOP_ROOT, 'node_modules', 'electron', 'dist', executableName)
   if (fs.existsSync(local)) return local
   const r = spawnSync('which', ['electron'], { encoding: 'utf8' })
   if (r.status === 0 && r.stdout.trim()) return r.stdout.trim()
