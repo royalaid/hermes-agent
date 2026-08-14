@@ -116,6 +116,33 @@ excluded_stale_pre_rebuild:
   - f94cb5280  # feat(gateway): armed diagnostics ring (U3b)
 ```
 
+## 2026-08-14 composer-viewport corrective integration
+
+The published integration branch moved while the corrective rebuild was being
+verified. The newer published tip was already based on the current upstream
+and contained patch-equivalent versions of every commit on the source lineage
+except the composer correction. The final reconstruction therefore starts at
+that newer published tip and replays only the missing corrective commit.
+
+```yaml
+published_input_sha: 644efbd5decd10bfe3e0d6be5b9d818f48e2fb68
+published_input_safety_ref: safety/fork-integration-published-input-before-composer-20260814-0030
+source_branch: fix/desktop-dropped-frames
+source_head_sha: 364ec0167c20483f6b8c0962cb932308e72592f2
+source_commit_sha: 364ec0167c20483f6b8c0962cb932308e72592f2
+integration_code_head_sha: 6a28e1aee98a7458987ff02314844c1a3d516f48
+upstream_main_sha: 7a9634568cdeb8f5363bc99042a24ebff9df0e1c
+verified_merge_base_sha: 7a9634568cdeb8f5363bc99042a24ebff9df0e1c
+provenance: "git cherry matched every source-lineage patch except 364ec0167; replayed with cherry-pick -x"
+status: rebuilt_verified_pending_publish
+tests:
+  - "apps/desktop typecheck: passed"
+  - "apps/desktop targeted ESLint (src/app/chat/index.tsx): passed"
+  - "apps/desktop focused pane Vitest: 12 passed"
+  - "apps/desktop build: passed; build stamp 6a28e1aee98a"
+  - "apps/desktop Electron cold-resume composer viewport E2E: passed"
+```
+
 ## Integrated local fix record
 
 The following fork-local fix was integrated from a clean worktree based on the
@@ -125,13 +152,15 @@ published `fork-integration` tip:
 - component: desktop-dropped-frames
   source_worktree: C:\Users\gwmai\git\hermes-agent\.worktrees\fix-desktop-dropped-frames
   source_branch: fix/desktop-dropped-frames
-  source_head_sha: 4118ab25b3ab9977b731fee99702dc2f29780016
-  integration_sha: 1d337bffceaeb7091a62c0255dcb5c98faf7cb4b
+  source_head_sha: 364ec0167c20483f6b8c0962cb932308e72592f2
+  integration_sha: 6a28e1aee98a7458987ff02314844c1a3d516f48
   status: integrated
-  behavior: hidden-pane contain-intrinsic-size permanent + content-visibility toggle; reveal catch-up as a transition; ordered text|tool queue on one timer; flush-time sessionInterrupted re-check; terminal/approval events flush-then-apply
+  behavior: hidden-pane contain-intrinsic-size permanent + content-visibility toggle; reveal catch-up as a transition; ordered text|tool queue on one timer; flush-time sessionInterrupted re-check; terminal/approval events flush-then-apply; chat surface pinned to the pane viewport so a long transcript cannot displace the composer
   tests:
-    - "apps/desktop typecheck: passed"
-    - "apps/desktop test:ui: 3895 passed; expected journal defect + 3 known load-flaky files (passed in isolation)"
+    - "apps/desktop typecheck: passed at 6a28e1aee98a"
+    - "apps/desktop build: passed at 6a28e1aee98a"
+    - "apps/desktop focused pane Vitest: 12 passed"
+    - "apps/desktop Electron cold-resume composer viewport E2E: passed"
   open_item: "R2 scroll retention still needs a real-browser/electron e2e check on a deep scrolled-up transcript"
 - component: desktop-session-history-pane
   source_worktree: C:\Users\gwmai\AppData\Local\hermes\worktrees\fix-session-history-pane
