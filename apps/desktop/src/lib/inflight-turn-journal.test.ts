@@ -367,6 +367,34 @@ describe('persistInFlightTurnState', () => {
     expect(readInFlightTurnJournal('stored-1')).toBeNull()
   })
 
+  it('writes only the current session instead of reading and rewriting the aggregate journal', () => {
+    // Boot may perform the one-time legacy migration; measure the steady-state write.
+    readInFlightTurnJournal('stored-1')
+
+    const localStorage = window.localStorage
+    const storageConstructor = window.Storage
+
+    const spyTarget =
+      typeof storageConstructor === 'function' && localStorage instanceof storageConstructor
+        ? storageConstructor.prototype
+        : localStorage
+
+    const getItem = vi.spyOn(spyTarget, 'getItem')
+    const setItem = vi.spyOn(spyTarget, 'setItem')
+
+    try {
+      persistInFlightTurnState(journalState())
+      vi.advanceTimersByTime(400)
+
+      expect(getItem).not.toHaveBeenCalledWith(STORAGE_KEY)
+      expect(setItem).not.toHaveBeenCalledWith(STORAGE_KEY, expect.any(String))
+      expect(setItem).toHaveBeenCalledWith(sessionStorageKey('stored-1'), expect.any(String))
+    } finally {
+      getItem.mockRestore()
+      setItem.mockRestore()
+    }
+  })
+
   it('expires entries older than the max age', () => {
     persistInFlightTurnState(journalState())
     vi.advanceTimersByTime(400)
