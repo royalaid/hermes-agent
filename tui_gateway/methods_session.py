@@ -304,6 +304,9 @@ def _(rid, params: dict) -> dict:
     raw_cwd = _str_param(params, "cwd")  # unguarded, as on BASE: only the path check is best-effort
     with contextlib.suppress(Exception):
         explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
+    cron_session = _normalize_cron_session_marker(params.get("cron_session"))
+    if "cron_session" in params and params.get("cron_session") not in (None, "") and not cron_session:
+        return _err(rid, 4006, "cron_session must be a 12-character hexadecimal job id")
     _enable_gateway_prompts()
     # ``profile`` (app-global remote mode): stored so the build and every turn re-bind HERMES_HOME.
     profile_home = _profile_home(profile := (params.get("profile") or "").strip() or None)
@@ -315,6 +318,7 @@ def _(rid, params: dict) -> dict:
             "close_on_disconnect": _flag(params, "close_on_disconnect"),
             "active_session_lease": None,  # claimed lazily on the first turn (_ensure_active_session_slot)
             "cols": int(params.get("cols", 80)), "created_at": now, "edit_snapshots": {},
+            "cron_session": cron_session,
             "explicit_cwd": explicit_cwd,
             "history": history, "history_lock": threading.Lock(), "history_version": 0, "image_counter": 0,
             "cwd": _completion_cwd(params), "inflight_turn": None, "last_active": now,

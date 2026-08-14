@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -883,6 +884,8 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     stored runtime, or an unroutable provider → this session's picked model/effort/tier, else the default."""
     kw = {"session_db": session_db, "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(current),
           "platform_override": _session_source(current)}
+    if _normalize_cron_session_marker(current.get("cron_session")):
+        kw["disabled_toolsets"] = _cron_session_disabled_toolsets()
     if resume_sid := current.get("resume_session_id"):
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
@@ -1192,6 +1195,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         resolved = cwd if cwd is not None else (str(sess.get("cwd") or "") if sess is not None else "")
         source = _resolve_session_platform()
         browser_control_principal = browser_control_transport_family = ""
+        cron_session = ""
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
         # (no os.environ fallback), so never leave it "" — agent's durable session_id, then session_key.
         session_id = session_key
@@ -1202,11 +1206,12 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             if _methods_browser_control._is_authenticated_identity(identity):
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
+            cron_session = _normalize_cron_session_marker(sess.get("cron_session"))
         return set_session_vars(
             session_key=session_key, session_id=session_id, source=source,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
-            ui_session_id=ui_session_id, cron_session="")
+            ui_session_id=ui_session_id, cron_session=cron_session)
     return []
 
 
@@ -1382,6 +1387,28 @@ def _resolve_session_source(explicit: str | None) -> str:
     """Session DB ``source``: an explicit caller value (plugin session tagged ``"telegram"``) is never
     rewritten; only empty/None falls back to the env-resolved platform."""
     return explicit or _resolve_session_platform()
+
+
+_CRON_SESSION_MARKER_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def _normalize_cron_session_marker(value: Any) -> str:
+    """Return a canonical cron job marker, or an explicit non-cron marker."""
+    if not isinstance(value, str):
+        return ""
+    marker = value.strip().lower()
+    return marker if _CRON_SESSION_MARKER_RE.fullmatch(marker) else ""
+
+
+def _cron_session_disabled_toolsets() -> list[str]:
+    """Apply the scheduler's existing default loop-prevention policy."""
+    from cron.scheduler import _resolve_cron_disabled_toolsets
+
+    return [
+        toolset
+        for toolset in _resolve_cron_disabled_toolsets(_load_cfg())
+        if toolset == "cronjob"
+    ]
 
 
 def _resolve_agent_platform(source: str | None) -> str:
@@ -2262,7 +2289,8 @@ def _make_agent(
     sid: str, key: str, session_id: str | None = None, session_db=None,
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
-    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None):
+    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
+    disabled_toolsets: list[str] | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -2290,6 +2318,7 @@ def _make_agent(
             reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
         service_tier=service_tier_override if service_tier_override is not None else _load_service_tier(),
         enabled_toolsets=_load_enabled_toolsets(platform),
+        disabled_toolsets=disabled_toolsets,
         # OpenRouter provider_routing prefs (gateway + CLI parity).
         providers_allowed=_pr.get("only"), providers_ignored=_pr.get("ignore"), providers_order=_pr.get("order"),
         provider_sort=_pr.get("sort"), provider_require_parameters=_pr.get("require_parameters", False),
