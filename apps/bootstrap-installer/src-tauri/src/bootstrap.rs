@@ -35,6 +35,9 @@ const MAX_STAGE_ATTEMPTS: usize = 3;
 /// Frontend → Rust: kick off the install.
 #[derive(Debug, Deserialize)]
 pub struct StartBootstrapArgs {
+    /// Optional GitHub owner/repository override. Defaults to the repository
+    /// baked in via `BUILD_PIN_REPOSITORY`.
+    pub repository: Option<String>,
     /// Optional override for the commit pin. Defaults to the build-time
     /// pin baked in via `BUILD_PIN_COMMIT`.
     pub commit: Option<String>,
@@ -446,6 +449,10 @@ async fn run_bootstrap(
     let kind = ScriptKind::for_current_os();
 
     let pin = Pin {
+        repository: args
+            .repository
+            .or_else(|| option_env_string("BUILD_PIN_REPOSITORY"))
+            .unwrap_or_else(|| crate::build_pin::DEFAULT_REPOSITORY.to_string()),
         commit: args.commit.or_else(|| option_env_string("BUILD_PIN_COMMIT")),
         branch: args.branch.or_else(|| option_env_string("BUILD_PIN_BRANCH")),
     };
@@ -919,7 +926,10 @@ async fn run_install_script(
 }
 
 fn build_pin_args(script: &install_script::ResolvedScript) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = vec![
+        "-RepoUrl".to_string(),
+        format!("https://github.com/{}.git", script.repository),
+    ];
     if let Some(c) = &script.commit {
         out.push("-Commit".to_string());
         out.push(c.clone());
@@ -978,6 +988,7 @@ fn emit_event(app: &AppHandle, event: BootstrapEvent) {
 fn option_env_string(key: &str) -> Option<String> {
     // option_env! only accepts literals, so we hardcode the known keys.
     let val = match key {
+        "BUILD_PIN_REPOSITORY" => option_env!("BUILD_PIN_REPOSITORY"),
         "BUILD_PIN_COMMIT" => option_env!("BUILD_PIN_COMMIT"),
         "BUILD_PIN_BRANCH" => option_env!("BUILD_PIN_BRANCH"),
         _ => None,
@@ -998,6 +1009,29 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::path::Path;
+
+    #[test]
+    fn build_pin_args_forwards_repository_url_before_ref_pins() {
+        let script = install_script::ResolvedScript {
+            path: PathBuf::from("install.ps1"),
+            source: ScriptSource::Downloaded,
+            repository: "royalaid/hermes-agent".to_string(),
+            commit: Some("f6e3c6081fbe82084ff42605b7d27ab8d0af31f7".to_string()),
+            branch: Some("fork-integration".to_string()),
+        };
+
+        assert_eq!(
+            build_pin_args(&script),
+            vec![
+                "-RepoUrl",
+                "https://github.com/royalaid/hermes-agent.git",
+                "-Commit",
+                "f6e3c6081fbe82084ff42605b7d27ab8d0af31f7",
+                "-Branch",
+                "fork-integration"
+            ]
+        );
+    }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -1111,6 +1145,7 @@ mod tests {
         let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
 
         let pin = Pin {
+            repository: crate::build_pin::DEFAULT_REPOSITORY.to_string(),
             commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
             branch: Some("main".to_string()),
         };
@@ -1125,6 +1160,7 @@ mod tests {
     fn bootstrap_complete_marker_uses_desktop_compatible_schema() {
         let root = unique_tmp_dir("marker-schema");
         let pin = Pin {
+            repository: crate::build_pin::DEFAULT_REPOSITORY.to_string(),
             commit: Some("abcdef1234567890".to_string()),
             branch: Some("main".to_string()),
         };
@@ -1151,6 +1187,7 @@ mod tests {
         let root = unique_tmp_dir("marker-atomic");
         make_release_tree(&root);
         let pin = Pin {
+            repository: crate::build_pin::DEFAULT_REPOSITORY.to_string(),
             commit: Some("abcdef1234567890".to_string()),
             branch: Some("main".to_string()),
         };
@@ -1198,6 +1235,7 @@ mod tests {
         let not_a_dir = base.join("not-a-dir");
         std::fs::write(&not_a_dir, b"not a directory").unwrap();
         let pin = Pin {
+            repository: crate::build_pin::DEFAULT_REPOSITORY.to_string(),
             commit: Some("abcdef1234567890".to_string()),
             branch: Some("main".to_string()),
         };
