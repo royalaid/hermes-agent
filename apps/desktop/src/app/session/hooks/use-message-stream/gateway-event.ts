@@ -206,6 +206,7 @@ interface GatewayEventDeps {
   activeGatewayProfile: string
   activeSessionIdRef: MutableRefObject<string | null>
   compactedTurnRef: MutableRefObject<Set<string>>
+  discardQueuedStreamState: (sessionId: string) => void
   lastCwdInfoSessionRef: MutableRefObject<string | null>
   nativeSubagentSessionsRef: MutableRefObject<Set<string>>
   appendAssistantDelta: (sessionId: string, delta: string) => void
@@ -218,8 +219,16 @@ interface GatewayEventDeps {
   ) => void
   failAssistantMessage: (sessionId: string, errorMessage: string) => void
   flushQueuedDeltas: (sessionId?: string) => void
+  flushSubagentEvents: (sessionId?: string) => void
   finalizeInterimAssistantMessage: (sessionId: string, text: string) => void
   queryClient: QueryClient
+  queueSubagentEvent: (
+    sessionId: string,
+    payload: Record<string, unknown>,
+    createIfMissing: boolean,
+    eventType: string
+  ) => void
+  queueToolCall: (sessionId: string, payload: GatewayEventPayload | undefined, sourceEventType?: string) => void
   refreshHermesConfig: () => Promise<void>
   sessionInterrupted: (sessionId: string) => boolean
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
@@ -244,13 +253,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     activeGatewayProfile,
     activeSessionIdRef,
     compactedTurnRef,
+    discardQueuedStreamState,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
     completeAssistantMessage,
     failAssistantMessage,
     flushQueuedDeltas,
+    flushSubagentEvents,
     finalizeInterimAssistantMessage,
     queryClient,
+    queueSubagentEvent,
+    queueToolCall,
     refreshHermesConfig,
     sessionInterrupted,
     sessionStateByRuntimeIdRef,
@@ -387,6 +400,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const reclaimedRuntimeId = String((payload as { session_id?: string } | undefined)?.session_id ?? '')
 
         if (reclaimedRuntimeId) {
+          // Buffered deltas / tool rows / subagent progress for a session the
+          // backend just reclaimed must not land: applying them would republish
+          // running state for a dead turn and re-create the cache entry the
+          // drop below removes.
+          discardQueuedStreamState(reclaimedRuntimeId)
           dropSessionState(reclaimedRuntimeId)
         }
 
@@ -857,8 +875,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           return
         }
 
-        flushQueuedDeltas(sessionId)
-        upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type)
+        // Non-terminal: queue it INTO the delta pipeline instead of flushing
+        // that pipeline and publishing now. A `tool.progress` burst otherwise
+        // costs one drain + one commit per tick; queued, the whole window
+        // applies in one commit with the text that arrived around it, still in
+        // arrival order. Terminal frames (below) keep the eager path.
+        queueToolCall(sessionId, toTodoPayload(payload) ?? payload, event.type)
 
         if (isActiveEvent) {
           setPetActivity({ reasoning: false, toolRunning: true })
@@ -921,18 +943,28 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // of a stopped turn, but accept its terminal frame so a dead child does
         // not remain a non-prunable running card across tabs or later turns.
         const isTerminalSubagentEvent = event.type === 'subagent.complete'
+
         if (sessionId && payload && (isTerminalSubagentEvent || !sessionInterrupted(sessionId))) {
           if (!nativeSubagentSessionsRef.current.has(sessionId)) {
             pruneDelegateFallbackSubagents(sessionId)
           }
 
           nativeSubagentSessionsRef.current.add(sessionId)
-          upsertSubagent(
-            sessionId,
-            payload as Record<string, unknown>,
-            event.type === 'subagent.spawn_requested' || event.type === 'subagent.start',
-            event.type
-          )
+          const createIfMissing = event.type === 'subagent.spawn_requested' || event.type === 'subagent.start'
+
+          if (isTerminalSubagentEvent) {
+            // Terminal: publish whatever the coalescer is holding for this
+            // session first, then apply now — a finished child must never sit
+            // behind a batching window, and its row must not be overwritten by
+            // stale running state flushed after it.
+            flushSubagentEvents(sessionId)
+            upsertSubagent(sessionId, payload as Record<string, unknown>, createIfMissing, event.type)
+          } else {
+            // Progress/thinking/tool frames of a row already on screen batch on
+            // the same timing profile as the text flusher; the coalescer passes
+            // the FIRST event for a new row straight through.
+            queueSubagentEvent(sessionId, payload as Record<string, unknown>, createIfMissing, event.type)
+          }
         }
       } else if (event.type === 'clarify.request') {
         // Surface the clarify tool's overlay. The Python side is blocked on
@@ -1027,6 +1059,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // surfaces once the user focuses that chat.
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
+
+        if (sessionId) {
+          // The inline approval strip binds POSITIONALLY to the pending tool
+          // row (terminal / execute_code), and that row now rides the queued
+          // delta pipeline. Publishing the request while its row is still
+          // queued mounts the floating fallback first and makes the strip jump
+          // when the timer flush lands — so drain the queue before the request
+          // goes out, the same ordering every other input request gets via
+          // upsertToolCall.
+          flushQueuedDeltas(sessionId)
+        }
 
         setApprovalRequest({
           // false only when a tirith warning forbids it; backend omits the field otherwise.
@@ -1352,12 +1395,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       activeGatewayProfile,
       compactedTurnRef,
       completeAssistantMessage,
+      discardQueuedStreamState,
       failAssistantMessage,
       finalizeInterimAssistantMessage,
       flushQueuedDeltas,
+      flushSubagentEvents,
       lastCwdInfoSessionRef,
       nativeSubagentSessionsRef,
       queryClient,
+      queueSubagentEvent,
+      queueToolCall,
       scheduleConfigRefresh,
       sessionInterrupted,
       sessionStateByRuntimeIdRef,

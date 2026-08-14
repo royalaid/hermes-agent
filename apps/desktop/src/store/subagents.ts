@@ -114,6 +114,12 @@ const asTail = (v: unknown): TailEntry[] =>
 const idOf = (p: SubagentPayload) =>
   str(p.subagent_id) || `${str(p.parent_id) || 'root'}:${num(p.task_index) ?? 0}:${str(p.goal)}`
 
+/** The row id a payload will land on. Exported so the desktop stream coalescer
+ *  can tell a brand-new delegate (publish now, so the row appears as it starts)
+ *  from progress on a row that is already on screen (safe to batch) without
+ *  re-deriving — and drifting from — this id rule. */
+export const subagentIdOf = idOf
+
 const appendStream = (stream: SubagentStreamEntry[], entry: SubagentStreamEntry) => {
   const last = stream.at(-1)
 
@@ -253,26 +259,80 @@ export function pruneDelegateFallbackSubagents(sid: string) {
   $subagentsBySession.set({ ...map, [sid]: next })
 }
 
-export function upsertSubagent(sid: string, payload: SubagentPayload, createIfMissing = true, eventType?: string) {
-  const map = $subagentsBySession.get()
-  const list = map[sid] ?? []
+/** Merge one payload into a session's list. Returns the next list, or null when
+ *  the payload changes nothing (missing row we may not create, or a row that
+ *  already reached a terminal status). Pure: no atom write, so a batch can fold
+ *  many payloads and publish once. */
+function mergeUpsert(
+  list: SubagentProgress[],
+  payload: SubagentPayload,
+  createIfMissing: boolean,
+  eventType?: string
+): SubagentProgress[] | null {
   const id = idOf(payload)
   const idx = list.findIndex(item => item.id === id)
 
   if (idx < 0 && !createIfMissing) {
-    return
+    return null
   }
 
   const prev = idx >= 0 ? list[idx] : undefined
 
   if (prev && TERMINAL.has(prev.status)) {
-    return
+    return null
   }
 
   const next = toProgress(payload, prev, eventType)
-  const nextList = idx >= 0 ? list.map(item => (item.id === id ? next : item)) : [...list, next]
+
+  return idx >= 0 ? list.map(item => (item.id === id ? next : item)) : [...list, next]
+}
+
+export function upsertSubagent(sid: string, payload: SubagentPayload, createIfMissing = true, eventType?: string) {
+  const map = $subagentsBySession.get()
+  const nextList = mergeUpsert(map[sid] ?? [], payload, createIfMissing, eventType)
+
+  if (!nextList) {
+    return
+  }
 
   $subagentsBySession.set({ ...map, [sid]: nextList })
+}
+
+export interface SubagentUpsert {
+  createIfMissing?: boolean
+  eventType?: string
+  payload: SubagentPayload
+}
+
+/**
+ * Apply a run of subagent events with ONE atom publish. A streaming delegate
+ * emits progress far faster than the UI can usefully repaint, and every
+ * `upsertSubagent` clones the whole session map + list and notifies every
+ * subscriber; folding a coalescing window's worth of payloads here keeps the
+ * per-event merge semantics (last write wins, terminal rows frozen, stream tail
+ * accumulated in arrival order) while costing one publish instead of N.
+ */
+export function upsertSubagents(sid: string, updates: readonly SubagentUpsert[]) {
+  if (!updates.length) {
+    return
+  }
+
+  const map = $subagentsBySession.get()
+  let list = map[sid] ?? []
+  let changed = false
+
+  for (const update of updates) {
+    const next = mergeUpsert(list, update.payload, update.createIfMissing ?? true, update.eventType)
+
+    if (next) {
+      list = next
+      changed = true
+    }
+  }
+
+  if (changed) {
+    $subagentsBySession.set({ ...map, [sid]: list })
+  }
 }
 
 export function buildSubagentTree(items: readonly SubagentProgress[]): SubagentNode[] {
