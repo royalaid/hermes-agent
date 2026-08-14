@@ -144,6 +144,34 @@ async function paintState(page: Page): Promise<PaintState> {
   return state!
 }
 
+async function assertComposerInsideViewport(page: Page): Promise<void> {
+  const composer = page.locator('[data-slot="composer-root"]:visible').first()
+  await expect(composer, 'the active chat surface should render a visible composer').toBeVisible()
+
+  const layout = await composer.evaluate(element => {
+    const composerRect = element.getBoundingClientRect()
+    const surfaceRect = element.closest<HTMLElement>('[data-chat-surface]')?.getBoundingClientRect() ?? null
+
+    return {
+      bottom: composerRect.bottom,
+      height: composerRect.height,
+      surfaceFound: surfaceRect !== null,
+      top: composerRect.top,
+      viewportBottom: Math.min(window.innerHeight, surfaceRect?.bottom ?? window.innerHeight),
+      viewportTop: Math.max(0, surfaceRect?.top ?? 0),
+    }
+  })
+
+  expect(layout.surfaceFound, 'the active composer should belong to a chat surface').toBe(true)
+  expect(layout.height, `composer should have non-zero height: ${JSON.stringify(layout)}`).toBeGreaterThan(0)
+  expect(layout.top, `composer should start inside the viewport: ${JSON.stringify(layout)}`).toBeGreaterThanOrEqual(
+    layout.viewportTop,
+  )
+  expect(layout.bottom, `composer should end inside the viewport: ${JSON.stringify(layout)}`).toBeLessThanOrEqual(
+    layout.viewportBottom,
+  )
+}
+
 async function textNodeOccurrences(page: Page, expected: string): Promise<number> {
   return page.evaluate(text => {
     const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
@@ -185,6 +213,14 @@ test.describe('large session resume', () => {
   test.afterEach(async () => {
     await fixture?.cleanup()
     fixture = null
+  })
+
+  test('cold resume keeps the composer inside the chat viewport', async () => {
+    fixture = await setupSeededDesktop()
+    await waitForAppReady(fixture, 120_000)
+
+    await openSeededSession(fixture.page)
+    await assertComposerInsideViewport(fixture.page)
   })
 
   test('cold resume of an unchanged session has one user row and bounded transcript paints', async ({}, testInfo) => {
