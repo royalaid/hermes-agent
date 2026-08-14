@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -2364,6 +2365,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
                 kw = {"session_db": session_db}
+                if _normalize_cron_session_marker(current.get("cron_session")):
+                    kw["disabled_toolsets"] = _cron_session_disabled_toolsets()
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -3438,12 +3441,16 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        cron_session = ""
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
                     source = _session_source(sess)
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
+                    )
+                    cron_session = _normalize_cron_session_marker(
+                        sess.get("cron_session")
                     )
                     break
         return set_session_vars(
@@ -3452,7 +3459,7 @@ def _set_session_context(
             source=source,
             cwd=resolved,
             ui_session_id=ui_session_id,
-            cron_session="",
+            cron_session=cron_session,
         )
     except Exception:
         return []
@@ -4036,6 +4043,28 @@ def _resolve_session_source(explicit: str | None) -> str:
     if explicit:
         return explicit
     return _resolve_session_platform()
+
+
+_CRON_SESSION_MARKER_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def _normalize_cron_session_marker(value: Any) -> str:
+    """Return a canonical cron job marker, or an explicit non-cron marker."""
+    if not isinstance(value, str):
+        return ""
+    marker = value.strip().lower()
+    return marker if _CRON_SESSION_MARKER_RE.fullmatch(marker) else ""
+
+
+def _cron_session_disabled_toolsets() -> list[str]:
+    """Apply the scheduler's existing default loop-prevention policy."""
+    from cron.scheduler import _resolve_cron_disabled_toolsets
+
+    return [
+        toolset
+        for toolset in _resolve_cron_disabled_toolsets(_load_cfg())
+        if toolset == "cronjob"
+    ]
 
 
 def _resolve_agent_platform(source: str | None) -> str:
@@ -6831,12 +6860,13 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
-        new_agent = _make_agent(
-            sid,
-            session["session_key"],
-            session_id=session["session_key"],
-            platform_override=_session_source(session),
-        )
+        kwargs = {
+            "session_id": session["session_key"],
+            "platform_override": _session_source(session),
+        }
+        if _normalize_cron_session_marker(session.get("cron_session")):
+            kwargs["disabled_toolsets"] = _cron_session_disabled_toolsets()
+        new_agent = _make_agent(sid, session["session_key"], **kwargs)
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
@@ -7006,6 +7036,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    disabled_toolsets: list[str] | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -7162,6 +7193,7 @@ def _make_agent(
             else _load_service_tier()
         ),
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        disabled_toolsets=disabled_toolsets,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
