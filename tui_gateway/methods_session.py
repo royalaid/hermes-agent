@@ -33,6 +33,9 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    cron_session = _normalize_cron_session_marker(params.get("cron_session"))
+    if "cron_session" in params and params.get("cron_session") not in (None, "") and not cron_session:
+        return _err(rid, 4006, "cron_session must be a 12-character hexadecimal job id")
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -83,6 +86,7 @@ def _(rid, params: dict) -> dict:
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "active_session_lease": lease,
             "cols": cols,
+            "cron_session": cron_session,
             "created_at": now,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
