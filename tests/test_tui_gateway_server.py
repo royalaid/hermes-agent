@@ -172,6 +172,57 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_session_create_cron_marker_is_live_only_and_scopes_agent_turn_context(monkeypatch):
+    """A desktop-visible investigation can carry a cron-origin marker safely."""
+    from gateway.session_context import get_session_env
+
+    persisted = {}
+
+    class FakeDb:
+        def create_session(self, _key, **kwargs):
+            persisted.update(kwargs)
+
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDb())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    try:
+        marked = server._methods["session.create"](
+            "r1", {"source": "desktop", "cron_session": " 1AB4C7013FEF "}
+        )
+        marked_sid = marked["result"]["session_id"]
+        marked_session = server._sessions[marked_sid]
+
+        assert marked_session["source"] == "desktop"
+        assert marked_session["cron_session"] == "1ab4c7013fef"
+        server._ensure_session_db_row(marked_session)
+        assert "cron_session" not in persisted
+        assert "cron_session" not in (persisted["model_config"] or {})
+        tokens = server._set_session_context(marked_session["session_key"])
+        try:
+            assert get_session_env("HERMES_CRON_SESSION") == "1ab4c7013fef"
+        finally:
+            server._clear_session_context(tokens)
+
+        before_invalid = set(server._sessions)
+        invalid = server._methods["session.create"](
+            "r-invalid", {"cron_session": "cron-origin"}
+        )
+        assert invalid["error"]["code"] == 4006
+        assert set(server._sessions) == before_invalid
+
+        plain = server._methods["session.create"]("r2", {"source": "desktop"})
+        plain_session = server._sessions[plain["result"]["session_id"]]
+        assert plain_session["source"] == "desktop"
+        assert plain_session["cron_session"] == ""
+        tokens = server._set_session_context(plain_session["session_key"])
+        try:
+            assert get_session_env("HERMES_CRON_SESSION") == ""
+        finally:
+            server._clear_session_context(tokens)
+    finally:
+        server._sessions.clear()
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):
@@ -16540,9 +16591,16 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
         server._sessions.clear()
 
 
-@pytest.mark.parametrize("service_tier_override", ["priority", ""])
-def test_start_agent_build_passes_session_model_override(
-    monkeypatch, service_tier_override
+@pytest.mark.parametrize(
+    ("service_tier_override", "cron_session", "expected_disabled_toolsets"),
+    [
+        ("priority", "", None),
+        ("", "", None),
+        ("", "1ab4c7013fef", ["cronjob"]),
+    ],
+)
+def test_start_agent_build_passes_session_model_override_and_cron_policy(
+    monkeypatch, service_tier_override, cron_session, expected_disabled_toolsets
 ):
     """A model staged on the session (e.g. by session.create from the desktop
     composer) must reach _make_agent so the first build runs on it directly —
@@ -16572,6 +16630,7 @@ def test_start_agent_build_passes_session_model_override(
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
     monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
     monkeypatch.setattr(server, "_probe_config_health", lambda *_a: None)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
 
     sid = "build-sid"
     override = {"model": "claude-sonnet-4.6", "provider": "anthropic"}
@@ -16584,6 +16643,7 @@ def test_start_agent_build_passes_session_model_override(
         "model_override": override,
         "create_reasoning_override": reasoning,
         "create_service_tier_override": service_tier_override,
+        "cron_session": cron_session,
     }
     server._sessions[sid] = session
     try:
@@ -16592,6 +16652,7 @@ def test_start_agent_build_passes_session_model_override(
         assert captured.get("model_override") == override
         assert captured.get("reasoning_config_override") == reasoning
         assert captured.get("service_tier_override") == service_tier_override
+        assert captured.get("disabled_toolsets") == expected_disabled_toolsets
         assert session["agent"].model == "claude-sonnet-4.6"
     finally:
         server._sessions.clear()
