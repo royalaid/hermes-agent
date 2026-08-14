@@ -63,6 +63,11 @@ class TestRouteGate:
             "https://chatgpt.com/backend-api/codex", is_codex_backend=True
         )
 
+    def test_codex_backend_flag_does_not_trust_custom_relays(self):
+        assert not is_direct_openai_route(
+            "https://relay.example/v1", is_codex_backend=True
+        )
+
     def test_everything_else_rejected(self):
         for url in (
             "https://openrouter.ai/api/v1",
