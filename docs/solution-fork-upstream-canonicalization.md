@@ -37,10 +37,12 @@ Use four explicit boundaries:
 repository: royalaid/hermes-agent
 integration_branch: fork-integration
 upstream_repository: NousResearch/hermes-agent
-upstream_main_sha: cc389f81550180ad81bfddaa8b40dd0338d13c6d
+upstream_main_sha: 423f92e607dd51908d23b04758bc0fcd6ec5ff39
 fork_main_sha: a8c50eb1d841563eff22bd707d80472e7f1e9c9f
-integration_base_sha: cc389f81550180ad81bfddaa8b40dd0338d13c6d
-integration_code_head_sha: 27b83dc8fcfee7ae437c614148a389542aa98e2a
+integration_base_sha: 423f92e607dd51908d23b04758bc0fcd6ec5ff39
+integration_code_head_sha: 1d337bffceaeb7091a62c0255dcb5c98faf7cb4b
+published_input_sha: 7d094ca310a6601271b8846ed291030cee2e3d6a
+reconstructed_replay_head_sha: ba65ac08b396e5f268c2435bc086ab09e14ca35f
 upstream_pr: https://github.com/NousResearch/hermes-agent/pull/84778
 upstream_pr_head_sha: 45213d7f718ab4e32f0b4b6274a75a004e7604bd
 status: rebuilt_pending_release_verification
@@ -72,12 +74,50 @@ An upstream PR being open or closed does not by itself authorize duplication or
 discarding. Use the PR head SHA, patch identity, and the readiness/exclusion
 record above.
 
+## 2026-08-14 rebuild provenance
+
+Replay source was `git rev-list --reverse cc389f815..7d094ca31` (82 commits)
+onto `upstream/main` `423f92e60`. `git cherry` of the old published tip against
+the reconstructed head reported 79 exact patch-id matches and three `+` entries.
+None of those three is the excluded stale pair `156931078` /
+`f94cb5280`.
+
+```yaml
+semantic_or_context_replays:
+  - source: b1563f6c9d358e42930d1a5e75aa655b951d05df
+    subject: "fix(updater): coordinate native Windows process ownership"
+    reason: content conflict with upstream #85539 node-deps repair on the already-current path
+    resolution: kept both the fork completion_message assignment and _repair_node_deps_on_current_checkout
+  - source: b1b989882a8c53b21a9f86f0ac0364b961997333
+    subject: "fix(updater): harden native Windows lifecycle authority"
+    reason: content conflict with upstream npx cache warm-up and the rewritten already-current path
+    resolution: kept upstream warm-up plus the fork is-False lockfile check; took the incoming health-proof rewrite that supersedes the intermediate else-branch
+  - source: 463636dea70f948ca008e560d6c5f6e296aef7e6
+    subject: "fix(installer): preserve custom fork remotes"
+    reason: context-only patch-id drift after upstream SkipComputerUse hunks moved nearby lines
+    resolution: same added lines (REPO_URL_OVERRIDE / fork origin preservation); no behavior change
+excluded_stale_pre_rebuild:
+  - 156931078  # fix(updater): coordinate native Windows process ownership
+  - f94cb5280  # feat(gateway): armed diagnostics ring (U3b)
+```
+
 ## Integrated local fix record
 
 The following fork-local fix was integrated from a clean worktree based on the
 published `fork-integration` tip:
 
 ```yaml
+- component: desktop-dropped-frames
+  source_worktree: C:\Users\gwmai\git\hermes-agent\.worktrees\fix-desktop-dropped-frames
+  source_branch: fix/desktop-dropped-frames
+  source_head_sha: 4118ab25b3ab9977b731fee99702dc2f29780016
+  integration_sha: 1d337bffceaeb7091a62c0255dcb5c98faf7cb4b
+  status: integrated
+  behavior: hidden-pane contain-intrinsic-size permanent + content-visibility toggle; reveal catch-up as a transition; ordered text|tool queue on one timer; flush-time sessionInterrupted re-check; terminal/approval events flush-then-apply
+  tests:
+    - "apps/desktop typecheck: passed"
+    - "apps/desktop test:ui: 3895 passed; expected journal defect + 3 known load-flaky files (passed in isolation)"
+  open_item: "R2 scroll retention still needs a real-browser/electron e2e check on a deep scrolled-up transcript"
 - component: desktop-session-history-pane
   source_worktree: C:\Users\gwmai\AppData\Local\hermes\worktrees\fix-session-history-pane
   source_branch: fix/desktop-session-history-pane
