@@ -1,5 +1,8 @@
 use std::process::Command;
 
+#[path = "src/build_pin.rs"]
+mod build_pin;
+
 fn main() {
     // -----------------------------------------------------------------
     // Bake the install.ps1 pin into the binary at compile time.
@@ -33,6 +36,10 @@ fn main() {
 
     let commit = resolve_commit_pin();
     let branch = resolve_branch_pin();
+    let repository = resolve_repository_pin();
+
+    println!("cargo:rustc-env=BUILD_PIN_REPOSITORY={repository}");
+    println!("cargo:warning=hermes-bootstrap: repository {repository}");
 
     if let Some(c) = &commit {
         println!("cargo:rustc-env=BUILD_PIN_COMMIT={c}");
@@ -81,6 +88,8 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_COMMIT");
     println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_BRANCH");
+    println!("cargo:rerun-if-env-changed=HERMES_BUILD_PIN_REPOSITORY");
+    println!("cargo:rerun-if-env-changed=GITHUB_REPOSITORY");
 
     // -----------------------------------------------------------------
     // Tauri windows manifest. See hermes-setup.manifest for rationale —
@@ -164,6 +173,39 @@ fn resolve_branch_pin() -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+fn resolve_repository_pin() -> String {
+    let explicit = std::env::var("HERMES_BUILD_PIN_REPOSITORY").ok();
+    let github_repository = std::env::var("GITHUB_REPOSITORY").ok();
+    let upstream_remote = git_output(&[
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ])
+    .and_then(|upstream| {
+        let remote = upstream.split('/').next()?;
+        git_output(&["remote", "get-url", remote])
+    });
+    let origin_remote = git_output(&["remote", "get-url", "origin"]);
+
+    build_pin::select_repository_pin(
+        explicit.as_deref(),
+        github_repository.as_deref(),
+        upstream_remote.as_deref(),
+        origin_remote.as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("invalid bootstrap repository pin: {error}"))
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn locate_git_dir() -> Option<std::path::PathBuf> {
