@@ -3277,8 +3277,8 @@ async function applyWindowsCanonicalHandoff() {
 
   // This is the only behavioral extension to upstream's hand-off: an explicit
   // Update drains every *currently proven* holder of this installation before
-  // the canonical script takes over. Unknown or respawning holders still stop
-  // the update; no name- or PID-only process is touched.
+  // the canonical updater hand-off takes over. Unknown or respawning holders
+  // still stop the update; no name- or PID-only process is touched.
   const preflight = await runWindowsForceDrain(updateRoot)
 
   if (preflight.kind !== 'clear') {
@@ -3296,7 +3296,7 @@ async function applyWindowsCanonicalHandoff() {
   const scriptHandoff = resolveUpdateScriptHandoff(updateRoot)
   let child
 
-  if (scriptHandoff) {
+  if (scriptHandoff && !updater) {
     const handoffArgs = [
       '-InstallRoot',
       updateRoot,
@@ -3357,7 +3357,7 @@ async function applyWindowsCanonicalHandoff() {
     app.quit()
   }, UPDATE_HANDOFF_DWELL_MS)
 
-  return { ok: true, handedOff: true, updater: scriptHandoff?.scriptPath ?? updater }
+  return { ok: true, handedOff: true, updater: updater ?? scriptHandoff?.scriptPath }
 }
 
 // applyUpdates — hand off to a repo-owned detached orchestrator, then exit.
