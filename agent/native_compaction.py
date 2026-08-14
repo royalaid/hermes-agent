@@ -44,12 +44,14 @@ def resolve_native_compaction_capabilities(
 
 def is_direct_openai_route(base_url: Optional[str], *, is_codex_backend: bool = False) -> bool:
     """True for api.openai.com or the ChatGPT Codex backend — nothing else."""
-    if is_codex_backend:
-        return True
     try:
-        hostname = (urlsplit(base_url or "").hostname or "").lower()
+        parsed = urlsplit(base_url or "")
+        hostname = (parsed.hostname or "").lower()
+        path = (parsed.path or "").rstrip("/").lower()
     except ValueError:
         return False
+    if is_codex_backend:
+        return hostname == "chatgpt.com" and path.startswith("/backend-api/codex")
     return hostname == "api.openai.com"
 
 
