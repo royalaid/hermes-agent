@@ -638,10 +638,12 @@ const ChatViewContent = memo(function ChatViewContent({
 
   const overlayKind: DragKind = dragKind === 'files' ? 'files' : sessionDragging && !sessionEdgeHover ? 'session' : null
 
+  // Pane content can grow intrinsically to retain a hidden tab's scroll box.
+  // Pin chat to that pane so a long transcript cannot move its docked composer below the viewport.
   return (
     <div
       className={cn(
-        'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
+        'absolute inset-0 isolate flex min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
         className
       )}
       data-chat-surface=""
