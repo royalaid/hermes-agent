@@ -1,9 +1,9 @@
 import type { McpBridgeQuiesceLease } from './mcp-bridge-quiesce'
 import {
+  type DesktopPluginServiceProcess,
   formatBlockerMessage,
   formatProbeFailedMessage,
   isExactVenvHolder,
-  type DesktopPluginServiceProcess,
   type ScanOutcome,
   type VenvBlockerProcess,
   type VenvBlockerScanResult
