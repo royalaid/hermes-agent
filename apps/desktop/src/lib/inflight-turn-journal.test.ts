@@ -386,9 +386,9 @@ describe('persistInFlightTurnState', () => {
       persistInFlightTurnState(journalState())
       vi.advanceTimersByTime(400)
 
-      expect(getItem).not.toHaveBeenCalledWith(LEGACY_STORAGE_KEY)
-      expect(setItem).not.toHaveBeenCalledWith(LEGACY_STORAGE_KEY, expect.any(String))
-      expect(setItem).toHaveBeenCalledWith(sessionKey('stored-1'), expect.any(String))
+      expect(getItem).not.toHaveBeenCalledWith(STORAGE_KEY)
+      expect(setItem).not.toHaveBeenCalledWith(STORAGE_KEY, expect.any(String))
+      expect(setItem).toHaveBeenCalledWith(sessionStorageKey('stored-1'), expect.any(String))
     } finally {
       getItem.mockRestore()
       setItem.mockRestore()
