@@ -1274,7 +1274,7 @@ def test_update_help_discloses_windows_mcp_interruption_consent():
     assert "exact, verified" in help_text
 
 
-def test_real_parser_to_check_path_uses_origin_and_forced_refspec(
+def test_real_parser_to_check_path_uses_configured_fork_remote_and_forced_refspec(
     tmp_path: Path, monkeypatch
 ):
     root = tmp_path / "repo"
@@ -1287,8 +1287,10 @@ def test_real_parser_to_check_path_uses_origin_and_forced_refspec(
     def run(command, **_kwargs):
         commands.append([str(part) for part in command])
         joined = " ".join(str(part) for part in command)
-        if "remote get-url -- origin" in joined:
-            return subprocess.CompletedProcess(command, 0, "file:///origin\n", "")
+        if "config --get branch.feature.remote" in joined:
+            return subprocess.CompletedProcess(command, 0, "fork\n", "")
+        if "remote get-url -- fork" in joined:
+            return subprocess.CompletedProcess(command, 0, "file:///fork\n", "")
         if "config --includes --show-origin --show-scope --name-only --get-regexp" in joined:
             return subprocess.CompletedProcess(command, 1, "", "")
         if "rev-parse --is-shallow-repository" in joined:
@@ -1313,11 +1315,11 @@ def test_real_parser_to_check_path_uses_origin_and_forced_refspec(
     fetch = next(command for command in commands if "fetch" in command)
     assert fetch[-3:] == [
         "--",
-        "origin",
-        "+refs/heads/feature:refs/remotes/origin/feature",
+        "fork",
+        "+refs/heads/feature:refs/remotes/fork/feature",
     ]
-    assert any("HEAD..refs/remotes/origin/feature" in command for command in commands)
-    assert not any("branch.feature.remote" in command for command in commands)
+    assert any("HEAD..refs/remotes/fork/feature" in command for command in commands)
+    assert any("branch.feature.remote" in command for command in commands)
 
 
 def test_branch_tracking_remote_is_not_update_authority(

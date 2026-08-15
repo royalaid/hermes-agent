@@ -215,7 +215,6 @@ import { buildHudWindowUrl } from './hud-url'
 import { imageContextMenuItems } from './image-context-menu'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
-import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   acquireMcpBridgeQuiesceLease,
   clearMcpBridgeQuiesceLease,
@@ -226,6 +225,7 @@ import {
   revokeMcpBridgeQuiesceLease,
   waitForMcpBridgeQuiesceLeaseAdoption
 } from './mcp-bridge-quiesce'
+import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
   oauthSessionIsLive,
@@ -243,11 +243,6 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
-import {
-  buildWindowsRelaunchCommand,
-  configureWindowsTaskbarDetails,
-  resolveWindowsAppUserModelId
-} from './windows-taskbar-details'
 import {
   createParentStartMarkerResolver,
   electronProcessStartMarker,
@@ -316,6 +311,7 @@ import {
 } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
+import { resolveDefaultUpdateBranch } from './update-branch'
 import {
   compareApiUrl,
   parseCompareBehindCount,
@@ -323,7 +319,6 @@ import {
   resolveCommitLogSelection,
   shouldCountCommits
 } from './update-count'
-import { resolveDefaultUpdateBranch } from './update-branch'
 import { UpdateInFlightTransaction, waitForLocalBackendClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import {
@@ -331,17 +326,17 @@ import {
   type UpdatePreflightOutcome,
   type UpdatePreflightPurpose
 } from './update-preflight'
-import { isOfficialSshRemote, resolveUpdateRemote } from './update-remote'
+import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL, resolveUpdateRemote } from './update-remote'
 import {
-  observeUpdaterHandoff,
   captureSpawnedUpdaterCreatedAt,
   collectRelaunchArgs,
   formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
   launchWindowsUpdateTransport,
-  resolveWindowsDevRelaunchAppPath,
+  observeUpdaterHandoff,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
+  resolveWindowsDevRelaunchAppPath,
   resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
@@ -396,6 +391,11 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
+import {
+  buildWindowsRelaunchCommand,
+  configureWindowsTaskbarDetails,
+  resolveWindowsAppUserModelId
+} from './windows-taskbar-details'
 import { readWindowsHostPath, readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -2281,10 +2281,9 @@ async function waitForUpdateToFinish() {
     timeoutMs: UPDATE_WAIT_TIMEOUT_MS
   })
 
-  // The detached hand-off scripts run hidden; on Windows the authenticated
-  // schema-v2 implementation is scripts/desktop-update.ps1. The result file
-  // is the ONLY way the user learns a detached update
-  // failed. Consume it exactly once, here, right where boot passes the
+  // On Windows, scripts/desktop-update/windows.ps1 owns the visible update
+  // surface while this result file carries the authenticated terminal state
+  // into the relaunched Desktop. Consume it exactly once where boot passes the
   // update gate — success gets a log line, failure gets a real dialog
   // (previously a failed detached update was indistinguishable from
   // "nothing happened").
@@ -3241,7 +3240,7 @@ let quitPromptOpen = false
 let quitConfirmedWithActiveWork = false
 
 // Resolve the staged updater used only for packaged Windows bootstrap
-// recovery. Ordinary updates require the repo-owned schema-v2 flat script;
+// recovery. Ordinary updates require the repo-owned canonical schema-v2 script;
 // legacy staged binaries have no proven bridge-lease protocol. macOS/Linux
 // stage the same binary but deliberately do not use it; see
 // resolveStagedUpdaterBinary for the policy and #74836.
@@ -3740,7 +3739,7 @@ async function releaseBackendLock(updateRoot, tag) {
 // `hermes update` (which refuses while we hold the venv shim) and rebuild the
 // desktop with our exe already gone.
 //
-// Windows requires the authenticated schema-v2 flat script. A staged installer
+// Windows requires the authenticated schema-v2 canonical script. A staged installer
 // remains available only to the separately bounded bootstrap-recovery path;
 // ordinary updates fail closed to a manual command when the script is absent.
 // POSIX uses its own detached script contract.
@@ -3776,9 +3775,9 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean } = {}
     const windowsTransport = resolveWindowsUpdateTransport(updateRoot)
 
     if (windowsTransport.kind === 'manual') {
-      // The checkout does not contain the authenticated flat hand-off. Do not
-      // substitute a staged binary or the incompatible nested Edge script:
-      // neither proves the schema-v2 bridge lease. Render a copyable
+      // The checkout does not contain the authenticated canonical hand-off.
+      // Do not substitute a staged binary for an ordinary update: it does not
+      // prove the schema-v2 bridge lease. Render a copyable
       // PowerShell command with the resolved branch as one quoted argv value.
       const manualArgv = ['hermes', 'update']
 
@@ -3799,7 +3798,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean } = {}
 
       const command = formatPowerShellArgvForDisplay(manualArgv)
 
-      rememberLog(`[updates] compatible repo hand-off absent; surfacing manual \`${command}\` at ${updateRoot}`)
+      rememberLog(`[updates] canonical repo hand-off absent; surfacing manual \`${command}\` at ${updateRoot}`)
       emitUpdateProgress({ stage: 'manual', message: command, percent: null })
 
       return { ok: true, manual: true, command, hermesRoot: updateRoot }
