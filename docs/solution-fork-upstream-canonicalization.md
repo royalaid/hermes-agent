@@ -143,6 +143,47 @@ tests:
   - "apps/desktop Electron cold-resume composer viewport E2E: passed"
 ```
 
+## 2026-08-15 canonical Windows updater integration
+
+The PR #84778 lineage was rebased onto the current upstream base and kept as a
+focused safety branch. The ordinary Desktop update path was then reconciled
+with the fork's authenticated handoff protocol: the upstream nested PowerShell
+script owns the visible updater, while the staged Tauri installer remains only
+in the separately bounded packaged bootstrap-recovery path. The temporary
+`aac5cb605` direct-installer path is not an ancestor of the candidate.
+
+```yaml
+source_branch: fix/windows-updater-handoff
+source_head_sha: c912255eeefde7707cf277bab75549b2057a2509
+source_upstream_base_sha: 0d1828294ad85657ac945bc10186d0e02d33c4d7
+integration_input_sha: 89b0cedaab9d65ffeafb59d9537229dd9e8f7ef4
+integration_code_head_sha: 7ede2958e83eb8122dafc7a3512a3930fd62dcaf
+rejected_direct_installer_sha: aac5cb6058656b7f5f5c07a2cbbda777f39b5401
+rejected_direct_installer_is_ancestor: false
+native_canary_sha: 903b78e6242fc7b11f0d8e12e48a067eced5f9af
+native_canary_tree_sha: c7dcb18ee87e7361f874c85e0807de03c6d6b100
+integration_code_tree_sha: c7dcb18ee87e7361f874c85e0807de03c6d6b100
+status: native_verified
+tests:
+  - "Windows PowerShell 5.1 handoff contract: passed"
+  - "PowerShell 7 handoff contract: passed"
+  - "focused Python updater suite: 377 passed, 12 skipped"
+  - "focused Electron updater suite: 249 passed"
+  - "full Electron suite: 1414 passed, 2 skipped; 28 unrelated POSIX-host assumptions failed on Windows"
+  - "Electron and E2E TypeScript checks: passed"
+  - "updater-branch focused Electron suite: 55 passed"
+native_proof:
+  - "visible Settings > About > Update now flow launched scripts/desktop-update/windows.ps1"
+  - "private receipt target/result SHA matched 903b78e6242fc7b11f0d8e12e48a067eced5f9af"
+  - "critical syntax, imports, dependencies, and node dependencies were healthy"
+  - "deferred gateway lease was adopted and the gateway fleet resumed"
+  - "managed Desktop relaunched from the rebuilt exact target and acknowledged authenticated backend readiness"
+```
+
+The canary commit lives only in an isolated local fixture repository. Its tree
+matches the integration code commit exactly; it is evidence, not an additional
+integration input.
+
 ## Integrated local fix record
 
 The following fork-local fix was integrated from a clean worktree based on the
