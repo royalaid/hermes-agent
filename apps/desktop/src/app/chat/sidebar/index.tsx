@@ -172,7 +172,7 @@ import {
 import { WorktreeDialog } from './projects/worktree-dialog'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
-import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { SidebarSessionsSection } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -224,24 +224,14 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
   }
 ]
 
-// Two modes via the `compact` height variant (styles.css):
-//   tall    → each section is shrink-0, capped, its own scroller; Sessions is flex-1.
-//   compact → COMPACT_FLAT drops the caps so the whole stack scrolls as one.
-// Sections stay shrink-0 so none can be squeezed below its content and bleed onto
-// the next — the flexbox `min-height: auto` overlap trap that caused the bug.
-const COMPACT_FLAT = 'compact:max-h-none compact:overflow-visible'
-
 // Vertical scroll only — never a horizontal bar from glow bleed, long titles,
 // etc. The bar itself only shows while the pointer is in the list.
 const SCROLL_Y = 'overflow-y-auto overflow-x-hidden overscroll-contain scrollbar-fade'
 
-// The outer list reserves its bar's width whether or not one is showing, so
-// filtering or collapsing a section doesn't reflow every row sideways. Only the
-// outer one: nested scrollers would each reserve their own and stack the inset.
-const SCROLL_GUTTER = '[scrollbar-gutter:stable]'
-
-// A non-session group's scroll body: own scroller when tall, flattened when compact.
-const GROUP_BODY = cn(SCROLL_Y, COMPACT_FLAT)
+// Every section body remains the scroll authority at compact heights. Reducing
+// the cap keeps every following header reachable without moving the navigation
+// or profile rail and without allowing one busy section to consume the stack.
+const GROUP_BODY = cn(SCROLL_Y, 'compact:max-h-16')
 
 // Section-header action icons stay hidden until the whole header row is hovered
 // (group/section lives on SidebarSectionHeader), mirroring the artifacts/file
@@ -1356,11 +1346,9 @@ export function ChatSidebar({
 
   const displayAgentGroups = profileGroups
 
-  // The recents list owns its own (virtualized) scroll container only when it's a
-  // long flat list. In that case it must keep its scroller even in short mode, so
-  // we don't flatten it (flattening would defeat virtualization). Short flat lists
-  // and grouped views (profile groups or the worktree tree) flatten into the
-  // single outer scroll instead.
+  // The recents list owns its scroll container, including in compact windows.
+  // Virtualized and ordinary lists therefore follow the same containment rule:
+  // section headers stay outside the scrolling body.
   // Whichever grouping is active, the flat set of repo subtrees on screen — the
   // single source for reconciling repo/worktree order, whether repos hang off
   // the bare tree or are nested under projects.
@@ -1368,18 +1356,6 @@ export function ChatSidebar({
     () => (agentProjectTree ? agentProjectTree.flatMap(project => project.repos) : []),
     [agentProjectTree]
   )
-
-  // Mirror the section's own virtualization inputs (the props it receives),
-  // not the raw tree cache: agentProjectTree persists after leaving Project
-  // grouping, and keying on it here while the section keys on projectOverview
-  // (which is nulled the moment grouping changes) left the two disagreeing —
-  // wrapper classes built for a virtualized list around a non-virtual one.
-  // Entered-project content is the third prop that suppresses virtualization.
-  const recentsVirtualizes =
-    !displayAgentGroups?.length &&
-    !projectOverview?.length &&
-    !(inProject && enteredProjectContent) &&
-    displayAgentSessions.length >= VIRTUALIZE_THRESHOLD
 
   // Keep the persisted parent + worktree orders reconciled with what's on screen:
   // freshly-seen repos/worktrees surface at the top, vanished ones drop out of
@@ -1595,9 +1571,10 @@ export function ChatSidebar({
 
         {showSessionSections && (
           <div
-            className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SCROLL_Y, SCROLL_GUTTER)}
+            className="flex min-h-0 flex-1 flex-col overflow-hidden pb-1.75"
             data-sessions-mode={sessionsMode}
             data-sessions-project={inProject ? (enteredProjectId ?? undefined) : undefined}
+            data-sidebar-sections=""
           >
             {trimmedQuery && (
               <SidebarSessionsSection
@@ -1631,7 +1608,7 @@ export function ChatSidebar({
             {!trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
-                contentClassName="flex flex-col gap-px rounded-lg pb-2 pt-1"
+                contentClassName={cn('flex max-h-56 flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}
                 dndSensors={dndSensors}
                 emptyState={<SidebarPinnedEmptyState />}
                 label={s.pinned}
@@ -1663,17 +1640,8 @@ export function ChatSidebar({
                 collapsible={!inProject}
                 contentClassName={cn(
                   'flex min-h-0 flex-1 flex-col gap-px pb-1.75',
-                  // The section is the ONE authority on whether the virtual
-                  // list owns scrolling: it neutralizes this wrapper scroller
-                  // itself (overflow-visible) when it virtualizes. Gating
-                  // SCROLL_Y here on index's own parallel guess desynced the
-                  // two — a cached project tree flipped this side but not the
-                  // section's, leaving the list with no scroller at all and
-                  // the recents pane rendering blank under Updated grouping.
                   SCROLL_Y,
-                  // Flatten into the single scroll when compact — unless this is the
-                  // virtualized long list, which must keep its own scroller.
-                  !recentsVirtualizes && COMPACT_FLAT
+                  'compact:max-h-24'
                 )}
                 dndSensors={dndSensors}
                 emptyState={
@@ -1832,8 +1800,7 @@ export function ChatSidebar({
                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
                 removedSessionIds={inProject ? removedSessionIds : undefined}
                 rootClassName={cn(
-                  'min-h-32 flex-1 overflow-hidden p-0',
-                  !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
+                  'min-h-20 flex-1 overflow-hidden p-0 compact:min-h-0'
                 )}
                 sessions={displayAgentSessions}
                 sortable={!showAllProfiles && agentSessions.length > 1}
