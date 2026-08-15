@@ -4667,6 +4667,9 @@ _LAZY_COMMAND_EXPORTS = {
         "_scan_dashboard_processes",
     ),
     "hermes_cli.update_cmd": (
+        "_cmd_update_drain",
+        "_cmd_update_preflight",
+        "_cmd_update_resume_deferred_gateway",
         "_abort_dependency_sync_if_self_locked",
         "_add_upstream_remote",
         "_atomic_replace_dir",
@@ -4707,6 +4710,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_npm_manifests_digest",
         "_orphaned_desktop_backend_pids",
         "_pause_windows_gateways_for_update",
+        "_prepare_atomic_windows_update",
         "_print_curator_first_run_notice",
         "_print_curator_recent_run_notice",
         "_print_fts_optimize_available_notice",
@@ -4723,6 +4727,8 @@ _LAZY_COMMAND_EXPORTS = {
         "_restart_phase_failure_is_incomplete",
         "_restore_active_tool_dependencies",
         "_restore_stashed_changes",
+        "_release_update_quiesce_lease",
+        "_revalidate_pausable_gateway_identity",
         "_resume_windows_gateways_after_update",
         "_run_logged_subprocess",
         "_run_pre_update_backup",
@@ -4733,6 +4739,8 @@ _LAZY_COMMAND_EXPORTS = {
         "_surviving_gateway_pids_after_failed_restart",
         "_sync_fork_with_upstream",
         "_sync_with_upstream_if_needed",
+        "_transfer_update_quiesce_lease",
+        "_validate_deferred_update_request",
         "_update_node_dependencies",
         "_update_via_zip",
         "_upgrade_pip_before_lazy_refresh",
@@ -4749,6 +4757,8 @@ _LAZY_COMMAND_EXPORTS = {
         "_write_marker_file",
         "_write_update_incomplete_marker",
         "_write_update_planned_stop_marker",
+        "_UpdateLeaseHeartbeat",
+        "_WindowsMutationJob",
         "_UPDATE_RUNTIME_RELOAD_MODULES",
         "_UPDATE_CRITICAL_FILES",
         "_UPDATE_CRITICAL_MODULES",
@@ -9764,7 +9774,7 @@ def cmd_update(args):
     ``sys.exit`` or unhandled exceptions).
     """
     try:
-        _validate_deferred_update_request(args)
+        _self()._validate_deferred_update_request(args)
     except ValueError as exc:
         print(f"✗ {exc}")
         raise SystemExit(2)
@@ -9774,11 +9784,11 @@ def cmd_update(args):
     # work. Preflight is a read-only local snapshot; drain mutates process
     # state only under its dedicated owner-bound lease.
     if getattr(args, "preflight", False):
-        _cmd_update_preflight(args, root=PROJECT_ROOT)
+        _self()._cmd_update_preflight(args, root=PROJECT_ROOT)
     if getattr(args, "drain", False):
-        _cmd_update_drain(args, root=PROJECT_ROOT)
+        _self()._cmd_update_drain(args, root=PROJECT_ROOT)
     if getattr(args, "resume_deferred_gateway", False):
-        _cmd_update_resume_deferred_gateway(args, root=PROJECT_ROOT)
+        _self()._cmd_update_resume_deferred_gateway(args, root=PROJECT_ROOT)
 
     from hermes_cli.config import (
         detect_install_method,
@@ -9824,11 +9834,10 @@ def cmd_update(args):
     # _install_hangup_protection for rationale.
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
     # Cross-process mutual exclusion. The dashboard's Update button spawns
-    # this same command detached, and the desktop hands off to the Tauri
-    # updater / install-mode bootstrap — all three mutate one checkout. Two of
-    # them running together rewrite source under a live interpreter and strand
-    # the tree half-updated. Share the marker the Tauri updater and Electron
-    # already use rather than inventing a second lock.
+    # this command detached, and the Desktop's ordinary Update UX hands off
+    # through scripts/desktop-update/windows.ps1. The staged installer uses
+    # install-mode bootstrap only for its bounded recovery path. All three
+    # mutate one checkout, so they share the existing updater marker.
     from hermes_cli.update_lock import (
         UPDATE_EXIT_CONCURRENT,
         UpdateLock,
@@ -9852,21 +9861,15 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
         sys.exit(UPDATE_EXIT_CONCURRENT)
 
+    from hermes_cli.update_transaction import _UpdateTransaction
+
     _update_transaction = _UpdateTransaction()
     _update_lease_heartbeat = None
     _update_mutation_job = None
-    from hermes_cli.update_quiesce import (
-        _prepare_atomic_windows_update,
-        _release_update_quiesce_lease,
-        _transfer_update_quiesce_lease,
-        _UpdateLeaseHeartbeat,
-        _WindowsMutationJob,
-    )
-    from hermes_cli.update_transaction import _UpdateTransaction
 
     try:
         if _is_windows():
-            _prepare_atomic_windows_update(
+            _self()._prepare_atomic_windows_update(
                 args,
                 root=PROJECT_ROOT,
                 transaction=_update_transaction,
@@ -9876,8 +9879,8 @@ def cmd_update(args):
             # Self-assignment makes every subsequently spawned git/uv/pip/npm
             # descendant part of the same kill-on-close job. Lease loss can
             # therefore fail-stop the whole mutation tree, not just orphan it.
-            _update_mutation_job = _WindowsMutationJob()
-            _update_lease_heartbeat = _UpdateLeaseHeartbeat(
+            _update_mutation_job = _self()._WindowsMutationJob()
+            _update_lease_heartbeat = _self()._UpdateLeaseHeartbeat(
                 PROJECT_ROOT,
                 _update_transaction.lease,
                 fail_stop=_update_mutation_job.abort,
@@ -9919,13 +9922,13 @@ def cmd_update(args):
                             raise RuntimeError(
                                 "deferred gateway resume has no verified handoff owner"
                             )
-                        _update_transaction.lease = _transfer_update_quiesce_lease(
+                        _update_transaction.lease = _self()._transfer_update_quiesce_lease(
                             PROJECT_ROOT,
                             _update_transaction.lease,
                             new_owner_pid=_handoff_owner,
                         )
                     else:
-                        if not _release_update_quiesce_lease(
+                        if not _self()._release_update_quiesce_lease(
                             PROJECT_ROOT, _update_transaction.lease
                         ):
                             raise RuntimeError(
