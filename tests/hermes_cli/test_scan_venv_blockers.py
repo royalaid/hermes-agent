@@ -951,12 +951,18 @@ def test_probe_fail_json_is_unambiguous_failure() -> None:
     when psutil was missing after a gutted venv. The document must mark
     ``probe_failed`` and keep ``ok`` false.
     """
-    data = json.loads(_probe_fail_json("psutil is not available: No module named 'psutil'"))
+    data = json.loads(
+        _probe_fail_json(
+            message="psutil is not available: No module named 'psutil'"
+        )
+    )
     assert data["ok"] is False
-    assert data["probe_failed"] is True
-    assert data["blocked"] is False
+    assert data["ready"] is False
+    assert data["blocked"] is True
+    assert data["reason"] == "probe_failed"
     assert data["processes"] == []
-    assert "psutil" in data["error"]
+    assert data["error"]["code"] == "probe_failed"
+    assert "psutil" in data["error"]["message"]
 
 
 def test_main_psutil_missing_is_probe_failure_not_clear(monkeypatch, capsys):
@@ -971,13 +977,17 @@ def test_main_psutil_missing_is_probe_failure_not_clear(monkeypatch, capsys):
     monkeypatch.setattr(builtins, "__import__", _no_psutil)
     monkeypatch.delitem(sys.modules, "psutil", raising=False)
 
+    root = Path(__file__).resolve().parents[2]
     with pytest.raises(SystemExit) as excinfo:
-        main()
+        main(["--root", str(root)])
     captured = capsys.readouterr()
     assert excinfo.value.code == 1
     data = json.loads(captured.out)
     assert data["ok"] is False
-    assert data["probe_failed"] is True
+    assert data["ready"] is False
+    assert data["blocked"] is True
+    assert data["reason"] == "probe_failed"
+    assert data["error"]["code"] == "probe_failed"
     assert "psutil" in captured.err.lower()
 
 
