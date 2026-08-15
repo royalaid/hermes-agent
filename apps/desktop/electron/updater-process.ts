@@ -112,7 +112,7 @@ export type WindowsUpdateLaunchResult =
  * updater-side fix only reaches users when a new binary is built, signed and
  * published — which historically lags main by months and strands users on
  * long-fixed bugs (cache resolver #67369, marker self-adopt #74782; the
- * 2026-08-09 incident chain). `scripts/desktop-update.ps1` lives in the repo
+ * 2026-08-09 incident chain). `scripts/desktop-update/windows.ps1` lives in the repo
  * checkout instead: every `hermes update` refreshes the code that drives the
  * NEXT update, and only PowerShell itself is frozen.
  *
@@ -133,12 +133,10 @@ export function resolveUpdateScriptHandoff(
 
   const exists = deps.fileExists ?? stagedFileExists
 
-  // The transactional Desktop protocol is implemented only by the hardened
-  // flat script on this branch. The upstream nested Edge handoff uses another
-  // wire contract, so treating it as a fallback would launch an incompatible
-  // updater after a partial/skewed checkout. Fail closed when the flat script
-  // is absent.
-  const scriptPath = path.join(updateRoot, 'scripts', 'desktop-update.ps1')
+  // The canonical nested script owns both upstream's visible update surface
+  // and the authenticated schema-v2 transaction. The old flat filename is a
+  // compatibility forwarder only; ordinary Desktop updates never select it.
+  const scriptPath = path.join(updateRoot, 'scripts', 'desktop-update', 'windows.ps1')
 
   if (exists(scriptPath)) {
     return {
@@ -277,7 +275,11 @@ export function resolveWindowsDevRelaunchAppPath(
   argv: readonly string[]
 ): string | undefined {
   const appEntry = argv[1]
-  if (!defaultApp || !appEntry || appEntry.startsWith('-')) return undefined
+
+  if (!defaultApp || !appEntry || appEntry.startsWith('-')) {
+    return undefined
+  }
+
   return path.resolve(appEntry)
 }
 

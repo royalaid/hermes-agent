@@ -5875,7 +5875,14 @@ def _inject_profile_env_vars() -> None:
 
 
 # Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
-_inject_profile_env_vars()
+# The public update preflight is the exception: provider entry-point discovery
+# consults the enabled-plugin config, and load_config() creates the Hermes-home
+# skeleton. A read-only safety probe must not make that write merely by
+# importing config.py on its dispatch path.
+_argv = tuple(sys.argv[1:])
+if not ("update" in _argv and "--preflight" in _argv):
+    _inject_profile_env_vars()
+del _argv
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────
