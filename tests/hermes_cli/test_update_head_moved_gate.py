@@ -31,6 +31,11 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
 
+        # The updater records the exact fetched target and will only publish
+        # a success receipt when the installed HEAD matches it.
+        if "rev-parse" in joined and "--verify" in joined:
+            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+
         # git rev-parse HEAD  — first call (pre-pull) returns pre_sha,
         # subsequent calls (post-pull) return post_sha.
         if joined.endswith("rev-parse HEAD"):
@@ -72,13 +77,14 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     attributes on that module is the canonical test surface (matches
     tests/hermes_cli/test_cmd_update.py).
     """
+    from hermes_cli import managed_uv, update_cmd
+
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate
     monkeypatch.setattr(
         hermes_main, "_resolve_update_branch", lambda args: "main"
     )
-    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
     monkeypatch.setattr(
         hermes_main, "_get_origin_url",
         lambda *a, **k: "https://github.com/NousResearch/hermes-agent.git",
@@ -95,14 +101,68 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_main, "_run_pre_update_backup", lambda *a, **k: None
     )
     monkeypatch.setattr(
-        hermes_main, "_pause_windows_gateways_for_update", lambda: None
-    )
-    monkeypatch.setattr(
         hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
     )
-    # Short-circuit the long tail: dependency install + desktop build.
+    # Short-circuit the long tail: this module proves only the relationship
+    # between the fetched target and pre/post-pull HEAD values.
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda **_kwargs: "uv")
+    monkeypatch.setattr(managed_uv, "update_managed_uv", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_install_python_dependencies_with_optional_fallback",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        hermes_main, "_abort_dependency_sync_if_self_locked", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_capture_active_lazy_features", lambda: []
+    )
+    monkeypatch.setattr(
+        hermes_main, "_capture_active_tool_dependencies", lambda: []
+    )
+    monkeypatch.setattr(
+        hermes_main, "_refresh_active_lazy_features", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        hermes_main, "_restore_active_tool_dependencies", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_refresh_active_memory_provider_dependencies", lambda: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_reload_updated_runtime_modules", lambda: None
+    )
+    monkeypatch.setattr(
+        hermes_main, "_refresh_bootstrap_cache_scripts", lambda *a, **k: None
+    )
+    monkeypatch.setattr(hermes_main, "_build_web_ui", lambda *a, **k: True)
     monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(
+        hermes_main, "_clear_lazy_refresh_incomplete_marker", lambda: None
+    )
+    monkeypatch.setattr(update_cmd, "_write_lazy_refresh_incomplete_marker", lambda: None)
+    monkeypatch.setattr(update_cmd, "_venv_core_imports_healthy", lambda: (True, ""))
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_critical_files_syntax",
+        lambda *_args: (True, None, None),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_critical_modules_import",
+        lambda *_args: (True, None, None),
+    )
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(
+        update_cmd, "_node_dependencies_healthy_read_only", lambda: True
+    )
+    monkeypatch.setattr(update_cmd, "_rebuild_desktop_after_update", lambda *a, **k: None)
+    monkeypatch.setattr(update_cmd, "_record_update_success", lambda *a, **k: None)
     # Gateway restart path (called after a successful update).
     monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a: None)
     # Keep the (now surfaced — #78574) gateway auto-restart phase away from
@@ -121,7 +181,9 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
 
 
-def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
+def test_update_success_when_head_moves(
+    monkeypatch, tmp_path, capsys, platform_neutral_update_lifecycle
+):
     """When the pull advances HEAD, the update proceeds normally."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
     _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
@@ -133,7 +195,9 @@ def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     assert "Code did not move" not in out
 
 
-def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
+def test_update_fails_loudly_when_head_pinned(
+    monkeypatch, tmp_path, capsys, platform_neutral_update_lifecycle
+):
     """A detached/pinned HEAD that never moves must fail loudly, not print
     '✓ Code updated!' against the stale tree."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
