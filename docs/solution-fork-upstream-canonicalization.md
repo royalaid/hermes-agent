@@ -184,6 +184,44 @@ The canary commit lives only in an isolated local fixture repository. Its tree
 matches the integration code commit exactly; it is evidence, not an additional
 integration input.
 
+### Live-upstream refresh after the native canary
+
+Upstream advanced after the proof above. Both the focused updater branch and
+the full integration line were therefore rebased again before publication. The
+canonical nested-script UX did not change in the new upstream commits. Their
+new stale-Git-lock recovery and wedged-gateway liveness protections were kept,
+with the fork's configured remote, scanner, process identity, lease, receipt,
+and deferred-resume gates still authoritative.
+
+```yaml
+upstream_main_sha: 45af7a71fcd420b4422d2c074b1ce58b9ce0d048
+source_branch: fix/windows-updater-handoff
+source_head_sha: 339504f532e340fd1c69af50b4660007c5b5fc43
+source_merge_base_sha: 45af7a71fcd420b4422d2c074b1ce58b9ce0d048
+source_range_diff: "five exact patch matches from c912255e onto 45af7a71f"
+integration_branch: fork-integration
+integration_rebased_proof_record_sha: 9f8e13652e5aba80b0ec578ad8b7eec02b873523
+integration_validation_head_sha: 4c700aa21db8b22b1d9216edfed5022e2bf6670f
+integration_merge_base_sha: 45af7a71fcd420b4422d2c074b1ce58b9ce0d048
+rejected_direct_installer_sha: aac5cb6058656b7f5f5c07a2cbbda777f39b5401
+rejected_direct_installer_is_ancestor: false
+status: ready_for_publication_native_gate
+tests:
+  - "Windows PowerShell 5.1 handoff contract: passed"
+  - "PowerShell 7 handoff contract: passed"
+  - "focused Python updater and scanner suites: 366 passed"
+  - "focused Electron updater suite: 309 passed"
+  - "updater-branch focused Electron suite: 59 passed"
+  - "integration Electron and E2E TypeScript checks: passed"
+  - "updater-branch Electron and E2E TypeScript checks: passed"
+  - "integration ESLint: 0 errors"
+  - "updater-branch ESLint: 0 errors"
+native_publication_gate:
+  - "use the visible Settings > About > Update now flow"
+  - "receipt target_sha and resulting_head must equal the observed origin/fork-integration publication head"
+  - "receipt health checks, deferred gateway resume, cleanup, exact Desktop relaunch, and authenticated backend readiness must all succeed"
+```
+
 ## Integrated local fix record
 
 The following fork-local fix was integrated from a clean worktree based on the
