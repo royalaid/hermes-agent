@@ -7,17 +7,16 @@ import path from 'node:path'
 import { test, vi } from 'vitest'
 
 import {
-  MARKER_SELF_ADOPT_EPOCH_MS,
-  observeUpdaterHandoff,
   captureSpawnedUpdaterCreatedAt,
   collectRelaunchArgs,
   formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
   launchWindowsUpdateTransport,
-  resolveWindowsDevRelaunchAppPath,
+  observeUpdaterHandoff,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
+  resolveWindowsDevRelaunchAppPath,
   resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
@@ -257,9 +256,9 @@ test('resolveStagedUpdaterBinary returns null on Windows when nothing is staged'
   assert.equal(resolved, null)
 })
 
-test('resolveUpdateScriptHandoff chooses the hardened flat script when both implementations exist', () => {
+test('resolveUpdateScriptHandoff chooses the canonical nested script when both entry points exist', () => {
   const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
-  const expected = path.join(root, 'scripts', 'desktop-update.ps1')
+  const expected = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
 
   const handoff = resolveUpdateScriptHandoff(root, {
     isWindows: true,
@@ -272,26 +271,26 @@ test('resolveUpdateScriptHandoff chooses the hardened flat script when both impl
   assert.deepEqual(handoff.args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', expected])
 })
 
-test('resolveUpdateScriptHandoff selects the hardened flat script by itself', () => {
+test('resolveUpdateScriptHandoff selects the canonical nested script by itself', () => {
+  const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
+  const canonical = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
+
+  const handoff = resolveUpdateScriptHandoff(root, {
+    isWindows: true,
+    fileExists: candidate => candidate === canonical
+  })
+
+  assert.ok(handoff)
+  assert.equal(handoff.scriptPath, canonical)
+})
+
+test('resolveUpdateScriptHandoff fails closed when only the legacy flat forwarder exists', () => {
   const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
   const legacy = path.join(root, 'scripts', 'desktop-update.ps1')
 
   const handoff = resolveUpdateScriptHandoff(root, {
     isWindows: true,
     fileExists: candidate => candidate === legacy
-  })
-
-  assert.ok(handoff)
-  assert.equal(handoff.scriptPath, legacy)
-})
-
-test('resolveUpdateScriptHandoff fails closed when only the incompatible nested script exists', () => {
-  const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
-  const nested = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
-
-  const handoff = resolveUpdateScriptHandoff(root, {
-    isWindows: true,
-    fileExists: candidate => candidate === nested
   })
 
   assert.equal(handoff, null)
@@ -315,9 +314,9 @@ test('resolveUpdateScriptHandoff is Windows-only (POSIX has a separate detached 
   assert.equal(handoff, null)
 })
 
-test('Windows flat handoff keeps branch, paths, and bridge capability out of cmd-parsed arguments', () => {
+test('Windows canonical handoff keeps branch, paths, and bridge capability out of cmd-parsed arguments', () => {
   const root = String.raw`C:\Hermes & 100%\agent`
-  const expected = path.join(root, 'scripts', 'desktop-update.ps1')
+  const expected = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
   const branch = 'fork/&|%integration'
   const bridgeLeaseId = 'unguessable-bridge-lease-id'
   const relaunchAppPath = String.raw`C:\Hermes & 100%\agent\apps\desktop`
@@ -331,7 +330,7 @@ test('Windows flat handoff keeps branch, paths, and bridge capability out of cmd
   assert.equal(transport.kind, 'script')
 
   if (transport.kind !== 'script') {
-    assert.fail('expected the hardened flat script transport')
+    assert.fail('expected the canonical script transport')
   }
 
   const wrapped = wrapHandoffForDetachedConsole(transport.handoff, {
@@ -390,19 +389,19 @@ test('Windows development relaunch preserves the Electron app entry only for def
   assert.equal(resolveWindowsDevRelaunchAppPath(true, [electron, '--inspect']), undefined)
 })
 
-test('Windows flat handoff rejects invalid private payload values before spawn', () => {
+test('Windows canonical handoff rejects invalid private payload values before spawn', () => {
   const root = String.raw`C:\Hermes\agent`
-  const flat = path.join(root, 'scripts', 'desktop-update.ps1')
+  const canonical = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
 
   const transport = resolveWindowsUpdateTransport(root, {
     isWindows: true,
-    fileExists: candidate => candidate === flat
+    fileExists: candidate => candidate === canonical
   })
 
   assert.equal(transport.kind, 'script')
 
   if (transport.kind !== 'script') {
-    assert.fail('expected the hardened flat script transport')
+    assert.fail('expected the canonical script transport')
   }
 
   const valid = {
@@ -427,14 +426,14 @@ test('Windows flat handoff rejects invalid private payload values before spawn',
   )
 })
 
-test('ordinary Windows updates refuse staged and nested fallbacks when the flat script is absent', () => {
+test('ordinary Windows updates refuse staged and legacy-flat fallbacks when the canonical script is absent', () => {
   const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
-  const nested = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
+  const legacy = path.join(root, 'scripts', 'desktop-update.ps1')
   const staged = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-setup.exe`
 
   const transport = resolveWindowsUpdateTransport(root, {
     isWindows: true,
-    fileExists: candidate => candidate === nested || candidate === staged
+    fileExists: candidate => candidate === legacy || candidate === staged
   })
 
   const spawnProcess = vi.fn(() => ({ kill: () => true, unref: () => {} }))
@@ -457,16 +456,16 @@ test('ordinary Windows updates refuse staged and nested fallbacks when the flat 
   assert.equal(spawnProcess.mock.calls.length, 0)
 })
 
-test('production Windows transport composes flat script, non-main branch, and BridgeLeaseId at spawn', () => {
+test('production Windows transport composes canonical script, non-main branch, and BridgeLeaseId at spawn', () => {
   const root = String.raw`C:\Hermes & 100%\agent`
-  const flat = path.join(root, 'scripts', 'desktop-update.ps1')
+  const canonical = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
   const bridgeLeaseId = 'unguessable-bridge-lease-id'
   const branch = 'fork/&|%integration'
   let captured: { args: string[]; command: string; options: SpawnOptions } | undefined
 
   const transport = resolveWindowsUpdateTransport(root, {
     isWindows: true,
-    fileExists: candidate => candidate === flat
+    fileExists: candidate => candidate === canonical
   })
 
   const launch = launchWindowsUpdateTransport(
@@ -493,7 +492,7 @@ test('production Windows transport composes flat script, non-main branch, and Br
   assert.ok(captured)
   assert.equal(captured.command, 'cmd.exe')
   assert.equal(captured.options.env?.PATH, String.raw`C:\Windows`)
-  assert.equal(captured.options.env?.HERMES_UPDATE_HANDOFF_SCRIPT, flat)
+  assert.equal(captured.options.env?.HERMES_UPDATE_HANDOFF_SCRIPT, canonical)
   assert.equal(captured.options.env?.HERMES_UPDATE_HANDOFF_BRANCH, branch)
   assert.equal(captured.options.env?.HERMES_UPDATE_BRIDGE_LEASE_ID, bridgeLeaseId)
   assert.equal(captured.args.join(' ').includes(branch), false)
@@ -659,6 +658,10 @@ class FakeChild {
   listeners = new Map<string, Array<(...args: unknown[]) => void>>()
   removed: string[] = []
 
+  kill() {
+    return true
+  }
+
   unref() {}
 
   once(event: string, listener: (...args: unknown[]) => void) {
@@ -793,7 +796,7 @@ test('observeUpdaterHandoff ignores events after the first settle', async () => 
 
 test('observeUpdaterHandoff settles ok for children without an event interface', async () => {
   const timer = manualTimer()
-  const outcomePromise = observeUpdaterHandoff({ pid: 1, unref: () => {} }, 2500, timer.deps)
+  const outcomePromise = observeUpdaterHandoff({ pid: 1, kill: () => true, unref: () => {} }, 2500, timer.deps)
 
   timer.fire()
 
