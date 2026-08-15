@@ -1,11 +1,12 @@
-# Contract tests for scripts/desktop-update.ps1.
+# Contract tests for scripts/desktop-update/windows.ps1.
 #
 # These tests run the handoff in a temporary install with a tiny fake
 # hermes.exe. No real checkout, venv, Desktop process, or update is touched.
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
-$handoffScript = Join-Path $repoRoot 'scripts\desktop-update.ps1'
+$handoffScript = Join-Path $repoRoot 'scripts\desktop-update\windows.ps1'
+$legacyForwarder = Join-Path $repoRoot 'scripts\desktop-update.ps1'
 $leaseFixture = Join-Path $repoRoot 'scripts\tests\fixtures\desktop-update-bridge-lease.json'
 $receiptFailureFixture = Join-Path $repoRoot 'scripts\tests\fixtures\desktop-update-receipt-failure.json'
 $powershellExe = (Get-Process -Id $PID).Path
@@ -265,12 +266,14 @@ public static class FakeHermes {
                 "\",\"branch\":\"" + branch + "\",\"timestamp\":" +
                 receiptTimestamp +
                 ",\"success\":true,\"gateway_resume_deferred\":true,\"health\":{\"critical_syntax\":true,\"critical_imports\":true,\"dependencies\":true,\"node_dependencies\":true}}";
+            if (mode == "oversized-receipt") receipt = new string('x', 70 * 1024);
             File.WriteAllText(Path.Combine(home, ".hermes-update-receipt.json"), receipt);
             if (File.Exists(leasePath) && parentLeaseOwnerPid > 0) {
                 var returned = File.ReadAllText(leasePath);
                 returned = Regex.Replace(returned, "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + parentLeaseOwnerPid);
                 ReplaceLease(leasePath, returned, "update-return");
             }
+            if (mode == "timeout") Thread.Sleep(30000);
         }
         Console.WriteLine("Update complete.");
         return 0;
@@ -470,7 +473,8 @@ function Invoke-TestHandoff(
     [string]$BridgeLeaseId = '',
     [string]$UpdateMode = 'normal',
     [string]$RelaunchExe = '',
-    [AllowNull()][object]$SelfPreclaimAgeSeconds = $null
+    [AllowNull()][object]$SelfPreclaimAgeSeconds = $null,
+    [string]$ScriptPath = $handoffScript
 ) {
     $oldOutput = $env:HERMES_TEST_PREFLIGHT_OUTPUT
     $oldCode = $env:HERMES_TEST_PREFLIGHT_CODE
@@ -487,6 +491,7 @@ function Invoke-TestHandoff(
     $oldBuildShaCapture = $env:HERMES_TEST_BUILD_SHA_CAPTURE
     $oldUpdateMode = $env:HERMES_TEST_UPDATE_MODE
     $oldTestMode = $env:HERMES_DESKTOP_UPDATE_TEST
+    $oldStageTimeout = $env:HERMES_INTERNAL_UPDATE_STAGE_TIMEOUT_SECONDS
     $oldPublishFail = $env:HERMES_TEST_RESULT_PUBLISH_FAIL
     $oldMarkerPath = $env:HERMES_TEST_UPDATE_MARKER_PATH
     $oldMarkerAge = $env:HERMES_TEST_UPDATE_MARKER_AGE_SECONDS
@@ -507,12 +512,20 @@ function Invoke-TestHandoff(
         $env:HERMES_TEST_BUILD_SHA_CAPTURE = $Install.BuildShaCapture
         $env:HERMES_TEST_UPDATE_MODE = $UpdateMode
         $env:HERMES_DESKTOP_UPDATE_TEST = '1'
+        if ($UpdateMode -eq 'timeout') {
+            # The fake child deliberately spends 750 ms transferring the
+            # lease. Leave enough time to prove return, then hang afterward so
+            # the deadline case can assert exact cleanup rather than lease loss.
+            $env:HERMES_INTERNAL_UPDATE_STAGE_TIMEOUT_SECONDS = '3'
+        } else {
+            Remove-Item Env:HERMES_INTERNAL_UPDATE_STAGE_TIMEOUT_SECONDS -ErrorAction SilentlyContinue
+        }
         if ($UpdateMode -eq 'result-publish-fail') {
             $env:HERMES_TEST_RESULT_PUBLISH_FAIL = '1'
         } else {
             Remove-Item Env:HERMES_TEST_RESULT_PUBLISH_FAIL -ErrorAction SilentlyContinue
         }
-        $scriptToRun = $handoffScript
+        $scriptToRun = $ScriptPath
         if ($null -ne $SelfPreclaimAgeSeconds) {
             $scriptToRun = Join-Path $Install.Home 'self-preclaim-wrapper.ps1'
             $wrapper = @'
@@ -534,7 +547,7 @@ exit $LASTEXITCODE
             [System.IO.File]::WriteAllText($scriptToRun, $wrapper, (New-Object System.Text.UTF8Encoding($false)))
             $env:HERMES_TEST_UPDATE_MARKER_PATH = $Install.UpdateMarker
             $env:HERMES_TEST_UPDATE_MARKER_AGE_SECONDS = "$SelfPreclaimAgeSeconds"
-            $env:HERMES_TEST_HANDOFF_SCRIPT = $handoffScript
+            $env:HERMES_TEST_HANDOFF_SCRIPT = $ScriptPath
         }
         $arguments = @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptToRun,
@@ -560,6 +573,7 @@ exit $LASTEXITCODE
         $env:HERMES_TEST_BUILD_SHA_CAPTURE = $oldBuildShaCapture
         $env:HERMES_TEST_UPDATE_MODE = $oldUpdateMode
         $env:HERMES_DESKTOP_UPDATE_TEST = $oldTestMode
+        $env:HERMES_INTERNAL_UPDATE_STAGE_TIMEOUT_SECONDS = $oldStageTimeout
         $env:HERMES_TEST_RESULT_PUBLISH_FAIL = $oldPublishFail
         $env:HERMES_TEST_UPDATE_MARKER_PATH = $oldMarkerPath
         $env:HERMES_TEST_UPDATE_MARKER_AGE_SECONDS = $oldMarkerAge
@@ -587,6 +601,23 @@ try {
     New-FakeHermes $fakeHermes
     $fakeDesktopTemplate = Join-Path $suiteRoot 'fake-desktop-template.exe'
     New-FakeDesktop $fakeDesktopTemplate
+
+    $selfTestTemp = Join-Path $suiteRoot 'self test ui'
+    New-Item -ItemType Directory -Path $selfTestTemp -Force | Out-Null
+    $oldTemp = $env:TEMP
+    $oldSelfTestHold = $env:HERMES_SELFTEST_HOLD_SECONDS
+    try {
+        $env:TEMP = $selfTestTemp
+        $env:HERMES_SELFTEST_HOLD_SECONDS = '0'
+        & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $legacyForwarder -SelfTestUi -NoUi | Out-Null
+        $selfTestCode = $LASTEXITCODE
+    } finally {
+        $env:TEMP = $oldTemp
+        $env:HERMES_SELFTEST_HOLD_SECONDS = $oldSelfTestHold
+    }
+    Assert-Equal 0 $selfTestCode 'legacy flat entry point preserves the no-update visible-UI self-test contract'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $selfTestTemp '.hermes-update-in-progress'))) 'UI self-test creates no update marker'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $selfTestTemp '.hermes-update-result.json'))) 'UI self-test publishes no update result'
 
     $fixture = [System.IO.File]::ReadAllText($leaseFixture) | ConvertFrom-Json
     $fixtureFields = @($fixture.PSObject.Properties | ForEach-Object { $_.Name })
@@ -743,8 +774,8 @@ try {
     $leaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $leased $leaseId
     Assert-Equal 1 (@([System.IO.File]::ReadAllLines((Join-Path $leased.Root 'venv\pyvenv.cfg')) | Where-Object { $_ -match '^\s*executable\s*=' }).Count) 'explicit-executable recovery fixture has one executable key'
-    $code = Invoke-TestHandoff $leased (New-PreflightJson $leased $true $true) 0 'preflight diagnostic' $leaseId 'normal' $leasedDesktop
-    Assert-Equal 0 $code 'ready preflight with matching lease completes'
+    $code = Invoke-TestHandoff $leased (New-PreflightJson $leased $true $true) 0 'preflight diagnostic' $leaseId 'normal' $leasedDesktop $null $legacyForwarder
+    Assert-Equal 0 $code 'legacy flat entry point forwards the complete named handoff contract to the canonical updater'
     Assert-Equal ('a' * 40) ([System.IO.File]::ReadAllText($leased.BuildShaCapture)) 'git rebuild stamp is pinned to the correlated resulting HEAD'
     Assert-True (Test-Path -LiteralPath $leased.Sentinel) 'ready preflight reaches update'
     Assert-True (-not (Test-Path -LiteralPath $leased.Lease)) 'exact update child clears its adopted lease before success'
@@ -949,6 +980,34 @@ try {
         Assert-Equal $consumerPid ([int]$consumed.relaunch.pid) 'published result correlates the exact relaunched Desktop pid'
     }
 
+    $delayedRelaunch = New-TestInstall 'delayed-relaunch-target' $fakeHermes
+    $delayedLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $delayedRelaunch $delayedLeaseId
+    $delayedDesktop = Join-Path $delayedRelaunch.Home 'rebuilt desktop.exe'
+    $materializedAtPath = Join-Path $delayedRelaunch.Home 'desktop-materialized-at.txt'
+    $copyScript = @"
+Start-Sleep -Milliseconds 750
+[System.IO.File]::Copy('$($fakeDesktopTemplate.Replace("'", "''"))', '$($delayedDesktop.Replace("'", "''"))', `$true)
+[System.IO.File]::WriteAllText('$($materializedAtPath.Replace("'", "''"))', "`$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())")
+"@
+    $encodedCopy = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($copyScript))
+    $materializer = Start-Process -FilePath $powershellExe -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCopy
+    ) -WindowStyle Hidden -PassThru
+    try {
+        $code = Invoke-TestHandoff $delayedRelaunch (New-PreflightJson $delayedRelaunch $true $true) 0 '' $delayedLeaseId 'normal' $delayedDesktop
+        $materializer.WaitForExit(5000) | Out-Null
+    } finally {
+        if (-not $materializer.HasExited) { $materializer.Kill() }
+        $materializer.Dispose()
+    }
+    Assert-Equal 0 $code 'relaunch target is resolved before publishing the bounded single-instance request'
+    if ((Test-Path -LiteralPath $delayedRelaunch.Result) -and (Test-Path -LiteralPath $materializedAtPath)) {
+        $delayedResult = [System.IO.File]::ReadAllText($delayedRelaunch.Result) | ConvertFrom-Json
+        $materializedAt = [int64][System.IO.File]::ReadAllText($materializedAtPath)
+        Assert-True ([int64]$delayedResult.relaunch.requested_at -ge $materializedAt) 'single-instance request lifetime starts only after the rebuilt executable exists'
+    }
+
     $survivor = New-TestInstall 'single-instance-survivor' $fakeHermes
     $survivorLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $survivor $survivorLeaseId
@@ -1003,6 +1062,40 @@ try {
     $code = Invoke-TestHandoff $stderrHeavy (New-PreflightJson $stderrHeavy $true $true) 0 '' $stderrLeaseId 'stderr-heavy' $stderrDesktop
     Assert-Equal 0 $code 'stderr-heavy update child is drained concurrently without deadlock'
     Assert-True (-not (Test-Path -LiteralPath $stderrHeavy.Lease)) 'stderr-heavy child cleans its exact adopted lease'
+
+    $timedOut = New-TestInstall 'contained-stage-timeout' $fakeHermes
+    $timedOutLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $timedOut $timedOutLeaseId
+    $code = Invoke-TestHandoff $timedOut (New-PreflightJson $timedOut $true $true) 0 '' $timedOutLeaseId 'timeout'
+    Assert-Equal 8 $code 'contained update stage fails after its test-bounded deadline'
+    Assert-True (Test-Path -LiteralPath $timedOut.TopologyCapture) 'timed-out stage records its contained process topology'
+    if (Test-Path -LiteralPath $timedOut.TopologyCapture) {
+        $timedOutTopology = @([System.IO.File]::ReadAllLines($timedOut.TopologyCapture) | Where-Object { $_ })
+        Assert-True ($timedOutTopology.Count -ge 2 -and -not (Get-Process -Id ([int]$timedOutTopology[0]) -ErrorAction SilentlyContinue)) 'deadline terminates the exact updater wrapper'
+        Assert-True ($timedOutTopology.Count -ge 2 -and -not (Get-Process -Id ([int]$timedOutTopology[1]) -ErrorAction SilentlyContinue)) 'deadline terminates the contained managed updater'
+    }
+    Assert-True (-not (Test-Path -LiteralPath $timedOut.UpdateMarker)) 'timed-out stage releases its exact update marker'
+    Assert-True (-not (Test-Path -LiteralPath $timedOut.Lease)) 'timed-out stage completes deferred recovery and clears its lease'
+    if (Test-Path -LiteralPath $timedOut.Result) {
+        $timedOutResult = [System.IO.File]::ReadAllText($timedOut.Result) | ConvertFrom-Json
+        Assert-Equal 'failed' $timedOutResult.state 'timed-out stage never publishes success'
+        Assert-Equal 8 ([int]$timedOutResult.exit_code) 'timed-out stage reports its bounded containment failure'
+    } else {
+        Assert-True $false 'timed-out stage publishes a terminal failure result'
+    }
+
+    $oversizedReceipt = New-TestInstall 'oversized-receipt' $fakeHermes
+    $oversizedReceiptLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $oversizedReceipt $oversizedReceiptLeaseId
+    $code = Invoke-TestHandoff $oversizedReceipt (New-PreflightJson $oversizedReceipt $true $true) 0 '' $oversizedReceiptLeaseId 'oversized-receipt'
+    Assert-Equal 9 $code 'oversized private receipt is rejected before JSON allocation and success verification'
+    Assert-True (-not (Test-Path -LiteralPath $oversizedReceipt.UpdateMarker)) 'oversized receipt failure releases its exact update marker'
+    Assert-True (-not (Test-Path -LiteralPath $oversizedReceipt.Lease)) 'oversized receipt failure resumes deferred gateways and clears its lease'
+    if (Test-Path -LiteralPath $oversizedReceipt.Result) {
+        $oversizedResult = [System.IO.File]::ReadAllText($oversizedReceipt.Result) | ConvertFrom-Json
+        Assert-Equal 'failed' $oversizedResult.state 'oversized receipt never publishes terminal success'
+        Assert-True ($null -eq $oversizedResult.receipt) 'oversized receipt is never trusted as update proof'
+    }
 
     $rollbackReceipt = New-TestInstall 'receipt-clock-rollback' $fakeHermes
     $rollbackLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
