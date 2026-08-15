@@ -15,9 +15,9 @@ import path from 'node:path'
 import { describe, it } from 'vitest'
 
 import {
+  type DesktopPluginServiceProcess,
   formatBlockerMessage,
   formatProbeFailedMessage,
-  type DesktopPluginServiceProcess,
   type McpBridgeProcess,
   parseVenvBlockerScanOutput,
   resolveVenvPython,
