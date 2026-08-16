@@ -7359,10 +7359,17 @@ def _cmd_update_impl(
                 # driver) keeps the installed version — `hermes update`
                 # must stay fast; `hermes computer-use install --upgrade`
                 # remains the force path.
+                # installer_timeout=180: a user is waiting on `hermes update`,
+                # so the refresh gets a short budget instead of the 660s
+                # explicit-install ceiling (2026-08-16: a slow installer run
+                # held the update splash for 11 minutes). Stale locks are
+                # pre-cleared on Windows; a genuinely slow install falls back
+                # to the printed manual command.
                 install_cua_driver(
                     upgrade=True,
                     require_confirmed_update=True,
                     show_installer_progress=False,
+                    installer_timeout=180,
                 )
         except Exception as e:
             logger.debug("cua-driver refresh failed: %s", e)
