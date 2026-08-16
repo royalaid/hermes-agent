@@ -397,11 +397,15 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.command("git", "checkout", "-q", "published")
         old_review_dir = release.REVIEW_DIR
         release.REVIEW_DIR = self.repo / "reviews"
+        # Reconciliation disabled: the fail-closed review path must be intact.
+        old_reconcile = release.IN_JOB_RECONCILIATION
+        release.IN_JOB_RECONCILIATION = False
         try:
             with chdir(self.repo), self.assertRaisesRegex(RuntimeError, re.escape(conflict)):
                 release.replay_published_integration_range(published, upstream)
         finally:
             release.REVIEW_DIR = old_review_dir
+            release.IN_JOB_RECONCILIATION = old_reconcile
 
         self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
         status = [line for line in self.command("git", "status", "--porcelain").stdout.splitlines() if line != "?? reviews/"]
@@ -410,6 +414,100 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         reviews = list((self.repo / "reviews").glob("reconstruction-*.json"))
         self.assertEqual(len(reviews), 1)
         self.assertEqual(json.loads(reviews[0].read_text(encoding="utf-8"))["failed_patch"]["commit"], conflict)
+
+    def _conflicting_published_range(self) -> tuple[str, str, str]:
+        self.command("git", "checkout", "-qb", "published", self.base)
+        conflict = self.write_and_commit("base.txt", "published\n", "direct conflicting user fix")
+        published = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.command("git", "checkout", "-q", self.initial_branch)
+        upstream = self.write_and_commit("base.txt", "upstream\n", "new upstream conflict")
+        self.command("git", "checkout", "-q", "published")
+        return conflict, published, upstream
+
+    @contextmanager
+    def _reconciliation(self, backend):
+        old = (
+            release.REVIEW_DIR, release.IN_JOB_RECONCILIATION,
+            release.RESOLUTION_BACKEND, release.WORKTREE,
+        )
+        release.REVIEW_DIR = self.repo / ".git" / "reviews"
+        release.IN_JOB_RECONCILIATION = True
+        release.RESOLUTION_BACKEND = backend
+        release.WORKTREE = self.repo
+        try:
+            with chdir(self.repo):
+                yield
+        finally:
+            (
+                release.REVIEW_DIR, release.IN_JOB_RECONCILIATION,
+                release.RESOLUTION_BACKEND, release.WORKTREE,
+            ) = old
+
+    def test_replay_conflict_is_reconciled_in_job_and_recorded(self) -> None:
+        conflict, published, upstream = self._conflicting_published_range()
+        calls: list[list[str]] = []
+
+        def backend(prompt: str, files: list[str]) -> str:
+            calls.append(list(files))
+            (self.repo / "base.txt").write_text("published\nupstream\n", encoding="utf-8")
+            return "union resolution applied"
+
+        with self._reconciliation(backend):
+            records = release.replay_published_integration_range(published, upstream, return_records=True)
+
+        self.assertEqual(calls, [["base.txt"]])
+        resolved = [record for record in records if record["status"] == "applied_in_job_resolution"]
+        self.assertEqual(len(resolved), 1)
+        record = resolved[0]
+        head = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(record["source_commit"], conflict)
+        self.assertEqual(record["conflicted_files"], ["base.txt"])
+        self.assertEqual(record["output_commit"], head)
+        self.assertNotEqual(head, published)
+        self.assertEqual(self.command("git", "show", "HEAD:base.txt").stdout, "published\nupstream\n")
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+        self.assertNotEqual(self.command("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode, 0)
+        artifacts = list((self.repo / ".git" / "reviews").glob("reconstruction-resolution-*.json"))
+        self.assertEqual(len(artifacts), 1)
+        payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "resolved_in_job")
+        self.assertEqual(payload["source_commit"], conflict)
+        self.assertEqual(payload["conflicted_files"], ["base.txt"])
+        self.assertEqual(record["resolution_artifact"], str(artifacts[0]))
+        # No human review request was written: the job proved the resolution.
+        self.assertEqual(list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json")), [])
+
+    def test_replay_conflict_backend_leaving_markers_falls_back_closed(self) -> None:
+        conflict, published, upstream = self._conflicting_published_range()
+
+        with self._reconciliation(lambda prompt, files: "changed nothing"):
+            with self.assertRaisesRegex(RuntimeError, re.escape(conflict)):
+                release.replay_published_integration_range(published, upstream)
+
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+        self.assertNotEqual(self.command("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode, 0)
+        reviews = list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json"))
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(json.loads(reviews[0].read_text(encoding="utf-8"))["failed_patch"]["commit"], conflict)
+
+    def test_replay_conflict_backend_touching_extra_files_falls_back_closed(self) -> None:
+        conflict, published, upstream = self._conflicting_published_range()
+
+        def backend(prompt: str, files: list[str]) -> str:
+            (self.repo / "base.txt").write_text("published\nupstream\n", encoding="utf-8")
+            (self.repo / "rogue.txt").write_text("overreach\n", encoding="utf-8")
+            return "overreached"
+
+        with self._reconciliation(backend):
+            with self.assertRaisesRegex(RuntimeError, re.escape(conflict)):
+                release.replay_published_integration_range(published, upstream)
+
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
+        self.assertFalse((self.repo / "rogue.txt").exists())
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+        reviews = list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json"))
+        self.assertEqual(len(reviews), 1)
 
     def test_merge_conflict_restoration_clears_index_and_worktree(self) -> None:
         self.command("git", "checkout", "-qb", "published", self.base)
@@ -426,11 +524,14 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.command("git", "checkout", "-q", "published")
         old_review_dir = release.REVIEW_DIR
         release.REVIEW_DIR = self.repo / "reviews"
+        old_reconcile = release.IN_JOB_RECONCILIATION
+        release.IN_JOB_RECONCILIATION = False
         try:
             with chdir(self.repo), self.assertRaisesRegex(RuntimeError, r"published merge resolution"):
                 release.replay_published_integration_range(published, upstream)
         finally:
             release.REVIEW_DIR = old_review_dir
+            release.IN_JOB_RECONCILIATION = old_reconcile
 
         self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
         self.assertEqual(self.command("git", "diff", "--cached", "--name-only").stdout.strip(), "")
@@ -1338,6 +1439,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
             "output_is_already_based_on_current_upstream", "validate_required_components",
             "validate_required_foundations", "validate_published_commit_preservation", "resolve_built_launcher",
             "sha256", "verify_existing_integration_release", "release_recovery_decision", "git", "run", "publish_release",
+            "integration_scripts_integrity_check",
         )}
         old_argv = __import__("sys").argv
         launcher = self.repo / "Hermes-Setup.exe"
@@ -1355,6 +1457,13 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
             return ""
 
         release.exclusive_lock = nullcontext
+        # This test wires post-push recovery; the integrity gate has its own
+        # coverage and must not couple this test to the machine's live
+        # operational generation (a worktree TRACKED_SET newer than the
+        # deployed stamp would otherwise fail main() before recovery runs).
+        release.integration_scripts_integrity_check = lambda **_kwargs: {
+            "ok": True, "source_sha": "stubbed", "stamped_source_sha": "stubbed", "files": {},
+        }
         release.ensure_clean_identity = lambda: ("stale-local", "published-current-output")
         release.synchronize_to_published_head = lambda *_args: "published-current-output"
         release.verify_upstream_foundations = lambda: []

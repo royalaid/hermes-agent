@@ -1004,7 +1004,7 @@ def fail(message: str, *, code: int = 1) -> None:
 
 
 def write_reconstruction_review_request(upstream: str, patch: dict[str, str] | None, error: Exception) -> Path:
-    """Persist a two-reviewer Opus brief; never auto-resolve a conflict or publish."""
+    """Persist a two-reviewer Opus brief for a conflict the job could not prove-resolve."""
     REVIEW_DIR.mkdir(parents=True, exist_ok=True)
     failed = patch or {"commit": "unknown", "subject": "unknown"}
     review_path = REVIEW_DIR / f"reconstruction-{datetime.now():%Y%m%d-%H%M%S}.json"
@@ -1523,6 +1523,127 @@ def _cherry_pick_stopped_empty() -> bool:
     )
 
 
+# ── in-job replay-conflict reconciliation (user directive 2026-08-16) ────────
+# A published-commit replay conflict is reconciled inside the job when the
+# result can be proven mechanically; anything unprovable falls back to the
+# fail-closed review-request stop. The proof belongs to the job, never to the
+# resolution backend: only both-modified files may change, no conflict marker
+# may survive, Python sources must still compile, and nothing outside the
+# conflicted set may be touched.
+IN_JOB_RECONCILIATION = True
+RESOLUTION_BACKEND = None  # tests inject a fake; None selects the claude backend
+
+
+def _claude_resolution_backend(prompt: str, conflicted: list[str]) -> str:
+    """Run a bounded, non-interactive resolver inside the job's worktree."""
+    result = run(
+        "claude", "-p", prompt,
+        "--model", "opus", "--effort", "high",
+        "--allowedTools", "Read,Edit,Grep,Glob",
+        "--permission-mode", "acceptEdits",
+        "--max-turns", "25", "--output-format", "json",
+        timeout=1200,
+    )
+    return result.stdout
+
+
+def _conflicted_paths() -> list[str]:
+    return [line for line in git("diff", "--name-only", "--diff-filter=U").splitlines() if line]
+
+
+def attempt_in_job_conflict_resolution(commit: str, subject: str) -> dict[str, Any] | None:
+    """Reconcile one replay conflict in-job; ``None`` means fall back closed.
+
+    Never raises: on ``None`` the caller re-raises the original cherry-pick
+    error and the existing restoration path cleans the checkout, so every
+    internal failure here degrades to exactly the old fail-closed behavior.
+    """
+    if not IN_JOB_RECONCILIATION:
+        return None
+    try:
+        conflicted = _conflicted_paths()
+        if not conflicted:
+            return None  # not a content conflict: a real git failure stays fatal
+        # Only both-modified content conflicts are provable here. Delete and
+        # rename conflicts need human intent and stay on the review path.
+        before = git("status", "--porcelain").splitlines()
+        states = {line[3:]: line[:2] for line in before if line}
+        if any(states.get(path) != "UU" for path in conflicted):
+            return None
+        prompt = (
+            "You are resolving one git cherry-pick conflict inside an automated "
+            f"Hermes integration release. Conflicted commit: {commit} ({subject}). "
+            f"Conflicted files (both-modified): {', '.join(conflicted)}. "
+            "Edit ONLY these files, and ONLY to reconcile the conflict markers: keep "
+            "both the upstream intent (HEAD side) and the fork intent (patch side) "
+            "wherever both apply — a union resolution. Never delete either side's "
+            "behavior just to make the conflict disappear. Do not stage, commit, or "
+            "run git commands; do not touch any other file. If the sides are "
+            "genuinely irreconcilable, change nothing and say so."
+        )
+        backend = RESOLUTION_BACKEND or _claude_resolution_backend
+        transcript = backend(prompt, list(conflicted))
+        # Job-owned proof, part 1: the backend touched nothing beyond editing
+        # the conflicted files in place (their porcelain lines stay "UU").
+        after = git("status", "--porcelain").splitlines()
+        if set(after) - set(before):
+            return None
+        for path in conflicted:
+            file_path = WORKTREE / path
+            if not file_path.is_file():
+                return None
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            if any(
+                line.startswith(("<<<<<<<", ">>>>>>>")) or line.rstrip() == "======="
+                for line in text.splitlines()
+            ):
+                return None
+            if path.endswith(".py") and run(
+                sys.executable, "-m", "py_compile", str(file_path), check=False
+            ).returncode:
+                return None
+        git("add", "--", *conflicted)
+        if _conflicted_paths():
+            return None
+        if run("git", "diff", "--cached", "--check", check=False).returncode:
+            return None
+        run(
+            "git", "-c", "rerere.enabled=false", "-c", "core.editor=true",
+            "cherry-pick", "--continue",
+            timeout=300, extra_env={"GIT_EDITOR": "true"},
+        )
+        output_commit = git("rev-parse", "HEAD")
+        REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        artifact_path = REVIEW_DIR / f"reconstruction-resolution-{datetime.now():%Y%m%d-%H%M%S}.json"
+        artifact_path.write_text(json.dumps({
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "resolved_in_job",
+            "source_commit": commit,
+            "subject": subject,
+            "conflicted_files": conflicted,
+            "output_commit": output_commit,
+            "resolved_delta": git("show", "--format=%H %s", output_commit, "--", *conflicted)[-20000:],
+            "backend_transcript_tail": (transcript or "")[-8000:],
+            "worktree": str(WORKTREE),
+        }, indent=2) + "\n", encoding="utf-8")
+        log(
+            f"RECONSTRUCTION_RESOLVED_IN_JOB commit={commit} "
+            f"files={','.join(conflicted)} artifact={artifact_path}"
+        )
+        return {
+            "kind": "published",
+            "status": "applied_in_job_resolution",
+            "source_commit": commit,
+            "output_commit": output_commit,
+            "output_patch_id": _commit_patch_id(output_commit),
+            "conflicted_files": conflicted,
+            "resolution_artifact": str(artifact_path),
+        }
+    except Exception as exc:
+        log(f"WARNING in-job reconciliation failed for {commit}: {exc}")
+        return None
+
+
 def _restore_replay_checkout(published_input_head: str) -> tuple[bool, bool, str, Exception | None]:
     """Abort replay and remove all owned tracked/untracked transaction debris."""
     git("cherry-pick", "--abort", check=False)
@@ -1544,9 +1665,12 @@ def replay_published_integration_range(
 ) -> list[Any]:
     """Rebuild upstream from every published-only commit, preserving direct work.
 
-    This helper performs no remote mutation.  A conflict restores the original
-    published checkout, leaves no cherry-pick state, and records the exact
-    source commit for human reconstruction review.
+    This helper performs no remote mutation.  A conflict is first offered to
+    the in-job reconciliation path (proof-carrying, see
+    ``attempt_in_job_conflict_resolution``); when that cannot prove a
+    resolution the original published checkout is restored, no cherry-pick
+    state is left behind, and the exact source commit is recorded for human
+    reconstruction review.
     """
     base, commits = published_integration_range(published_input_head, upstream_head)
     # An already-published/absorbed branch needs no reconstruction.  Return
@@ -1586,21 +1710,29 @@ def replay_published_integration_range(
             try:
                 git(*cherry_pick_args, commit, timeout=900)
             except Exception:
-                if not is_merge or not _cherry_pick_stopped_empty():
+                if is_merge and _cherry_pick_stopped_empty():
+                    # The side-parent commits can already represent the whole
+                    # first-parent delta.  Resolve Git's empty stop explicitly
+                    # and retain the merge source in the preservation ledger.
+                    git("cherry-pick", "--skip", timeout=120)
+                    output_commit = git("rev-parse", "HEAD")
+                    records.append({
+                        "kind": "published",
+                        "status": "merge_delta_already_represented",
+                        "source_commit": commit,
+                        "output_commit": output_commit,
+                        "output_patch_id": None,
+                        "parent_count": len(parents),
+                        "mainline": 1,
+                    })
+                    continue
+                resolution = attempt_in_job_conflict_resolution(commit, subject)
+                if resolution is None:
                     raise
-                # The side-parent commits can already represent the whole
-                # first-parent delta.  Resolve Git's empty stop explicitly and
-                # retain the merge source in the preservation ledger.
-                git("cherry-pick", "--skip", timeout=120)
-                output_commit = git("rev-parse", "HEAD")
+                replayed.append(commit)
                 records.append({
-                    "kind": "published",
-                    "status": "merge_delta_already_represented",
-                    "source_commit": commit,
-                    "output_commit": output_commit,
-                    "output_patch_id": None,
-                    "parent_count": len(parents),
-                    "mainline": 1,
+                    **resolution,
+                    **({"parent_count": len(parents), "mainline": 1} if is_merge else {}),
                 })
                 continue
             replayed.append(commit)

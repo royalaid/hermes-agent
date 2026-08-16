@@ -561,3 +561,16 @@ dirty, provenance is missing, or a required gate fails.
 - [ ] Native tests, build, checksum, and served-SHA checks pass.
 - [ ] The readiness switch is explicit for every excluded component.
 - [ ] The user receives the exact supported update path and artifact identity.
+
+### 2026-08-16 policy amendment: replay conflicts reconcile in-job
+
+User directive after the first live conflict (fork `270d7549f8` vs upstream
+`a525bbed0e`, both touching the Windows-updater dotenv guard in
+`hermes_cli/main.py`): a published-commit replay conflict no longer stops the
+nightly for a human by default. The job first attempts a proof-carrying
+in-job resolution (bounded non-interactive resolver; the job itself verifies
+scope, markers, compilation, and index cleanliness before continuing the
+pick) and records the outcome as `applied_in_job_resolution` plus a
+`resolved_in_job` artifact. The fail-closed review-request stop is retained
+strictly as the fallback for unprovable cases. Authority, integrity, and
+restoration gates are unchanged.

@@ -41,6 +41,12 @@ it, per the U2 runbook):
     carrying them must come from a published SHA that contains them --
     until then the operational generation keeps running its own older
     ``sync.py`` with the older tracked set, which is unaffected.
+  - ``ledger.py`` (U7 provenance) is tracked because the release script
+    loads it as a sibling file (``_fold_provenance``) to derive and fold
+    provenance into every run receipt. Its initial omission was a real
+    operational defect: every deployed run logged
+    ``WARNING provenance derivation failed: FileNotFoundError .. ledger.py``
+    because the file had never arrived through the sync boundary.
   - ``sync.py`` (this file) is ALSO tracked -- a deviation from the plan's
     literal enumeration, made deliberately: ``release.py`` loads this
     module as a sibling file via ``importlib`` (the operational directory
@@ -124,6 +130,7 @@ TRACKED_SET: tuple[str, ...] = (
     "overdue_check.py",
     "sync.py",
     "proposals.py",
+    "ledger.py",
     "fork-integration-blocklist.json",
 )
 
