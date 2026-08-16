@@ -1,0 +1,616 @@
+"""U2 (KTD2, R14): the sync boundary between the in-repo release system and
+its operational copies at ``%HERMES_HOME%\\scripts``.
+
+Covers ``scripts/fork_integration/sync.py`` directly (staged atomic
+``sync()``, tree-authoritative ``verify()``, narrow-attestation
+``restamp_manifest()``, and the CLI), plus the two wiring points in
+``hermes-integration-release-windows.py``: the run-start integrity gate
+(``integration_scripts_integrity_check``) and the post-publish hook
+(``sync_operational_copies``, called only from the true publish success
+branch -- never on failure or under ``--dry-run``).
+
+Fixtures build small real git repos (mirrors this suite's existing
+``test_stable_patch_id_matches_real_git_patch_id`` idiom) rather than
+mocking git, since ``sync.py``'s entire job is to be trustworthy against
+what git actually has committed.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from scripts.fork_integration import sync
+
+SYNC_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "fork_integration" / "sync.py"
+
+
+# ── fixtures ─────────────────────────────────────────────────────────────
+
+
+def _init_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Fork Integration Sync Test"], cwd=repo, check=True)
+    # sync.py compares working-tree bytes against committed blob bytes
+    # byte-for-byte (that IS the point of the tool). Disable autocrlf for
+    # this fixture repo so a host-level global core.autocrlf=true setting
+    # cannot silently normalize what git stores relative to what these
+    # tests write and read back -- exactly the class of drift the real
+    # operational files guard against via .gitattributes "-text".
+    subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "core.safecrlf", "false"], cwd=repo, check=True)
+    return repo
+
+
+def _write_tracked_files(repo: Path, *, variant: str) -> None:
+    tracked_dir = repo / "scripts" / "fork_integration"
+    tracked_dir.mkdir(parents=True, exist_ok=True)
+    for name in sync.TRACKED_SET:
+        (tracked_dir / name).write_text(f"# {name} content {variant}\n", encoding="utf-8")
+
+
+def _commit(repo: Path, message: str) -> str:
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", message], cwd=repo, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True,
+    ).stdout.strip()
+
+
+# ── TRACKED_SET ──────────────────────────────────────────────────────────
+
+
+def test_tracked_set_matches_the_named_files_plus_sync_py() -> None:
+    """The five plan-named files, plus sync.py itself (documented deviation
+    -- see sync.py's module docstring). Shims/README are excluded."""
+    assert set(sync.TRACKED_SET) == {
+        "hermes-integration-release-windows.py",
+        "hermes-release-failure-investigator.py",
+        "hermes-integration-manifest.json",
+        "test_hermes_integration_release_windows.py",
+        "overdue_check.py",
+        "sync.py",
+    }
+    for excluded in ("release.py", "investigator.py", "__init__.py", "README.md"):
+        assert excluded not in sync.TRACKED_SET
+
+
+# ── sync(): exact-set copy + stamp ──────────────────────────────────────
+
+
+def test_sync_copies_exact_tracked_set_and_writes_stamp(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+
+    stamp = sync.sync(sha, repo, dest)
+
+    on_disk_names = {f.name for f in dest.iterdir() if f.name != sync.SYNC_STAMP_FILENAME}
+    assert on_disk_names == set(sync.TRACKED_SET)
+    assert stamp["source_sha"] == sha
+    assert set(stamp["files"]) == set(sync.TRACKED_SET)
+    assert stamp["provisional"] is False
+    assert stamp["reason"] is None
+    assert stamp["actor"] is None
+    assert "synced_at" in stamp
+
+    stamp_on_disk = json.loads((dest / sync.SYNC_STAMP_FILENAME).read_text(encoding="utf-8"))
+    assert stamp_on_disk == stamp
+    for name in sync.TRACKED_SET:
+        assert (dest / name).read_text(encoding="utf-8") == f"# {name} content v1\n"
+
+
+# ── sync(): idempotent re-sync ───────────────────────────────────────────
+
+
+def test_sync_is_idempotent_for_the_same_sha(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+
+    first = sync.sync(sha, repo, dest)
+    second = sync.sync(sha, repo, dest)
+
+    assert first["source_sha"] == second["source_sha"] == sha
+    assert first["files"] == second["files"]
+    assert sync.verify(dest, repo)["ok"] is True
+
+
+# ── verify(): tree is authoritative, not the stamp ──────────────────────
+
+
+def test_verify_fails_when_file_and_stamp_are_rewritten_consistently(tmp_path: Path) -> None:
+    """A consistently-rewritten file+stamp (self-agreeing, but disagreeing
+    with the actual committed tree) must still fail -- the tree is
+    authoritative, never the stamp's own recorded per-file hash."""
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+    sync.sync(sha, repo, dest)
+
+    tampered_name = sync.TRACKED_SET[0]
+    tampered_bytes = b"tampered content that matches no commit\n"
+    (dest / tampered_name).write_bytes(tampered_bytes)
+    stamp_path = dest / sync.SYNC_STAMP_FILENAME
+    stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+    # Attacker "fixes" the stamp to agree with the tampered file.
+    stamp["files"][tampered_name] = hashlib.sha256(tampered_bytes).hexdigest()
+    stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
+
+    result = sync.verify(dest, repo)
+
+    assert result["ok"] is False
+    problems_by_file = {p["file"]: p["reason"] for p in result["problems"]}
+    assert problems_by_file[tampered_name] == "hash_mismatch"
+
+
+def test_verify_reports_no_stamp(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    _commit(repo, "v1")
+    dest = tmp_path / "dest"  # never synced
+    dest.mkdir()
+
+    result = sync.verify(dest, repo)
+
+    assert result["ok"] is False
+    assert result["reason"] == "no_stamp"
+
+
+def test_verify_reports_unreachable_stamped_sha(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+    sync.sync(sha, repo, dest)
+
+    stamp_path = dest / sync.SYNC_STAMP_FILENAME
+    stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+    stamp["source_sha"] = "f" * 40  # never committed
+    stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
+
+    result = sync.verify(dest, repo)
+
+    assert result["ok"] is False
+    assert result["reason"] == "unreachable_sha"
+
+
+def test_verify_reports_missing_file(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+    sync.sync(sha, repo, dest)
+
+    (dest / sync.TRACKED_SET[0]).unlink()
+
+    result = sync.verify(dest, repo)
+
+    assert result["ok"] is False
+    problems_by_file = {p["file"]: p["reason"] for p in result["problems"]}
+    assert problems_by_file[sync.TRACKED_SET[0]] == "missing_file"
+
+
+# ── sync(): a run claiming any repair status cannot use mismatched files;
+# only re-sync is permitted (release.py's run-start gate) ───────────────
+
+
+def test_run_start_check_fails_closed_then_only_resync_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end against the real sync module: release.py's run-start
+    integrity gate refuses on a mismatch, and the ONLY thing that clears
+    it is re-running sync() from a verified sha -- not a bypass."""
+    from scripts.fork_integration.release import mod as release
+
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha = _commit(repo, "v1")
+    hermes_home = tmp_path / "hermes-home"
+    dest = hermes_home / "scripts"
+    sync.sync(sha, repo, dest)
+
+    monkeypatch.setattr(release, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr(release, "WORKTREE", repo)
+    monkeypatch.setattr(release, "log", lambda message: None)
+
+    def spy_fail(message: str, *, code: int = 1) -> None:
+        raise SystemExit(code)
+
+    monkeypatch.setattr(release, "fail", spy_fail)
+
+    healthy = release.integration_scripts_integrity_check(dry_run=False)
+    assert healthy["ok"] is True
+
+    (dest / sync.TRACKED_SET[0]).write_text("tampered out of band\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        release.integration_scripts_integrity_check(dry_run=False)
+
+    # Re-sync (the only permitted remedy) clears it.
+    sync.sync(sha, repo, dest)
+    recovered = release.integration_scripts_integrity_check(dry_run=False)
+    assert recovered["ok"] is True
+
+
+def test_run_start_check_fails_closed_on_real_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolated unit test of the gate function via a monkeypatched sync
+    module (complements the end-to-end test above)."""
+    from scripts.fork_integration.release import mod as release
+
+    fail_calls: list[str] = []
+
+    def spy_fail(message: str, *, code: int = 1) -> None:
+        fail_calls.append(message)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(release, "fail", spy_fail)
+    monkeypatch.setattr(release, "log", lambda message: None)
+    fake_sync = SimpleNamespace(verify=lambda dest, repo: {"ok": False, "reason": "hash_mismatch", "problems": []})
+    monkeypatch.setattr(release, "_sync_module", lambda: fake_sync)
+
+    with pytest.raises(SystemExit):
+        release.integration_scripts_integrity_check(dry_run=False)
+
+    assert len(fail_calls) == 1
+    assert "sync.py deploy" in fail_calls[0]
+    assert "no bypass" not in fail_calls[0]  # no bypass flag is ever mentioned as an option
+
+
+def test_run_start_check_dry_run_continues_and_reports_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.fork_integration.release import mod as release
+
+    monkeypatch.setattr(release, "log", lambda message: None)
+
+    def unexpected_fail(message: str, *, code: int = 1) -> None:
+        raise AssertionError("fail() must not be called under --dry-run")
+
+    monkeypatch.setattr(release, "fail", unexpected_fail)
+    fake_sync = SimpleNamespace(verify=lambda dest, repo: {"ok": False, "reason": "hash_mismatch", "problems": []})
+    monkeypatch.setattr(release, "_sync_module", lambda: fake_sync)
+
+    result = release.integration_scripts_integrity_check(dry_run=True)
+
+    assert result["ok"] is False
+    assert result["reason"] == "hash_mismatch"
+
+
+def test_run_start_check_missing_stamp_is_bootstrap_tolerance_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.fork_integration.release import mod as release
+
+    logs: list[str] = []
+    monkeypatch.setattr(release, "log", lambda message: logs.append(message))
+
+    def unexpected_fail(message: str, *, code: int = 1) -> None:
+        raise AssertionError("fail() must not be called for a pre-U2 missing stamp")
+
+    monkeypatch.setattr(release, "fail", unexpected_fail)
+    fake_sync = SimpleNamespace(verify=lambda dest, repo: {"ok": False, "reason": "no_stamp"})
+    monkeypatch.setattr(release, "_sync_module", lambda: fake_sync)
+
+    result = release.integration_scripts_integrity_check(dry_run=False)
+
+    assert result["reason"] == "no_stamp"
+    assert any("no sync stamp" in line for line in logs)
+
+
+# ── sync(): interrupted commit phase leaves a detectable, never-lied-about
+# state (prior generation's untouched files + stamp stay consistent) ────
+
+
+def test_interrupted_sync_leaves_prior_generation_and_stamp_consistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha1 = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+    sync.sync(sha1, repo, dest)
+
+    _write_tracked_files(repo, variant="v2")
+    sha2 = _commit(repo, "v2")
+
+    real_replace = sync.os.replace
+    call_count = {"n": 0}
+
+    def flaky_replace(src: Any, dst: Any) -> Any:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise OSError("simulated kill between file writes")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(sync.os, "replace", flaky_replace)
+
+    with pytest.raises(OSError):
+        sync.sync(sha2, repo, dest)
+
+    # The stamp is written strictly last -- it was never reached this run,
+    # so it still names the OLD generation.
+    stamp_on_disk = json.loads((dest / sync.SYNC_STAMP_FILENAME).read_text(encoding="utf-8"))
+    assert stamp_on_disk["source_sha"] == sha1
+
+    replaced_name = sync.TRACKED_SET[0]  # 1st os.replace call: succeeded
+    untouched_name = sync.TRACKED_SET[2]  # loop died on call #2 (index 1); never reached
+    assert (dest / replaced_name).read_text(encoding="utf-8") == f"# {replaced_name} content v2\n"
+    assert (dest / untouched_name).read_text(encoding="utf-8") == f"# {untouched_name} content v1\n"
+
+    # verify() catches the torn state instead of silently trusting it: the
+    # replaced file no longer matches what the still-old stamp implies.
+    monkeypatch.setattr(sync.os, "replace", real_replace)
+    torn = sync.verify(dest, repo)
+    assert torn["ok"] is False
+    problems_by_file = {p["file"]: p["reason"] for p in torn["problems"]}
+    assert problems_by_file[replaced_name] == "hash_mismatch"
+    assert untouched_name not in problems_by_file
+
+    # Recovery: re-sync from the intended sha lands a fully consistent
+    # generation again.
+    recovered = sync.sync(sha2, repo, dest)
+    assert recovered["source_sha"] == sha2
+    assert sync.verify(dest, repo)["ok"] is True
+
+
+# ── sync(): provisional stamps + next non-provisional sync re-stamps ────
+
+
+def test_provisional_deploy_stamps_provisional_and_next_publish_restamps(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha1 = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+
+    provisional_stamp = sync.sync(
+        sha1, repo, dest, provisional=True, reason="publish path broken", actor="operator-x",
+    )
+    assert provisional_stamp["provisional"] is True
+    assert provisional_stamp["reason"] == "publish path broken"
+    assert provisional_stamp["actor"] == "operator-x"
+
+    _write_tracked_files(repo, variant="v2")
+    sha2 = _commit(repo, "v2")
+    published_stamp = sync.sync(sha2, repo, dest)  # normal (non-provisional) post-publish sync
+
+    assert published_stamp["provisional"] is False
+    assert published_stamp["reason"] is None
+    assert published_stamp["actor"] is None
+    assert published_stamp["source_sha"] == sha2
+
+
+# ── sync(): never fires on a failed or dry-run publish ───────────────────
+
+
+def test_sync_hook_call_site_is_inside_the_publish_success_branch() -> None:
+    """Code-inspection proof (explicitly permitted by the U2 test-scenario
+    wording): the post-publish sync call appears only in main()'s true
+    success path -- never in the exception handler, never in the
+    --dry-run branch."""
+    import inspect
+
+    from scripts.fork_integration.release import mod as release
+
+    source = inspect.getsource(release.main)
+
+    # main() has TWO "except Exception as exc:" blocks: an inner one inside
+    # the --dry-run branch's own try/except, and the outer one wrapping the
+    # whole real-run pipeline (textually last). rpartition targets that
+    # outer/last one so try_body covers the full real-run success path and
+    # except_body is exactly the real-run failure handler.
+    try_body, separator, except_body = source.rpartition("except Exception as exc:")
+    assert separator, "main() must retain its try/except structure"
+    assert "sync_operational_copies(" in try_body
+    assert "sync_operational_copies(" not in except_body
+
+    dry_run_branch, separator, real_run_branch = source.partition(
+        "started_at = datetime.now().astimezone()"
+    )
+    assert separator, "main() must retain the real-run/dry-run split at started_at"
+    assert "sync_operational_copies(" not in dry_run_branch
+    assert "sync_operational_copies(" in real_run_branch
+
+
+def test_sync_operational_copies_never_raises_and_reports_failure_honestly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-publish hook wrapper is best-effort: a sync failure must
+    not raise back into main() (the release already succeeded), but it
+    must be reported truthfully in the returned dict, not swallowed."""
+    from scripts.fork_integration.release import mod as release
+
+    logs: list[str] = []
+    monkeypatch.setattr(release, "log", lambda message: logs.append(message))
+
+    def broken_sync_module() -> Any:
+        raise RuntimeError("sync.py unavailable")
+
+    monkeypatch.setattr(release, "_sync_module", broken_sync_module)
+
+    outcome = release.sync_operational_copies("f" * 40)
+
+    assert outcome["ok"] is False
+    assert "sync.py unavailable" in outcome["error"]
+    assert any("post-publish sync failed" in line for line in logs)
+
+
+# ── restamp_manifest(): accepts matching fragment, refuses otherwise ────
+
+
+def test_restamp_manifest_accepts_matching_fragment_refuses_otherwise(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+    pre_stamp = sync.sync(sha, repo, dest)
+
+    manifest_path = dest / sync.MANIFEST_FILENAME
+    # Simulate the U6 approval flow having already applied an approved
+    # edit directly to the operational manifest, out of band.
+    manifest_path.write_text('{"approved": "fragment"}', encoding="utf-8")
+    approved_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+    restamped = sync.restamp_manifest(dest, repo, approved_hash)
+
+    assert restamped["files"][sync.MANIFEST_FILENAME] == approved_hash
+    assert restamped["source_sha"] == pre_stamp["source_sha"]
+    other_name = sync.TRACKED_SET[1]
+    assert restamped["files"][other_name] == pre_stamp["files"][other_name]
+    stamp_on_disk = json.loads((dest / sync.SYNC_STAMP_FILENAME).read_text(encoding="utf-8"))
+    assert stamp_on_disk == restamped
+
+    # Any further, un-approved delta refuses closed.
+    manifest_path.write_text('{"further": "unapproved edit"}', encoding="utf-8")
+    with pytest.raises(sync.SyncError):
+        sync.restamp_manifest(dest, repo, approved_hash)
+
+    # The refusal did not silently mutate the stamp.
+    stamp_after_refusal = json.loads((dest / sync.SYNC_STAMP_FILENAME).read_text(encoding="utf-8"))
+    assert stamp_after_refusal == restamped
+
+
+def test_restamp_manifest_refuses_without_a_prior_stamp(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    _commit(repo, "v1")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    manifest_path = dest / sync.MANIFEST_FILENAME
+    manifest_path.write_text("{}", encoding="utf-8")
+    approved_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+    with pytest.raises(sync.SyncError, match="no prior sync stamp"):
+        sync.restamp_manifest(dest, repo, approved_hash)
+
+
+# ── sync canary: marker absent before, present exactly once after ───────
+
+
+def test_sync_canary_sequence(tmp_path: Path) -> None:
+    """U2 execution note: commit a trivial marker change to a tracked
+    file, run sync() from that sha into a fake dest, and prove the marker
+    is absent until the sync, then present exactly once after."""
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="pre-canary")
+    _commit(repo, "pre-canary baseline")
+
+    marker_name = sync.TRACKED_SET[0]
+    marker_line = "CANARY-MARKER-2026-08-15"
+    tracked_path = repo / "scripts" / "fork_integration" / marker_name
+    tracked_path.write_text(tracked_path.read_text(encoding="utf-8") + marker_line + "\n", encoding="utf-8")
+    canary_sha = _commit(repo, "sync canary: marker change")
+
+    dest = tmp_path / "fake-operational-dest"
+    assert not dest.exists(), "marker must be absent before any sync/deploy"
+
+    stamp = sync.sync(canary_sha, repo, dest)
+
+    marker_text = (dest / marker_name).read_text(encoding="utf-8")
+    assert marker_text.count(marker_line) == 1
+    assert stamp["source_sha"] == canary_sha
+    assert stamp["files"][marker_name] == hashlib.sha256(tracked_path.read_bytes()).hexdigest()
+    assert sync.verify(dest, repo)["ok"] is True
+
+
+# ── CLI ────────────────────────────────────────────────────────────────
+
+
+class TestCli:
+    def test_deploy_then_verify_succeed(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path)
+        _write_tracked_files(repo, variant="v1")
+        sha = _commit(repo, "v1")
+        dest = tmp_path / "dest"
+
+        deploy = subprocess.run(
+            [
+                sys.executable, str(SYNC_SCRIPT_PATH), "deploy",
+                "--from-sha", sha, "--repo", str(repo), "--dest", str(dest),
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        assert deploy.returncode == 0, deploy.stderr
+        payload = json.loads(deploy.stdout)
+        assert payload["ok"] is True
+        assert payload["source_sha"] == sha
+
+        verify_run = subprocess.run(
+            [sys.executable, str(SYNC_SCRIPT_PATH), "verify", "--repo", str(repo), "--dest", str(dest)],
+            capture_output=True, text=True, check=False,
+        )
+        assert verify_run.returncode == 0, verify_run.stderr
+        assert json.loads(verify_run.stdout)["ok"] is True
+
+    def test_verify_exit_code_2_on_mismatch(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path)
+        _write_tracked_files(repo, variant="v1")
+        sha = _commit(repo, "v1")
+        dest = tmp_path / "dest"
+        sync.sync(sha, repo, dest)
+        (dest / sync.TRACKED_SET[0]).write_text("tampered\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(SYNC_SCRIPT_PATH), "verify", "--repo", str(repo), "--dest", str(dest)],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 2
+        assert json.loads(result.stdout)["ok"] is False
+
+    def test_provisional_deploy_requires_reason(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path)
+        _write_tracked_files(repo, variant="v1")
+        sha = _commit(repo, "v1")
+        dest = tmp_path / "dest"
+
+        result = subprocess.run(
+            [
+                sys.executable, str(SYNC_SCRIPT_PATH), "deploy",
+                "--from-sha", sha, "--repo", str(repo), "--dest", str(dest), "--provisional",
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 2
+        assert "reason" in json.loads(result.stdout)["error"]
+
+    def test_restamp_manifest_cli_success_and_exit_code_2_on_refusal(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path)
+        _write_tracked_files(repo, variant="v1")
+        sha = _commit(repo, "v1")
+        dest = tmp_path / "dest"
+        sync.sync(sha, repo, dest)
+        manifest_path = dest / sync.MANIFEST_FILENAME
+        manifest_path.write_text('{"approved": "fragment"}', encoding="utf-8")
+        approved_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+        ok_result = subprocess.run(
+            [
+                sys.executable, str(SYNC_SCRIPT_PATH), "restamp-manifest",
+                "--repo", str(repo), "--dest", str(dest), "--approved-fragment", approved_hash,
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        assert ok_result.returncode == 0, ok_result.stderr
+        assert json.loads(ok_result.stdout)["ok"] is True
+
+        manifest_path.write_text('{"further": "unapproved"}', encoding="utf-8")
+        refused = subprocess.run(
+            [
+                sys.executable, str(SYNC_SCRIPT_PATH), "restamp-manifest",
+                "--repo", str(repo), "--dest", str(dest), "--approved-fragment", approved_hash,
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        assert refused.returncode == 2
+        assert json.loads(refused.stdout)["ok"] is False

@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 SCRIPT = Path(__file__).with_name("hermes-integration-release-windows.py")
 SPEC = importlib.util.spec_from_file_location("integration_release", SCRIPT)
@@ -1486,6 +1487,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         old = {name: getattr(release, name) for name in (
             "inspect_dry_run", "log", "exclusive_lock", "run", "git", "synchronize_to_published_head",
             "replay_published_integration_range", "push_rebased_output", "publish_release", "resolve_built_launcher",
+            "_sync_module",
         )}
         old_argv = __import__("sys").argv
         result = {
@@ -1505,6 +1507,14 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         release.push_rebased_output = forbidden("push")
         release.publish_release = forbidden("release")
         release.resolve_built_launcher = forbidden("build")
+        # U2: the run-start integrity gate now runs before the dry-run
+        # inspection too. Stub sync.py's verify() as a clean pass so this
+        # test's "nothing but inspect_dry_run runs" contract stays exact,
+        # without performing real git subprocess calls against the real
+        # WORKTREE/HERMES_HOME (which are not overridden in this test).
+        release._sync_module = lambda: SimpleNamespace(
+            verify=lambda dest, repo: {"ok": True, "source_sha": "stub", "files": {}, "problems": []}
+        )
         try:
             __import__("sys").argv = [str(SCRIPT), "--dry-run"]
             self.assertEqual(release.main(), 0)

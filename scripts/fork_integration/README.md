@@ -24,15 +24,28 @@ and CI coverage.
 
 ## Sync contract (summary)
 
-These are currently a **one-time snapshot**, not a live mirror — the
-operational copies in the ops directory keep evolving independently.
-Automated sync entry points (so this directory tracks ops changes, or so
-reviewed changes flow back out) are **U2's** responsibility, not this unit's.
+As of **U2**, `sync.py` is the only path by which the operational copies at
+`%HERMES_HOME%\scripts` may change: an automatic post-publish sync (right
+after a successful release publish) and a provisional/break-glass
+`sync.py deploy` for an in-window investigator or an authorized operator.
+Operational copies are verified against this repo's committed git tree
+(never against the sync stamp's own recorded hashes — the tree is
+authoritative) by `hermes-integration-release-windows.py`'s run-start
+integrity gate, which fails closed on a real run and reports (without
+blocking) under `--dry-run`. See `sync.py`'s module docstring for the full
+mechanics, the tracked-file-set decision (which files sync and why the
+in-repo shims/README do not), and `python sync.py --help`.
+
+Note this changes the "byte-pure, do not hand-edit" policy above only for
+`sync.py`'s own two call sites inside
+`hermes-integration-release-windows.py` (the run-start gate and the
+post-publish hook) — everything else in that file, and every other
+imported file, is still byte-pure per the U1 import commit.
 
 ## Running the tests
 
 ```
-uv run python -m pytest tests/cron/test_fork_integration_release.py -q
+uv run python -m pytest tests/cron/test_fork_integration_release.py tests/cron/test_fork_integration_sync.py -q
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-fork-integration-release.ps1
 ```
 

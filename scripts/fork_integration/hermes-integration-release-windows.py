@@ -396,6 +396,82 @@ def resolve_failure_investigator_success() -> None:
         pass
 
 
+def _sync_module() -> Any:
+    """Load sync.py by path (U2/KTD2): same pattern as
+    ``_failure_investigator_module()`` -- the operational directory is flat
+    (no package ``__init__``), so a normal import statement cannot reach a
+    sibling module there. ``sync.py`` itself is a tracked file (see its
+    module docstring's TRACKED_SET rationale), so this always resolves
+    alongside this script in both the in-repo and operational locations.
+    """
+    spec = importlib.util.spec_from_file_location("fork_integration_sync", SCRIPT_DIR / "sync.py")
+    if not spec or not spec.loader:
+        raise RuntimeError("sync module is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def integration_scripts_integrity_check(*, dry_run: bool) -> dict[str, Any]:
+    """Run-start integrity gate (U2/KTD2, R14).
+
+    Verifies the operational copies at ``HERMES_HOME/scripts`` against the
+    published git tree (via the ``WORKTREE`` clone) BEFORE any mutation --
+    called immediately after argument parsing, before the exclusive lock,
+    before any fetch.
+
+    - No stamp at all (pre-U2 bootstrap: sync.py has never deployed
+      anything into this environment yet) is tolerated with a single
+      warning, not a failure -- there is no prior verified generation to
+      have drifted from.
+    - Any other ``verify()`` failure (hash mismatch, unreachable stamped
+      sha, a tracked file missing from disk or from the tree) fails closed
+      on a real run: refuse before touching the worktree, the lock, or
+      GitHub. The only remedy is ``python sync.py deploy ...``; there is
+      deliberately no bypass flag (KTD2: "never a bypass assertion").
+    - Under ``--dry-run`` the mismatch is folded into the dry-run report
+      instead of raising, since dry-run must stay read-only and must not
+      abort the rest of the (harmless) inspection.
+    """
+    try:
+        result = _sync_module().verify(HERMES_HOME / "scripts", WORKTREE)
+    except Exception as exc:
+        # The gate itself must fail closed, not silently pass, if it
+        # cannot even run (e.g. sync.py missing or broken).
+        result = {"ok": False, "reason": "integrity_check_unavailable", "error": str(exc)}
+    if not result.get("ok") and result.get("reason") == "no_stamp":
+        log("WARNING operational copies have no sync stamp yet (pre-U2 bootstrap); continuing without integrity verification")
+        return result
+    if not result.get("ok") and not dry_run:
+        fail(
+            "operational copies fail integrity check; run `sync.py deploy` "
+            f"to restore a verified generation: {json.dumps(result, sort_keys=True, default=str)}"
+        )
+    return result
+
+
+def sync_operational_copies(published_sha: str) -> dict[str, Any]:
+    """Post-publish sync hook (U2/KTD2): deploy the exact published tree's
+    tracked release-system files to ``HERMES_HOME/scripts``.
+
+    Best-effort by design: the release itself has already succeeded, been
+    pushed, and had its checksum verified by the time this runs, so a sync
+    failure here must not retroactively fail (or roll back) a genuinely
+    successful release. It is instead reported honestly in the result
+    JSON's ``"sync"`` key and logged loudly -- the next run's
+    ``integration_scripts_integrity_check()`` fails closed on the stale
+    operational copies until a human runs ``sync.py deploy`` (or the next
+    successful publish supersedes it).
+    """
+    try:
+        outcome = _sync_module().sync(published_sha, WORKTREE, HERMES_HOME / "scripts")
+        log(f"POST_PUBLISH_SYNC ok=true source_sha={published_sha}")
+        return {"ok": True, **outcome}
+    except Exception as exc:
+        log(f"WARNING post-publish sync failed: source_sha={published_sha} {type(exc).__name__}: {exc}")
+        return {"ok": False, "error": str(exc), "source_sha": published_sha}
+
+
 @contextmanager
 def dry_run_inspection_logging_disabled() -> Any:
     """Prevent checked command failures during dry-run inspection from being logged."""
@@ -1804,16 +1880,26 @@ def main() -> int:
         help="identity recorded on the exclusive lock, for busy/stale-reclaim diagnostics (default: scheduler)",
     )
     args = parser.parse_args()
+    # Run-start integrity gate (U2/KTD2, R14): before ANY mutation -- before
+    # the lock, before any fetch, even before the read-only dry-run
+    # inspection below -- the operational copies must match the published
+    # git tree. fail()s (raising SystemExit) on a real-run mismatch.
+    sync_integrity = integration_scripts_integrity_check(dry_run=args.dry_run)
     # A dry-run must not acquire the persistent lock, fetch (which updates
     # tracking refs), or invoke any normal-path verification that materializes
     # refs.  It intentionally performs only the read-only inspection above.
     if args.dry_run:
         try:
             result = inspect_dry_run()
+            result["sync_integrity"] = sync_integrity
             print(json.dumps(result))
             return 0
         except Exception as exc:
-            print(json.dumps({"ok": False, "error": f"dry-run inspection failed without mutation: {exc}"}, ensure_ascii=False))
+            print(json.dumps({
+                "ok": False,
+                "error": f"dry-run inspection failed without mutation: {exc}",
+                "sync_integrity": sync_integrity,
+            }, ensure_ascii=False))
             return 1
     started_at = datetime.now().astimezone()
     pre_run_local_head: str | None = None
@@ -1980,6 +2066,8 @@ def main() -> int:
             repaired_release = verify_existing_integration_release(rebased_output_head, expected_sha=checksum)
             if not repaired_release["complete"]:
                 raise RuntimeError(f"published release integrity verification failed: {repaired_release['reason']}")
+            stage = "sync_operational_copies"
+            sync_outcome = sync_operational_copies(rebased_output_head)
             result = {
                 "ok": True,
                 "changed": True,
@@ -1995,6 +2083,7 @@ def main() -> int:
                 "launcher": public_asset,
                 "sha256": checksum,
                 "retention_deleted": removed,
+                "sync": sync_outcome,
             }
             log(json.dumps(result, sort_keys=True))
             resolve_failure_investigator_success()
