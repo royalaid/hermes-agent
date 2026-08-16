@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Windows Task Scheduler definition for the fork-integration dead-man's
+  switch (U4/R18): runs scripts/fork_integration/overdue_check.py every 30
+  minutes. This file is AUTHORED ONLY: it is not registered by this
+  commit. Registration is a user-gated operational step (see
+  docs/plans/2026-08-15-001-feat-fork-integration-release-system-plan.md,
+  U4 approach note: "Do NOT register the task, that's operational
+  deployment, user-gated").
+
+  PLACEHOLDERS to fill in before deploying (search-and-replace both):
+
+    __PYTHON_EXE_PLACEHOLDER__
+        Full path to a Python 3.11+ interpreter. overdue_check.py is
+        stdlib-only by design (no hermes-agent venv dependency, since it
+        must keep working even if that environment is broken), so any
+        system Python works, e.g. C:\Windows\py.exe or
+        C:\Python311\python.exe.
+
+    __REPO_ROOT_PLACEHOLDER__
+        Full path to the hermes-agent checkout containing
+        scripts\fork_integration\overdue_check.py, e.g.
+        C:\Users\<you>\git\hermes-agent.
+
+  The task intentionally does NOT pass the hermes-home override flag: a
+  deployed watchdog should resolve the live HERMES_HOME the same way the
+  checker's default does (HERMES_HOME env var, else %LOCALAPPDATA%\hermes),
+  so it watches the real environment. Only test fixtures use that override.
+
+  Deploy (after filling in the placeholders above), from an elevated or
+  standard PowerShell prompt as appropriate for the target account:
+
+    schtasks /Create /TN "Hermes\ForkIntegrationOverdueCheck" ^
+      /XML "__REPO_ROOT_PLACEHOLDER__\scripts\fork_integration\overdue-check-task.xml"
+
+  Exit codes the task run history will show (see overdue_check.py's own
+  docstring for the full contract): 0 healthy, 1 indeterminate (job/jobs.json
+  not found, treat as needing investigation, not "fine"), 2 ALARM (job
+  overdue AND scheduler heartbeat stale, also appended to
+  <hermes-home>\logs\cron-scripts\overdue-alerts.log). This v1 checker has no
+  live alert transport of its own (Discord/webhook wiring is deferred); an
+  operator or a wrapping watcher consumes the exit code / alert log.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Hermes fork-integration dead-man's switch (U4/R18): every 30 minutes, checks whether the fork-integration nightly cron job is overdue AND the cron scheduler's own heartbeat is stale. Exit 2 = ALARM (also logged to logs\cron-scripts\overdue-alerts.log); exit 1 = indeterminate (could not find the job); exit 0 = healthy. See scripts\fork_integration\overdue_check.py for the full contract. Not auto-registered: fill in the placeholder paths in this file before deploying.</Description>
+    <URI>\Hermes\ForkIntegrationOverdueCheck</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>2026-08-15T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT30M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>__PYTHON_EXE_PLACEHOLDER__</Command>
+      <Arguments>"__REPO_ROOT_PLACEHOLDER__\scripts\fork_integration\overdue_check.py" --job-id 1ab4c7013fef --grace-minutes 90</Arguments>
+      <WorkingDirectory>__REPO_ROOT_PLACEHOLDER__</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
