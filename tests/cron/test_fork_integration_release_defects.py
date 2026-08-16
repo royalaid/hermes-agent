@@ -1,6 +1,8 @@
 """U5: characterize the 2026-08-13 audit-item behaviors as they currently
-stand in the imported ``hermes-integration-release-windows.py``.
+stand in the imported ``hermes-integration-release-windows.py``, then close
+the two verified residuals.
 
+Part 1 (characterization, pins current behavior, no production edits):
   - ``main()`` validates foundations against the reconstructed *records*
     ledger, not a live upstream/rebased-head scan (anchor: ``main()``'s
     ``validate_required_foundations(upstream, rebased_output_head,
@@ -12,10 +14,11 @@ stand in the imported ``hermes-integration-release-windows.py``.
     ``remote_ref_head`` (``git ls-remote``) and never calls ``git fetch``
     (anchor: ~line 1313, ~1361-1362).
 
-These pin current behavior only; the 2026-08-15 script largely fixed the
-2026-08-13 audit items already. The residuals that survived are closed in a
-follow-up commit (see ``_validate_required_records`` and
-``has_integration_release``).
+Part 2 (residual closure):
+  - ``_validate_required_records`` recomputes the output patch identity from
+    the reconstructed tree instead of trusting the record's stored value.
+  - ``has_integration_release`` was dead code (never called); its
+    disposition is recorded here.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,6 +34,7 @@ import pytest
 from scripts.fork_integration.release import mod as release
 
 _HEX40_A = "a" * 40
+_HEX40_B = "b" * 40
 
 
 def _harmless_run(*args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -53,7 +58,7 @@ def _quiet_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-# ── validate_required_foundations is called with records=... ───────────────
+# ── Part 1a: validate_required_foundations is called with records=... ──────
 
 
 def test_main_validates_foundations_against_reconstructed_records(
@@ -94,7 +99,7 @@ def test_main_validates_foundations_against_reconstructed_records(
     assert records == []  # empty because every resolution stub above produced no patches
 
 
-# ── pre-push failure restores to published_input_head ───────────────────────
+# ── Part 1b: pre-push failure restores to published_input_head ─────────────
 
 
 def test_main_pre_push_failure_restores_published_input_head(
@@ -126,7 +131,7 @@ def test_main_pre_push_failure_restores_published_input_head(
     assert restore_calls == [_HEX40_A]
 
 
-# ── --dry-run reads remotes via remote_ref_head, never fetches ──────────────
+# ── Part 1c: --dry-run reads remotes via remote_ref_head, never fetches ────
 
 
 def test_dry_run_reads_remotes_via_remote_ref_head_never_fetches(
@@ -172,3 +177,113 @@ def test_dry_run_reads_remotes_via_remote_ref_head_never_fetches(
     assert len(remote_ref_calls) == 2
     assert {call[0] for call in remote_ref_calls} == {release.FORK_REMOTE, release.UPSTREAM_REMOTE}
     assert not any(args and args[0] == "git" and "fetch" in args for args in recorded)
+
+
+# ── Part 2: _validate_required_records recomputes identity from the tree ───
+
+
+def _foundation_patch(**overrides: Any) -> dict[str, Any]:
+    base = {
+        "commit": _HEX40_A,
+        "stable_patch_id": "source-stable",
+        "subject": "fix: thing",
+        "accepted_output_patch_ids": ["accepted-1", "accepted-2"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _application_record(**overrides: Any) -> dict[str, Any]:
+    base = {
+        "kind": "foundation",
+        "status": "represented",
+        "source_commit": _HEX40_A,
+        "output_commit": _HEX40_B,
+        "output_patch_id": "accepted-1",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_validate_required_records_raises_when_recomputed_identity_mismatches_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A record whose stored output_patch_id no longer matches what the
+    reconstructed tree actually produces must fail closed, even though both
+    the stored and the recomputed identity are individually accepted."""
+    patch = _foundation_patch()
+    record = _application_record(output_patch_id="accepted-1")
+
+    monkeypatch.setattr(release, "stable_patch_id", lambda ref: "accepted-2")
+    monkeypatch.setattr(release, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+
+    with pytest.raises(RuntimeError, match="does not match reconstructed output"):
+        release._validate_required_records([patch], "rebased-head", [record], "foundation")
+
+
+def test_validate_required_records_passes_when_recomputed_matches_recorded_and_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = _foundation_patch()
+    record = _application_record(output_patch_id="accepted-1")
+
+    monkeypatch.setattr(release, "stable_patch_id", lambda ref: "accepted-1")
+    monkeypatch.setattr(release, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+
+    release._validate_required_records([patch], "rebased-head", [record], "foundation")  # must not raise
+
+
+def test_validate_required_records_still_enforces_reachability_after_identity_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-existing reachability check is not weakened by the new
+    identity recomputation: a matching, accepted identity whose output
+    commit is unreachable from the rebased head still fails."""
+    patch = _foundation_patch()
+    record = _application_record(output_patch_id="accepted-1")
+
+    monkeypatch.setattr(release, "stable_patch_id", lambda ref: "accepted-1")
+    monkeypatch.setattr(release, "run", lambda *args, **kwargs: SimpleNamespace(returncode=1))
+
+    with pytest.raises(RuntimeError, match="is not reachable from output"):
+        release._validate_required_records([patch], "rebased-head", [record], "foundation")
+
+
+def test_validate_required_records_recomputes_from_the_recorded_output_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the exact recompute call target: stable_patch_id(output_commit),
+    not the source commit or any other value."""
+    calls: list[str] = []
+    patch = _foundation_patch()
+    record = _application_record(output_commit=_HEX40_B, output_patch_id="accepted-1")
+
+    def fake_stable_patch_id(ref: str) -> str:
+        calls.append(ref)
+        return "accepted-1"
+
+    monkeypatch.setattr(release, "stable_patch_id", fake_stable_patch_id)
+    monkeypatch.setattr(release, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+
+    release._validate_required_records([patch], "rebased-head", [record], "foundation")
+
+    assert calls == [_HEX40_B]
+
+
+# ── Part 2: has_integration_release disposition ─────────────────────────────
+
+
+def test_has_integration_release_was_deleted_as_unwireable_dead_code() -> None:
+    """R-b disposition: ``has_integration_release`` was a checksum-less
+    'a release object exists' probe, confirmed (by grep, and by this test)
+    to be unreferenced by main() or anything else in the module. The one
+    place that decides release existence -- ``release_recovery_decision``'s
+    ``release_exists`` argument, fed by ``verify_existing_integration_release(
+    ..., expected_sha=checksum).get("complete")`` -- already performs a
+    strictly stronger, checksum-backed check. Wiring the probe in there
+    would either duplicate that network round-trip for no behavioral change,
+    or silently weaken the gate from "complete" to merely "candidate" (an
+    incomplete/broken release would then read as "exists"). Deleted rather
+    than wired; see the U5 residual commit body for the full rationale.
+    """
+    assert not hasattr(release, "has_integration_release")

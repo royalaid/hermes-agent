@@ -1145,11 +1145,19 @@ def _validate_required_records(
                 f"missing or ambiguous required {label} application record: source={patch['commit']} records={len(matches)}"
             )
         record = matches[0]
-        if record.get("output_patch_id") not in _accepted_output_patch_ids(patch):
-            raise RuntimeError(
-                f"required {label} application record has an unapproved output identity: source={patch['commit']}"
-            )
         output_commit = record.get("output_commit", "")
+        recorded_patch_id = record.get("output_patch_id")
+        accepted = _accepted_output_patch_ids(patch)
+        # Do not trust the recorded output_patch_id at face value: recompute
+        # it from the reconstructed tree so a record that was stamped once
+        # and never re-verified cannot silently drift from what output_commit
+        # actually contains.
+        recomputed = stable_patch_id(output_commit) if output_commit else None
+        if recomputed is None or recomputed not in accepted or recomputed != recorded_patch_id:
+            raise RuntimeError(
+                f"required {label} application record identity does not match reconstructed output: "
+                f"source={patch['commit']} output={output_commit} recorded={recorded_patch_id} recomputed={recomputed}"
+            )
         if not output_commit or run(
             "git", "merge-base", "--is-ancestor", output_commit, rebased_head, timeout=60, check=False
         ).returncode:
@@ -1678,11 +1686,6 @@ def publish_release(tag: str, commit: str, launcher: Path, checksum: str) -> tup
         run(str(GH_EXE), "release", "delete", old_tag, "--repo", REPOSITORY, "--yes", timeout=180)
         removed.append(old_tag)
     return view, removed
-
-
-def has_integration_release(commit: str) -> bool:
-    """Compatibility wrapper; callers with a build checksum must use rich verification."""
-    return bool(verify_existing_integration_release(commit).get("candidate"))
 
 
 def verify_public_asset(url: str, expected_sha: str) -> None:

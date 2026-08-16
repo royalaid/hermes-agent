@@ -1085,7 +1085,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         old_required_validator, old_foundation_validator, old_preservation_validator = (
             release.validate_required_components, release.validate_required_foundations, release.validate_published_commit_preservation
         )
-        old_has_release, old_verify_release, old_run = release.has_integration_release, release.verify_existing_integration_release, release.run
+        old_verify_release, old_run = release.verify_existing_integration_release, release.run
         old_current_output = release.output_is_already_based_on_current_upstream
 
         def harmless_run(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -1110,7 +1110,6 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         release.validate_required_components = lambda upstream, head, **_kwargs: calls.append(("required", (upstream, head)))
         release.validate_required_foundations = lambda upstream, head, **_kwargs: calls.append(("foundations", (upstream, head)))
         release.validate_published_commit_preservation = lambda commits, upstream, head, **_kwargs: calls.append(("preserved", (commits, upstream, head)))
-        release.has_integration_release = lambda head: True
         release.verify_existing_integration_release = lambda head, expected_sha=None: {"complete": True, "reason": "release_complete"}
         release.output_is_already_based_on_current_upstream = lambda published, upstream: False
         try:
@@ -1126,7 +1125,6 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
             release.validate_required_components, release.validate_required_foundations, release.validate_published_commit_preservation = (
                 old_required_validator, old_foundation_validator, old_preservation_validator
             )
-            release.has_integration_release = old_has_release
             release.verify_existing_integration_release = old_verify_release
             release.output_is_already_based_on_current_upstream = old_current_output
         self.assertEqual([name for name, _value in calls], ["required", "foundations", "preserved"])
@@ -1280,7 +1278,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         old = {name: getattr(release, name) for name in (
             "exclusive_lock", "ensure_clean_identity", "synchronize_to_published_head", "verify_upstream_foundations",
             "verify_manifest_sources", "patch_resolution", "upstream_patch_resolution", "published_integration_range",
-            "replay_published_integration_range", "output_is_already_based_on_current_upstream", "has_integration_release",
+            "replay_published_integration_range", "output_is_already_based_on_current_upstream",
             "validate_required_components", "validate_required_foundations", "validate_published_commit_preservation",
             "push_rebased_output", "run",
         )}
@@ -1309,7 +1307,6 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         release.validate_required_components = lambda *_args, **_kwargs: calls.append(("validate_required", None))
         release.validate_required_foundations = lambda *_args, **_kwargs: calls.append(("validate_foundations", None))
         release.validate_published_commit_preservation = lambda *_args, **_kwargs: calls.append(("validate_preservation", None))
-        release.has_integration_release = lambda head: False
         release.push_rebased_output = lambda *args: (_ for _ in ()).throw(AssertionError("recovery must not push"))
         release.run = stop_at_release_build
         try:
