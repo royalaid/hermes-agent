@@ -982,6 +982,7 @@ def install_cua_driver(
     upgrade: bool = False,
     require_confirmed_update: bool = False,
     show_installer_progress: bool = True,
+    installer_timeout: Optional[int] = None,
 ) -> bool:
     """Install or refresh the cua-driver binary used by Computer Use.
 
@@ -1070,7 +1071,7 @@ def install_cua_driver(
         # Pre-install asset probe deleted — see comment near the top of
         # tools_config.py for why. install.sh has CUA_DRIVER_RS_BAKED_VERSION
         # baked in by CD and errors cleanly on missing-arch assets.
-        return _run_cua_driver_installer(label="Installing")
+        return _run_cua_driver_installer(label="Installing", installer_timeout=installer_timeout)
 
     # An installed driver that fails Hermes' runtime contract (version floor,
     # missing manifest verbs) is repaired regardless of the caller's mode.
@@ -1209,6 +1210,7 @@ def install_cua_driver(
         verbose=False,
         pin_version=confirmed_version,
         show_progress=show_installer_progress,
+        installer_timeout=installer_timeout,
     )
     if ok and repair_existing:
         repaired = _cua_driver_contract_status()
@@ -1497,6 +1499,7 @@ def _run_cua_driver_installer(
     verbose: bool = True,
     pin_version: Optional[str] = None,
     show_progress: bool = True,
+    installer_timeout: Optional[int] = None,
 ) -> bool:
     """Run the upstream cua-driver installer for this platform.
 
@@ -1517,6 +1520,12 @@ def _run_cua_driver_installer(
     import platform as _plat
     import shutil
     import subprocess
+
+    # Callers with a user waiting (the `hermes update` refresh) pass a short
+    # budget; the default keeps the #58762-safe 660s ceiling for explicit
+    # installs, which must outlast the upstream installer's 600s stale-lock
+    # recovery window.
+    timeout_s = installer_timeout or _CUA_INSTALLER_TIMEOUT
 
     system = _plat.system()
     is_windows = system == "Windows"
@@ -1668,7 +1677,7 @@ def _run_cua_driver_installer(
                 **popen_kwargs
             )
             try:
-                proc.communicate(timeout=_CUA_INSTALLER_TIMEOUT)
+                proc.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 _kill_installer_tree(proc)
                 proc.communicate()
@@ -1685,10 +1694,29 @@ def _run_cua_driver_installer(
                 **popen_kwargs
             )
             try:
-                out, _ = proc.communicate(timeout=_CUA_INSTALLER_TIMEOUT)
+                out, _ = proc.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 _kill_installer_tree(proc)
-                proc.communicate()
+                # Keep whatever the installer said before the kill — without
+                # it a timeout is undiagnosable (2026-08-16: an 11-minute
+                # refresh stall left zero evidence of what the installer was
+                # doing).
+                partial, _ = proc.communicate()
+                if partial:
+                    logger.debug(
+                        "cua-driver installer output before timeout:\n%s", partial
+                    )
+                    _update_log = getattr(sys.stdout, "_log", None)
+                    if _update_log is not None:
+                        try:
+                            _update_log.write(
+                                "\n--- cua-driver installer output (timed out) ---\n"
+                                + partial
+                                + "\n"
+                            )
+                            _update_log.flush()
+                        except Exception:
+                            pass
                 raise
             result = subprocess.CompletedProcess(
                 install_cmd, proc.returncode, stdout=out, stderr=None
@@ -1739,7 +1767,7 @@ def _run_cua_driver_installer(
     except subprocess.TimeoutExpired:
         _print_warning(
             f"    cua-driver {label.lower()} timed out after "
-            f"{_CUA_INSTALLER_TIMEOUT}s."
+            f"{timeout_s}s."
         )
         if not is_windows:
             _print_info(
