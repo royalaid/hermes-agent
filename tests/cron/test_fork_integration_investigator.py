@@ -1046,3 +1046,143 @@ def test_run_artifact_links_the_created_session_to_the_token_and_the_incident(
     goal_command = transport.requests[1][1]["command"]
     assert goal_command.startswith("goal Finish or fail-closed")
     assert decision["token_path"] in goal_command
+
+
+# ═══ Part 3: sidebar visibility (R11) ═══════════════════════════════════════
+#
+# Trace, verified by these tests rather than by reading alone:
+#   desktop $sessions
+#     <- use-session-list-actions.ts listSidebarSessions(recentsExclude=
+#        SIDEBAR_EXCLUDED_SOURCES)
+#     <- GET /api/profiles/sessions/sidebar   (hermes_cli/web_routers/profiles.py)
+#     <- SessionDB.list_sessions_rich(exclude_sources=..., min_message_count=1,
+#        include_archived=False, include_hidden=False)
+# ``cron_session`` is a LIVE-ONLY marker: the gateway never persists it, there
+# is no column for it, and nothing filters on it. Nightly run sessions stay out
+# of recents purely because they are created with source="cron"; the
+# investigator session is source="desktop" and is therefore listed.
+#
+# So NO production code change was needed for the visibility half of R11 --
+# only the title, which the spawner now sets. These tests are the proof, and
+# they fail if either invariant is ever taken away.
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_investigator_session_reaches_the_sidebar_and_the_run_session_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end at the layer the Desktop actually calls."""
+    pytest.importorskip("starlette")
+    from starlette.testclient import TestClient
+
+    import hermes_state
+    from hermes_cli import profiles as profiles_mod
+    from hermes_cli.web_routers import profiles as profiles_router
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+    from tui_gateway import server
+
+    home = Path(get_hermes_home())
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(profiles_mod, "_get_default_hermes_home", lambda: home)
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: home / "profiles")
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
+    profiles_router._sidebar_profile_cache_clear()
+
+    db = SessionDB(db_path=home / "state.db")
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    artifact = json.loads(Path(_record(tmp_path)["artifact_path"]).read_text(encoding="utf-8"))
+    params = investigator.session_create_params(artifact)
+    run_session_id = f"cron_{JOB_ID}_20260815_120000"
+    try:
+        created = server._methods["session.create"]("rid-investigator", params)["result"]
+        session = server._sessions[created["session_id"]]
+        assert session["source"] == "desktop"
+        assert session["cron_session"] == JOB_ID
+        # What prompt.submit does on the spawner's first (and only) prompt.
+        server._ensure_session_db_row(session)
+        investigator_key = session["session_key"]
+        db.append_message(session_id=investigator_key, role="user", content="investigate")
+        db.set_session_title(investigator_key, session["pending_title"])
+        # The nightly no_agent RUN session, created the way cron/scheduler.py
+        # creates it.
+        db.create_session(run_session_id, source="cron")
+        db.append_message(session_id=run_session_id, role="user", content="no_agent script: release.py")
+    finally:
+        server._sessions.clear()
+        db.close()
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    payload = client.get("/api/profiles/sessions/sidebar", params={
+        "recents_profile": "all",
+        "recents_exclude": "cron,kanban,subagent,tool",
+        # A distinctive cap so the endpoint's 5s response cache cannot serve
+        # another test's payload for these arguments.
+        "recents_limit": 37,
+        "messaging_exclude": "cli,cron,desktop,tui",
+    }).json()
+
+    assert payload["errors"] == []
+    recents = {row["id"]: row for row in payload["recents"]["sessions"]}
+    assert investigator_key in recents, "the investigator session must be visible in recents"
+    assert recents[investigator_key]["title"] == params["title"]
+    assert recents[investigator_key]["title"].startswith("Release investigator · ")
+    # The nightly run session keeps its out-of-recents invariant, and is still
+    # reachable in the cron slice the cron section renders.
+    assert run_session_id not in recents
+    assert run_session_id in {row["id"] for row in payload["cron"]["sessions"]}
+
+
+def test_the_persisted_investigator_row_is_keyed_on_source_not_on_the_cron_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker cannot become the thing anything filters on (R11)."""
+    from tui_gateway import server
+
+    persisted: dict[str, Any] = {}
+
+    class _FakeDb:
+        def create_session(self, _key: str, **kwargs: Any) -> None:
+            persisted.update(kwargs)
+
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDb())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    artifact = json.loads(Path(_record(tmp_path)["artifact_path"]).read_text(encoding="utf-8"))
+    try:
+        created = server._methods["session.create"]("rid", investigator.session_create_params(artifact))
+        server._ensure_session_db_row(server._sessions[created["result"]["session_id"]])
+    finally:
+        server._sessions.clear()
+
+    assert persisted["source"] == "desktop"
+    assert "cron_session" not in persisted
+    assert "cron_session" not in (persisted.get("model_config") or {})
+
+
+def test_the_desktop_recents_filter_excludes_cron_but_not_the_investigator_source() -> None:
+    """Guard on the client half of the trace: the exclusion taxonomy the
+    sidebar sends must keep dropping ``cron`` run sessions and must never
+    grow a ``desktop`` entry (which would hide investigator sessions)."""
+    import re
+
+    actions = (REPO_ROOT / "apps/desktop/src/app/session/hooks/use-session-list-actions.ts").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"SIDEBAR_EXCLUDED_SOURCES\s*=\s*\[(.*?)\]", actions, re.S)
+    assert match, "SIDEBAR_EXCLUDED_SOURCES moved; re-trace the sidebar filter"
+    excluded = match.group(1)
+    assert "'cron'" in excluded
+    assert "'desktop'" not in excluded
+
+    sources = (REPO_ROOT / "apps/desktop/src/lib/session-source.ts").read_text(encoding="utf-8")
+    messaging = re.search(r"MESSAGING_SESSION_SOURCE_IDS\s*=\s*\[(.*?)\]", sources, re.S)
+    assert messaging, "MESSAGING_SESSION_SOURCE_IDS moved; re-trace the sidebar filter"
+    assert "'desktop'" not in messaging.group(1)

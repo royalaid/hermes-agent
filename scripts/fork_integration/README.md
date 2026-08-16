@@ -79,6 +79,68 @@ for the `churn_livelock` escalation after three regenerations.
 
 Blocklisted patch-ids never count as equivalent and are never re-proposed.
 
+## Investigator finish authority (U9)
+
+When a run fails, `hermes-release-failure-investigator.py` records a
+sanitized incident and — for the first failure with no live finisher —
+**mints an authority record** at
+`%HERMES_HOME%\cron\authority\<job>-<signature>.json` before spawning the
+investigator session. The record carries the job id, the incident
+signature, the session id (patched in after `session.create` returns),
+`issued_at`, a **frozen** `expires_at` = `min(next scheduled fire, issue +
+4h)`, and the allowed action set (`push`, `publish`).
+
+`hermes-integration-release-windows.py --authority-token <path>` validates
+it in code immediately before **each** privileged action: any `--holder`
+other than `scheduler` must present a token that parses, names this job, is
+unexpired at that instant, allows that action, and whose recomputed digest
+matches the digest the spawner recorded in the still-open incident. Every
+failure is a named refusal (`authority_token_expired`,
+`authority_token_sha256_mismatch`, `authority_incident_closed`, …) that
+lands in the result JSON as well as the log, and exits nonzero. The nightly
+scheduler run is the sanctioned automated path and needs no token.
+
+**Honest limit (R20).** Ambient same-user git/gh credentials mean these
+file-based controls bound accidents and drift, not a fully hostile
+in-context agent: nothing here stops a process running as this account from
+passing `--holder scheduler` or writing its own incident record. What the
+gate does buy is that an investigator following its contract cannot push or
+publish outside a window a non-agent process opened for the incident it was
+spawned for, and that a superseded or abandoned finisher loses its
+authority the moment its incident closes. No HMAC is used — a shared secret
+readable by the same account would be theater. The enforcement point
+outside this host is GitHub branch protection on `origin/fork-integration`
+(deferred, user-owned).
+
+**Deviation from KTD5's wording**, recorded deliberately: KTD5 asks for a
+monotonic timestamp. No monotonic clock is shared across the spawner
+process, the investigator session, and the release process. The mechanism
+that delivers KTD5's intent — a schedule edit after the spawn cannot extend
+a live window — is the frozen wall-clock `expires_at`, computed once at
+mint and never recomputed by a reader.
+
+Incident state (`%HERMES_HOME%\cron\failure-investigators\<job>.json`) is
+schema 2: entries carry `session_id`, `spawned_at`, `heartbeat_at`,
+`token_sha256`, `token_expires_at` and a `closure` (`resolved`, `expired`,
+`abandoned`, `superseded`); `open` holds only live incidents and closed ones
+move to `closed`. Schema-1 files migrate on first write, closing any open
+legacy incident `superseded`. At most one finisher runs per job per window:
+a live finisher (heartbeat < 20 min) absorbs further failures, a stale one
+is closed `abandoned` and replaced exactly once within the same window end.
+The session beats with:
+
+```
+python hermes-release-failure-investigator.py heartbeat --job <id> --signature <sig>
+```
+
+Investigator sessions are created with `source="desktop"` and the title
+`Release investigator · <job> · <sig8>`, so they appear in the Desktop
+sidebar's recents; nightly `source="cron"` run sessions stay out of recents
+as before. The `cron_session` marker is never persisted and nothing filters
+on it — the visibility contract is keyed on the session's own source and
+title (proved by the gateway-layer tests in
+`tests/cron/test_fork_integration_investigator.py`).
+
 ## Running the tests
 
 ```
