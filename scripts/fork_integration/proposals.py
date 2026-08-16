@@ -615,7 +615,8 @@ def apply_manifest_edit(manifest_path: Path | str, edit: dict[str, Any]) -> str:
     """Apply the edit on disk and verify the result still parses as the
     manifest it claims to be. Returns the new text."""
     manifest_path = Path(manifest_path)
-    original = manifest_path.read_text(encoding="utf-8", newline="")
+    with manifest_path.open("r", encoding="utf-8", newline="") as _fh:
+        original = _fh.read()
     updated = apply_manifest_edit_text(original, edit)
     parsed = json.loads(updated)
     pin_patch = _find_manifest_patch(parsed, edit)

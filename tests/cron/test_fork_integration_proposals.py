@@ -345,7 +345,8 @@ def test_manifest_edit_preserves_hand_formatting_of_the_real_manifest(
 ) -> None:
     """The approval edit must be reviewable: exactly the touched key changes,
     line endings and the rest of the hand formatting survive."""
-    source = Path(release.MANIFEST_PATH).read_text(encoding="utf-8", newline="")
+    with Path(release.MANIFEST_PATH).open("r", encoding="utf-8", newline="") as _fh:
+        source = _fh.read()
     document = json.loads(source)
     pin_patch = document["components"][0]["patches"][0]
     new_id = "f" * 40
