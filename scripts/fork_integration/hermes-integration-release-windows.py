@@ -317,6 +317,36 @@ def log(message: str) -> None:
         handle.write(line + "\n")
 
 
+def emit_stage(stage: str, ok: bool = True, detail: str = "") -> None:
+    """Emit one flushed NDJSON progress line (U8/KTD8, R10).
+
+    ``{"ts", "stage", "ok", "detail"}`` on stdout, flushed immediately, plus
+    the same payload in the durable file log. The scheduler classifies any
+    stdout JSON object carrying a ``"stage"`` key as progress
+    (``cron.scheduler._classify_ndjson_stage_line``) and keeps it out of the
+    delivered brief, so the final result line this script already prints
+    stays byte-compatible with every existing consumer.
+
+    Emission point: a stage line is written when the run ENTERS that stage,
+    so a run that dies mid-stage still shows how far it got. ``resolve`` is
+    the one exception -- it is emitted on completion, because its detail
+    (the parked-pin count) is the whole reason the stage is interesting.
+    Failures are reported by the caller as a final ``ok=False`` line.
+    """
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "stage": stage,
+        "ok": bool(ok),
+        "detail": redact_process_output(str(detail))[:800],
+    }
+    line = json.dumps(payload, ensure_ascii=False)
+    print(line, flush=True)
+    try:
+        log(f"STAGE {line}")
+    except Exception:
+        # Progress reporting must never be able to fail a release.
+        pass
+
 
 _DRY_RUN_INSPECTION = contextvars.ContextVar("dry_run_inspection", default=False)
 
@@ -2097,11 +2127,13 @@ def main() -> int:
     # the lock, before any fetch, even before the read-only dry-run
     # inspection below -- the operational copies must match the published
     # git tree. fail()s (raising SystemExit) on a real-run mismatch.
+    emit_stage("integrity_gate")
     sync_integrity = integration_scripts_integrity_check(dry_run=args.dry_run)
     # A dry-run must not acquire the persistent lock, fetch (which updates
     # tracking refs), or invoke any normal-path verification that materializes
     # refs.  It intentionally performs only the read-only inspection above.
     if args.dry_run:
+        emit_stage("dry_run_gate")
         try:
             result = inspect_dry_run()
             result["sync_integrity"] = sync_integrity
@@ -2125,6 +2157,7 @@ def main() -> int:
             stage = "identity"
             pre_run_local_head, _pre_fetch_remote_head = ensure_clean_identity()
             stage = "fetch"
+            emit_stage("fetch")
             git("fetch", UPSTREAM_REMOTE, "--prune", timeout=300)
             git("fetch", FORK_REMOTE, "--prune", timeout=300)
             stage = "resolve_refs"
@@ -2137,8 +2170,10 @@ def main() -> int:
             stage = "verify_foundations"
             verified_foundations = verify_upstream_foundations()
             stage = "verify_manifest"
+            emit_stage("verify_manifest")
             verify_manifest_sources()
             stage = "reconstruct"
+            emit_stage("reconstruct")
             published_base, published_commits = published_integration_range(published_input_head, upstream)
             # If the published line already descends from fetched upstream, retain
             # it exactly and append only newly required invariants.  Otherwise
@@ -2174,6 +2209,16 @@ def main() -> int:
             patches_to_apply, absorbed_components = upstream_patch_resolution(
                 current_output, records=[*published_records, *foundation_records], upstream_tip=upstream
             )
+            # Emitted on completion (not entry): the parked-pin count is the
+            # reason this stage is worth a progress line at all (KTD13/R19).
+            emit_stage(
+                "resolve",
+                detail=(
+                    f"parked={len(PARKED_PINS)} "
+                    f"absorbed={len(absorbed_foundations) + len(absorbed_components)} "
+                    f"to_apply={len(foundation_to_apply) + len(patches_to_apply)}"
+                ),
+            )
             component_records = _resolution_records(absorbed_components, "component")
             component_records.extend(apply_required_patches(
                 patches_to_apply,
@@ -2184,6 +2229,7 @@ def main() -> int:
 
             rebased_output_head = git("rev-parse", "HEAD")
             stage = "validate_output"
+            emit_stage("validate")
             validate_required_components(upstream, rebased_output_head, records=component_records)
             validate_required_foundations(upstream, rebased_output_head, records=foundation_records)
             validate_published_commit_preservation(
@@ -2194,6 +2240,7 @@ def main() -> int:
             needs_push = rebased_output_head != published_input_head
             recovering_unchanged_output = recovering_current_output and not needs_push
             stage = "verify_build"
+            emit_stage("build")
             run("git", "diff", "--check", timeout=120)
             run("npm", "--workspace", "apps/bootstrap-installer", "run", "typecheck", timeout=900)
             # This test deliberately spawns Windows `timeout /t 30`.  In the
@@ -2272,6 +2319,7 @@ def main() -> int:
                 f"{RELEASE_PREFIX}{datetime.now().astimezone():%Y%m%d}-{rebased_output_head[:12]}"
             )
             stage = "publish_release"
+            emit_stage("publish", detail=f"tag={tag}")
             release_url, removed = publish_release(tag, rebased_output_head, launcher, checksum)
             public_asset = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{urllib.parse.quote(launcher.name)}"
             verify_public_asset(public_asset, checksum)
@@ -2280,6 +2328,7 @@ def main() -> int:
             if not repaired_release["complete"]:
                 raise RuntimeError(f"published release integrity verification failed: {repaired_release['reason']}")
             stage = "sync_operational_copies"
+            emit_stage("sync")
             sync_outcome = sync_operational_copies(rebased_output_head)
             result = {
                 "ok": True,
@@ -2318,6 +2367,7 @@ def main() -> int:
                     f"rebased_output_head={rebased_output_head}; post-push release/validation failure)"
                 )
             message = redact_process_output(f"{exc}{restoration_error}")
+            emit_stage(stage, ok=False, detail=message)
             launch_failure_investigator(stage=stage, error=message)
             emit_fleet_receipt(started_at, outcome="failed", changed=branch_pushed, error=message)
             fail(message)

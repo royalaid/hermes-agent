@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -285,6 +286,95 @@ def test_stable_patch_id_matches_real_git_patch_id(
     ).stdout.split()[0]
 
     assert actual == expected
+
+
+# ── U8/KTD8: NDJSON stage emitter ───────────────────────────────────────────
+
+
+def test_emit_stage_writes_one_flushed_redacted_ndjson_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The stage line's shape is the scheduler's contract: a single JSON
+    object on stdout carrying ``stage``, mirrored into the durable log, with
+    the detail redacted before it can reach any surface."""
+    from cron.scheduler import _classify_ndjson_stage_line
+
+    log_path = tmp_path / "logs" / "release.log"
+    monkeypatch.setattr(release, "LOG_PATH", log_path)
+
+    release.emit_stage("resolve", detail="parked=1 token: hunter2")
+
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1
+    payload = json.loads(out)
+    assert set(payload) == {"ts", "stage", "ok", "detail"}
+    assert payload["stage"] == "resolve"
+    assert payload["ok"] is True
+    assert "hunter2" not in payload["detail"]
+    assert "[REDACTED]" in payload["detail"]
+    # The scheduler must classify it as progress, not as the final result.
+    assert _classify_ndjson_stage_line(out.strip()) == payload
+    assert f"STAGE {out.strip()}" in log_path.read_text(encoding="utf-8")
+
+    release.emit_stage("publish", ok=False, detail="boom")
+    failed = json.loads(capsys.readouterr().out)
+    assert failed["ok"] is False
+
+
+def test_final_result_line_is_not_a_stage_line() -> None:
+    """Byte-compatibility guard: the script's final result JSON must never
+    carry a ``stage`` key, or the scheduler would swallow it as progress."""
+    from cron.scheduler import _classify_ndjson_stage_line
+
+    assert _classify_ndjson_stage_line(json.dumps({"ok": False, "error": "x"})) is None
+    assert _classify_ndjson_stage_line(json.dumps({"ok": True, "changed": False, "parked_pins": []})) is None
+
+
+def test_main_emits_integrity_gate_and_fetch_stages_before_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run that dies in the fetch stage still shows how far it got: the
+    entered stages stream out, then one ``ok=false`` line for the stage that
+    failed, then the unchanged final result line."""
+    repo = tmp_path / "worktree"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Stage Emitter Test"], cwd=repo, check=True)
+    (repo / "file.txt").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+
+    original_run = release.run
+
+    def run_in_repo(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("cwd", repo)
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(release, "run", run_in_repo)
+    monkeypatch.setattr(release, "WORKTREE", repo)
+    monkeypatch.setattr(release, "HERMES_HOME", tmp_path / "hermes")
+    monkeypatch.setattr(release, "LOG_PATH", tmp_path / "logs" / "release.log")
+    monkeypatch.setattr(release, "LOCK_PATH", tmp_path / "locks" / "release.lock")
+    monkeypatch.setattr(release, "ensure_clean_identity", lambda: ("head", "head"))
+    monkeypatch.setattr(release, "launch_failure_investigator", lambda **_kwargs: None)
+    monkeypatch.setattr(release, "emit_fleet_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["hermes-integration-release-windows.py"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        release.main()
+
+    assert excinfo.value.code == 1
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    parsed = [json.loads(line) for line in lines]
+    stages = [(item["stage"], item["ok"]) for item in parsed if "stage" in item]
+    assert ("integrity_gate", True) in stages
+    assert ("fetch", True) in stages
+    # The failing stage is reported honestly, and the final line is still the
+    # plain result object every existing consumer parses.
+    assert stages[-1] == ("fetch", False)
+    assert "stage" not in parsed[-1]
+    assert parsed[-1]["ok"] is False
 
 
 # ── Smoke test ───────────────────────────────────────────────────────────────
