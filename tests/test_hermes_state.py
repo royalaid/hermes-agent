@@ -665,6 +665,87 @@ class TestMessageStorage:
 
 
 # =========================================================================
+# update_message (U8/KTD8): smallest primitive for in-place message edits
+# =========================================================================
+
+
+class TestUpdateMessage:
+    """``SessionDB.update_message`` — in-place content edit addressed by the
+    ``messages.id`` row id (the same value ``append_message`` returns).
+
+    Exercised end-to-end by the cron no_agent live-progress scheduler code
+    (``tests/cron/test_fork_integration_live_progress.py``); these tests
+    cover the primitive itself in isolation.
+    """
+
+    def test_update_message_changes_content_in_place(self, db):
+        db.create_session(session_id="s1", source="cli")
+        msg_id = db.append_message("s1", role="assistant", content="1 stage so far")
+
+        updated = db.update_message("s1", msg_id, "2 stages so far")
+        assert updated is True
+
+        messages = db.get_messages("s1")
+        assert len(messages) == 1  # no new row was created
+        assert messages[0]["id"] == msg_id
+        assert messages[0]["content"] == "2 stages so far"
+
+    def test_update_message_does_not_touch_message_count(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="hello")
+        msg_id = db.append_message("s1", role="assistant", content="v1")
+
+        before = db.get_session("s1")["message_count"]
+        db.update_message("s1", msg_id, "v2")
+        after = db.get_session("s1")["message_count"]
+
+        assert before == after == 2
+
+    def test_update_message_returns_false_for_unknown_message_id(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="assistant", content="v1")
+
+        assert db.update_message("s1", 999999, "v2") is False
+
+    def test_update_message_is_scoped_to_the_given_session(self, db):
+        """A message id from a DIFFERENT session must never be editable by
+        naming the wrong session_id — id addressing is not global."""
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        msg_id = db.append_message("s1", role="assistant", content="s1 content")
+
+        updated = db.update_message("s2", msg_id, "hijacked")
+        assert updated is False
+
+        messages = db.get_messages("s1")
+        assert messages[0]["content"] == "s1 content"
+
+    def test_update_message_keeps_fts_index_current(self, db):
+        """The messages_fts triggers fire on UPDATE of content columns
+        (same mechanism replace_messages' archive_dropped branch relies on)
+        — search must find the NEW text and not the stale old text."""
+        db.create_session(session_id="s1", source="cli")
+        msg_id = db.append_message("s1", role="assistant", content="warmup stage running")
+
+        db.update_message("s1", msg_id, "verify stage running")
+
+        assert len(db.search_messages("verify")) == 1
+        assert len(db.search_messages("warmup")) == 0
+
+    def test_update_message_handles_structured_content(self, db):
+        """Multimodal (list) content round-trips through the same
+        _encode_content/_decode_content pair append_message uses."""
+        db.create_session(session_id="s1", source="cli")
+        msg_id = db.append_message("s1", role="assistant", content="v1")
+
+        parts = [{"type": "text", "text": "v2"}]
+        assert db.update_message("s1", msg_id, parts) is True
+
+        messages = db.get_messages("s1")
+        assert messages[0]["content"] == parts
+
+
+# =========================================================================
 # Timestamp preservation
 # =========================================================================
 

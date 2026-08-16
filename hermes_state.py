@@ -9115,6 +9115,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    def update_message(self, session_id: str, message_id: int, content: str) -> bool:
+        """Update a single message's content in place, addressed by row id.
+
+        ``message_id`` is the integer ``messages.id`` AUTOINCREMENT primary
+        key — the same value :meth:`append_message` returns — NOT a
+        positional index into the session's message list (mirrors the id
+        addressing :meth:`rewind_to_message` already uses).
+
+        This is the smallest primitive for finalizing a message written
+        earlier in the same run (cron no_agent live progress, KTD8): unlike
+        :meth:`append_message` / :meth:`append_messages_batch` there is no
+        ``message_count``/``tool_call_count`` to adjust and no new row to
+        create. SQLite's ``messages_fts`` triggers fire on UPDATE of the
+        indexed content columns exactly as they do on INSERT (see the
+        ``archive_dropped`` branch of :meth:`replace_messages`), so the
+        search index tracks the edit automatically.
+
+        Returns ``True`` if a row was updated (both ``session_id`` and
+        ``message_id`` matched an existing row), ``False`` otherwise. Never
+        raises for a missing row/session — a best-effort progress update
+        must not abort the caller's run over a lost message.
+        """
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            session = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                session is not None
+                and session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
+            cursor = conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ? AND session_id = ?",
+                (stored_content, message_id, session_id),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
     def append_messages_batch(
         self,
         session_id: str,

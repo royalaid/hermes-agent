@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -108,6 +109,55 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert "RAM 92% on host" in doc
 
 
+def test_no_agent_no_stage_lines_doc_output_byte_identical_to_pre_ktd8(hermes_env):
+    """Golden byte-compat test (KTD8, U8): a script that never emits an
+    NDJSON stage line ({..., "stage": ...}) must produce EXACTLY the same
+    doc/final_response run_job produced before the live-progress change —
+    full multi-line, non-JSON stdout preserved verbatim, never reduced to
+    "the last line" or padded with a stage summary. See
+    tests/cron/test_fork_integration_live_progress.py for the stage-emitting
+    counterparts (growing/finalized message, redaction, wake-gate on abort)."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+    from hermes_time import now as _hermes_now
+
+    script_path = hermes_env / "scripts" / "multiline.sh"
+    script_path.write_text(
+        "#!/bin/bash\necho 'first line of output'\necho 'second line of output'\n"
+    )
+
+    job = create_job(
+        prompt=None, schedule="every 5m", script="multiline.sh",
+        no_agent=True, deliver="local", name="multiline watchdog",
+    )
+    before = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    success, doc, final_response, error = run_job(job)
+    after = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    assert success is True
+    assert error is None
+    # The full multi-line stdout survives verbatim as `final_response`
+    # (what gets delivered) — not truncated to a single "final line".
+    assert final_response == "first line of output\nsecond line of output"
+    # `doc` follows the exact pre-KTD8 template, with `final_response`
+    # substituted unchanged for the trailing script-output body — no
+    # "(k/k stages, last: ...)" summary is ever appended when no stage line
+    # was seen. The run-time line is independently bounded (before <= t <=
+    # after) rather than read back out of `doc` itself.
+    run_time_line = doc.splitlines()[3]
+    assert run_time_line.startswith("**Run Time:** ")
+    run_time = run_time_line[len("**Run Time:** "):]
+    assert before <= run_time <= after
+    assert doc == (
+        f"# Cron Job: {job['name']}\n\n"
+        f"**Job ID:** {job['id']}\n"
+        f"**Run Time:** {run_time}\n"
+        f"**Mode:** no_agent (script)\n\n"
+        f"---\n\n"
+        f"{final_response}\n"
+    )
+
+
 def test_run_job_no_agent_reloads_dotenv_before_script(hermes_env, monkeypatch):
     """Regression: a standalone cron tick process starts without home-channel
     vars in its environment, and the agent path's per-run dotenv reload never
@@ -160,17 +210,35 @@ def test_timed_out_no_agent_script_delivery_is_not_mislabeled_as_provider_failur
     )
     delivered = []
 
+    # run_job's no_agent branch now always passes an on_line callback
+    # (KTD8), so _run_job_script takes the reader-thread path: two daemon
+    # threads block in stdout.readline()/stderr.readline(). A never-ending
+    # script's pipes never produce a line and never hit EOF, so the fake
+    # streams here must actually BLOCK (not return "" instantly, which
+    # readline() DOES do for a plain None/absent stream) — otherwise the
+    # reader threads would report immediate EOF instead of exercising the
+    # deadline-polling path this test is about.
+    class _BlockingStream:
+        def __init__(self):
+            self._closed = threading.Event()
+
+        def readline(self):
+            self._closed.wait()
+            return ""
+
+        def close(self):
+            self._closed.set()
+
     # The script runner uses Popen + a polling loop (cancel/timeout aware),
     # so simulate a process that never finishes: communicate() always times
     # out and the script deadline is shrunk to keep the test fast.
     class _NeverFinishes:
         returncode = None
         pid = 0
-        stdout = None
-        stderr = None
 
         def __init__(self, *_args, **_kwargs):
-            pass
+            self.stdout = _BlockingStream()
+            self.stderr = _BlockingStream()
 
         def poll(self):
             return None
@@ -184,13 +252,17 @@ def test_timed_out_no_agent_script_delivery_is_not_mislabeled_as_provider_failur
         def kill(self):
             self.returncode = -9
 
+    def _fake_terminate(proc):
+        # Real termination kills the process tree, which closes its stdio —
+        # that's what unblocks the reader threads' readline() calls. Mirror
+        # that here instead of leaving the fake streams blocked forever.
+        proc.returncode = -15
+        proc.stdout.close()
+        proc.stderr.close()
+
     monkeypatch.setattr(scheduler.subprocess, "Popen", _NeverFinishes)
     monkeypatch.setattr(scheduler, "_get_script_timeout", lambda: 1)
-    monkeypatch.setattr(
-        scheduler,
-        "_terminate_cron_script_process",
-        lambda proc: setattr(proc, "returncode", -15),
-    )
+    monkeypatch.setattr(scheduler, "_terminate_cron_script_process", _fake_terminate)
     monkeypatch.setattr(
         scheduler,
         "_deliver_result",

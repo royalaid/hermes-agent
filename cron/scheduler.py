@@ -16,6 +16,7 @@ import contextvars
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
@@ -36,7 +37,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional, Protocol
+from typing import Any, Callable, List, Optional, Protocol
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -2933,6 +2934,13 @@ _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS = _RUN_CLAIM_HEARTBEAT_SECONDS * 3
 
+# KTD8: minimum spacing between live in-place updates of a no_agent run's
+# progress message. Every stage line is still recorded (see _progress
+# tracking in run_job's no_agent branch) — this only throttles how often the
+# SQLite write + desktop-visible content refresh happens, so a chatty script
+# emitting stage lines faster than this can't turn a run into a write storm.
+_NO_AGENT_PROGRESS_UPDATE_MIN_INTERVAL_S = 0.5
+
 
 def _get_script_timeout() -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
@@ -3110,6 +3118,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    on_line: Optional[Callable[[str, str], None]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -3117,6 +3126,26 @@ def _run_job_script(
     absolute paths are resolved and validated against this directory to
     prevent arbitrary script execution via path traversal or absolute
     path injection.
+
+    ``on_line``: optional ``(stream_name, line)`` callback invoked once per
+    complete ``stdout`` line as it is produced (``stream_name`` is always
+    ``"stdout"`` for the callback itself — stderr is still captured but
+    never drives the callback). When ``None`` (the default), execution
+    takes the ORIGINAL ``proc.communicate()``-polling path byte-for-byte —
+    every existing caller (``cron.monitor``, prerun-script checks) is
+    unaffected. When provided, per-pipe daemon reader threads run
+    ``readline()`` loops and feed ``(stream_name, line)`` pairs to an
+    internal queue; the main thread drains that queue with the same
+    deadline/cancel-event polling cadence the ``communicate()`` path uses,
+    so termination/drain semantics are identical either way. A line is only
+    delivered once ``readline()`` returns it — a partial write with no
+    trailing ``\\n`` yet simply hasn't produced a line, so a secret split
+    across two OS-level read/write chunks can never reach the callback
+    half-formed. ``readline()`` also returns a final line with no trailing
+    newline at EOF (a script whose last write has no ``\\n``), so nothing
+    is lost when the process exits mid-line. Windows' ``communicate()``
+    yields nothing until EOF, which is why partial/live output requires
+    these reader threads instead of a smaller timeout on ``communicate()``.
 
     Supported interpreters (chosen by file extension):
 
@@ -3237,21 +3266,141 @@ def _run_job_script(
             **popen_kwargs,
         )
         deadline = time.monotonic() + script_timeout
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
+
+        if on_line is None:
+            # EXACTLY today's behavior — byte-for-byte path for callers that
+            # don't pass on_line (cron.monitor, prerun wake-gate checks).
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    _terminate_cron_script_process(proc)
+                    _drain_script_pipes(proc)
+                    return False, "Script cancelled because cron fire ownership was lost"
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_cron_script_process(proc)
+                    _drain_script_pipes(proc)
+                    return False, f"Script timed out after {script_timeout}s: {path}"
+                try:
+                    stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        else:
+            # Reader-thread path: readline() loops on each pipe (each in its
+            # own daemon thread) feed (stream_name, line) pairs into a
+            # queue; THIS thread drains the queue with the same
+            # deadline/cancel-event polling cadence as the communicate()
+            # branch above, so termination/drain/deadline semantics are
+            # identical — only the source of "did we make progress" differs
+            # (a dequeued line vs. a completed communicate() call).
+            stdout_chunks: list[str] = []
+            stderr_chunks: list[str] = []
+            line_queue: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
+
+            def _pipe_reader(stream, stream_name: str) -> None:
+                try:
+                    if stream is not None:
+                        for raw_line in iter(stream.readline, ""):
+                            line_queue.put((stream_name, raw_line))
+                except (OSError, ValueError):
+                    # Pipe torn down under us (process killed mid-read) —
+                    # fall through to the EOF sentinel so the consumer loop
+                    # doesn't wait forever on this stream.
+                    pass
+                finally:
+                    line_queue.put((stream_name, None))
+
+            stdout_thread = threading.Thread(
+                target=_pipe_reader, args=(proc.stdout, "stdout"),
+                name="cron-script-stdout-reader", daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=_pipe_reader, args=(proc.stderr, "stderr"),
+                name="cron-script-stderr-reader", daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+
+            eof_seen = {"stdout": False, "stderr": False}
+            outcome: Optional[tuple[bool, str]] = None
+
+            while not (eof_seen["stdout"] and eof_seen["stderr"]):
+                if cancel_event is not None and cancel_event.is_set():
+                    outcome = (False, "Script cancelled because cron fire ownership was lost")
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    outcome = (False, f"Script timed out after {script_timeout}s: {path}")
+                    break
+                try:
+                    stream_name, raw_line = line_queue.get(timeout=min(0.1, remaining))
+                except queue.Empty:
+                    continue
+                if raw_line is None:
+                    eof_seen[stream_name] = True
+                    continue
+                if stream_name == "stdout":
+                    stdout_chunks.append(raw_line)
+                    try:
+                        on_line("stdout", raw_line)
+                    except Exception:
+                        logger.debug(
+                            "on_line callback raised for %s", path, exc_info=True,
+                        )
+                else:
+                    stderr_chunks.append(raw_line)
+
+            if outcome is not None:
+                # Reader threads own proc.stdout/stderr — do NOT route
+                # through _drain_script_pipes here: it internally calls
+                # proc.communicate(), which would read the same pipe
+                # objects from a second consumer while a reader thread may
+                # still be mid-readline(). Terminating closes the child's
+                # stdio (or SIGKILLs a TERM-ignoring descendant holding it
+                # open), so the readline() loops hit EOF and the threads
+                # exit on their own.
                 _terminate_cron_script_process(proc)
-                _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _terminate_cron_script_process(proc)
-                _drain_script_pipes(proc)
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                stdout_thread.join(timeout=5.0)
+                stderr_thread.join(timeout=5.0)
+                if stdout_thread.is_alive() or stderr_thread.is_alive():
+                    # Still blocked in readline() (termination didn't close
+                    # the fd) — force it: closing the stream makes the
+                    # blocked readline() raise, and the reader's except
+                    # clause turns that into the EOF sentinel.
+                    for _stream in (proc.stdout, proc.stderr):
+                        try:
+                            if _stream is not None:
+                                _stream.close()
+                        except OSError:
+                            pass
+                    stdout_thread.join(timeout=2.0)
+                    stderr_thread.join(timeout=2.0)
+                return outcome
+
+            # Both pipes hit EOF — the child closed its stdio, which
+            # normally happens at process exit. Reap it so proc.returncode
+            # is set, exactly like communicate() guarantees on the branch
+            # above. Both reader threads have already observed EOF at this
+            # point, so there is no concurrent reader left on the pipes.
+            stdout_thread.join(timeout=5.0)
+            stderr_thread.join(timeout=5.0)
             try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
-                break
+                proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                continue
+                # Truly wedged post-EOF (rare) — best-effort kill+reap,
+                # matching _drain_script_pipes' "never block forever"
+                # contract, without touching the already-EOF streams.
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            stdout_raw = "".join(stdout_chunks)
+            stderr_raw = "".join(stderr_chunks)
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
@@ -3285,6 +3434,7 @@ def _run_job_script_with_claim_heartbeat(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    on_line: Optional[Callable[[str, str], None]] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -3297,6 +3447,8 @@ def _run_job_script_with_claim_heartbeat(
     The claim owner is captured from the dispatched job and never re-read from
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
+
+    ``on_line`` is forwarded verbatim to :func:`_run_job_script`.
     """
     schedule = job.get("schedule")
     claim = job.get("run_claim")
@@ -3306,7 +3458,9 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, on_line=on_line,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -3337,15 +3491,61 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, on_line=on_line,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path, workdir=workdir, cancel_event=cancel_event, on_line=on_line,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
         # heartbeat is already waiting on another process's jobs-file lock.
         heartbeat_thread.join(timeout=1.0)
+
+
+def _classify_ndjson_stage_line(line: str) -> Optional[dict]:
+    """Return the parsed dict if *line* is a KTD8 NDJSON progress-stage line
+    — a JSON object carrying a ``"stage"`` key — else ``None``.
+
+    ``None`` covers everything that is NOT a stage line: blank text, plain
+    text, JSON that isn't an object, and an object without a ``"stage"``
+    key. All of those are candidates for the script's final result line.
+    Shared by the live ``on_line`` classification in ``run_job``'s no_agent
+    branch and the post-exit :func:`_final_result_line` scan, so both agree
+    on what counts as a stage line.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or "stage" not in parsed:
+        return None
+    return parsed
+
+
+def _final_result_line(output: str) -> str:
+    """Last non-empty NON-stage line of *output* (KTD8).
+
+    The counterpart to :func:`_parse_wake_gate`'s "last non-empty line",
+    but skipping NDJSON progress-stage lines so a stage-emitting script's
+    true final result line is found regardless of how many stage lines
+    preceded it. Returns ``""`` if every non-empty line was a stage line
+    (the run aborted before ever printing a final result).
+    """
+    for line in reversed(output.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _classify_ndjson_stage_line(stripped) is not None:
+            continue
+        return stripped
+    return ""
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -4268,12 +4468,104 @@ def run_job(
             )
             _session_db = None
 
+        # KTD8 live progress: NDJSON stage lines (JSON objects carrying a
+        # "stage" key) are streamed on stdout alongside the eventual final
+        # JSON result line. `_progress` accumulates the (redacted) stage
+        # entries seen so far and tracks the ONE in-place-updated assistant
+        # message id, so a chatty script never produces more than one extra
+        # session row. A plain dict (not a small class) is enough state for
+        # a single closure to share with `_on_no_agent_line` below.
+        _progress: dict[str, Any] = {"message_id": None, "last_update": 0.0, "stages": []}
+
+        def _render_progress_doc(stages: list) -> str:
+            """Render the growing in-progress surface for an active run."""
+            lines = [
+                f"# Cron Job: {job_name}",
+                "",
+                f"**Job ID:** {job_id}",
+                f"**Mode:** no_agent (script) — running",
+                f"**Status:** {len(stages)} stage(s) so far",
+                "",
+                "---",
+                "",
+            ]
+            for entry in stages:
+                mark = "ok" if entry.get("ok") else "FAILED"
+                detail = entry.get("detail") or ""
+                line = f"- [{mark}] {entry.get('stage')}"
+                if detail:
+                    line += f" — {detail}"
+                lines.append(line)
+            return "\n".join(lines) + "\n"
+
+        def _on_no_agent_line(stream_name: str, raw_line: str) -> None:
+            """``on_line`` callback: classify, redact, and (throttled) persist
+            live NDJSON stage lines. Stderr and non-stage stdout lines are
+            left for the post-exit bulk-redacted `output` to carry — this
+            callback's only job is the LIVE surface."""
+            if stream_name != "stdout":
+                return
+            parsed = _classify_ndjson_stage_line(raw_line)
+            if parsed is None:
+                return
+            try:
+                from agent.redact import redact_sensitive_text
+                stage_name = redact_sensitive_text(str(parsed.get("stage") or ""))
+                detail_text = redact_sensitive_text(str(parsed.get("detail") or ""))
+            except Exception:
+                stage_name = "[REDACTED - redaction failed]"
+                detail_text = "[REDACTED - redaction failed]"
+            _progress["stages"].append(
+                {"stage": stage_name, "ok": bool(parsed.get("ok", True)), "detail": detail_text}
+            )
+
+            if not _session_db or not _run_session_id:
+                return
+            now_ts = time.monotonic()
+            if (
+                _progress["message_id"] is not None
+                and (now_ts - _progress["last_update"])
+                < _NO_AGENT_PROGRESS_UPDATE_MIN_INTERVAL_S
+            ):
+                # Still recorded above — the next throttled update (or the
+                # final finalize-in-place write) carries this stage too.
+                return
+            _progress["last_update"] = now_ts
+            content = _render_progress_doc(_progress["stages"])
+            try:
+                if _progress["message_id"] is None:
+                    _progress["message_id"] = _session_db.append_message(
+                        _run_session_id, "assistant", content,
+                    )
+                else:
+                    _session_db.update_message(
+                        _run_session_id, _progress["message_id"], content,
+                    )
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug(
+                    "Job '%s': failed to update no_agent live progress: %s", job_id, e
+                )
+
         def _record_run(run_doc: str) -> None:
-            """Persist the outcome and close out this run's session record."""
+            """Persist the outcome and close out this run's session record.
+
+            Finalizes the live progress message IN PLACE when one was
+            started (never a second assistant message — role alternation
+            stays user -> assistant); falls back to a plain append when no
+            progress message was ever created (no stage lines emitted, or
+            the session store was unavailable when the first one arrived).
+            """
             if not _session_db:
                 return
             try:
-                _session_db.append_message(_run_session_id, "assistant", run_doc)
+                _progress_message_id = _progress["message_id"]
+                updated = False
+                if _progress_message_id is not None:
+                    updated = _session_db.update_message(
+                        _run_session_id, _progress_message_id, run_doc,
+                    )
+                if not updated:
+                    _session_db.append_message(_run_session_id, "assistant", run_doc)
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug(
                     "Job '%s': failed to record no_agent run output: %s", job_id, e
@@ -4315,6 +4607,7 @@ def run_job(
         try:
             ok, output = _run_job_script_with_claim_heartbeat(
                 job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
+                on_line=_on_no_agent_line,
             )
         except Exception as exc:
             logger.exception(
@@ -4328,6 +4621,9 @@ def run_job(
             # Script crashed / timed out / exited non-zero.  Deliver the
             # error so the user knows the watchdog itself broke — silent
             # failure for an alerting job is the worst-case outcome.
+            # (Unchanged by KTD8: `output` here is already the composed
+            # "exited with code N / stderr / stdout" error text, not a raw
+            # stdout stream to split stage lines out of.)
             alert = (
                 f"⚠ Cron watchdog '{job_name}' script failed\n\n"
                 f"{output}\n\n"
@@ -4344,9 +4640,32 @@ def run_job(
             _record_run(doc)
             return False, doc, alert, output
 
+        # KTD8: split NDJSON progress-stage lines from the script's true
+        # final result line. `_progress["stages"]` was populated live by
+        # `_on_no_agent_line` as the script ran (already per-line redacted).
+        # When no stage lines were ever seen, `effective_output` IS `output`
+        # unchanged — doc/final_response/_parse_wake_gate are then
+        # byte-identical to the pre-KTD8 behavior (golden compat test).
+        _stages = _progress["stages"]
+        if _stages:
+            _final_line = _final_result_line(output)
+            _stage_count = len(_stages)
+            _stage_summary = (
+                f"{_stage_count}/{_stage_count} stages, last: {_stages[-1]['stage']}"
+            )
+            effective_output = (
+                f"{_final_line}\n\n({_stage_summary})" if _final_line else f"({_stage_summary})"
+            )
+        else:
+            _final_line = output
+            effective_output = output
+
         # Honour the wakeAgent gate as a silent signal — `wakeAgent: false`
-        # means "nothing to report this tick", same as empty stdout.
-        if not _parse_wake_gate(output):
+        # means "nothing to report this tick", same as empty stdout. Gated
+        # on the final result line alone (KTD8) — a stage line's JSON,
+        # including one seen right before an abort with no final line at
+        # all (`_final_line == ""`), never drives this decision.
+        if not _parse_wake_gate(_final_line):
             logger.info(
                 "Job '%s' (no_agent): wakeAgent=false gate — silent run", job_id
             )
@@ -4378,10 +4697,10 @@ def run_job(
             f"**Run Time:** {now_iso}\n"
             f"**Mode:** no_agent (script)\n\n"
             f"---\n\n"
-            f"{output}\n"
+            f"{effective_output}\n"
         )
         _record_run(doc)
-        return True, doc, output, None
+        return True, doc, effective_output, None
 
     # ---------------------------------------------------------------
     # Monitor gate — hash-suppressed change detection (see cron/monitor.py).
