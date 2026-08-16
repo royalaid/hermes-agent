@@ -1394,7 +1394,9 @@ def apply_required_patches(
             ), None)
             if prior_application is not None:
                 output_patch_id = prior_application["output_patch_id"]
-                if output_patch_id not in _accepted_output_patch_ids(patch):
+                if output_patch_id not in _accepted_output_patch_ids(patch) and (
+                    prior_application.get("status") != "applied_in_job_resolution"
+                ):
                     raise RuntimeError(
                         f"prior {kind} application identity was not approved: "
                         f"source={patch['commit']} applied={applied_commit}"
@@ -1412,18 +1414,40 @@ def apply_required_patches(
             try:
                 git("cherry-pick", applied_commit, timeout=900)
             except Exception:
-                if not _cherry_pick_stopped_empty():
+                if _cherry_pick_stopped_empty():
+                    # Git has applied no delta and reports a clean index/worktree.
+                    # This is not a conflict resolution to invent: it proves the
+                    # required patch is already represented by the current tree.
+                    git("cherry-pick", "--skip", timeout=120)
+                    records.append({
+                        "kind": kind,
+                        "status": "already_present_after_empty_cherry_pick",
+                        "source_commit": patch["commit"],
+                        "output_commit": git("rev-parse", "HEAD"),
+                        "output_patch_id": patch["stable_patch_id"],
+                        **parked,
+                    })
+                    continue
+                resolution = attempt_in_job_conflict_resolution(
+                    applied_commit, str(patch.get("subject", "")), kind=kind,
+                )
+                if resolution is None:
                     raise
-                # Git has applied no delta and reports a clean index/worktree.
-                # This is not a conflict resolution to invent: it proves the
-                # required patch is already represented by the current tree.
-                git("cherry-pick", "--skip", timeout=120)
+                # The resolved output identity is by definition not in the pin's
+                # accepted set; the resolution artifact IS the approval evidence
+                # (user directive 2026-08-16: reconcile in-job instead of
+                # stopping the nightly). The record carries the artifact path so
+                # a follow-up proposal can bless the identity permanently and
+                # end the per-run re-resolution of the same pin conflict.
                 records.append({
                     "kind": kind,
-                    "status": "already_present_after_empty_cherry_pick",
+                    "status": "applied_in_job_resolution",
                     "source_commit": patch["commit"],
-                    "output_commit": git("rev-parse", "HEAD"),
-                    "output_patch_id": patch["stable_patch_id"],
+                    **({"applied_commit": applied_commit} if replacement else {}),
+                    "output_commit": resolution["output_commit"],
+                    "output_patch_id": resolution["output_patch_id"],
+                    "conflicted_files": resolution["conflicted_files"],
+                    "resolution_artifact": resolution["resolution_artifact"],
                     **parked,
                 })
                 continue
@@ -1551,7 +1575,7 @@ def _conflicted_paths() -> list[str]:
     return [line for line in git("diff", "--name-only", "--diff-filter=U").splitlines() if line]
 
 
-def attempt_in_job_conflict_resolution(commit: str, subject: str) -> dict[str, Any] | None:
+def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "published") -> dict[str, Any] | None:
     """Reconcile one replay conflict in-job; ``None`` means fall back closed.
 
     Never raises: on ``None`` the caller re-raises the original cherry-pick
@@ -1618,6 +1642,7 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str) -> dict[str, A
         artifact_path.write_text(json.dumps({
             "created_at": datetime.now(timezone.utc).isoformat(),
             "status": "resolved_in_job",
+            "kind": kind,
             "source_commit": commit,
             "subject": subject,
             "conflicted_files": conflicted,
@@ -1631,7 +1656,7 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str) -> dict[str, A
             f"files={','.join(conflicted)} artifact={artifact_path}"
         )
         return {
-            "kind": "published",
+            "kind": kind,
             "status": "applied_in_job_resolution",
             "source_commit": commit,
             "output_commit": output_commit,

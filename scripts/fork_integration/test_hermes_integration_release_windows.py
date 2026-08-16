@@ -48,6 +48,10 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.original_review_dir = release.REVIEW_DIR
         self.original_launch_failure_investigator = release.launch_failure_investigator
         self.original_resolve_failure_investigator_success = release.resolve_failure_investigator_success
+        self.original_resolution_backend = release.RESOLUTION_BACKEND
+        # A test must never spawn the real claude backend: a no-op backend
+        # changes nothing, fails verification, and degrades to fail-closed.
+        release.RESOLUTION_BACKEND = lambda _prompt, _files: ""
         release.run = self.local_run
         release.LOG_PATH = self.repo / ".git" / "release.log"
         release.REVIEW_DIR = self.repo / "reviews"
@@ -61,6 +65,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         release.REVIEW_DIR = self.original_review_dir
         release.launch_failure_investigator = self.original_launch_failure_investigator
         release.resolve_failure_investigator_success = self.original_resolve_failure_investigator_success
+        release.RESOLUTION_BACKEND = self.original_resolution_backend
         self.temp.cleanup()
 
     def command(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -733,6 +738,59 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.assertTrue(all(record["status"] == "applied" for record in records))
         self.assertEqual(self.command("git", "show", "HEAD:foundation.txt").stdout, "foundation\n")
         self.assertEqual(self.command("git", "show", "HEAD:component.txt").stdout, "component\n")
+
+    def test_required_patch_conflict_is_reconciled_in_job_despite_unapproved_identity(self) -> None:
+        """A pin conflict resolves in-job; the artifact stands in for identity approval."""
+        self.command("git", "checkout", "-qb", "required-source")
+        source = self.write_and_commit("base.txt", "required fix\n", "required component fix")
+        patch_id = release.stable_patch_id(source)
+        self.command("git", "checkout", "-q", self.initial_branch)
+        published = self.write_and_commit("base.txt", "upstream drift\n", "conflicting upstream drift")
+        patch = {"commit": source, "subject": "required component fix", "stable_patch_id": patch_id}
+
+        def backend(prompt: str, files: list[str]) -> str:
+            (self.repo / "base.txt").write_text("upstream drift\nrequired fix\n", encoding="utf-8")
+            return "union resolution"
+
+        with self._reconciliation(backend):
+            records = release.apply_required_patches(
+                [patch], published_input_head=published, upstream_head=published, kind="component"
+            )
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        head = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(record["status"], "applied_in_job_resolution")
+        self.assertEqual(record["kind"], "component")
+        self.assertEqual(record["source_commit"], source)
+        self.assertEqual(record["output_commit"], head)
+        self.assertEqual(record["conflicted_files"], ["base.txt"])
+        # The resolved identity is intentionally NOT the approved patch-id.
+        self.assertNotEqual(record["output_patch_id"], patch_id)
+        self.assertEqual(self.command("git", "show", "HEAD:base.txt").stdout, "upstream drift\nrequired fix\n")
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+        artifacts = list((self.repo / ".git" / "reviews").glob("reconstruction-resolution-*.json"))
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(json.loads(artifacts[0].read_text(encoding="utf-8"))["kind"], "component")
+
+    def test_required_patch_conflict_falls_back_closed_when_backend_refuses(self) -> None:
+        self.command("git", "checkout", "-qb", "required-source")
+        source = self.write_and_commit("base.txt", "required fix\n", "required component fix")
+        patch_id = release.stable_patch_id(source)
+        self.command("git", "checkout", "-q", self.initial_branch)
+        published = self.write_and_commit("base.txt", "upstream drift\n", "conflicting upstream drift")
+        patch = {"commit": source, "subject": "required component fix", "stable_patch_id": patch_id}
+
+        with self._reconciliation(lambda _prompt, _files: "changed nothing"):
+            with self.assertRaisesRegex(RuntimeError, re.escape(source)):
+                release.apply_required_patches(
+                    [patch], published_input_head=published, upstream_head=published, kind="component"
+                )
+
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+        reviews = list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json"))
+        self.assertEqual(len(reviews), 1)
 
     def test_required_patch_already_present_as_an_empty_cherry_pick_is_recorded(self) -> None:
         """A clean empty pick proves the required patch is already in the target tree."""
