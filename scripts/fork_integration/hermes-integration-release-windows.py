@@ -33,7 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1294,16 +1294,113 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+LOCK_STALE_AFTER = timedelta(hours=6)
+
+
+def _lock_holder_pid_alive(pid: int) -> bool:
+    """Cross-platform "is this PID alive" check that never sends a real signal.
+
+    ``os.kill(pid, 0)`` is NOT a safe existence probe on Windows: CPython's
+    Windows implementation collides ``sig=0`` with ``CTRL_C_EVENT`` and
+    routes it through ``GenerateConsoleCtrlEvent``, which can terminate the
+    target process (and other processes sharing its console group) instead
+    of merely checking it -- see ``gateway/status.py``'s ``_pid_exists`` and
+    this repo's ``psutil`` dependency comment in ``pyproject.toml`` for the
+    same footgun. ``psutil`` is a hard project dependency specifically to
+    replace that idiom; only fall back to a read-only Windows ``OpenProcess``
+    probe (never ``TerminateProcess``) if psutil is somehow unavailable.
+    """
+    try:
+        import psutil  # type: ignore
+
+        return bool(psutil.pid_exists(int(pid)))
+    except ImportError:
+        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            ERROR_INVALID_PARAMETER = 87
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle:
+                return kernel32.GetLastError() != ERROR_INVALID_PARAMETER
+            kernel32.CloseHandle(handle)
+            return True
+        except (OSError, AttributeError):
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock_info() -> dict[str, Any]:
+    """Best-effort parse of the lock file; corrupt/empty content is tolerated
+    and reported as an unknown holder rather than raising."""
+    try:
+        data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("lock payload was not a JSON object")
+    except Exception:
+        return {"holder": "unknown holder", "pid": None, "started_at": None}
+    holder = data.get("holder")
+    return {
+        "holder": holder if isinstance(holder, str) and holder else "unknown holder",
+        "pid": data.get("pid"),
+        "started_at": data.get("started_at"),
+    }
+
+
+def _lock_is_reclaimable(info: dict[str, Any]) -> bool:
+    """A stale lock is a dead holder pid whose lock predates the grace window."""
+    pid = info.get("pid")
+    started_at = info.get("started_at")
+    if not isinstance(pid, int) or not isinstance(started_at, str):
+        return False
+    try:
+        started = datetime.fromisoformat(started_at)
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if _lock_holder_pid_alive(pid):
+        return False
+    return datetime.now(timezone.utc) - started > LOCK_STALE_AFTER
+
+
 @contextmanager
-def exclusive_lock() -> Any:
+def exclusive_lock(holder: str = "scheduler") -> Any:
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        fail(f"another integration-release run holds {LOCK_PATH}")
+        info = _read_lock_info()
+        if _lock_is_reclaimable(info):
+            log(
+                f"reclaiming stale lock held by {info['holder']} pid {info['pid']} "
+                f"since {info['started_at']}"
+            )
+            try:
+                LOCK_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                info = _read_lock_info()
+                fail(f"busy, held by {info['holder']} (pid {info['pid']}) since {info['started_at']}")
+        else:
+            fail(f"busy, held by {info['holder']} (pid {info['pid']}) since {info['started_at']}")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()}, handle)
+            json.dump(
+                {"holder": holder, "pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()},
+                handle,
+            )
         yield
     finally:
         try:
@@ -1702,6 +1799,10 @@ def verify_public_asset(url: str, expected_sha: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="inspect only; do not modify GitHub or the worktree")
+    parser.add_argument(
+        "--holder", default="scheduler",
+        help="identity recorded on the exclusive lock, for busy/stale-reclaim diagnostics (default: scheduler)",
+    )
     args = parser.parse_args()
     # A dry-run must not acquire the persistent lock, fetch (which updates
     # tracking refs), or invoke any normal-path verification that materializes
@@ -1720,7 +1821,7 @@ def main() -> int:
     rebased_output_head: str | None = None
     branch_pushed = False
     stage = "prepare"
-    with exclusive_lock():
+    with exclusive_lock(args.holder):
         try:
             stage = "identity"
             pre_run_local_head, _pre_fetch_remote_head = ensure_clean_identity()
