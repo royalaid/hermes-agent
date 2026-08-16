@@ -493,6 +493,35 @@ no plan document required:
   `--dry-run` and no injected failure to prove the loop still completes and
   publishes end to end.
 
+### 2026-08-16 witnessed canary (historical audit snapshot, append-only)
+
+```yaml
+witness:
+  deploy:
+    kind: provisional_break_glass
+    source_sha: 32ea9a80e8b9e34053d188ea2cf156b35b81e886
+    verified: tree-authoritative, all 8 tracked files, independent + run-start gate
+    reachability: runtime clone lacked the unpushed sha (sync_integrity
+      unreachable_sha on first dry-run); fixed by local ref fetch and, structurally,
+      by deploy --runtime-repo (committed same day)
+  forced_failure_canary:
+    stages: [integrity_gate ok, fetch ok, verify_manifest ok(real), verify_manifest
+      fail(canary pin unavailable), transaction restored]
+    incident: 575cf32953fcf07a530bb0ce (schema v2; session_id + token digest recorded)
+    investigator_session: 71fb5010 (spawned live)
+    authority_token: allowed [push, publish]; expiry computed to the next scheduled
+      fire (02:00 PT) per min(next-fire, spawn+4h); revoked by operator after the
+      witness was captured
+    provenance: derived on the failure path; JSONL history appended; 39 pins mapped
+      (journal fix absorbed-modified; gateway-config-offloop absorbed-verbatim)
+  overdue_check: healthy verdict, on schedule, read-only
+  outstanding:
+    - Discord delivery witness rides the next cron-fired run (this canary was manual)
+    - killed-owner reap live drill optional (mechanism covered by tests)
+    - known nits: duplicate transition entry for one foundation pin in the first
+      derivation; history entries do not yet carry the canary flag
+```
+
 ## Rebase subagent contract
 
 A Terra Medium regular-mode subagent may inspect or rebase only an explicitly
