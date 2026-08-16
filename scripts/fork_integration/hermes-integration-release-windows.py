@@ -262,6 +262,45 @@ UPSTREAM_FOUNDATIONS = MANIFEST["upstream_foundations"]
 FOUNDATION_PATCHES = [patch for foundation in UPSTREAM_FOUNDATIONS for patch in foundation["patches"]]
 REQUIRED_PATCHES = [patch for component in MANIFEST["components"] for patch in component["patches"]]
 
+#: U11 canary entry point (``--canary-manifest``): true for the remainder of
+#: THIS PROCESS once a canary manifest has been applied. Never true on the
+#: sanctioned scheduler path.
+CANARY_MANIFEST_ACTIVE = False
+
+
+def reset_run_canary_state() -> None:
+    global CANARY_MANIFEST_ACTIVE
+    CANARY_MANIFEST_ACTIVE = False
+
+
+def apply_canary_manifest(path: str) -> None:
+    """U11 canary entry point: swap ``MANIFEST_PATH`` and every
+    manifest-derived global for THIS RUN ONLY, before any gate executes.
+
+    Deliberately a DIFFERENT filename than ``hermes-integration-manifest.json``
+    under this same directory, so sync.py's ``TRACKED_SET`` (a fixed tuple of
+    filenames, defined independently of this module's ``MANIFEST_PATH``
+    variable -- see ``sync.py``) never names it: the run-start integrity gate
+    stamp-checks the tracked operational manifest copy exactly as before, and
+    never touches this file at all (U11's "outside the tracked set, no stamp
+    check" requirement holds structurally, not by special-casing the gate).
+
+    Called once, at the very top of ``main()``, before the integrity gate.
+    """
+    global MANIFEST_PATH, MANIFEST, BRANCH, UPSTREAM_REMOTE, UPSTREAM_REF, REPOSITORY
+    global UPSTREAM_FOUNDATIONS, FOUNDATION_PATCHES, REQUIRED_PATCHES, CANARY_MANIFEST_ACTIVE
+    MANIFEST_PATH = Path(path)
+    MANIFEST = load_manifest()
+    BRANCH = MANIFEST["integration_branch"]
+    UPSTREAM_REMOTE = MANIFEST["upstream"]["remote"]
+    UPSTREAM_REF = MANIFEST["upstream"]["ref"]
+    REPOSITORY = MANIFEST["fork"]["repository"]
+    UPSTREAM_FOUNDATIONS = MANIFEST["upstream_foundations"]
+    FOUNDATION_PATCHES = [patch for foundation in UPSTREAM_FOUNDATIONS for patch in foundation["patches"]]
+    REQUIRED_PATCHES = [patch for component in MANIFEST["components"] for patch in component["patches"]]
+    CANARY_MANIFEST_ACTIVE = True
+    log(f"CANARY_MANIFEST_ACTIVE path={MANIFEST_PATH}")
+
 
 def emit_fleet_receipt(
     started_at: datetime,
@@ -770,6 +809,168 @@ def open_proposal_summary() -> list[dict[str, Any]]:
     ]
 
 
+# ── U7/R7/KTD14: every-run provenance wiring + retirement bridge (U6) ───────
+
+#: This run's fetched/resolved upstream ref (a SHA once ``upstream`` in
+#: main() is set; otherwise the local tracking ref, best-effort). Read by
+#: ``_fold_provenance()``/``generate_retirement_proposals()`` so provenance
+#: derivation can use "this run's fetched upstream when available" without
+#: threading it through every call site (R7's own wording; ``derive()``
+#: tolerates a stale/unresolvable ref -- see ledger.py's module docstring).
+_RUN_UPSTREAM_REF: str | None = None
+
+_LEDGER_MODULE: Any = None
+
+
+def _ledger_module() -> Any:
+    """Load ledger.py by path and cache it (same flat-directory reason as
+    ``_sync_module()``/``_proposals_module()``; ``ledger.py`` is a tracked
+    file)."""
+    global _LEDGER_MODULE
+    if _LEDGER_MODULE is None:
+        spec = importlib.util.spec_from_file_location("fork_integration_ledger", SCRIPT_DIR / "ledger.py")
+        if not spec or not spec.loader:
+            raise RuntimeError("ledger module is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LEDGER_MODULE = module
+    return _LEDGER_MODULE
+
+
+def reset_run_provenance_state() -> None:
+    global _RUN_UPSTREAM_REF
+    _RUN_UPSTREAM_REF = None
+
+
+def record_run_upstream_ref(ref: str) -> None:
+    """Called once ``main()`` resolves this run's fetched upstream SHA."""
+    global _RUN_UPSTREAM_REF
+    _RUN_UPSTREAM_REF = ref
+
+
+def _fallback_upstream_ref() -> str:
+    """Best-effort upstream ref when this run never got far enough to fetch
+    (an early integrity-gate/identity failure): the local tracking ref from
+    the manifest, unresolved and possibly stale. ``ledger.derive()`` degrades
+    gracefully on every git failure this can cause (see its module
+    docstring) -- it never raises, so a stale ref only means fewer resolved
+    candidates this run, never a broken run."""
+    return f"{UPSTREAM_REMOTE}/{UPSTREAM_REF.removeprefix('refs/heads/')}"
+
+
+# ── U6 (retirement bridge): a pin absorbed-verbatim for several consecutive
+# runs, still an ancestor of the live upstream tip, retires through the SAME
+# reviewed state machine churn proposals use (R4's "never a parallel
+# mechanism", applied to removal). ──────────────────────────────────────────
+
+
+def generate_retirement_proposals(*, upstream_ref: str, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """For each ``ledger.retirement_candidates()`` pin id, generate (or
+    refresh) a retire-pin proposal via ``proposals.generate_or_refresh_retirement``.
+
+    Best-effort and NEVER raises into the release path (KTD7: provenance and
+    its retirement bridge report, they do not gate) -- one bad pin's failure
+    is logged and skipped, never breaking the rest.
+    """
+    generated: list[dict[str, Any]] = []
+    try:
+        ledger = _ledger_module()
+        history_path = ledger.default_history_path()
+        candidate_pin_ids = ledger.retirement_candidates(history_path, repo_dir=WORKTREE, upstream_ref=upstream_ref)
+        if not candidate_pin_ids:
+            return generated
+        records_by_pin = {record["pin_id"]: record for record in records}
+        proposals = _proposals_module()
+        store = proposals.ProposalStore()
+        git_repo = proposals.Git(WORKTREE)
+        for pin_id in candidate_pin_ids:
+            record = records_by_pin.get(pin_id)
+            if not record:
+                continue
+            try:
+                kind, container_id, _commit = pin_id.split(":", 2)
+            except ValueError:
+                log(f"WARNING retirement bridge: unparseable pin_id={pin_id!r}")
+                continue
+            pin = {
+                "kind": kind, "id": container_id, "commit": record["commit"],
+                "stable_patch_id": record["stable_patch_id"], "subject": record["subject"],
+            }
+            try:
+                artifact = proposals.generate_or_refresh_retirement(
+                    store, git_repo, pin=pin, evidence=record.get("evidence") or {},
+                    upstream_ref=upstream_ref, upstream_tip=upstream_ref,
+                )
+                generated.append({
+                    "pin_id": pin_id, "proposal_id": artifact["id"], "state": artifact["state"],
+                    "refreshed": bool(artifact.get("refreshed")),
+                })
+                log(f"RETIREMENT_PROPOSED pin={pin_id} proposal={artifact['id']} state={artifact['state']}")
+            except Exception as exc:
+                log(f"WARNING retirement proposal generation failed for pin={pin_id}: {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        log(f"WARNING retirement bridge unavailable: {type(exc).__name__}: {exc}")
+    return generated
+
+
+def _fold_provenance(payload: dict[str, Any], *, dry_run: bool) -> None:
+    """R7 (every run, any outcome) / KTD14 (folded into the single aggregated
+    run-summary): derive ground-truth provenance and fold it into the
+    result JSON. NEVER lets a ledger failure break the run -- caught,
+    logged, and reported as ``provenance: {"error": ...}`` (KTD7: report,
+    never gate).
+
+    Dry-run derives (so the report is visible) but never appends to the
+    JSONL history and never generates retirement proposals -- both are
+    mutations, and dry-run stays read-only.
+    """
+    try:
+        ledger = _ledger_module()
+        upstream_ref = _RUN_UPSTREAM_REF or _fallback_upstream_ref()
+        history_path = ledger.default_history_path()
+        records = ledger.derive(
+            manifest_path=MANIFEST_PATH, repo_dir=WORKTREE, upstream_ref=upstream_ref, blocklist_path=BLOCKLIST_PATH,
+        )
+        transitions = ledger.diff_vs_previous(records, history_path)
+        if not dry_run:
+            try:
+                manifest_sha256 = sha256(MANIFEST_PATH)
+            except OSError:
+                manifest_sha256 = None
+            ledger.append_history(records, history_path, manifest_sha256=manifest_sha256, upstream_tip=upstream_ref)
+        retiring = ledger.retirement_candidates(history_path, repo_dir=WORKTREE, upstream_ref=upstream_ref)
+        provenance: dict[str, Any] = {
+            "states": {record["pin_id"]: record["state"] for record in records},
+            "transitions": transitions,
+            "retirement_candidates": retiring,
+        }
+        if not dry_run and retiring:
+            provenance["retirement_proposals"] = generate_retirement_proposals(
+                upstream_ref=upstream_ref, records=records,
+            )
+        payload["provenance"] = provenance
+    except Exception as exc:
+        payload["provenance"] = {"error": f"{type(exc).__name__}: {exc}"}
+        log(f"WARNING provenance derivation failed: {type(exc).__name__}: {exc}")
+
+
+def _fold_canary_flag(payload: dict[str, Any]) -> None:
+    if CANARY_MANIFEST_ACTIVE:
+        payload["canary"] = True
+
+
+def _emit_result(payload: dict[str, Any], *, dry_run: bool, exit_code: int = 0) -> int:
+    """Single choke point for every SUCCESSFUL (non-``fail()``) exit from
+    ``main()`` -- the dry-run report and every non-dry-run success return.
+    Folds provenance (R7) and the canary flag (U11) into the result JSON
+    before printing, so every outcome carries them (``fail()`` does the same
+    for the failure path, below)."""
+    _fold_provenance(payload, dry_run=dry_run)
+    _fold_canary_flag(payload)
+    print(json.dumps(payload, ensure_ascii=False))
+    return exit_code
+
+
 @contextmanager
 def dry_run_inspection_logging_disabled() -> Any:
     """Prevent checked command failures during dry-run inspection from being logged."""
@@ -789,6 +990,14 @@ def fail(message: str, *, code: int = 1) -> None:
     # every existing caller and test spy keeps working.
     if AUTHORITY_REFUSALS:
         payload["authority_refusals"] = list(AUTHORITY_REFUSALS)
+    # R7/KTD7: every run, any outcome, including every failure/abort path --
+    # fail() is the single choke point every one of them already passes
+    # through. dry_run=False is always correct here: fail() is never called
+    # from the dry-run branch (integration_scripts_integrity_check() only
+    # calls it when dry_run is False; the dry-run branch composes and
+    # returns its own payload without going through fail()).
+    _fold_provenance(payload, dry_run=False)
+    _fold_canary_flag(payload)
     print(json.dumps(payload, ensure_ascii=False))
     raise SystemExit(code)
 
@@ -2222,9 +2431,21 @@ def main() -> int:
             "publish whenever --holder is not 'scheduler'; ignored on the scheduler path."
         ),
     )
+    parser.add_argument(
+        "--canary-manifest", default=None, dest="canary_manifest",
+        help=(
+            "U11 witnessed-canary entry point: resolve MANIFEST_PATH from this file instead of the "
+            "tracked manifest, for this run only. Outside sync.py's TRACKED_SET (no stamp check); the "
+            "tracked operational manifest copy is still verified. Result JSON gains \"canary\": true."
+        ),
+    )
     args = parser.parse_args()
     reset_run_reconciliation_state()
     reset_run_authority_state(args.authority_token)
+    reset_run_provenance_state()
+    reset_run_canary_state()
+    if args.canary_manifest:
+        apply_canary_manifest(args.canary_manifest)
     # Run-start integrity gate (U2/KTD2, R14): before ANY mutation -- before
     # the lock, before any fetch, even before the read-only dry-run
     # inspection below -- the operational copies must match the published
@@ -2239,15 +2460,16 @@ def main() -> int:
         try:
             result = inspect_dry_run()
             result["sync_integrity"] = sync_integrity
-            print(json.dumps(result))
-            return 0
+            return _emit_result(result, dry_run=True)
         except Exception as exc:
-            print(json.dumps({
-                "ok": False,
-                "error": f"dry-run inspection failed without mutation: {exc}",
-                "sync_integrity": sync_integrity,
-            }, ensure_ascii=False))
-            return 1
+            return _emit_result(
+                {
+                    "ok": False,
+                    "error": f"dry-run inspection failed without mutation: {exc}",
+                    "sync_integrity": sync_integrity,
+                },
+                dry_run=True, exit_code=1,
+            )
     started_at = datetime.now().astimezone()
     pre_run_local_head: str | None = None
     published_input_head: str | None = None
@@ -2264,6 +2486,11 @@ def main() -> int:
             git("fetch", FORK_REMOTE, "--prune", timeout=300)
             stage = "resolve_refs"
             upstream = git("rev-parse", f"{UPSTREAM_REMOTE}/{UPSTREAM_REF.removeprefix('refs/heads/')}")
+            # R7: "this run's fetched upstream when available" for provenance
+            # derivation -- recorded as soon as it is resolved so a failure
+            # anywhere downstream (including inside fail()) still derives
+            # against the freshest available upstream.
+            record_run_upstream_ref(upstream)
             # This is the sole lease authority for this transaction.  Do not
             # overwrite it after the fetch, including after a failed push.
             published_input_head = git("rev-parse", f"refs/remotes/{FORK_REMOTE}/{BRANCH}")
@@ -2390,15 +2617,13 @@ def main() -> int:
                 log(json.dumps(result, sort_keys=True))
                 resolve_failure_investigator_success()
                 emit_fleet_receipt(started_at, outcome="produced", changed=False)
-                print(json.dumps(result))
-                return 0
+                return _emit_result(result, dry_run=False)
             if not recovering_current_output and not needs_push and existing_release["complete"]:
                 result = {"ok": True, "changed": False, "reason": "integration_and_release_already_current", "head": rebased_output_head, "upstream": upstream, "parked_pins": parked_pin_summary()}
                 log(json.dumps(result, sort_keys=True))
                 resolve_failure_investigator_success()
                 emit_fleet_receipt(started_at, outcome="produced", changed=False)
-                print(json.dumps(result))
-                return 0
+                return _emit_result(result, dry_run=False)
 
             if needs_push:
                 stage = "push"
@@ -2462,8 +2687,7 @@ def main() -> int:
             log(json.dumps(result, sort_keys=True))
             resolve_failure_investigator_success()
             emit_fleet_receipt(started_at, outcome="produced", changed=True)
-            print(json.dumps(result))
-            return 0
+            return _emit_result(result, dry_run=False)
         except Exception as exc:
             restoration_error = ""
             if published_input_head and not branch_pushed:

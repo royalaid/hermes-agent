@@ -48,12 +48,19 @@ report -- no database. ``append_history`` never rewrites or prunes a prior
 line, so a lineage's current state is always answerable even if it was last
 touched months ago (R6).
 
-Retirement candidates bridge to U6 (``proposals.py``, not yet built as of
-this unit -- do not import it here): a pin absorbed verbatim for several
-consecutive runs, whose absorbing candidate is still an ancestor of the live
-upstream tip, is worth retiring from the manifest through that state
-machine. This module only computes and reports the candidate list; it never
-mutates the manifest or invokes proposal machinery itself.
+Retirement candidates bridge to U6 (``proposals.py``): a pin absorbed
+verbatim for several consecutive runs, whose absorbing candidate is still an
+ancestor of the live upstream tip, is worth retiring from the manifest
+through that state machine. This module only COMPUTES and reports the
+candidate list (``retirement_candidates()`` below); it never mutates the
+manifest or invokes proposal machinery itself. The bridge that turns a
+candidate pin_id into an actual retire-pin proposal --
+``generate_retirement_proposals()`` -- lives in the release script (the one
+module already permitted to import both this module and ``proposals.py``),
+calling ``proposals.generate_or_refresh_retirement()``. Deliberate: this
+module still does not import ``proposals.py``, keeping its own git-layer
+tests (see the module docstring above) independent of a concurrently-edited
+state machine.
 """
 
 from __future__ import annotations
@@ -597,9 +604,9 @@ def retirement_candidates(
     Bridges to U6: a pin_id returned here is a candidate for a retire-pin
     proposal through ``proposals.py``'s state machine. This function only
     computes and returns the list -- it never mutates the manifest or
-    invokes proposal machinery.
-    TODO(U6): wire this list into proposals.py's retire-pin generator once
-    that module exists.
+    invokes proposal machinery. The release script's
+    ``generate_retirement_proposals()`` calls this, then
+    ``proposals.generate_or_refresh_retirement()`` per candidate.
 
     When ``repo_dir`` is omitted, live ancestry cannot be verified and no
     candidate is claimed (an unverifiable retirement claim is worse than an
