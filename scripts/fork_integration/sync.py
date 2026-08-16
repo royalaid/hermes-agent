@@ -242,6 +242,44 @@ def _write_stamp(dest_dir: Path, stamp: dict[str, Any]) -> None:
 # ── public API ────────────────────────────────────────────────────────────
 
 
+def ensure_runtime_reachability(
+    resolved_sha: str, repo_dir: Path | str, runtime_repo: Path | str
+) -> dict[str, str]:
+    """Make ``resolved_sha`` resolvable in the runtime verifier's clone.
+
+    The run-start integrity gate verifies operational files against the git
+    tree at the stamped SHA using the *runtime* clone (the scheduler
+    worktree), not the deploy source. A provisional deploy from an unpushed
+    commit is unreachable there and would fail the next real run closed
+    (observed live 2026-08-16). When the SHA does not resolve, fetch the
+    deploy source's branch heads into a pinned namespace and re-check.
+    Non-fatal by design: the run-start gate remains the enforcement point;
+    this only reports what it did.
+    """
+    runtime_repo = Path(runtime_repo)
+    repo_dir = Path(repo_dir)
+
+    def _resolvable() -> bool:
+        probe = subprocess.run(
+            ["git", "-C", str(runtime_repo), "cat-file", "-t", resolved_sha],
+            capture_output=True, text=True,
+        )
+        return probe.returncode == 0 and probe.stdout.strip() == "commit"
+
+    if _resolvable():
+        return {"reachable": "true", "action": "none"}
+    fetch = subprocess.run(
+        [
+            "git", "-C", str(runtime_repo), "fetch", str(repo_dir),
+            f"+refs/heads/*:refs/pinned/deploy/{resolved_sha[:12]}/*",
+        ],
+        capture_output=True, text=True,
+    )
+    if fetch.returncode != 0:
+        return {"reachable": "false", "action": "fetch-failed", "error": fetch.stderr.strip()[:400]}
+    return {"reachable": "true" if _resolvable() else "false", "action": "fetched"}
+
+
 def sync(
     from_sha: str,
     repo_dir: Path | str,
@@ -250,6 +288,7 @@ def sync(
     provisional: bool = False,
     reason: str | None = None,
     actor: str | None = None,
+    runtime_repo: Path | str | None = None,
 ) -> dict[str, Any]:
     """Staged, atomic, tree-verified deploy of ``TRACKED_SET`` from
     ``repo_dir``'s git history at ``from_sha`` into ``dest_dir``.
@@ -298,6 +337,10 @@ def sync(
                 "synced_at": datetime.now(timezone.utc).isoformat(),
             }
             _write_stamp(dest_dir, stamp)
+            if runtime_repo is not None:
+                stamp["runtime_reachability"] = ensure_runtime_reachability(
+                    resolved_sha, repo_dir, runtime_repo
+                )
             return stamp
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
@@ -473,6 +516,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     deploy.add_argument("--provisional", action="store_true", help="Mark this deploy break-glass/provisional (KTD2).")
     deploy.add_argument("--reason", default=None, help="Required context for a provisional deploy; recorded in the stamp.")
     deploy.add_argument("--actor", default=None, help="Identity performing this deploy; recorded in the stamp.")
+    deploy.add_argument(
+        "--runtime-repo", default=None, type=Path, dest="runtime_repo",
+        help="Runtime verifier clone (the scheduler worktree). When given, the deployed "
+             "SHA is made resolvable there (local fetch into refs/pinned/deploy/) so the "
+             "next run-start integrity check can verify against it.",
+    )
 
     verify_parser = subparsers.add_parser("verify", help="Verify --dest's tracked files against --repo's tree at the stamped sha.")
     verify_parser.add_argument("--repo", required=True, type=Path)
@@ -513,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
             stamp = sync(
                 args.from_sha, args.repo, args.dest,
                 provisional=args.provisional, reason=args.reason, actor=args.actor,
+                runtime_repo=args.runtime_repo,
             )
             print(json.dumps({"ok": True, "command": "deploy", **stamp}, indent=2, sort_keys=True))
             return 0

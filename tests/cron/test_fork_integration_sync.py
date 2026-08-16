@@ -640,3 +640,38 @@ class TestCli:
         )
         assert refused.returncode == 2
         assert json.loads(refused.stdout)["ok"] is False
+
+
+def test_deploy_ensures_runtime_reachability(tmp_path: Path) -> None:
+    """A provisional deploy from an unpushed commit must leave the deployed
+    SHA resolvable in the runtime verifier's clone (observed live
+    2026-08-16: unreachable_sha would fail the next real run closed)."""
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="reach")
+    sha = _commit(repo, "reachability baseline")
+
+    (tmp_path / "runtime-holder").mkdir()
+    runtime = _init_repo(tmp_path / "runtime-holder")
+    (runtime / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(runtime), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(runtime), "commit", "-q", "-m", "seed"],
+        check=True, capture_output=True,
+    )
+    probe = subprocess.run(
+        ["git", "-C", str(runtime), "cat-file", "-t", sha], capture_output=True, text=True
+    )
+    assert probe.returncode != 0, "runtime clone must start without the deploy sha"
+
+    dest = tmp_path / "dest"
+    stamp = sync.sync(sha, repo, dest, provisional=True, reason="test", runtime_repo=runtime)
+
+    assert stamp["runtime_reachability"]["action"] == "fetched"
+    assert stamp["runtime_reachability"]["reachable"] == "true"
+    resolved = subprocess.run(
+        ["git", "-C", str(runtime), "cat-file", "-t", sha], capture_output=True, text=True
+    )
+    assert resolved.stdout.strip() == "commit"
+
+    second = sync.sync(sha, repo, dest, provisional=True, reason="test", runtime_repo=runtime)
+    assert second["runtime_reachability"]["action"] == "none"
