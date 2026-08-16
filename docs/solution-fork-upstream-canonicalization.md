@@ -18,12 +18,14 @@ Use four explicit boundaries:
    edits out of the upstream branch.
 2. **Upstream boundary.** Rebase onto the current upstream base, run the
    focused/native gates, and open the PR against that explicit base. Record the
-   PR head and base SHAs. Normally, do not integrate the feature into the fork
-   branch until the upstream merge SHA exists. The narrow exception is an
-   explicitly approved, pinned unmerged foundation: record its PR, exact head
-   SHA, approval, and reason, then use only that immutable head as the first
-   integration input. The exception does not authorize newer PR heads, related
-   PR variants, or other unmerged work.
+   PR head and base SHAs. For ordinary fork work, wait for the upstream merge
+   SHA before integrating. **Pinned-unmerged-foundation policy (in force):**
+   an explicitly approved PR head may be integrated pinned to current upstream
+   regardless of merge state — the approval, exact head SHA, and reason are
+   recorded in the manifest, and every carried patch is verified by stable
+   patch identity (`git patch-id --stable`), not by merge status. The pin does
+   not travel: it does not authorize newer PR heads, related PR variants, or
+   other unmerged work without their own explicit approval.
 3. **Integration boundary.** The published `fork-integration` head is
    canonical. Reconstruct it from the explicit upstream `main` SHA, the pinned
    approved foundation when one exists, and the complete ordered set of fork PR
@@ -82,11 +84,15 @@ Closed PRs remain in-process for this fork and are not treated as disposable.
 | [#76815](https://github.com/NousResearch/hermes-agent/pull/76815) | closed, unmerged | `dd2f89085050` | In process/superseded; its PATH change is covered by #79726. |
 
 An upstream PR being open or closed does not by itself authorize duplication or
-discarding. The current integration manifest is authoritative for any explicitly
-approved pinned unmerged foundation; at the time of writing it records #82832.
-PR #84778 is downstream fork work, not that foundation. All other unmerged work
-still follows the normal merge-wait rule unless it has its own explicit approval.
-Use the manifest's exact approved head, patch identities, and the
+discarding. The current integration manifest is authoritative for which pinned
+unmerged foundations are approved — query it directly
+(`hermes-integration-manifest.json` → `upstream_foundations[].pull_request` /
+`.approved_head`, or run `ledger.py report`) rather than trusting a number
+recorded here; at the time of writing it recorded PR #82832 (historical
+example, not a live value). PR #84778 is downstream fork work, not a pinned
+foundation. Every other unmerged item still requires its own explicit approval
+before it may be pinned; absent that, it follows the ordinary merge-wait
+default. Use the manifest's exact approved head, patch identities, and the
 readiness/exclusion record above.
 
 ## 2026-08-14 rebuild provenance
@@ -341,8 +347,151 @@ verified sequence is:
 - verify the public download checksum and retain the documented release count.
 
 Use the release script's dry-run before any mutation. It must not be used to
-paper over an unmerged upstream PR, a dirty worktree, a stale remote ref, or a
-manifest mismatch.
+paper over a dirty worktree, a stale remote ref, an integration-scripts
+integrity-check failure, or a manifest mismatch. A pinned-unmerged foundation
+is sanctioned policy (see above), not a condition dry-run is hiding.
+
+## Automated release system (`scripts/fork_integration/`)
+
+The nightly job automating the four boundaries above lives in this repository
+at `scripts/fork_integration/` — the system's source of truth, versioned and
+tested in CI (`.github/workflows/installer-tests.yml`). `%HERMES_HOME%\scripts`
+holds only operational deployments produced by the sync boundary below; it is
+never hand-edited. `scripts/fork_integration/README.md` is the operator
+quickstart for running and approving it; this section is the durable policy
+record behind it.
+
+### (a) Reconciliation proposals & park-and-continue
+
+Upstream rewrites the same logical change repeatedly; `proposals.py` turns
+that into a state machine instead of a hard nightly refusal:
+`generated -> pending-approval -> approved | rejected | stale-invalidated`,
+where `stale-invalidated` regenerates back to `generated` with fresh
+evidence. A candidate is eligible only when its subject line exactly equals
+the pinned patch's subject (never a substring or body match), it is an
+ancestor of the upstream tip fetched that run, it is not a `Revert "..."`,
+and its patch-id is not blocklisted; author, committer, and signature state
+are recorded with it. A rejected or superseded candidate's patch-id is
+appended to the blocklist (`fork-integration-blocklist.json`) and can never
+be re-proposed or silently re-absorbed. `refs/pinned/<pin>/<patch-id>`
+keep-refs protect evidence from garbage collection. Approval is attributable
+(approver identity, timestamp, candidate SHA/patch-id recorded in the
+manifest commit message), interactive-channel only, re-verifies the
+candidate is still upstream's current form, and re-derives the manifest edit,
+requiring byte-equality with the stored artifact; `--lineage` approves by
+subject plus changed-file set instead of one SHA for a context-drift re-land,
+and three stale-invalidations escalate to `churn-livelock`. Churn alone never
+skips a nightly: park-and-continue re-applies the pin's last verified form
+and tags output provenance `pin-parked-pending-proposal:<id>`; only a failed
+re-apply of that last-good form aborts the run.
+
+### (b) Sync boundary
+
+Operational copies at `%HERMES_HOME%\scripts` change through exactly two
+attributable entry points: automatic post-publish sync of the exact
+published `fork-integration` SHA, and a provisional/break-glass
+`sync.py deploy --from-sha <SHA> --reason <text>` for an authorized operator
+or an in-window investigator, stamped `provisional: true` and re-stamped by
+the next successful publish. Never mid-run, never on a tick, never a direct
+edit. Verification is tree-authoritative: the sync stamp only names *which*
+SHA to check; `verify()` always re-reads the committed git tree's blob
+hashes, so a file and its stamp edited consistently out of band still fail.
+Deployment is a staged atomic swap: every tracked file is staged to a
+sibling temp directory, re-hashed after the write, then committed with one
+`os.replace` per file, in order; the stamp is written strictly last as the
+single commit point, so an interrupted swap leaves the prior generation
+intact and provably stale rather than silently torn. The run-start integrity
+gate runs before the exclusive lock and before any fetch; a mismatch permits
+exactly one action, `sync.py deploy` — never a bypass flag — and a dry-run
+folds the mismatch into its report instead of aborting. `sync.py
+restamp-file`/`restamp-manifest` re-stamps one approval-mutated tracked file
+in place, and only when its current on-disk content byte-equals the approved
+hash.
+
+### (c) Run lifecycle & loud failures
+
+The release script's exclusive lock now records holder identity, pid, and
+start time; a second entrant gets an explicit "busy, held by X (pid P) since
+T" refusal instead of a silent wait, and a dead-pid lock older than the
+stale window (6 hours) is reclaimed with the reclaim logged. Scheduler,
+investigator, and manual runs all acquire this one lock — no second lease.
+An execution reclassified `unknown` is delivered as "unconfirmed", never
+"failed", and the reap pass corrects `jobs.json` `last_status` synchronously
+in the same pass rather than leaving a stale-green status for hours. A
+completion that arrives after `unknown` writes a sibling late-outcome record
+instead of overwriting the original `unknown` audit row, and that late
+outcome is delivered too. An out-of-process dead-man's switch — independent
+of the Hermes Python environment, so it survives the exact failure mode it
+watches for — alarms only when the job is overdue *and* the scheduler's own
+ticker heartbeat is stale; an overdue job with a fresh heartbeat is read as a
+long healthy run, not a dead scheduler. Delivery volume stays bounded: one
+aggregated run-summary delivery per run, deliver-on-transition semantics per
+class, and an explicit escalation when a condition persists unchanged across
+runs rather than repeating the same notice forever.
+
+### (d) Investigator authority
+
+**Status: specified, not yet implemented — landing in U9.** The design below
+is the contract `scripts/fork_integration/investigator.py` and the release
+script's push/publish paths must enforce in code; as of this writing the
+operational investigator still runs its pre-U9 form (failure dedupe + spawn
+only — no token, no incident/heartbeat schema). Authority is enforced by the
+push/publish code path, not by goal text: a spawner-minted, expiring token
+(job id, incident signature, session id, frozen expiry, allowed action set)
+is required at every privileged call, and a forged, expired, or absent token
+is refused in code. The authority window is `min(next scheduled fire of the
+job, spawn + 4h hard cap)`, computed from a monotonic clock at spawn and
+frozen into the record; an absent or unresolvable next fire means immediate
+expiry, a schedule edit after spawn cannot extend a live window, and
+remaining authority is re-checked immediately before each privileged action.
+One active finisher runs per job per window; a stale-heartbeat or dead
+finisher closes its incident `abandoned` and permits exactly one replacement
+in the remaining window. Forbidden regardless of token: installer execution,
+cron mutation, credentials, gateway restarts, and proposal approval (always
+human, interactive-channel only). Honest limit: ambient same-user git/gh
+credentials mean this token gate bounds accidents and drift in code, not a
+fully hostile in-context agent; branch protection on `origin/fork-integration`
+is the outstanding enforcement point outside this host (operational note,
+user-owned).
+
+### (e) Provenance
+
+`ledger.py` answers "did carried change X get merged upstream, and in what
+form?" derived from ground truth on every run — the manifest's declared
+patch identities, live git ancestry/patch-identity search against the
+tracked upstream ref, and a best-effort `gh pr view` for components sourced
+from a named fork branch — never from a cached or trusted prior verdict.
+States: `private-only`, `pr-open`, `absorbed-verbatim`, `absorbed-modified`,
+`superseded`, plus the manifest's `excluded_until_*` reason codes.
+Persistence is an append-only JSONL history, one record per run, one line per
+carried patch; nothing ever prunes a lineage's current state, so `ledger.py
+report` can still answer for a change untouched for months. Report, not
+gate: the report renders the operator-facing evidence table and flags state
+transitions since the previous run, but it never blocks a release — the
+manifest validators in the release script remain the sole enforcement layer.
+A pin absorbed verbatim for several consecutive runs, still an ancestor of
+the live upstream tip, is surfaced as a retirement candidate for a
+human-approved retire-pin proposal through (a)'s state machine — the
+manifest shrinks by the same mechanism it grows, never by auto-mutation.
+
+## Witnessed verification sequence
+
+An operator can prove the whole loop using only the commands named here, with
+no plan document required:
+
+- **Forced-failure canary:** run `hermes-integration-release-windows.py
+  --canary-manifest <path>` (a manifest injected outside the sync boundary's
+  tracked set on purpose) to trip a real gate failure and witness the
+  aggregated delivery plus the visible investigator session.
+- **Killed-owner reap:** hold the exclusive lock as a foreground run, kill it,
+  then trigger a scheduler reap pass to witness the busy-refusal/stale-reclaim
+  path and the "unconfirmed" delivery with its late-outcome record.
+- **Overdue alarm:** run `overdue_check.py` (`--dry-run` first, then live)
+  against a paused scheduler to witness the alarm firing only once the job is
+  overdue *and* the ticker heartbeat is stale.
+- **Green nightly:** run `hermes-integration-release-windows.py` with no
+  `--dry-run` and no injected failure to prove the loop still completes and
+  publishes end to end.
 
 ## Rebase subagent contract
 
@@ -374,7 +523,9 @@ dirty, provenance is missing, or a required gate fails.
 
 - [ ] Original checkout changes, dirty worktrees, and excluded investigations remain untouched.
 - [ ] Upstream branch contains only generic, tested changes.
-- [ ] PR head/base and upstream merge SHA are recorded.
+- [ ] PR head/base SHAs are recorded; the upstream merge SHA is recorded once
+      merged, or the approved pinned head is recorded per the
+      pinned-unmerged-foundation policy when it is not.
 - [ ] Integration starts from the exact published fork-integration SHA.
 - [ ] The upstream result is reachable by SHA and no duplicate fork patch was reimplemented.
 - [ ] Manifest/tracking metadata and component scope validate.
