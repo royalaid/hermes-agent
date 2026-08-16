@@ -522,6 +522,26 @@ def derive_manifest_edit(pin: dict[str, Any], candidate: dict[str, Any]) -> dict
     }
 
 
+def derive_retirement_edit(pin: dict[str, Any]) -> dict[str, Any]:
+    """The ready-to-apply manifest fragment that RETIRES (removes) a pin the
+    ledger (U7) found stably absorbed-verbatim -- the manifest shrinks
+    through the same reviewed mechanism it grows through (R4's "never a
+    parallel mechanism", applied to removal).
+
+    A pure function of the pin alone (no candidate): re-derived at approval
+    time and required to be byte-equal to the stored fragment, exactly like
+    ``derive_manifest_edit``'s contract (R2, reused verbatim for
+    retirement).
+    """
+    return {
+        "operation": "remove_manifest_pin",
+        "pin_kind": str(pin["kind"]),
+        "pin_id": str(pin["id"]),
+        "patch_commit": str(pin["commit"]),
+        "patch_stable_patch_id": str(pin["stable_patch_id"]),
+    }
+
+
 def _line_indent(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
@@ -541,18 +561,26 @@ def _render_accepted_ids(ids: Sequence[str], indent: int) -> list[str]:
 def apply_manifest_edit_text(text: str, edit: dict[str, Any]) -> str:
     """Apply *edit* to the manifest SOURCE TEXT, preserving its formatting.
 
-    A whole-file ``json.dumps`` round-trip is not byte-preserving for this
-    manifest (it is hand-formatted: single-element id arrays inline, a
-    deliberate blank line), and an approval commit that reformats the entire
-    reviewable contract is exactly the kind of unreviewable change this
-    system exists to remove. So the edit is surgical: locate the patch object
-    by its unique ``"commit": "<sha>"`` line and touch only its
-    ``accepted_output_patch_ids``.
-
-    Fails closed when the anchor is missing or ambiguous.
+    Dispatches on ``edit["operation"]``: ``append_accepted_output_patch_id``
+    (R4, churn absorption) or ``remove_manifest_pin`` (U7's retirement
+    bridge). Both are surgical text edits -- never a whole-file
+    ``json.dumps`` round-trip, which is not byte-preserving for this
+    manifest (hand-formatted: single-element id arrays inline, a deliberate
+    blank line) and would turn a reviewable one-field diff into an
+    unreviewable reformat.
     """
-    if edit.get("operation") != "append_accepted_output_patch_id":
-        raise ProposalError(f"unsupported manifest edit operation: {edit.get('operation')!r}")
+    operation = edit.get("operation")
+    if operation == "append_accepted_output_patch_id":
+        return _append_accepted_id_text(text, edit)
+    if operation == "remove_manifest_pin":
+        return _remove_manifest_pin_text(text, edit)
+    raise ProposalError(f"unsupported manifest edit operation: {operation!r}")
+
+
+def _append_accepted_id_text(text: str, edit: dict[str, Any]) -> str:
+    """Locate the patch object by its unique ``"commit": "<sha>"`` line and
+    touch only its ``accepted_output_patch_ids``. Fails closed when the
+    anchor is missing or ambiguous."""
     new_id = str(edit["accepted_output_patch_id"])
     if not _HEX40.fullmatch(new_id):
         raise ProposalError(f"refusing a manifest edit with a malformed patch id: {new_id!r}")
@@ -611,6 +639,86 @@ def apply_manifest_edit_text(text: str, edit: dict[str, Any]) -> str:
     return newline.join(updated)
 
 
+def _remove_manifest_pin_text(text: str, edit: dict[str, Any]) -> str:
+    """Delete one patch OBJECT (not just a field) from its ``patches`` array
+    -- U7's retirement bridge (R4 applied to removal).
+
+    Locates the same unique ``"commit": "<sha>"`` anchor the append edit
+    uses, then walks outward to the enclosing ``{`` / ``},``/``}`` lines
+    (this manifest's patch objects are always opened/closed on their own
+    line at ``anchor_indent - 2``) and deletes that whole block, fixing up
+    the now-last element's trailing comma when the removed element used to
+    be last.
+
+    Fails closed -- refusing rather than guessing -- when: the anchor is
+    missing/ambiguous (same rule as the append edit), the brace shape is not
+    the expected one, OR the removed patch is the SOLE element of its
+    ``patches`` array (the manifest loader rejects an empty ``patches``
+    list; retiring the last pin in a container needs a human to remove the
+    container itself, which this surgical single-object edit deliberately
+    does not attempt).
+    """
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split(newline)
+    anchor = f'"commit": "{edit["patch_commit"]}"'
+    matches = [index for index, line in enumerate(lines) if anchor in line]
+    if len(matches) != 1:
+        raise ProposalError(
+            f"manifest anchor for {edit['patch_commit']} is missing or ambiguous "
+            f"(occurrences={len(matches)}); refusing an automated removal"
+        )
+    commit_idx = matches[0]
+    body_indent = _line_indent(lines[commit_idx])
+    container_indent = body_indent - 2
+    if container_indent < 0:
+        raise ProposalError(
+            f"patch {edit['patch_commit']} has unexpected indentation; refusing an automated removal"
+        )
+
+    open_idx = next(
+        (
+            index for index in range(commit_idx - 1, -1, -1)
+            if lines[index].strip() == "{" and _line_indent(lines[index]) == container_indent
+        ),
+        None,
+    )
+    close_idx = next(
+        (
+            index for index in range(commit_idx + 1, len(lines))
+            if lines[index].strip() in ("}", "},") and _line_indent(lines[index]) == container_indent
+        ),
+        None,
+    )
+    if open_idx is None or open_idx == 0 or close_idx is None:
+        raise ProposalError(
+            f"could not locate the patch object braces for {edit['patch_commit']}; refusing an automated removal"
+        )
+
+    has_trailing_comma = lines[close_idx].strip() == "},"
+    is_first_element = lines[open_idx - 1].rstrip().endswith("[")
+    if is_first_element and not has_trailing_comma:
+        raise ProposalError(
+            f"patch {edit['patch_commit']} is the sole patch in its container; removing it would leave an "
+            "empty patches array, which the manifest loader rejects -- refusing an automated retirement edit "
+            "for the sole-patch case (a human must remove the container itself)"
+        )
+    if not is_first_element and not has_trailing_comma:
+        # The removed element was the LAST one: the preceding element's
+        # closing line currently ends in a comma that must come off, since
+        # the preceding element becomes the new last element.
+        prev_close_idx = open_idx - 1
+        stripped_prev = lines[prev_close_idx].rstrip()
+        if not stripped_prev.endswith(","):
+            raise ProposalError(
+                f"expected a trailing comma before patch {edit['patch_commit']}; manifest formatting is not "
+                "in the expected shape, refusing an automated removal"
+            )
+        lines[prev_close_idx] = stripped_prev[:-1]
+
+    updated = [*lines[:open_idx], *lines[close_idx + 1:]]
+    return newline.join(updated)
+
+
 def apply_manifest_edit(manifest_path: Path | str, edit: dict[str, Any]) -> str:
     """Apply the edit on disk and verify the result still parses as the
     manifest it claims to be. Returns the new text."""
@@ -619,9 +727,13 @@ def apply_manifest_edit(manifest_path: Path | str, edit: dict[str, Any]) -> str:
         original = _fh.read()
     updated = apply_manifest_edit_text(original, edit)
     parsed = json.loads(updated)
-    pin_patch = _find_manifest_patch(parsed, edit)
-    if str(edit["accepted_output_patch_id"]) not in pin_patch.get("accepted_output_patch_ids", []):
-        raise ProposalError("manifest edit did not take effect; refusing to write")
+    if edit.get("operation") == "remove_manifest_pin":
+        if _manifest_has_pin(parsed, edit):
+            raise ProposalError("manifest edit did not take effect; refusing to write")
+    else:
+        pin_patch = _find_manifest_patch(parsed, edit)
+        if str(edit["accepted_output_patch_id"]) not in pin_patch.get("accepted_output_patch_ids", []):
+            raise ProposalError("manifest edit did not take effect; refusing to write")
     _atomic_write_text(manifest_path, updated)
     return updated
 
@@ -640,6 +752,17 @@ def _find_manifest_patch(manifest: dict[str, Any], edit: dict[str, Any]) -> dict
     raise ProposalError(
         f"manifest has no {edit['pin_kind']} {edit['pin_id']!r} patch {edit['patch_commit']}"
     )
+
+
+def _manifest_has_pin(manifest: dict[str, Any], edit: dict[str, Any]) -> bool:
+    """True when the edit's pin is STILL present -- used to verify a
+    ``remove_manifest_pin`` edit actually took effect (the removal's
+    postcondition is the append edit's postcondition, inverted)."""
+    try:
+        _find_manifest_patch(manifest, edit)
+        return True
+    except ProposalError:
+        return False
 
 
 def manifest_pin_index(manifest: dict[str, Any]) -> dict[tuple[str, str], tuple[str, str]]:
@@ -842,6 +965,90 @@ def generate_or_refresh(
     return saved
 
 
+# ── retirement (U7 bridge): same state machine, removal instead of growth ────
+
+
+def generate_or_refresh_retirement(
+    store: ProposalStore,
+    git: Git,
+    *,
+    pin: dict[str, Any],
+    evidence: dict[str, Any],
+    upstream_ref: str = "",
+    upstream_tip: str = "",
+) -> dict[str, Any]:
+    """Create, keep, or refresh a RETIRE-PIN proposal (U7->U6 bridge).
+
+    Called by the release script for each pin ``ledger.retirement_candidates()``
+    names: absorbed-verbatim for several consecutive runs, and its absorbing
+    commit still an ancestor of the live upstream tip. ``evidence`` is that
+    absorbing candidate's ledger evidence (``candidate_commit`` required --
+    it is the retirement's proof, and generation refuses without it, mirroring
+    churn generation's ``candidates`` requirement).
+
+    Same dedupe rule as churn proposals (KTD3): the SAME pin with an already
+    OPEN retirement proposal is returned untouched (``refreshed=False``) --
+    ``proposal_id()`` keys only on the pin's own identity, reused verbatim.
+    Unlike churn, there is nothing to regenerate against (the manifest edit
+    is a pure function of the pin, not of a candidate SHA that can drift), so
+    a closed (rejected/stale/applied) prior proposal for this pin id simply
+    starts a fresh one rather than incrementing ``regen_count``.
+    """
+    if not evidence.get("candidate_commit"):
+        raise ProposalError("refusing to generate a retirement proposal without absorbing-commit evidence")
+    identifier = proposal_id(pin)
+    existing = store.load(identifier)
+    edit = derive_retirement_edit(pin)
+
+    if (
+        existing is not None
+        and existing.get("recommended_edit", {}).get("operation") == "remove_manifest_pin"
+        and existing.get("state") in OPEN_STATES
+    ):
+        existing["refreshed"] = False
+        return existing
+
+    created_at = _now()
+    history: list[dict[str, Any]] = [{
+        "at": created_at,
+        "event": "generated",
+        "detail": f"retire pin={pin['id']} commit={pin['commit']} absorbed_by={evidence.get('candidate_commit')}",
+    }]
+    artifact: dict[str, Any] = {
+        "schema": SCHEMA,
+        "id": identifier,
+        "proposal_kind": "retire-pin",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "state": STATE_PENDING_APPROVAL,
+        "evidence": EVIDENCE_COMPLETE,
+        "regen_count": 0,
+        "churn_livelock": False,
+        "low_confidence": False,
+        "pin": {
+            "kind": str(pin["kind"]), "id": str(pin["id"]), "commit": str(pin["commit"]),
+            "stable_patch_id": str(pin["stable_patch_id"]), "subject": str(pin["subject"]),
+        },
+        "upstream_ref": upstream_ref,
+        "upstream_tip": upstream_tip,
+        "candidates": [],
+        "recommended_candidate": None,
+        "candidate_diff": None,
+        "interdiff_stat": None,
+        "recommended_edit": edit,
+        "retirement_evidence": dict(evidence),
+        "lineage": {
+            "subject": str(pin["subject"]),
+            "file_set": sorted(git.changed_files(str(pin["commit"]))) if git.exists(str(pin["commit"])) else [],
+        },
+        "superseded_patch_ids": [],
+        "history": history,
+    }
+    saved = store.save(artifact)
+    saved["refreshed"] = True
+    return saved
+
+
 # ── approval / rejection (KTD3 steps 2-4, R2/R3) ─────────────────────────────
 
 
@@ -962,6 +1169,49 @@ def reverify_candidate(
     }
 
 
+def reverify_retirement(
+    git: Git,
+    artifact: dict[str, Any],
+    *,
+    upstream_tip: str,
+    patch_id_of: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
+    """Re-verify a RETIRE-PIN proposal at approval time (R2, applied to U7's
+    retirement bridge): "a retire proposal's re-derive = re-verify still
+    absorbed-verbatim + still ancestor". The pin must STILL have an upstream
+    ancestor of the current tip carrying its exact subject AND its own
+    stable patch-id -- the same absorbed-verbatim test ``ledger.py`` runs,
+    reimplemented here with this module's own git layer so ``proposals.py``
+    stays independent of ``ledger.py`` (see both modules' docstrings).
+
+    Returns the same ``{"ok", "reason", "candidate"}`` shape as
+    ``reverify_candidate`` so ``approve()``'s shared plumbing (superseded-id
+    computation, commit message, result payload) needs no None-guards: on
+    success, ``candidate`` describes the absorbing commit.
+    """
+    identity = patch_id_of or git.patch_id
+    pin = artifact["pin"]
+    own_id = str(pin["stable_patch_id"])
+    subject = str(pin["subject"])
+    for sha in exact_subject_candidates(git, upstream_tip, subject):
+        if not git.is_ancestor(sha, upstream_tip):
+            continue
+        try:
+            candidate_patch_id = identity(sha)
+        except Exception:
+            continue
+        if candidate_patch_id == own_id:
+            return {"ok": True, "reason": "", "candidate": describe_candidate(git, sha, patch_id=candidate_patch_id)}
+    return {
+        "ok": False,
+        "reason": (
+            f"pin {pin['id']} {pin['commit']} is no longer verifiably absorbed-verbatim "
+            f"under upstream tip {upstream_tip}"
+        ),
+        "candidate": None,
+    }
+
+
 def approve(
     identifier: str,
     *,
@@ -1026,9 +1276,13 @@ def approve(
         git.run("fetch", remote, "--prune", check=False)
         resolved_tip = git.resolve(upstream_ref)
 
-    verification = reverify_candidate(
-        git, artifact, upstream_tip=resolved_tip, lineage=lineage, patch_id_of=patch_id_of,
-    )
+    operation = str((artifact.get("recommended_edit") or {}).get("operation") or "append_accepted_output_patch_id")
+    if operation == "remove_manifest_pin":
+        verification = reverify_retirement(git, artifact, upstream_tip=resolved_tip, patch_id_of=patch_id_of)
+    else:
+        verification = reverify_candidate(
+            git, artifact, upstream_tip=resolved_tip, lineage=lineage, patch_id_of=patch_id_of,
+        )
     if not verification["ok"]:
         _mark_stale(store, artifact, verification["reason"])
         return {
@@ -1037,7 +1291,10 @@ def approve(
             "churn_livelock": bool(artifact.get("churn_livelock")),
         }
 
-    rederived = derive_manifest_edit(artifact["pin"], verification["candidate"])
+    rederived = (
+        derive_retirement_edit(artifact["pin"]) if operation == "remove_manifest_pin"
+        else derive_manifest_edit(artifact["pin"], verification["candidate"])
+    )
     stored_edit = artifact.get("recommended_edit") or {}
     if lineage:
         comparable = {k: v for k, v in rederived.items() if k not in LINEAGE_MUTABLE_EDIT_KEYS}
@@ -1080,15 +1337,23 @@ def approve(
             for value in superseded
         ])
 
+    if operation == "remove_manifest_pin":
+        subject_line = f"chore(fork-integration): retire absorbed pin {artifact['pin']['id']} ({identifier})"
+        candidate_line = f"Absorbed-By: {candidate['sha']} (patch-id {candidate['stable_patch_id']})\n"
+        mode_line = "Approval-Mode: retirement\n"
+    else:
+        subject_line = f"fix(fork-integration): absorb upstream rewrite of {artifact['pin']['id']} ({identifier})"
+        candidate_line = f"Candidate: {candidate['sha']} (patch-id {candidate['stable_patch_id']})\n"
+        mode_line = f"Approval-Mode: {'lineage' if lineage else 'patch-id'}\n"
     message = (
-        f"fix(fork-integration): absorb upstream rewrite of {artifact['pin']['id']} ({identifier})\n"
+        f"{subject_line}\n"
         "\n"
         f"Approved-By: {approver} at {approved_at}\n"
-        f"Candidate: {candidate['sha']} (patch-id {candidate['stable_patch_id']})\n"
+        f"{candidate_line}"
         f"Pin: {artifact['pin']['kind']} {artifact['pin']['id']} {artifact['pin']['commit']}\n"
         f"Proposal: {identifier} (artifact sha256 {stored_hash})\n"
         f"Superseded-Patch-Ids: {', '.join(superseded) if superseded else 'none'}\n"
-        f"Approval-Mode: {'lineage' if lineage else 'patch-id'}\n"
+        f"{mode_line}"
         "\n"
         f"{_COMMIT_FOOTER}\n"
     )
@@ -1124,6 +1389,7 @@ def approve(
         "superseded_patch_ids": superseded, "keep_ref": keep_ref,
         "manifest_sha256": manifest_sha256, "blocklist_sha256": blocklist_sha256,
         "restamp_commands": restamp_commands(repo_dir, manifest_sha256, blocklist_sha256),
+        "operation": operation,
     }
 
 

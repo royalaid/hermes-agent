@@ -121,6 +121,33 @@ def _manifest_document(patch: dict[str, Any], *, accepted: list[str] | None = No
     }
 
 
+def _multi_patch_manifest_document(patch: dict[str, Any], decoy: dict[str, Any]) -> dict[str, Any]:
+    """Two patches in ONE component (U7 retirement tests need a container
+    that is not emptied by removing the pin under test -- see
+    ``_remove_manifest_pin_text``'s sole-element refusal)."""
+    return {
+        "schema": 3,
+        "integration_branch": "fork-integration",
+        "upstream": {"remote": "origin", "ref": "refs/heads/main"},
+        "upstream_foundations": [{
+            "id": "test-foundation",
+            "repository": "owner/upstream",
+            "pull_request": 1,
+            "approved_head": "a" * 40,
+            "base_ref": "main",
+            "patches": [{"commit": "b" * 40, "stable_patch_id": "c" * 40, "subject": "foundation subject"}],
+        }],
+        "fork": {"repository": "owner/fork"},
+        "components": [{
+            "id": "test-component", "source_ref": "fork/test",
+            "patches": [
+                {"commit": patch["commit"], "stable_patch_id": patch["stable_patch_id"], "subject": patch["subject"]},
+                {"commit": decoy["commit"], "stable_patch_id": decoy["stable_patch_id"], "subject": decoy["subject"]},
+            ],
+        }],
+    }
+
+
 def _install_manifest(repo: Path, document: dict[str, Any]) -> Path:
     path = repo / proposals.REPO_TRACKED_SUBDIR / proposals.MANIFEST_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -816,3 +843,192 @@ def test_context_drift_reland_is_absorbed_through_lineage_approval(tmp_path: Pat
     assert outcome["accepted_output_patch_id"] == drifted
     message = _run(churn.repo, "git", "log", "-1", "--format=%B")
     assert "Approval-Mode: lineage" in message
+
+
+# ── 12. U7 retirement bridge: same state machine, removal instead of growth ──
+
+
+def test_derive_retirement_edit_is_a_pure_function_of_the_pin() -> None:
+    pin = {"kind": "component", "id": "comp1", "commit": "1" * 40, "stable_patch_id": "2" * 40, "subject": "x"}
+    assert proposals.derive_retirement_edit(pin) == {
+        "operation": "remove_manifest_pin", "pin_kind": "component", "pin_id": "comp1",
+        "patch_commit": "1" * 40, "patch_stable_patch_id": "2" * 40,
+    }
+
+
+def _three_patch_text() -> str:
+    return json.dumps(
+        {"components": [{"id": "comp1", "source_ref": "x", "patches": [
+            {"commit": "1" * 40, "stable_patch_id": "2" * 40, "subject": "first"},
+            {"commit": "3" * 40, "stable_patch_id": "4" * 40, "subject": "second"},
+            {"commit": "5" * 40, "stable_patch_id": "6" * 40, "subject": "third"},
+        ]}]},
+        indent=2,
+    )
+
+
+def _removal_edit(commit: str, stable_patch_id: str) -> dict[str, Any]:
+    return {
+        "operation": "remove_manifest_pin", "pin_kind": "component", "pin_id": "comp1",
+        "patch_commit": commit, "patch_stable_patch_id": stable_patch_id,
+    }
+
+
+def test_remove_manifest_pin_text_middle_element() -> None:
+    updated = proposals.apply_manifest_edit_text(_three_patch_text(), _removal_edit("3" * 40, "4" * 40))
+    patches = json.loads(updated)["components"][0]["patches"]
+    assert [p["commit"] for p in patches] == ["1" * 40, "5" * 40]
+
+
+def test_remove_manifest_pin_text_first_element() -> None:
+    updated = proposals.apply_manifest_edit_text(_three_patch_text(), _removal_edit("1" * 40, "2" * 40))
+    patches = json.loads(updated)["components"][0]["patches"]
+    assert [p["commit"] for p in patches] == ["3" * 40, "5" * 40]
+
+
+def test_remove_manifest_pin_text_last_element_strips_preceding_comma() -> None:
+    updated = proposals.apply_manifest_edit_text(_three_patch_text(), _removal_edit("5" * 40, "6" * 40))
+    parsed = json.loads(updated)  # would raise json.JSONDecodeError on a stray trailing comma
+    patches = parsed["components"][0]["patches"]
+    assert [p["commit"] for p in patches] == ["1" * 40, "3" * 40]
+
+
+def test_remove_manifest_pin_text_sole_patch_refuses_to_empty_the_container() -> None:
+    text = json.dumps(
+        {"components": [{"id": "c", "source_ref": "x", "patches": [
+            {"commit": "7" * 40, "stable_patch_id": "8" * 40, "subject": "only"},
+        ]}]},
+        indent=2,
+    )
+    with pytest.raises(proposals.ProposalError, match="sole patch"):
+        proposals.apply_manifest_edit_text(text, _removal_edit("7" * 40, "8" * 40))
+
+
+def test_apply_manifest_edit_text_rejects_unknown_operation() -> None:
+    with pytest.raises(proposals.ProposalError, match="unsupported manifest edit operation"):
+        proposals.apply_manifest_edit_text("{}", {"operation": "bogus"})
+
+
+def test_generate_or_refresh_retirement_requires_absorbing_commit_evidence(tmp_path: Path) -> None:
+    churn = Churn(tmp_path)
+    patch = churn.pin({"pinfile.txt": "x\n"})
+    store = proposals.ProposalStore(tmp_path / "store")
+    with pytest.raises(proposals.ProposalError, match="absorbing-commit evidence"):
+        proposals.generate_or_refresh_retirement(store, churn.git, pin=_pin_record(churn, patch), evidence={})
+
+
+def test_generate_or_refresh_retirement_dedupes_the_open_proposal(tmp_path: Path) -> None:
+    churn = Churn(tmp_path)
+    patch = churn.pin({"pinfile.txt": "x\n"})
+    absorbing = churn.upstream({"pinfile.txt": "x\n"}, PIN_SUBJECT)
+    store = proposals.ProposalStore(tmp_path / "store")
+    pin = _pin_record(churn, patch)
+    evidence = {"candidate_commit": absorbing}
+
+    first = proposals.generate_or_refresh_retirement(store, churn.git, pin=pin, evidence=evidence)
+    assert first["refreshed"] is True
+    assert first["state"] == proposals.STATE_PENDING_APPROVAL
+    assert first["recommended_edit"]["operation"] == "remove_manifest_pin"
+
+    second = proposals.generate_or_refresh_retirement(store, churn.git, pin=pin, evidence=evidence)
+    assert second["refreshed"] is False
+    assert second["id"] == first["id"]
+    assert len(list(store.root.glob("*.json"))) == 1
+
+
+def test_retirement_approval_removes_the_pin_and_stays_loader_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bridge's acceptance proof: a pin the ledger found stably
+    absorbed-verbatim retires through proposals.py's SAME approve() verb --
+    no blocklist entry (nothing was superseded), manifest loader-green
+    afterward, and the decoy sibling pin untouched."""
+    churn = Churn(tmp_path)
+    patch = churn.pin({"pinfile.txt": "same content\n"})
+    # NOT churn.pin() again -- that recreates the "pin-source" branch, which
+    # already exists after the first call. A plain commit on the current
+    # (trunk) branch is all a decoy sibling pin needs.
+    decoy_commit = _commit(churn.repo, {"decoyfile.txt": "decoy\n"}, "fix: unrelated decoy")
+    decoy = {
+        "commit": decoy_commit, "subject": "fix: unrelated decoy",
+        "stable_patch_id": churn.git.patch_id(decoy_commit),
+    }
+    manifest_path = _install_manifest(churn.repo, _multi_patch_manifest_document(patch, decoy))
+    # Upstream absorbs the pin VERBATIM: same content + same subject -> same patch-id.
+    absorbing = churn.upstream({"pinfile.txt": "same content\n"}, PIN_SUBJECT)
+    tip = churn.tip()
+
+    store = proposals.ProposalStore(tmp_path / "store")
+    pin = _pin_record(churn, patch)
+    evidence = {"candidate_commit": absorbing, "candidate_patch_id": patch["stable_patch_id"], "upstream_ref": "origin/main"}
+    artifact = proposals.generate_or_refresh_retirement(
+        store, churn.git, pin=pin, evidence=evidence, upstream_ref="origin/main", upstream_tip=tip,
+    )
+
+    outcome = proposals.approve(
+        artifact["id"], artifact_hash_arg=artifact["artifact_sha256"], store=store,
+        repo_dir=churn.repo, upstream_tip=tip, allow_noninteractive=True, approver="tester",
+    )
+
+    assert outcome["ok"] is True
+    assert outcome["operation"] == "remove_manifest_pin"
+    assert outcome["superseded_patch_ids"] == []
+    assert store.load(artifact["id"])["state"] == proposals.STATE_APPLIED
+
+    loaded = _assert_loader_green(monkeypatch, manifest_path)
+    remaining = loaded["components"][0]["patches"]
+    assert [p["commit"] for p in remaining] == [decoy["commit"]]  # only the decoy survives
+
+    blocklist = proposals.load_blocklist(churn.repo / proposals.REPO_TRACKED_SUBDIR / proposals.BLOCKLIST_FILENAME)
+    assert blocklist["entries"] == []  # a retirement supersedes nothing
+
+    message = _run(churn.repo, "git", "log", "-1", "--format=%B")
+    assert "retire absorbed pin test-component" in message
+    assert "Approval-Mode: retirement" in message
+    assert "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>" in message
+    committed = _run(churn.repo, "git", "show", "--stat", "--format=", "HEAD")
+    assert proposals.MANIFEST_FILENAME in committed
+    assert proposals.BLOCKLIST_FILENAME not in committed  # nothing superseded, blocklist untouched
+
+
+def test_retirement_approval_stale_invalidates_when_no_longer_absorbed_verbatim(tmp_path: Path) -> None:
+    """R2 applied to retirement: upstream rewrites again before approval, the
+    pin is no longer verifiably absorbed-verbatim -> stale-invalidated, no
+    manifest edit."""
+    churn = Churn(tmp_path)
+    patch = churn.pin({"pinfile.txt": "same content\n"})
+    # NOT churn.pin() again -- that recreates the "pin-source" branch, which
+    # already exists after the first call. A plain commit on the current
+    # (trunk) branch is all a decoy sibling pin needs.
+    decoy_commit = _commit(churn.repo, {"decoyfile.txt": "decoy\n"}, "fix: unrelated decoy")
+    decoy = {
+        "commit": decoy_commit, "subject": "fix: unrelated decoy",
+        "stable_patch_id": churn.git.patch_id(decoy_commit),
+    }
+    manifest_path = _install_manifest(churn.repo, _multi_patch_manifest_document(patch, decoy))
+    fixture_head = churn.tip()
+    before = manifest_path.read_text(encoding="utf-8")
+    absorbing = churn.upstream({"pinfile.txt": "same content\n"}, PIN_SUBJECT)
+    tip = churn.tip()
+
+    store = proposals.ProposalStore(tmp_path / "store")
+    pin = _pin_record(churn, patch)
+    evidence = {"candidate_commit": absorbing, "candidate_patch_id": patch["stable_patch_id"]}
+    artifact = proposals.generate_or_refresh_retirement(
+        store, churn.git, pin=pin, evidence=evidence, upstream_ref="origin/main", upstream_tip=tip,
+    )
+
+    # Upstream rewrites: the absorbing line is gone, and nothing else on the
+    # new tip carries the pin's own patch-id under its exact subject.
+    churn.rewind_upstream(fixture_head)
+    churn.upstream({"pinfile.txt": "a different fix entirely\n"}, PIN_SUBJECT)
+    new_tip = churn.tip()
+
+    outcome = proposals.approve(
+        artifact["id"], artifact_hash_arg=artifact["artifact_sha256"], store=store,
+        repo_dir=churn.repo, upstream_tip=new_tip, allow_noninteractive=True, approver="tester",
+    )
+
+    assert outcome["ok"] is False
+    assert store.load(artifact["id"])["state"] == proposals.STATE_STALE_INVALIDATED
+    assert manifest_path.read_text(encoding="utf-8") == before
