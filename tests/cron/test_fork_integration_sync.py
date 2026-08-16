@@ -71,8 +71,9 @@ def _commit(repo: Path, message: str) -> str:
 
 
 def test_tracked_set_matches_the_named_files_plus_sync_py() -> None:
-    """The five plan-named files, plus sync.py itself (documented deviation
-    -- see sync.py's module docstring). Shims/README are excluded."""
+    """The five plan-named files, plus sync.py itself and U6's
+    proposals.py/blocklist pair (documented deviations -- see sync.py's
+    module docstring). Shims/README are excluded."""
     assert set(sync.TRACKED_SET) == {
         "hermes-integration-release-windows.py",
         "hermes-release-failure-investigator.py",
@@ -80,6 +81,8 @@ def test_tracked_set_matches_the_named_files_plus_sync_py() -> None:
         "test_hermes_integration_release_windows.py",
         "overdue_check.py",
         "sync.py",
+        "proposals.py",
+        "fork-integration-blocklist.json",
     }
     for excluded in ("release.py", "investigator.py", "__init__.py", "README.md"):
         assert excluded not in sync.TRACKED_SET
@@ -479,6 +482,29 @@ def test_restamp_manifest_accepts_matching_fragment_refuses_otherwise(tmp_path: 
     # The refusal did not silently mutate the stamp.
     stamp_after_refusal = json.loads((dest / sync.SYNC_STAMP_FILENAME).read_text(encoding="utf-8"))
     assert stamp_after_refusal == restamped
+
+
+def test_restamp_file_attests_the_blocklist_and_refuses_untracked_names(tmp_path: Path) -> None:
+    """U6 approvals mutate the blocklist as well as the manifest, so the
+    generalized primitive must attest any tracked file -- and only those."""
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    sha = _commit(repo, "v1")
+    dest = tmp_path / "dest"
+    pre_stamp = sync.sync(sha, repo, dest)
+
+    blocklist_path = dest / sync.BLOCKLIST_FILENAME
+    blocklist_path.write_text('{"schema": 1, "entries": [{"patch_id": "a"}]}', encoding="utf-8")
+    approved_hash = hashlib.sha256(blocklist_path.read_bytes()).hexdigest()
+
+    restamped = sync.restamp_file(dest, repo, sync.BLOCKLIST_FILENAME, approved_hash)
+
+    assert restamped["files"][sync.BLOCKLIST_FILENAME] == approved_hash
+    assert restamped["source_sha"] == pre_stamp["source_sha"]
+    assert restamped["files"][sync.MANIFEST_FILENAME] == pre_stamp["files"][sync.MANIFEST_FILENAME]
+
+    with pytest.raises(sync.SyncError, match="untracked file"):
+        sync.restamp_file(dest, repo, "not-a-tracked-file.json", approved_hash)
 
 
 def test_restamp_manifest_refuses_without_a_prior_stamp(tmp_path: Path) -> None:

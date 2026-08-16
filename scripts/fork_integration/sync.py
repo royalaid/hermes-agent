@@ -29,6 +29,18 @@ it, per the U2 runbook):
     ``hermes-release-failure-investigator.py``,
     ``hermes-integration-manifest.json``,
     ``test_hermes_integration_release_windows.py``, ``overdue_check.py``.
+  - ``proposals.py`` and ``fork-integration-blocklist.json`` (U6) are
+    tracked for the same reason as ``sync.py`` below: the release script
+    loads ``proposals.py`` as a sibling file (``_proposals_module()``) to
+    detect churn candidates and park pins, and reads the blocklist beside
+    the manifest so a rejected patch-id can never be re-absorbed
+    operationally. Both are approval-mutated (``proposals.py approve``
+    appends blocklist entries), which makes them exactly the kind of file
+    that must arrive through an attributable sync boundary rather than by
+    hand. NOTE the deploy ordering this implies: the first operational sync
+    carrying them must come from a published SHA that contains them --
+    until then the operational generation keeps running its own older
+    ``sync.py`` with the older tracked set, which is unaffected.
   - ``sync.py`` (this file) is ALSO tracked -- a deviation from the plan's
     literal enumeration, made deliberately: ``release.py`` loads this
     module as a sibling file via ``importlib`` (the operational directory
@@ -111,10 +123,14 @@ TRACKED_SET: tuple[str, ...] = (
     "test_hermes_integration_release_windows.py",
     "overdue_check.py",
     "sync.py",
+    "proposals.py",
+    "fork-integration-blocklist.json",
 )
 
 MANIFEST_FILENAME = "hermes-integration-manifest.json"
+BLOCKLIST_FILENAME = "fork-integration-blocklist.json"
 assert MANIFEST_FILENAME in TRACKED_SET
+assert BLOCKLIST_FILENAME in TRACKED_SET
 
 # Path, relative to a repo_dir's root, holding the tracked files -- matches
 # this file's own location in this repo (KTD1: scripts/fork_integration/).
@@ -358,33 +374,41 @@ def verify(dest_dir: Path | str, repo_dir: Path | str) -> dict[str, Any]:
     }
 
 
-def restamp_manifest(dest_dir: Path | str, repo_dir: Path | str, approved_fragment_sha256: str) -> dict[str, Any]:
-    """Narrow attestation primitive for the U6 manifest-approval path (KTD2
-    Approach step 5: approvals commit to ``fork-integration`` and re-stamp
-    the operational manifest in place).
+def restamp_file(dest_dir: Path | str, repo_dir: Path | str, name: str, approved_sha256: str) -> dict[str, Any]:
+    """Narrow attestation primitive for the U6 approval path (KTD2 Approach
+    step 5: approvals commit to ``fork-integration`` and re-stamp the
+    approval-mutated operational file in place).
+
+    Generalized from the original manifest-only primitive because a U6
+    approval mutates TWO tracked files -- the manifest and the blocklist --
+    and both must be attested by the same mechanism; ``restamp_manifest()``
+    remains as a thin back-compat wrapper.
 
     Does NOT copy any file content, and does NOT touch ``source_sha`` or
-    any other tracked file's stamped hash -- it only asserts "the
-    operational manifest currently on disk is byte-for-byte the approved
-    fragment" and records that single fact in the stamp. Recomputes the
-    manifest's sha256 fresh from ``dest_dir`` every call; never trusts a
-    caller-supplied hash for anything except the equality check itself.
+    any other tracked file's stamped hash -- it only asserts "``name``
+    currently on disk is byte-for-byte what was approved" and records that
+    single fact in the stamp. Recomputes the file's sha256 fresh from
+    ``dest_dir`` every call; never trusts a caller-supplied hash for
+    anything except the equality check itself.
 
     Refuses (raises ``SyncError``) unless:
+      - ``name`` is a tracked file (an untracked name has no stamp entry to
+        amend and would be a silent no-op);
       - ``repo_dir`` looks like a real git working tree (a basic
-        environment sanity check -- a manifest approval always runs
-        against a real repo clone in practice);
+        environment sanity check -- an approval always runs against a real
+        repo clone in practice);
       - a prior stamp already exists in ``dest_dir`` (there must be a
         prior generation to amend; this is not a bootstrap entry point);
-      - the manifest file exists in ``dest_dir``; and
-      - its current sha256 equals ``approved_fragment_sha256`` exactly.
+      - the file exists in ``dest_dir``; and
+      - its current sha256 equals ``approved_sha256`` exactly.
 
-    Any other manifest delta -- one byte different from what was approved
-    -- fails closed rather than silently re-stamping something nobody
-    reviewed.
+    Any other delta -- one byte different from what was approved -- fails
+    closed rather than silently re-stamping something nobody reviewed.
     """
     dest_dir = Path(dest_dir)
     repo_dir = Path(repo_dir)
+    if name not in TRACKED_SET:
+        raise SyncError(f"refusing to restamp an untracked file: {name!r}")
 
     probe = subprocess.run(
         ["git", "-C", str(repo_dir), "rev-parse", "--is-inside-work-tree"],
@@ -403,23 +427,32 @@ def restamp_manifest(dest_dir: Path | str, repo_dir: Path | str, approved_fragme
     if not isinstance(stamp, dict):
         raise SyncError("existing stamp is not a JSON object")
 
-    manifest_path = dest_dir / MANIFEST_FILENAME
-    if not manifest_path.is_file():
-        raise SyncError(f"manifest is missing from dest_dir: {manifest_path}")
-    actual_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    if actual_sha256 != approved_fragment_sha256:
+    file_path = dest_dir / name
+    if not file_path.is_file():
+        raise SyncError(f"{name} is missing from dest_dir: {file_path}")
+    actual_sha256 = hashlib.sha256(file_path.read_bytes()).hexdigest()
+    if actual_sha256 != approved_sha256:
         raise SyncError(
-            "manifest on disk does not match the approved fragment hash; refusing to restamp "
-            f"(expected={approved_fragment_sha256}, actual={actual_sha256})"
+            f"{name} on disk does not match the approved hash; refusing to restamp "
+            f"(expected={approved_sha256}, actual={actual_sha256})"
         )
 
     files = dict(stamp.get("files") or {})
-    files[MANIFEST_FILENAME] = actual_sha256
+    files[name] = actual_sha256
     new_stamp = {**stamp, "files": files}
 
     with _dest_directory_exclusion(dest_dir):
         _write_stamp(dest_dir, new_stamp)
     return new_stamp
+
+
+def restamp_manifest(dest_dir: Path | str, repo_dir: Path | str, approved_fragment_sha256: str) -> dict[str, Any]:
+    """Back-compat wrapper: restamp the manifest specifically.
+
+    Kept so the original ``restamp-manifest`` CLI verb and its callers keep
+    working unchanged now that :func:`restamp_file` carries the mechanics.
+    """
+    return restamp_file(dest_dir, repo_dir, MANIFEST_FILENAME, approved_fragment_sha256)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
@@ -456,6 +489,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="sha256 the operational manifest's current on-disk content must equal.",
     )
 
+    restamp_any = subparsers.add_parser(
+        "restamp-file",
+        help="Re-stamp one tracked file's entry after an out-of-band approved edit (U6 hook).",
+    )
+    restamp_any.add_argument("--repo", required=True, type=Path)
+    restamp_any.add_argument("--dest", required=True, type=Path)
+    restamp_any.add_argument("--name", required=True, help=f"Tracked file name; one of {', '.join(TRACKED_SET)}.")
+    restamp_any.add_argument(
+        "--approved-sha256", required=True, dest="approved_sha256",
+        help="sha256 the operational file's current on-disk content must equal.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -478,6 +523,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "restamp-manifest":
             stamp = restamp_manifest(args.dest, args.repo, args.approved_fragment)
             print(json.dumps({"ok": True, "command": "restamp-manifest", **stamp}, indent=2, sort_keys=True))
+            return 0
+        if args.command == "restamp-file":
+            stamp = restamp_file(args.dest, args.repo, args.name, args.approved_sha256)
+            print(json.dumps({"ok": True, "command": "restamp-file", **stamp}, indent=2, sort_keys=True))
             return 0
     except SyncError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2, sort_keys=True))

@@ -39,13 +39,50 @@ in-repo shims/README do not), and `python sync.py --help`.
 Note this changes the "byte-pure, do not hand-edit" policy above only for
 `sync.py`'s own two call sites inside
 `hermes-integration-release-windows.py` (the run-start gate and the
-post-publish hook) — everything else in that file, and every other
-imported file, is still byte-pure per the U1 import commit.
+post-publish hook), plus U6's park-and-continue changes described below —
+everything else in that file, and every other imported file, is still
+byte-pure per the U1 import commit.
+
+## Reconciliation proposals (U6)
+
+`proposals.py` owns upstream-churn reconciliation. When upstream carries a
+same-subject, non-patch-equivalent rewrite of a pinned patch, the run no
+longer refuses: it writes a hash-stamped proposal artifact under
+`%HERMES_HOME%\review-artifacts\fork-integration-proposals\` (evidence:
+candidate SHAs + patch-ids + author/committer/signature, the full candidate
+diff in a sibling `.diff`, an interdiff summary, and a ready-to-apply
+manifest fragment), records the parked pin, and **continues** with the pin's
+last verified form, tagging output provenance
+`pin-parked-pending-proposal:<id>`. Only a failed re-apply of that last-good
+form aborts a run.
+
+Operator commands (approval is interactive-only and is on the investigator's
+forbidden list):
+
+```
+python proposals.py list
+python proposals.py approve <id> --artifact-hash <sha256> [--lineage]
+python proposals.py reject  <id> --reason "<why>"
+```
+
+`approve` re-verifies the candidate against current upstream, re-derives the
+manifest edit and requires byte-equality with the stored fragment (else
+`stale-invalidated`), edits `hermes-integration-manifest.json` in place
+(surgically — the hand formatting is preserved), appends superseded
+patch-ids to `fork-integration-blocklist.json`, commits both with the
+approver/candidate/proposal recorded in the message, writes a
+`refs/pinned/<pin>/<patch-id>` keep-ref for the outgoing commit, and prints
+the `sync.py restamp-file` commands that carry the approved edit across the
+U2 sync boundary. `--lineage` approves the lineage (subject + changed-file
+set) rather than one SHA — the escape hatch for a context-drift re-land and
+for the `churn_livelock` escalation after three regenerations.
+
+Blocklisted patch-ids never count as equivalent and are never re-proposed.
 
 ## Running the tests
 
 ```
-uv run python -m pytest tests/cron/test_fork_integration_release.py tests/cron/test_fork_integration_sync.py -q
+uv run python -m pytest tests/cron/ -k fork_integration -q
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-fork-integration-release.ps1
 ```
 
