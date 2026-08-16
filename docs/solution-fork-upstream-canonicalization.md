@@ -431,11 +431,11 @@ runs rather than repeating the same notice forever.
 
 ### (d) Investigator authority
 
-**Status: specified, not yet implemented — landing in U9.** The design below
-is the contract `scripts/fork_integration/investigator.py` and the release
-script's push/publish paths must enforce in code; as of this writing the
-operational investigator still runs its pre-U9 form (failure dedupe + spawn
-only — no token, no incident/heartbeat schema). Authority is enforced by the
+**Status: landed (U9; see the `feat(fork-integration): spawner-minted authority
+tokens gate push/publish` and `feat(fork-integration): incident schema v2 -
+heartbeat, closures, single finisher` commits).** The design below is the
+contract `scripts/fork_integration/investigator.py` and the release script's
+push/publish paths enforce in code. Authority is enforced by the
 push/publish code path, not by goal text: a spawner-minted, expiring token
 (job id, incident signature, session id, frozen expiry, allowed action set)
 is required at every privileged call, and a forged, expired, or absent token
