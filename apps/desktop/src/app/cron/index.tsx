@@ -37,6 +37,7 @@ import {
   getAutomationBlueprints,
   getCronDeliveryTargets,
   getCronJobRuns,
+  getLatestSessionMessages,
   instantiateAutomationBlueprint,
   pauseCronJob,
   resumeCronJob,
@@ -866,7 +867,35 @@ function formatRunTime(seconds?: null | number): string {
 const RUNS_POLL_INTERVAL_MS = 8000
 const RUNS_BACKSTOP_INTERVAL_MS = 60_000
 
-function CronJobRuns({
+// A no_agent run's row.preview never changes (it's the FIRST *user* message
+// — "no_agent script: <path>" — set once before the script starts; see
+// cron/scheduler.py run_job). Live stage progress (U8/KTD8) instead lands in
+// the run's one in-place-updated *assistant* message, so an is_active run's
+// growing text has to be fetched separately and polled while it runs. This
+// interval only applies to that per-active-run poll, not the run list poll
+// above — short enough to feel "live" against the scheduler's own >=0.5s
+// throttle on writing progress updates.
+export const ACTIVE_RUN_PROGRESS_POLL_INTERVAL_MS = 1500
+
+// The live-progress doc (cron/scheduler.py _render_progress_doc) is
+// markdown with one "- [ok] <stage>: <detail>" bullet per stage line,
+// growing at the end. The last non-empty line is the most recent stage —
+// exactly the "growing stage lines" signal this row should surface.
+export function lastNonEmptyLine(text: string): string {
+  const lines = text.split('\n')
+
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const trimmed = lines[i]?.trim()
+
+    if (trimmed) {
+      return trimmed
+    }
+  }
+
+  return ''
+}
+
+export function CronJobRuns({
   c,
   jobId,
   onOpenSession
@@ -876,6 +905,8 @@ function CronJobRuns({
   onOpenSession?: (sessionId: string) => void
 }) {
   const [runs, setRuns] = useState<null | SessionInfo[]>(null)
+  // sessionId -> most recent assistant-message content for an is_active run.
+  const [activeRunProgress, setActiveRunProgress] = useState<Record<string, string>>({})
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const cronChangeTick = useStore($cronChangeTick)
 
@@ -922,6 +953,72 @@ function CronJobRuns({
     // cronChangeTick: a fired run moves jobs.json bookkeeping → reload now.
   }, [changeEventsAvailable, cronChangeTick, jobId])
 
+  const activeRunIds = useMemo(
+    () => (runs ?? []).filter(run => run.is_active).map(run => run.id),
+    [runs]
+  )
+
+  // Stable dep for the effect below — an array literal from useMemo is a
+  // new reference every render even when its contents are unchanged.
+  const activeRunIdsKey = activeRunIds.join(',')
+
+  useEffect(() => {
+    if (activeRunIds.length === 0) {
+      return
+    }
+
+    let cancelled = false
+
+    const poll = () => {
+      void Promise.all(
+        activeRunIds.map(sessionId =>
+          getLatestSessionMessages(sessionId)
+            .then(({ messages }) => {
+              const assistant = [...messages].reverse().find(m => m.role === 'assistant')
+
+              return [sessionId, typeof assistant?.content === 'string' ? assistant.content : ''] as const
+            })
+            .catch(() => [sessionId, ''] as const)
+        )
+      ).then(entries => {
+        if (cancelled) {
+          return
+        }
+
+        setActiveRunProgress(prev => {
+          const next = { ...prev }
+
+          for (const [sessionId, content] of entries) {
+            if (content) {
+              next[sessionId] = content
+            } else {
+              delete next[sessionId]
+            }
+          }
+
+          return next
+        })
+      })
+    }
+
+    void poll()
+
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        poll()
+      }
+    }, ACTIVE_RUN_PROGRESS_POLL_INTERVAL_MS)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+    }
+    // activeRunIds itself is a fresh array each render; key it on its
+    // stringified contents so the poll only restarts when the SET of
+    // active runs actually changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRunIdsKey])
+
   return (
     <div>
       <PanelSectionLabel className="mb-1.5">
@@ -936,19 +1033,41 @@ function CronJobRuns({
         <div className="py-1 text-xs text-muted-foreground">{c.noRuns}</div>
       ) : (
         <div className="flex flex-col gap-px">
-          {runs.map(run => (
-            <button
-              className="row-hover flex items-center justify-between gap-3 rounded-md px-2 py-1 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-              key={run.id}
-              onClick={() => onOpenSession?.(run.id)}
-              type="button"
-            >
-              <span className="truncate text-foreground/85">{run.title?.trim() || run.preview?.trim() || run.id}</span>
-              <span className="shrink-0 text-[0.62rem] text-muted-foreground/55 tabular-nums">
-                {formatRunTime(run.last_active || run.started_at)}
-              </span>
-            </button>
-          ))}
+          {runs.map(run => {
+            const progress = run.is_active ? activeRunProgress[run.id] : undefined
+            const progressLine = progress ? lastNonEmptyLine(progress) : ''
+
+            return (
+              <button
+                className="row-hover flex flex-col gap-0.5 rounded-md px-2 py-1 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                key={run.id}
+                onClick={() => onOpenSession?.(run.id)}
+                type="button"
+              >
+                <span className="flex items-center justify-between gap-3">
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    {run.is_active ? (
+                      // Decorative, like the run-list loading spinner above —
+                      // the growing progress line below it is the actual
+                      // signal; no separate translated label needed.
+                      <Codicon className="shrink-0 text-accent" name="loading" size="0.7rem" spinning />
+                    ) : null}
+                    <span className="truncate text-foreground/85">
+                      {run.title?.trim() || run.preview?.trim() || run.id}
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-[0.62rem] text-muted-foreground/55 tabular-nums">
+                    {formatRunTime(run.last_active || run.started_at)}
+                  </span>
+                </span>
+                {progressLine ? (
+                  <span className="truncate pl-[1.1rem] text-[0.62rem] text-muted-foreground/70">
+                    {progressLine}
+                  </span>
+                ) : null}
+              </button>
+            )
+          })}
         </div>
       )}
     </div>
