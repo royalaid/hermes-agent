@@ -422,6 +422,93 @@ def launch_failure_investigator(*, stage: str, error: str) -> None:
         log(f"WARNING failure investigator unavailable: {type(investigator_exc).__name__}")
 
 
+# ── U9/KTD12/R20: privileged-action authority gate ──────────────────────────
+
+#: Refusals recorded by ``require_authority()`` this run. ``fail()`` folds
+#: them into the result JSON so the refusal reaches the delivered brief and
+#: the cron run doc, not just the log.
+AUTHORITY_REFUSALS: list[dict[str, Any]] = []
+#: Granted privileged actions (audit trail in the log + result JSON).
+AUTHORITY_GRANTS: list[dict[str, Any]] = []
+#: The token path this run was started with (``--authority-token``).
+AUTHORITY_TOKEN_PATH: str | None = None
+
+
+class AuthorityRefused(RuntimeError):
+    """A privileged action was refused by the authority gate.
+
+    Raised (not ``fail()``ed) so the normal failure path still runs: the
+    pre-push restoration, the incident record, and the Fleet receipt all
+    behave exactly as they do for any other refusal.
+    """
+
+    def __init__(self, refusal: dict[str, Any]) -> None:
+        super().__init__(f"privileged action refused by authority gate: {refusal.get('reason')}")
+        self.refusal = refusal
+
+
+def reset_run_authority_state(token_path: str | None = None) -> None:
+    global AUTHORITY_TOKEN_PATH
+    AUTHORITY_REFUSALS.clear()
+    AUTHORITY_GRANTS.clear()
+    AUTHORITY_TOKEN_PATH = token_path
+
+
+def require_authority(action: str, *, holder: str, token_path: str | None) -> dict[str, Any]:
+    """Gate one privileged action (``push`` / ``publish``) in code (R20).
+
+    Called immediately before EACH privileged action, never once per run, so
+    a window that expires between the push and the publish refuses the
+    publish.
+
+    - ``--holder scheduler`` (the default, i.e. the nightly cron run) is the
+      sanctioned automated path and needs no token.
+    - Any other holder -- an investigator session, a manual operator run --
+      must present a spawner-minted token that parses, names this job, is
+      unexpired at THIS moment, allows THIS action, and whose recomputed
+      digest matches the digest the spawner recorded in the (still open)
+      incident entry.  Every failure is a named refusal.
+
+    HONEST LIMIT (R20, same wording as the plan): ambient same-user git/gh
+    credentials mean file-based controls bound accidents and drift, not a
+    fully hostile in-context agent -- nothing here stops a process on this
+    account from passing ``--holder scheduler`` or writing its own incident
+    record.  What it does buy: an investigator that follows its contract
+    cannot push or publish outside a window a NON-AGENT process opened for
+    the incident it was spawned for, and a stale or superseded finisher's
+    authority dies the moment its incident is closed.  The enforcement point
+    outside this host is GitHub branch protection on the published branch
+    (deferred, user-owned).
+    """
+    holder_label = (holder or "scheduler").strip() or "scheduler"
+    if holder_label == "scheduler":
+        grant = {"ok": True, "action": action, "holder": holder_label, "reason": "scheduler_holder"}
+        AUTHORITY_GRANTS.append(grant)
+        log(f"AUTHORITY_OK action={action} holder={holder_label} reason=scheduler_holder")
+        return grant
+    try:
+        verdict = dict(_failure_investigator_module().verify_authority(
+            token_path=token_path,
+            job_id=FLEET_JOB_ID,
+            action=action,
+            home=HERMES_HOME,
+        ))
+    except Exception as exc:
+        # The verifier itself failing is a refusal, never a bypass.
+        verdict = {"ok": False, "reason": "authority_verifier_unavailable", "detail": type(exc).__name__}
+    verdict.update({"action": action, "holder": holder_label})
+    if token_path:
+        verdict.setdefault("token_path", str(token_path))
+    if not verdict.get("ok"):
+        AUTHORITY_REFUSALS.append(verdict)
+        log("AUTHORITY_REFUSED " + json.dumps(verdict, sort_keys=True, default=str))
+        emit_stage(f"authority_{action}", ok=False, detail=str(verdict.get("reason")))
+        raise AuthorityRefused(verdict)
+    AUTHORITY_GRANTS.append(verdict)
+    log("AUTHORITY_OK " + json.dumps(verdict, sort_keys=True, default=str))
+    return verdict
+
+
 def resolve_failure_investigator_success() -> None:
     """A real successful return closes all open dedupe keys for the job."""
     try:
@@ -695,7 +782,14 @@ def dry_run_inspection_logging_disabled() -> Any:
 
 def fail(message: str, *, code: int = 1) -> None:
     log(f"ERROR {message}")
-    print(json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+    payload: dict[str, Any] = {"ok": False, "error": message}
+    # U9/R20: a refused privileged action must be visible wherever the run's
+    # outcome is read (delivered brief, cron run doc, Fleet receipt consumer),
+    # not only in the durable log. The signature is deliberately unchanged so
+    # every existing caller and test spy keeps working.
+    if AUTHORITY_REFUSALS:
+        payload["authority_refusals"] = list(AUTHORITY_REFUSALS)
+    print(json.dumps(payload, ensure_ascii=False))
     raise SystemExit(code)
 
 
@@ -2121,8 +2215,16 @@ def main() -> int:
         "--holder", default="scheduler",
         help="identity recorded on the exclusive lock, for busy/stale-reclaim diagnostics (default: scheduler)",
     )
+    parser.add_argument(
+        "--authority-token", default=None, dest="authority_token",
+        help=(
+            "path to a spawner-minted authority record (U9/KTD12). Required for push and "
+            "publish whenever --holder is not 'scheduler'; ignored on the scheduler path."
+        ),
+    )
     args = parser.parse_args()
     reset_run_reconciliation_state()
+    reset_run_authority_state(args.authority_token)
     # Run-start integrity gate (U2/KTD2, R14): before ANY mutation -- before
     # the lock, before any fetch, even before the read-only dry-run
     # inspection below -- the operational copies must match the published
@@ -2300,6 +2402,8 @@ def main() -> int:
 
             if needs_push:
                 stage = "push"
+                # Re-checked here, immediately before the action (R20/KTD5).
+                require_authority("push", holder=args.holder, token_path=args.authority_token)
                 push_rebased_output(published_input_head, rebased_output_head)
                 branch_pushed = True
             stage = "verify_pushed_branch"
@@ -2319,6 +2423,9 @@ def main() -> int:
                 f"{RELEASE_PREFIX}{datetime.now().astimezone():%Y%m%d}-{rebased_output_head[:12]}"
             )
             stage = "publish_release"
+            # A second, independent check: a window that expired between the
+            # push and here refuses the publish (KTD5's per-action re-check).
+            require_authority("publish", holder=args.holder, token_path=args.authority_token)
             emit_stage("publish", detail=f"tag={tag}")
             release_url, removed = publish_release(tag, rebased_output_head, launcher, checksum)
             public_asset = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{urllib.parse.quote(launcher.name)}"
@@ -2348,6 +2455,10 @@ def main() -> int:
                 "sync": sync_outcome,
                 "parked_pins": parked_pin_summary(),
             }
+            if args.holder != "scheduler":
+                # Audit trail for a token-gated finish; absent (not empty) on
+                # the scheduler path so the nightly brief keeps its shape.
+                result["authority"] = list(AUTHORITY_GRANTS)
             log(json.dumps(result, sort_keys=True))
             resolve_failure_investigator_success()
             emit_fleet_receipt(started_at, outcome="produced", changed=True)

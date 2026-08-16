@@ -18,16 +18,31 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 ARTIFACT_SUBDIR = Path("review-artifacts") / "release-failures"
 STATE_SUBDIR = Path("cron") / "failure-investigators"
+# U9/KTD12: spawner-minted authority records live beside the incident state.
+AUTHORITY_SUBDIR = Path("cron") / "authority"
+# U9/KTD5: hard cap on a finish-authority window, regardless of the schedule.
+AUTHORITY_MAX_WINDOW_SECONDS = 4 * 60 * 60
+#: The only privileged actions a token may ever carry (R12).
+AUTHORITY_ACTIONS = ("push", "publish")
 # The helper must give the standing goal enough time to reproduce and verify a
 # local fix.  Tests inject a small budget through ``run_artifact``.
 LIFECYCLE_SECONDS = 2 * 60 * 60
 GOAL_STATUS_INTERVAL_SECONDS = 2.0
 _IN_PROCESS_STATE_LOCK = threading.RLock()
+
+
+def default_home() -> Path:
+    """The Hermes home this helper reads state from when not given one."""
+    configured = os.environ.get("HERMES_HOME", "").strip()
+    if configured:
+        return Path(configured)
+    return Path.home() / "AppData" / "Local" / "hermes"
 
 
 def python_executable() -> str:
@@ -98,6 +113,264 @@ def _state_lock(path: Path):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
                 handle.close()
+
+
+# ── U9/KTD12/R20: spawner-minted finish authority ───────────────────────────
+#
+# HONEST LIMIT, stated once here and repeated at the enforcement point in
+# ``hermes-integration-release-windows.py``: this host runs the scheduler, the
+# investigator session, and the operator under ONE user account with ambient
+# git/gh credentials.  A file-based token therefore bounds accidents, drift,
+# and prompt-drift -- an investigator can only finish a release inside a
+# window that a NON-AGENT process minted, for the incident it was spawned for,
+# and only for the two actions the window names -- but it is not a control
+# against a fully hostile in-context agent, which could mint its own record.
+# No HMAC is used: a shared secret readable by the same account would be
+# theater.  The enforcement point outside this host is GitHub branch
+# protection on ``origin/fork-integration`` (deferred, user-owned; R20).
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO-8601 instant into an aware UTC datetime, or ``None``."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def authority_token_path(home: Path, job_id: str, signature: str) -> Path:
+    return Path(home) / AUTHORITY_SUBDIR / f"{job_id}-{signature}.json"
+
+
+def next_scheduled_fire(home: Path, job_id: str) -> datetime | None:
+    """This job's next scheduled fire from the cron jobs store.
+
+    ``None`` means "no resolvable next fire" -- an unreadable store, a job
+    that is absent or disabled, or an unparseable ``next_run_at``.  KTD5
+    makes that case expire the window immediately rather than fall back to
+    the 4h cap: an authority window that cannot be bounded by the schedule
+    is not granted at all.
+    """
+    try:
+        store = json.loads((Path(home) / "cron" / "jobs.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    jobs = store.get("jobs") if isinstance(store, dict) else None
+    if not isinstance(jobs, list):
+        return None
+    for job in jobs:
+        if not isinstance(job, dict) or str(job.get("id", "")) != job_id:
+            continue
+        if job.get("enabled") is False:
+            return None
+        return parse_timestamp(job.get("next_run_at"))
+    return None
+
+
+def authority_window_end(
+    issued_at: datetime,
+    next_fire: datetime | None,
+    *,
+    max_seconds: float = AUTHORITY_MAX_WINDOW_SECONDS,
+    cap: datetime | None = None,
+) -> datetime:
+    """KTD5's ``min(next scheduled fire, issue + 4h)``, frozen at mint.
+
+    ``cap`` bounds a REPLACEMENT finisher to the abandoned finisher's own
+    window end, so a die-and-replace cycle can never walk the authority
+    window forward.
+
+    Deviation from KTD5's wording, recorded deliberately: KTD5 says the
+    window is computed "from a monotonic timestamp".  There is no monotonic
+    clock shared across the spawner process, the investigator session, and
+    the release process -- ``time.monotonic()`` is per-process by
+    definition.  The mechanism that delivers KTD5's actual intent (a
+    schedule edit after the spawn cannot extend a live window) is the
+    FROZEN wall-clock ``expires_at``: it is computed once, at mint, written
+    into the record, and never recomputed by any later reader.
+    """
+    end = issued_at + timedelta(seconds=max(0.0, max_seconds))
+    if next_fire is None:
+        # No resolvable next fire: issue an already-expired window rather
+        # than an unbounded one (KTD5).
+        return issued_at
+    end = min(end, next_fire)
+    if cap is not None:
+        end = min(end, cap)
+    # A next fire already in the past yields an immediately-expired window
+    # rather than a negative one.
+    return max(end, issued_at)
+
+
+def authority_claim(token: dict[str, Any]) -> dict[str, Any]:
+    """The immutable half of an authority record.
+
+    ``session_id`` is deliberately excluded: it is patched in after
+    ``session.create`` returns and must not change the record's identity.
+    ``token_sha256`` is excluded because it is the digest OF this claim.
+    """
+    return {
+        "job_id": str(token.get("job_id", "")),
+        "incident_signature": str(token.get("incident_signature", "")),
+        "issued_at": str(token.get("issued_at", "")),
+        "expires_at": str(token.get("expires_at", "")),
+        "allowed_actions": sorted(str(action) for action in token.get("allowed_actions", []) or []),
+    }
+
+
+def authority_token_sha256(token: dict[str, Any]) -> str:
+    payload = json.dumps(authority_claim(token), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def mint_authority_token(
+    *,
+    home: Path,
+    job_id: str,
+    signature: str,
+    now: datetime | None = None,
+    cap: datetime | None = None,
+    allowed_actions: tuple[str, ...] = AUTHORITY_ACTIONS,
+) -> dict[str, Any]:
+    """Write the authority record for one spawned finisher and return it.
+
+    Returns ``{"path", "token", "token_sha256"}``.  The caller records
+    ``token_sha256`` in the incident entry; that record -- not the token
+    file's own self-declared digest -- is what the release script trusts.
+    """
+    issued = (now or _utc_now()).astimezone(timezone.utc)
+    expires = authority_window_end(issued, next_scheduled_fire(home, job_id), cap=cap)
+    token = {
+        "schema": 1,
+        "job_id": job_id,
+        "incident_signature": signature,
+        "session_id": None,
+        "issued_at": issued.isoformat(),
+        "expires_at": expires.isoformat(),
+        "allowed_actions": [str(action) for action in allowed_actions],
+    }
+    token["token_sha256"] = authority_token_sha256(token)
+    path = authority_token_path(home, job_id, signature)
+    _atomic_json(path, token)
+    return {"path": path, "token": token, "token_sha256": token["token_sha256"]}
+
+
+def attach_session_to_authority(token_path: Path, session_id: str) -> bool:
+    """Patch the created session id into a minted record (digest-neutral)."""
+    try:
+        token = json.loads(Path(token_path).read_text(encoding="utf-8"))
+        if not isinstance(token, dict):
+            return False
+        token["session_id"] = session_id
+        _atomic_json(Path(token_path), token)
+        return True
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def incident_state_path(home: Path, job_id: str) -> Path:
+    return Path(home) / STATE_SUBDIR / f"{job_id}.json"
+
+
+def read_incident_state(path: Path) -> dict[str, Any]:
+    """Read an incident state file without writing anything."""
+    try:
+        state = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _open_incidents(state: dict[str, Any]) -> dict[str, Any]:
+    open_incidents = state.get("open")
+    return open_incidents if isinstance(open_incidents, dict) else {}
+
+
+def _closed_incidents(state: dict[str, Any]) -> list[dict[str, Any]]:
+    closed = state.get("closed")
+    return [entry for entry in closed if isinstance(entry, dict)] if isinstance(closed, list) else []
+
+
+def verify_authority(
+    *,
+    token_path: Any,
+    job_id: str,
+    action: str,
+    home: Path,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Validate one privileged action against a minted authority record.
+
+    Called immediately before EACH privileged action (never once per run),
+    so a window that expires mid-run refuses the next action.  Read-only:
+    it never mutates the token, the incident state, or the artifact.
+
+    Refusal reasons name the check that failed:
+    ``authority_token_absent``, ``authority_token_unparseable``,
+    ``authority_token_malformed``, ``authority_token_job_mismatch``,
+    ``authority_token_expired``, ``authority_action_not_allowed``,
+    ``authority_incident_record_missing``, ``authority_incident_closed``,
+    ``authority_incident_token_unrecorded``,
+    ``authority_token_sha256_mismatch``.
+    """
+    moment = (now or _utc_now()).astimezone(timezone.utc)
+    verdict: dict[str, Any] = {"ok": False, "action": action, "job_id": job_id, "checked_at": moment.isoformat()}
+
+    if not token_path:
+        return {**verdict, "reason": "authority_token_absent"}
+    path = Path(token_path)
+    try:
+        token = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {**verdict, "reason": "authority_token_unparseable", "detail": type(exc).__name__, "token_path": str(path)}
+    if not isinstance(token, dict):
+        return {**verdict, "reason": "authority_token_unparseable", "detail": "not a JSON object", "token_path": str(path)}
+
+    signature = token.get("incident_signature")
+    allowed = token.get("allowed_actions")
+    if not isinstance(signature, str) or not signature or not isinstance(allowed, list):
+        return {**verdict, "reason": "authority_token_malformed", "token_path": str(path)}
+    verdict["incident_signature"] = signature
+
+    if str(token.get("job_id", "")) != job_id:
+        return {**verdict, "reason": "authority_token_job_mismatch", "token_job_id": str(token.get("job_id", ""))}
+
+    expires = parse_timestamp(token.get("expires_at"))
+    if expires is None:
+        return {**verdict, "reason": "authority_token_malformed", "detail": "expires_at is not an ISO instant"}
+    verdict["expires_at"] = expires.isoformat()
+    if moment >= expires:
+        return {**verdict, "reason": "authority_token_expired"}
+
+    if action not in [str(item) for item in allowed]:
+        return {**verdict, "reason": "authority_action_not_allowed", "allowed_actions": [str(item) for item in allowed]}
+
+    state = read_incident_state(incident_state_path(home, job_id))
+    entry = _open_incidents(state).get(signature)
+    if not isinstance(entry, dict) or entry.get("closure"):
+        closed = any(str(item.get("signature", "")) == signature for item in _closed_incidents(state))
+        return {**verdict, "reason": "authority_incident_closed" if (closed or isinstance(entry, dict)) else "authority_incident_record_missing"}
+    recorded = entry.get("token_sha256")
+    if not isinstance(recorded, str) or not recorded:
+        return {**verdict, "reason": "authority_incident_token_unrecorded"}
+    # A plain comparison: both digests are non-secret values recorded in
+    # files this account can read. A constant-time compare here would imply
+    # a secrecy property this design deliberately does not claim.
+    if recorded != authority_token_sha256(token):
+        return {**verdict, "reason": "authority_token_sha256_mismatch"}
+    return {**verdict, "ok": True, "reason": "authority_granted", "session_id": token.get("session_id")}
 
 
 def record_failure(*, job_id: str, stage: str, error: str, home: Path, worktree: Path,
