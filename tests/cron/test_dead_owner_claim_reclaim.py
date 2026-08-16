@@ -116,10 +116,13 @@ class TestTickReapsDeadOwnerClaims:
         assert executions.latest_execution("live-job")["status"] == "running"
 
     def test_reap_is_throttled_between_ticks(self, monkeypatch, executions):
+        # The reap site calls the U4 detailed variant (it needs the
+        # recovered records themselves, not just a count) -- see
+        # cron.scheduler.tick's dead-owner reap block.
         calls = []
         monkeypatch.setattr(
-            "cron.executions.recover_interrupted_executions",
-            lambda: calls.append(1) or 0,
+            "cron.executions.recover_interrupted_executions_detailed",
+            lambda: calls.append(1) or [],
         )
 
         _run_tick()
@@ -139,7 +142,7 @@ class TestTickReapsDeadOwnerClaims:
             raise RuntimeError("ledger unavailable")
 
         monkeypatch.setattr(
-            "cron.executions.recover_interrupted_executions", _boom
+            "cron.executions.recover_interrupted_executions_detailed", _boom
         )
 
         assert _run_tick() == 0

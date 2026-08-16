@@ -6215,12 +6215,13 @@ def _run_one_job_body(
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
-        finish_execution(
+        finish_result = finish_execution(
             execution_id,
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
         )
+        _notify_late_outcome(finish_result, job, adapters=adapters, loop=loop)
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
@@ -6374,6 +6375,137 @@ _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
 
 
+def _classify_notice_delivery_outcome(job: dict, delivery_error: Optional[str]) -> str:
+    """Classify a best-effort administrative delivery (reap/late-outcome
+    notices) the same way the primary job-result delivery is classified at
+    its ``finish_execution`` call site in ``run_one_job``: a transport
+    failure wins over an unresolved target, which wins over a resolved
+    ``deliver=local`` (suppressed), which loses to an actual send."""
+    if delivery_error:
+        return "failed"
+    if not _resolve_delivery_targets(job):
+        return "not_configured"
+    normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    return "suppressed" if normalized_deliver == "local" else "delivered"
+
+
+def _notify_late_outcome(result: Optional[dict], job: dict, *, adapters=None, loop=None) -> None:
+    """Deliver + record a completion that arrives after its execution had
+    already reached a terminal state (KTD6/U3 — see
+    ``cron.executions.finish_execution``'s late-outcome path). ``result`` is
+    that function's return value; a normal completion (no ``late_outcome``
+    key) is a no-op here. Best-effort: never raises, and never blocks the
+    caller's own return.
+    """
+    if not result or not result.get("late_outcome"):
+        return
+    late = result["late_outcome"]
+    outcome_word = "succeeded" if late.get("success") else "failed"
+    text = (
+        f"late outcome for run {result.get('id')}: {outcome_word} after being "
+        "reclassified unconfirmed"
+    )
+    delivery_error: Optional[str] = None
+    try:
+        delivery_error = _deliver_result(job, text, adapters=adapters, loop=loop)
+    except Exception as exc:
+        delivery_error = str(exc)
+        logger.debug(
+            "Late-outcome delivery failed for job %s: %s", job.get("id"), exc,
+        )
+    delivery_outcome = _classify_notice_delivery_outcome(job, delivery_error)
+
+    try:
+        from cron.executions import set_late_outcome_delivery_outcome
+
+        set_late_outcome_delivery_outcome(late["rowid"], delivery_outcome)
+    except Exception:
+        logger.debug("Failed to record late-outcome delivery_outcome", exc_info=True)
+
+    try:
+        from agent.monitoring.cron_health import emit_execution_state
+
+        emit_execution_state(result, delivery_outcome=delivery_outcome)
+    except Exception:
+        logger.debug("telemetry emit failed for late outcome", exc_info=True)
+
+
+def _reap_unconfirmed_runs(records: List[dict], *, adapters=None, loop=None) -> None:
+    """Correct jobs.json ``last_status``/``last_error`` honestly and deliver
+    one aggregated notice per affected job for a batch of dead-owner-reaped
+    executions (U4/R8/R9).
+
+    Grouped by ``job_id`` rather than fired once per execution: a single
+    reap pass can recover more than one row for the SAME job (overlapping
+    claims), and grouping keeps "one aggregated delivery per reap batch"
+    well-defined against a single resolvable delivery target — the job's own
+    ``deliver`` config — instead of inventing a new cross-job broadcast
+    channel that isn't part of this unit's scope. Never raises: a reap pass
+    must finish even when jobs.json or delivery are unavailable, matching
+    the try/except-and-log pattern the caller already wraps this in.
+    """
+    from cron.jobs import get_job, update_job
+    from agent.monitoring.cron_health import emit_execution_state
+
+    by_job: dict[str, List[dict]] = {}
+    for record in records:
+        by_job.setdefault(str(record.get("job_id")), []).append(record)
+
+    for job_id, job_records in by_job.items():
+        last_error = (
+            f"{len(job_records)} run(s) reclassified unconfirmed: scheduler "
+            "restarted before the owner process reached a durable terminal "
+            "state; whether side effects ran is unknown."
+        )
+        try:
+            update_job(job_id, {"last_status": "unknown", "last_error": last_error})
+        except Exception:
+            logger.debug(
+                "Failed to correct last_status for reaped job %s", job_id, exc_info=True,
+            )
+
+        try:
+            job = get_job(job_id)
+        except Exception:
+            job = None
+
+        delivery_outcome = "not_configured"
+        if job is not None:
+            lines = "\n".join(
+                f"- run {record.get('id', '?')} (claimed {record.get('claimed_at', '?')}): "
+                f"{record.get('error') or 'unconfirmed'}"
+                for record in job_records
+            )
+            summary = (
+                f"{len(job_records)} run(s) reclassified unconfirmed for "
+                f"'{job.get('name') or job_id}':\n{lines}\n\n"
+                "Orphan evidence to check before assuming failure or re-running: "
+                "origin tip, worktree HEAD, and lock state."
+            )
+            delivery_error: Optional[str] = None
+            try:
+                delivery_error = _deliver_result(job, summary, adapters=adapters, loop=loop)
+            except Exception as exc:
+                delivery_error = str(exc)
+                logger.debug(
+                    "Unconfirmed-run delivery failed for job %s: %s", job_id, exc,
+                )
+            delivery_outcome = _classify_notice_delivery_outcome(job, delivery_error)
+        else:
+            logger.debug(
+                "Reaped job %s no longer exists in jobs.json; skipping delivery", job_id,
+            )
+
+        for record in job_records:
+            try:
+                emit_execution_state(record, delivery_outcome=delivery_outcome)
+            except Exception:
+                logger.debug(
+                    "telemetry emit failed for reaped execution %s",
+                    record.get("id"), exc_info=True,
+                )
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -6450,15 +6582,27 @@ def tick(
         ):
             _last_dead_owner_reap_at = _reap_now
             try:
-                from cron.executions import recover_interrupted_executions
+                from cron.executions import recover_interrupted_executions_detailed
 
-                _reclaimed = recover_interrupted_executions()
-                if _reclaimed:
+                # Detailed variant (U4): the reap site needs the recovered
+                # records themselves — to correct jobs.json last_status and
+                # attempt one aggregated "unconfirmed" delivery per affected
+                # job — not just a count. It does NOT auto-emit telemetry
+                # (unlike the int-returning `recover_interrupted_executions`
+                # still used by other callers, e.g. cronjob_tools); the emit
+                # happens inside _reap_unconfirmed_runs once the delivery
+                # outcome is known, so each record gets exactly one
+                # projection event. Rows are CAS-transitioned, so a
+                # back-to-back reap (e.g. throttle window reset in tests)
+                # never returns the same row twice — no double delivery.
+                _recovered_records = recover_interrupted_executions_detailed()
+                if _recovered_records:
                     logger.warning(
                         "Reclaimed %d cron execution(s) whose owner process died "
                         "before reaching a terminal state (marked unknown)",
-                        _reclaimed,
+                        len(_recovered_records),
                     )
+                    _reap_unconfirmed_runs(_recovered_records, adapters=adapters, loop=loop)
             except Exception as _reap_exc:
                 logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 
