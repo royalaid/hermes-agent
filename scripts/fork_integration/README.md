@@ -79,6 +79,55 @@ for the `churn_livelock` escalation after three regenerations.
 
 Blocklisted patch-ids never count as equivalent and are never re-proposed.
 
+## Provenance and retirement (U7)
+
+`ledger.py` derives, from ground truth, whether every carried change was
+`private-only`, `pr-open`, `absorbed-verbatim`, `absorbed-modified`, or
+`superseded` (plus the manifest's `excluded_until_*` markers) — the manifest's
+declared patch identities, live git ancestry/patch-identity search against
+the tracked upstream ref, and a best-effort `gh pr view` for components
+sourced from a named fork branch. Nothing here gates a release (KTD7): the
+manifest validators remain the sole enforcement layer.
+
+**Every run, any outcome (R7).** The release script derives provenance and
+folds a compact `"provenance": {"states": {...}, "transitions": [...],
+"retirement_candidates": [...]}` section into the result JSON on every exit
+path — the full success return, the two "already current" early returns, the
+dry-run report, and every `fail()` (including a failure before the fetch even
+runs). A ledger exception never breaks the run: it is caught and reported as
+`"provenance": {"error": "..."}` instead. Dry-run derives (so the report is
+visible) but never appends to the JSONL history — history append is a
+mutation, and dry-run stays read-only. Non-dry-run runs append exactly one
+line per run to the history at
+`%HERMES_HOME%\review-artifacts\fork-integration-history\provenance-history.jsonl`,
+never pruned (R6).
+
+```
+python ledger.py report --repo <worktree> --upstream origin/main
+python ledger.py history --repo <worktree> --upstream origin/main
+```
+
+**Retirement bridge (U7→U6).** A pin absorbed-verbatim for `ledger.py`'s
+default 3 consecutive runs, whose absorbing candidate is still an ancestor of
+the live upstream tip, generates (or refreshes) a **retire-pin** proposal
+through the SAME state machine churn proposals use
+(`proposals.generate_or_refresh_retirement`) — the manifest shrinks by the
+same reviewed mechanism it grows through. Its `recommended_edit` is
+`{"operation": "remove_manifest_pin", ...}`, applied by the same surgical
+text editor as the append edit (`proposals.apply_manifest_edit_text`), and
+refuses closed rather than emptying a `patches` array when the retiring patch
+is the sole one in its container. Approval reuses `proposals.py approve`
+verbatim: a retire proposal's re-derive is re-verify-still-absorbed-verbatim
+plus still-ancestor (`reverify_retirement`), and the manifest edit re-derives
+as a pure function of the pin (no candidate SHA to drift), so byte-equality
+against the stored fragment is essentially free. Dedupe follows the churn
+rule: an already-open retirement proposal for the same pin is left untouched.
+
+```
+python proposals.py list
+python proposals.py approve <id> --artifact-hash <sha256>
+```
+
 ## Investigator finish authority (U9)
 
 When a run fails, `hermes-release-failure-investigator.py` records a
@@ -140,6 +189,66 @@ as before. The `cron_session` marker is never persisted and nothing filters
 on it — the visibility contract is keyed on the session's own source and
 title (proved by the gateway-layer tests in
 `tests/cron/test_fork_integration_investigator.py`).
+
+## Witnessed canary sequence (U11)
+
+`--canary-manifest <path>` resolves `MANIFEST_PATH` (and every
+manifest-derived global) from the given file instead of the tracked
+manifest, **for that run only**. `canary-manifest.example.json` in this
+directory is a copy of the real manifest with one extra foundation patch
+entry (subject `canary: forced verify failure`, reusing a real, already-
+verified commit for its own identity so `verify_upstream_foundations()`
+passes cleanly, but declaring a `reviewed_replacement` — and, because the
+manifest schema requires a foundation's `reviewed_replacement` to name a
+declared component patch, a paired `canary-forced-verify-failure` component
+— both anchored on a `deadbeef`-repeated 40-hex SHA that exists in no real
+repository). `verify_manifest_sources()` fails closed on it (`mandatory
+component/reviewed-replacement patch is unavailable`) — after the run-start
+integrity gate (which never stamp-checks this file: it is a different
+filename than `hermes-integration-manifest.json`, outside `sync.py`'s
+`TRACKED_SET` by construction) and before any push, so a canary run never
+touches GitHub. The existing failure path handles it exactly like any other
+run-time failure: pre-push restoration, `launch_failure_investigator(...)`,
+and `fail()` (whose result JSON carries `"canary": true`).
+
+The three-step witnessed sequence this unit proves (R13):
+
+1. **Canary run** — forces the failure, produces the delivery, and spawns the
+   visible investigator session:
+
+   ```
+   python hermes-integration-release-windows.py --canary-manifest canary-manifest.example.json
+   ```
+
+   Expect a nonzero exit, a result JSON with `"ok": false` and `"canary":
+   true`, a `FAILURE_INVESTIGATOR ...` log line, and (first occurrence for
+   the job) a spawned, sidebar-visible investigator session per U9.
+
+2. **Killed-owner reap** — separately, kill a running job's owner process
+   mid-run and let the scheduler's next tick reap it, witnessing the
+   `unconfirmed` delivery and the late-outcome record (R8/R9):
+
+   ```
+   taskkill /PID <owner-pid> /F
+   ```
+
+   then wait for the next scheduler tick and confirm the reaped execution's
+   delivery is classified `unconfirmed` (never `failed`) and that
+   `jobs.json`'s `last_status` reflects the reaped run, not a stale prior
+   `ok`.
+
+3. **Overdue check** — pause the scheduler (or simply let the job's window
+   pass) and run the out-of-process dead-man's switch to confirm it alarms
+   only when the job is genuinely overdue with a stale ticker heartbeat
+   (R18):
+
+   ```
+   python overdue_check.py --job-id 1ab4c7013fef
+   ```
+
+Each step's evidence (delivery ids, incident record, provenance report,
+result JSON) belongs in the closing evidence bundle; the real publish to
+`origin/fork-integration` remains a separate, user-authorized action.
 
 ## Running the tests
 
