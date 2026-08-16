@@ -527,7 +527,7 @@ def verify_authority(
 
 def record_failure(*, job_id: str, stage: str, error: str, home: Path, worktree: Path,
                    script_path: Path, log_path: Path, test_path: Path, manifest_path: Path,
-                   investigator: dict[str, str] | None = None) -> dict[str, Any]:
+                   investigator: dict[str, str] | None = None, canary: bool = False) -> dict[str, Any]:
     """Atomically record a sanitized failure and decide whether it is newly open.
 
     ``spawn`` here means only "this signature was not already open".  Whether
@@ -564,6 +564,7 @@ def record_failure(*, job_id: str, stage: str, error: str, home: Path, worktree:
             "session_id": entry.get("session_id"),
             "spawned_at": entry.get("spawned_at"),
             "heartbeat_at": entry.get("heartbeat_at"),
+            "canary": bool(canary),
             "worktree": str(worktree),
             "paths": {"release_script": str(script_path), "log": str(log_path), "tests": str(test_path), "manifest": str(manifest_path)},
             "investigator": dict(investigator or {}),
@@ -866,6 +867,11 @@ def build_goal(artifact: dict[str, Any], *, authority_token_path: Any = None) ->
 def build_prompt(artifact: dict[str, Any], *, authority_token_path: Any = None) -> str:
     paths = artifact["paths"]
     token = str(authority_token_path or artifact.get("authority", {}).get("token_path", "<no token minted>"))
+    canary_context = (
+        "This is an expected deliberate canary failure. Confirm the normal manifest path succeeds; do not treat "
+        "the forced canary pin as a release-system defect.\n"
+        if artifact.get("canary") is True else ""
+    )
     return (
         f"Investigate incident {artifact['signature']} at stage {artifact['stage']}.\n"
         f"Read the sanitized incident artifact: {artifact.get('artifact_path', '<this artifact>')}\n"
@@ -874,6 +880,7 @@ def build_prompt(artifact: dict[str, Any], *, authority_token_path: Any = None) 
         f"Authority token: {token}\n"
         f"Heartbeat: {heartbeat_command(artifact)}\n"
         f"Failure: {artifact['normalized_error']}\n"
+        f"{canary_context}"
         "Start with orphan evidence (origin tip vs expected published head, worktree HEAD, release lock state) and "
         "write it into the artifact before any mutation. Then reproduce the failure, add or adjust a regression "
         "test, and make the smallest local fix; deploy it only through `sync.py deploy --provisional` and re-run "

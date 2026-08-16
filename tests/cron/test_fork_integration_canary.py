@@ -147,6 +147,37 @@ def test_apply_canary_manifest_swaps_globals_for_this_run_only(
     assert release.MANIFEST_PATH != path
 
 
+def test_canary_failure_investigator_receives_expected_canary_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deliberate U11 failure must remain identifiable after sanitization.
+
+    The investigator only receives the incident artifact, not the release
+    process's result JSON.  Preserve the canary context there so it can
+    classify this known forced failure without treating the deadbeef pin as a
+    release-system defect.
+    """
+    received: dict[str, Any] = {}
+
+    class FakeInvestigator:
+        @staticmethod
+        def record_failure(**kwargs: Any) -> dict[str, Any]:
+            received.update(kwargs)
+            return {"signature": "test", "spawn": False, "occurrences": 1}
+
+        @staticmethod
+        def maybe_launch_investigator(_result: dict[str, Any]) -> None:
+            return None
+
+    monkeypatch.setattr(release, "_failure_investigator_module", lambda: FakeInvestigator)
+    monkeypatch.setattr(release, "CANARY_MANIFEST_ACTIVE", True)
+    monkeypatch.setattr(release, "log", lambda _message: None)
+
+    release.launch_failure_investigator(stage="verify_manifest", error="forced canary failure")
+
+    assert received["canary"] is True
+
+
 # ── end-to-end: a real main() run under --canary-manifest ──────────────────
 
 

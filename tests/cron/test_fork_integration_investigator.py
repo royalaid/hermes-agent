@@ -659,6 +659,20 @@ def test_recurrence_of_an_open_signature_counts_occurrences_not_new_incidents(tm
     assert second["occurrences"] == 2
 
 
+def test_record_failure_preserves_a_deliberate_canary_marker_in_the_artifact(tmp_path: Path) -> None:
+    result = investigator.record_failure(
+        job_id=JOB_ID, stage="verify_manifest", error="forced canary failure",
+        home=tmp_path, worktree=tmp_path / "worktree", script_path=tmp_path / "release.py",
+        log_path=tmp_path / "log.txt", test_path=tmp_path / "tests.py",
+        manifest_path=tmp_path / "canary-manifest.json", canary=True,
+    )
+
+    artifact = json.loads(Path(result["artifact_path"]).read_text(encoding="utf-8"))
+
+    assert artifact["canary"] is True
+    assert "expected deliberate canary" in investigator.build_prompt(artifact)
+
+
 def test_resolve_success_closes_open_incidents_as_resolved(tmp_path: Path) -> None:
     result = _record(tmp_path)
     state_path = Path(result["state_path"])

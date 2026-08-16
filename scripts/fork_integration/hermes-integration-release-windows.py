@@ -447,6 +447,7 @@ def launch_failure_investigator(*, stage: str, error: str) -> None:
             job_id=FLEET_JOB_ID,
             stage=stage,
             error=redact_process_output(error),
+            canary=CANARY_MANIFEST_ACTIVE,
             home=HERMES_HOME,
             worktree=WORKTREE,
             script_path=Path(__file__).resolve(),
