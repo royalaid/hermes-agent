@@ -264,7 +264,12 @@ def ensure_runtime_reachability(
     this only reports what it did.
     """
     runtime_repo = Path(runtime_repo)
-    repo_dir = Path(repo_dir)
+    # A relative deploy source (e.g. `--repo .`) MUST be resolved before it is
+    # handed to `git -C <runtime_repo> fetch <repo_dir>`: -C changes directory
+    # first, so a relative path silently makes the runtime repo fetch from
+    # itself — a slow no-op that leaves the SHA unresolvable (observed live
+    # 2026-08-16).
+    repo_dir = Path(repo_dir).resolve()
 
     def _resolvable() -> bool:
         probe = subprocess.run(
