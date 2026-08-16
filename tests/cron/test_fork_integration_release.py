@@ -183,11 +183,17 @@ def test_patch_resolution_absorbs_when_candidate_patch_id_is_accepted(
     ]
 
 
-def test_patch_resolution_raises_on_same_subject_non_equivalent_without_replacement(
+def test_patch_resolution_parks_same_subject_non_equivalent_instead_of_raising(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A same-subject candidate whose patch-id is NOT accepted and no reviewed
-    replacement is declared must fail closed."""
+    """U6/KTD13 supersedes the U1 characterization pinned here.
+
+    A same-subject candidate whose patch-id is NOT accepted used to raise
+    "same-subject but non-equivalent" and skip the nightly. It now
+    park-and-continues: the pin is queued for application exactly as if no
+    candidate existed (R19). Detection itself is off here — no
+    ``upstream_tip`` is supplied, so no proposal may be generated (see the
+    proposals suite for the parking path with a tip)."""
     patch = _patch(stable_patch_id="stable-source")  # no reviewed_replacement
 
     def fake_git(*args: str, **kwargs: Any) -> str:
@@ -200,8 +206,11 @@ def test_patch_resolution_raises_on_same_subject_non_equivalent_without_replacem
     monkeypatch.setattr(release, "git", fake_git)
     monkeypatch.setattr(release, "stable_patch_id", fake_stable_patch_id)
 
-    with pytest.raises(RuntimeError, match="same-subject but non-equivalent"):
-        release.patch_resolution("upstream-ref", [patch])
+    to_apply, absorbed = release.patch_resolution("upstream-ref", [patch])
+
+    assert to_apply == [patch]
+    assert absorbed == []
+    assert release.PARKED_PINS == []
 
 
 def test_patch_resolution_defers_to_apply_when_replacement_present_and_no_match(

@@ -41,6 +41,10 @@ HOME = Path.home()
 HERMES_HOME = HOME / "AppData" / "Local" / "hermes"
 SCRIPT_DIR = Path(__file__).resolve().parent
 MANIFEST_PATH = SCRIPT_DIR / "hermes-integration-manifest.json"
+# U6 (R3): rejected and superseded candidate patch-ids. Lives beside the
+# manifest and is tracked by sync.py; an absent file is an empty blocklist.
+BLOCKLIST_PATH = SCRIPT_DIR / "fork-integration-blocklist.json"
+PROPOSALS_SCRIPT = SCRIPT_DIR / "proposals.py"
 WORKTREE = HERMES_HOME / "worktrees" / "openai-native-windows"
 FORK_REMOTE = "fork"
 RELEASE_PREFIX = "integration-"
@@ -313,6 +317,7 @@ def log(message: str) -> None:
         handle.write(line + "\n")
 
 
+
 _DRY_RUN_INSPECTION = contextvars.ContextVar("dry_run_inspection", default=False)
 
 
@@ -470,6 +475,182 @@ def sync_operational_copies(published_sha: str) -> dict[str, Any]:
     except Exception as exc:
         log(f"WARNING post-publish sync failed: source_sha={published_sha} {type(exc).__name__}: {exc}")
         return {"ok": False, "error": str(exc), "source_sha": published_sha}
+
+
+# ── U6: reconciliation proposals, blocklist, park-and-continue ──────────────
+
+_PROPOSALS_MODULE: Any = None
+#: Pins parked by this run: ``{"pin_id", "pin_kind", "proposal_id",
+#: "churn_livelock", "subject", ...}``. Reset at run start by
+#: ``reset_run_reconciliation_state()`` and reported in the result JSON.
+PARKED_PINS: list[dict[str, Any]] = []
+_BLOCKLIST_CACHE: set[str] | None = None
+PARKED_PROVENANCE_PREFIX = "pin-parked-pending-proposal"
+
+
+def _proposals_module() -> Any:
+    """Load proposals.py by path and cache it (same flat-directory reason as
+    ``_sync_module()``; ``proposals.py`` is a tracked file)."""
+    global _PROPOSALS_MODULE
+    if _PROPOSALS_MODULE is None:
+        spec = importlib.util.spec_from_file_location("fork_integration_proposals", PROPOSALS_SCRIPT)
+        if not spec or not spec.loader:
+            raise RuntimeError("proposals module is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PROPOSALS_MODULE = module
+    return _PROPOSALS_MODULE
+
+
+def reset_run_reconciliation_state() -> None:
+    """Clear per-run proposal state so one process never reports another
+    run's parked pins (and re-reads a blocklist edited between runs)."""
+    global _BLOCKLIST_CACHE
+    PARKED_PINS.clear()
+    _BLOCKLIST_CACHE = None
+
+
+def blocklisted_patch_ids() -> set[str]:
+    """Patch identities that may never count as equivalent or be proposed (R3).
+
+    Fails closed on a corrupt blocklist: silently treating it as empty would
+    let a human-rejected rewrite be absorbed on the next run. An absent file
+    is legitimately empty.
+    """
+    global _BLOCKLIST_CACHE
+    if _BLOCKLIST_CACHE is None:
+        _BLOCKLIST_CACHE = set(_proposals_module().blocklisted_patch_ids(BLOCKLIST_PATH))
+    return _BLOCKLIST_CACHE
+
+
+def pin_identity(patch: dict[str, Any]) -> tuple[str, str]:
+    """Map a flat manifest patch back to its ``(kind, container id)`` pin.
+
+    ``patch_resolution`` receives foundation/component patches as one flat
+    list, but a proposal must name the pin a human would edit. Resolved
+    live against the loaded manifest so tests that swap
+    ``REQUIRED_PATCHES``/``FOUNDATION_PATCHES`` still get a stable answer.
+    """
+    key = (str(patch.get("commit")), str(patch.get("stable_patch_id")))
+    index = _proposals_module().manifest_pin_index(MANIFEST)
+    return index.get(key, ("component", "unindexed"))
+
+
+def park_pin_for_churn(
+    patch: dict[str, Any], *, search_ref: str, upstream_tip: str,
+) -> dict[str, Any] | None:
+    """Generate-or-refresh this pin's proposal and record the park (KTD13).
+
+    Returns the parked-pin note, or ``None`` when nothing qualifies. NEVER
+    raises into the release path: a proposal is evidence for a human, and
+    evidence machinery that failed must not be able to skip a nightly (R19).
+    The park note itself is still recorded on failure, honestly carrying the
+    error, because the run genuinely did continue past a churn signal.
+    """
+    kind, pin_id = "component", "unindexed"
+    pin = {
+        "kind": kind,
+        "id": pin_id,
+        "commit": str(patch["commit"]),
+        "stable_patch_id": str(patch["stable_patch_id"]),
+        "subject": str(patch["subject"]),
+    }
+    try:
+        kind, pin_id = pin_identity(patch)
+        pin.update({"kind": kind, "id": pin_id})
+        proposals = _proposals_module()
+        git_repo = proposals.Git(WORKTREE)
+        detected = proposals.detect_candidates(
+            git_repo, pin,
+            search_ref=search_ref,
+            upstream_tip=upstream_tip,
+            blocked=blocklisted_patch_ids(),
+            accepted_patch_ids=_accepted_output_patch_ids(patch),
+            patch_id_of=stable_patch_id,
+        )
+        if not detected["candidates"]:
+            return None
+        artifact = proposals.generate_or_refresh(
+            proposals.ProposalStore(), git_repo, pin=pin,
+            candidates=detected["candidates"],
+            low_confidence=detected["low_confidence"],
+            upstream_ref=f"{UPSTREAM_REMOTE}/{UPSTREAM_REF.removeprefix('refs/heads/')}",
+            upstream_tip=upstream_tip,
+        )
+        note = {
+            "pin_id": pin_id,
+            "pin_kind": kind,
+            "source_commit": pin["commit"],
+            "subject": pin["subject"],
+            "proposal_id": artifact["id"],
+            "state": artifact["state"],
+            "evidence": artifact["evidence"],
+            "regen_count": artifact["regen_count"],
+            "churn_livelock": bool(artifact["churn_livelock"]),
+            "low_confidence": bool(artifact["low_confidence"]),
+            "artifact_sha256": artifact["artifact_sha256"],
+        }
+        log(
+            f"PIN_PARKED pin={pin_id} proposal={artifact['id']} state={artifact['state']} "
+            f"evidence={artifact['evidence']} regen={artifact['regen_count']} "
+            f"churn_livelock={str(note['churn_livelock']).lower()}"
+        )
+    except Exception as exc:
+        note = {
+            "pin_id": pin_id,
+            "pin_kind": kind,
+            "source_commit": pin["commit"],
+            "subject": pin["subject"],
+            "proposal_id": None,
+            "state": "unavailable",
+            "churn_livelock": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        log(f"WARNING proposal generation failed for pin={pin_id}: {type(exc).__name__}: {exc}")
+    PARKED_PINS.append(note)
+    return note
+
+
+def parked_pin_provenance(patch: dict[str, Any]) -> str | None:
+    """``pin-parked-pending-proposal:<id>`` for a pin parked by this run."""
+    commit = str(patch.get("commit"))
+    for note in PARKED_PINS:
+        if note.get("source_commit") == commit and note.get("proposal_id"):
+            return f"{PARKED_PROVENANCE_PREFIX}:{note['proposal_id']}"
+    return None
+
+
+def parked_pin_summary() -> list[dict[str, Any]]:
+    """The result-JSON shape for this run's parked pins (R19)."""
+    return [
+        {
+            "pin_id": note.get("pin_id"),
+            "proposal_id": note.get("proposal_id"),
+            "churn_livelock": bool(note.get("churn_livelock")),
+        }
+        for note in PARKED_PINS
+    ]
+
+
+def open_proposal_summary() -> list[dict[str, Any]]:
+    """Parked pins as the ARTIFACT STORE currently sees them.
+
+    Used by the read-only dry-run report, which never runs resolution and so
+    has no per-run parked list of its own. Best-effort: an unreadable store
+    must not fail an otherwise clean inspection.
+    """
+    try:
+        artifacts = _proposals_module().ProposalStore().list_open()
+    except Exception:
+        return []
+    return [
+        {
+            "pin_id": artifact.get("pin", {}).get("id"),
+            "proposal_id": artifact.get("id"),
+            "churn_livelock": bool(artifact.get("churn_livelock")),
+        }
+        for artifact in artifacts
+    ]
 
 
 @contextmanager
@@ -751,16 +932,33 @@ def patch_resolution(
     patches: list[dict[str, str]],
     *,
     records: list[dict[str, Any]] | None = None,
+    upstream_tip: str | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Split required patches into patches to apply and exact upstream equivalents.
 
-    An upstream commit is accepted only when both its subject and stable patch
-    identity match the manifest source. A matching subject with a different
-    patch is an ambiguity, not an absorption: fail closed before mutation,
-    unless the manifest declares a reviewed replacement to apply instead.
+    An upstream commit is accepted as absorbed only when both its subject and
+    stable patch identity match the manifest source, and only when that
+    identity is not blocklisted (R3: a human-rejected or superseded rewrite
+    never counts as equivalent again).
+
+    A matching subject with a DIFFERENT patch used to be a hard refusal
+    ("manual reconciliation is required"), which meant upstream churn alone
+    skipped the nightly. It is now park-and-continue (KTD13/R19): the run
+    generates or refreshes a reconciliation proposal for a human, records the
+    parked pin, and then resolves exactly as if no candidate existed -- the
+    pin's existing manifest form goes to ``apply_required_patches`` as
+    before. If that last-good form no longer applies, the unchanged
+    conflict-abort path in ``apply_required_patches`` is what fails the run.
+    That is the ONLY remaining churn abort.
+
+    ``upstream_tip`` is the upstream head fetched by THIS run. Candidate
+    eligibility (R1) requires ancestry from it, so a caller that cannot name
+    it gets no detection at all rather than a proposal built on an
+    unverifiable ancestry claim.
     """
     to_apply: list[dict[str, str]] = []
     absorbed: list[dict[str, str]] = []
+    blocked = blocklisted_patch_ids()
     recorded_by_patch_id = {
         record.get("output_patch_id"): record
         for record in (records or [])
@@ -777,13 +975,20 @@ def patch_resolution(
                 "output_patch_id": str(recorded["output_patch_id"]),
             })
             continue
-        candidates = [
-            line for line in git(
-                "log", upstream, "--format=%H", "--fixed-strings", f"--grep={patch['subject']}", check=False
+        # `--grep` is the cheap pre-filter only; `%s` carries the subject so
+        # eligibility can demand EXACT subject equality (R1) instead of the
+        # substring/body match `--grep` actually performs.
+        candidate_rows = [
+            line.partition("\x00") for line in git(
+                "log", upstream, "--format=%H%x00%s", "--fixed-strings", f"--grep={patch['subject']}", check=False
             ).splitlines() if line
         ]
+        candidates = [row[0] for row in candidate_rows]
         candidate_ids = {candidate: stable_patch_id(candidate) for candidate in candidates}
-        equivalent = next((candidate for candidate, patch_id in candidate_ids.items() if patch_id in accepted_ids), None)
+        equivalent = next((
+            candidate for candidate, patch_id in candidate_ids.items()
+            if patch_id in accepted_ids and patch_id not in blocked
+        ), None)
         if equivalent:
             absorbed.append({
                 "commit": patch["commit"],
@@ -791,22 +996,18 @@ def patch_resolution(
                 "upstream_commit": equivalent,
                 "output_patch_id": candidate_ids[equivalent],
             })
-        elif candidates and not patch.get("reviewed_replacement"):
-            raise RuntimeError(
-                "upstream has a same-subject but non-equivalent required patch; "
-                f"manual reconciliation is required: source={patch['commit']} subject={patch['subject']!r} "
-                f"upstream_candidates={candidates}"
-            )
-        else:
-            to_apply.append(patch)
+            continue
+        if upstream_tip:
+            park_pin_for_churn(patch, search_ref=upstream, upstream_tip=upstream_tip)
+        to_apply.append(patch)
     return to_apply, absorbed
 
 
 def upstream_patch_resolution(
-    upstream: str, *, records: list[dict[str, Any]] | None = None
+    upstream: str, *, records: list[dict[str, Any]] | None = None, upstream_tip: str | None = None
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Resolve the fork-only overlay patches against upstream."""
-    return patch_resolution(upstream, REQUIRED_PATCHES, records=records)
+    return patch_resolution(upstream, REQUIRED_PATCHES, records=records, upstream_tip=upstream_tip)
 
 
 def _ignore_review_dir_inside_worktree() -> None:
@@ -847,6 +1048,10 @@ def apply_required_patches(
     try:
         for patch in patches:
             failed_patch = patch
+            # R19: a pin parked behind a pending proposal still applies its
+            # last verified form -- the output just carries who parked it.
+            provenance = parked_pin_provenance(patch)
+            parked = {"provenance": provenance} if provenance else {}
             replacement = patch.get("reviewed_replacement")
             applied_commit = replacement["commit"] if replacement else patch["commit"]
             prior_application = next((
@@ -867,6 +1072,7 @@ def apply_required_patches(
                     **({"applied_commit": applied_commit} if replacement else {}),
                     "output_commit": prior_application["output_commit"],
                     "output_patch_id": output_patch_id,
+                    **parked,
                 })
                 continue
             try:
@@ -884,6 +1090,7 @@ def apply_required_patches(
                     "source_commit": patch["commit"],
                     "output_commit": git("rev-parse", "HEAD"),
                     "output_patch_id": patch["stable_patch_id"],
+                    **parked,
                 })
                 continue
             output_commit = git("rev-parse", "HEAD")
@@ -899,6 +1106,7 @@ def apply_required_patches(
                 **({"applied_commit": applied_commit} if replacement else {}),
                 "output_commit": output_commit,
                 "output_patch_id": output_patch_id,
+                **parked,
             })
     except Exception as exc:
         git("cherry-pick", "--abort", check=False)
@@ -1561,6 +1769,10 @@ def inspect_dry_run() -> dict[str, Any]:
         "absorbed_commit_count": 0,
         "commits_to_replay": [],
         "required_components": [component["id"] for component in MANIFEST["components"]],
+        # Read-only: the open proposals currently parking a pin (R19). A
+        # dry-run never resolves patches, so this reports the store's state
+        # rather than this invocation's -- and never writes to it.
+        "parked_pins": open_proposal_summary(),
         "would_rebase_complete_published_range": False,
         "recovery_current_upstream": False,
         "push_lease_head": published_input_head,
@@ -1880,6 +2092,7 @@ def main() -> int:
         help="identity recorded on the exclusive lock, for busy/stale-reclaim diagnostics (default: scheduler)",
     )
     args = parser.parse_args()
+    reset_run_reconciliation_state()
     # Run-start integrity gate (U2/KTD2, R14): before ANY mutation -- before
     # the lock, before any fetch, even before the read-only dry-run
     # inspection below -- the operational copies must match the published
@@ -1943,7 +2156,7 @@ def main() -> int:
             current_output = git("rev-parse", "HEAD")
             stage = "apply_foundations"
             foundation_to_apply, absorbed_foundations = patch_resolution(
-                current_output, FOUNDATION_PATCHES, records=published_records
+                current_output, FOUNDATION_PATCHES, records=published_records, upstream_tip=upstream
             )
             foundation_records = _resolution_records(absorbed_foundations, "foundation")
             foundation_records.extend(apply_required_patches(
@@ -1959,7 +2172,7 @@ def main() -> int:
             current_output = git("rev-parse", "HEAD")
             stage = "apply_components"
             patches_to_apply, absorbed_components = upstream_patch_resolution(
-                current_output, records=[*published_records, *foundation_records]
+                current_output, records=[*published_records, *foundation_records], upstream_tip=upstream
             )
             component_records = _resolution_records(absorbed_components, "component")
             component_records.extend(apply_required_patches(
@@ -2024,14 +2237,14 @@ def main() -> int:
                 release_exists=bool(existing_release["complete"]),
             )
             if recovering_unchanged_output and not recovery["publish_release"]:
-                result = {"ok": True, "changed": False, "reason": recovery["reason"], "head": rebased_output_head, "upstream": upstream}
+                result = {"ok": True, "changed": False, "reason": recovery["reason"], "head": rebased_output_head, "upstream": upstream, "parked_pins": parked_pin_summary()}
                 log(json.dumps(result, sort_keys=True))
                 resolve_failure_investigator_success()
                 emit_fleet_receipt(started_at, outcome="produced", changed=False)
                 print(json.dumps(result))
                 return 0
             if not recovering_current_output and not needs_push and existing_release["complete"]:
-                result = {"ok": True, "changed": False, "reason": "integration_and_release_already_current", "head": rebased_output_head, "upstream": upstream}
+                result = {"ok": True, "changed": False, "reason": "integration_and_release_already_current", "head": rebased_output_head, "upstream": upstream, "parked_pins": parked_pin_summary()}
                 log(json.dumps(result, sort_keys=True))
                 resolve_failure_investigator_success()
                 emit_fleet_receipt(started_at, outcome="produced", changed=False)
@@ -2084,6 +2297,7 @@ def main() -> int:
                 "sha256": checksum,
                 "retention_deleted": removed,
                 "sync": sync_outcome,
+                "parked_pins": parked_pin_summary(),
             }
             log(json.dumps(result, sort_keys=True))
             resolve_failure_investigator_success()
