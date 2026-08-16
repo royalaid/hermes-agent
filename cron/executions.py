@@ -64,6 +64,24 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    # Sibling audit table for completions that arrive after their execution
+    # already reached a terminal state (KTD6/U3). The `executions` row and
+    # its CHECK constraint above are never touched for this case — see
+    # `record_late_outcome_if_terminal`. No migration: purely additive, and
+    # safe to create against an existing production-shaped executions.db.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS execution_late_outcomes (
+             execution_id TEXT NOT NULL,
+             observed_at REAL NOT NULL,
+             success INTEGER NOT NULL,
+             error TEXT,
+             delivery_outcome TEXT
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_late_outcomes_execution "
+        "ON execution_late_outcomes(execution_id, observed_at DESC)"
+    )
 
 
 @contextmanager
@@ -176,11 +194,91 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     return record
 
 
+def record_late_outcome_if_terminal(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    *,
+    success: bool,
+    error: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Record a completion that arrives after its execution is already terminal.
+
+    Must be called inside the caller's own open ledger transaction (the same
+    one whose CAS ``UPDATE`` just matched zero rows) so the terminal-state
+    check and the insert are atomic with that failed update — no separate
+    connection is opened here.
+
+    Returns ``None`` when the execution id is unknown or the row is still
+    non-terminal (a genuine claimed/running race, not a late outcome — the
+    caller's normal no-op behavior applies). Otherwise returns the untouched
+    execution row (``executions`` and its CHECK constraint are never written
+    here) with an embedded ``late_outcome`` dict describing the new sibling
+    ``execution_late_outcomes`` record, including its ``rowid`` so a caller
+    that later resolves a delivery outcome (see U4) can attach it with
+    :func:`set_late_outcome_delivery_outcome` instead of re-querying.
+    """
+    row = conn.execute(
+        "SELECT * FROM executions WHERE id=?", (execution_id,)
+    ).fetchone()
+    if row is None or row["status"] not in _TERMINAL_STATES:
+        return None
+    observed_at = _hermes_now().timestamp()
+    cur = conn.execute(
+        """INSERT INTO execution_late_outcomes
+           (execution_id, observed_at, success, error, delivery_outcome)
+           VALUES (?, ?, ?, ?, ?)""",
+        (execution_id, observed_at, 1 if success else 0, error, None),
+    )
+    record = _record(row)
+    assert record is not None
+    record["late_outcome"] = {
+        "rowid": cur.lastrowid,
+        "execution_id": execution_id,
+        "observed_at": observed_at,
+        "success": success,
+        "error": error,
+        "delivery_outcome": None,
+    }
+    return record
+
+
+def set_late_outcome_delivery_outcome(rowid: int, delivery_outcome: str) -> None:
+    """Attach a resolved delivery outcome to a previously written late-outcome row."""
+    with _transaction() as conn:
+        conn.execute(
+            "UPDATE execution_late_outcomes SET delivery_outcome=? WHERE rowid=?",
+            (delivery_outcome, rowid),
+        )
+
+
+def list_late_outcomes(execution_id: str) -> List[Dict[str, Any]]:
+    """Return late-outcome rows for one execution, oldest first (test/inspection helper)."""
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT rowid AS rowid, * FROM execution_late_outcomes "
+            "WHERE execution_id=? ORDER BY observed_at",
+            (execution_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    A completion that arrives for an execution already in a terminal state
+    (KTD6) is never applied to that row — instead a sibling late-outcome
+    record is written (see `record_late_outcome_if_terminal`) and returned
+    here so a caller that cares (the scheduler's finish-execution call site)
+    can deliver a late-outcome notice. The return value stays
+    ``Optional[Dict[str, Any]]`` for existing callers: a genuine no-op
+    (unknown execution id, or a row still non-terminal) still returns
+    ``None`` exactly as before; a late outcome returns a dict distinguishable
+    by its extra ``late_outcome`` key, so callers that only ever did a
+    truthy/None check on a *normal* completion keep working unchanged.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
@@ -191,7 +289,9 @@ def finish_execution(
             (status, now, detail, execution_id),
         )
         if cur.rowcount != 1:
-            return None
+            return record_late_outcome_if_terminal(
+                conn, execution_id, success=success, error=detail,
+            )
         _prune_unlocked(conn)
         record = _record(conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -200,10 +300,25 @@ def finish_execution(
     return record
 
 
-def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
+def recover_interrupted_executions_detailed() -> List[Dict[str, Any]]:
+    """Mark provably abandoned attempts unknown; return the recovered rows.
+
+    Same CAS reclaim logic as :func:`recover_interrupted_executions`. Unlike
+    that ``-> int`` wrapper (kept for the unchanged ``scheduler_provider``
+    protocol and any caller that only wants a count with today's auto-emit
+    behavior), this variant does NOT emit telemetry itself: the per-record
+    ``project_execution_event`` emit is deferred to the caller so a record's
+    status transition and its eventual delivery outcome (U4 — resolved by
+    the scheduler's reap site after it attempts delivery) land in the same
+    projection event instead of racing two separate emits.
+
+    Because each row's ``UPDATE ... WHERE status IN ('claimed','running')``
+    only matches (and is only appended to the return list) when it actually
+    flips the row, a second call after a prior reap already transitioned a
+    row finds it excluded by the same-shaped ``SELECT`` and never re-appears
+    here — callers may rely on this for double-reap safety.
+    """
     now = _hermes_now().isoformat()
-    changed = 0
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
@@ -223,18 +338,23 @@ def recover_interrupted_executions() -> int:
                  "terminal state; whether side effects ran is unknown.",
                  row["id"]),
             )
-            changed += cur.rowcount
             if cur.rowcount:
                 record = _record(conn.execute(
                     "SELECT * FROM executions WHERE id=?", (row["id"],)
                 ).fetchone())
                 if record is not None:
                     recovered.append(record)
-        if changed:
+        if recovered:
             _prune_unlocked(conn)
+    return recovered
+
+
+def recover_interrupted_executions() -> int:
+    """Mark provably abandoned attempts unknown without scheduling retries."""
+    recovered = recover_interrupted_executions_detailed()
     for record in recovered:
         _emit_execution_state(record)
-    return changed
+    return len(recovered)
 
 
 def list_executions(

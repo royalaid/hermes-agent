@@ -58,15 +58,93 @@ def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path
 
 
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
+    """A completion arriving after the row is already terminal writes a
+    sibling late-outcome record instead of a silent no-op (KTD6/U3): the
+    `unknown`/terminal audit row itself is never overwritten."""
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")
     executions.mark_execution_running(record["id"])
     executions.finish_execution(record["id"], success=True)
 
-    assert executions.finish_execution(
+    late = executions.finish_execution(
         record["id"], success=False, error="late writer"
-    ) is None
+    )
+
+    # The terminal execution row is returned untouched, not rewritten.
+    assert late is not None
+    assert late["id"] == record["id"]
+    assert late["status"] == "completed"
+    assert late["error"] is None
     assert executions.latest_execution("immutable")["status"] == "completed"
+
+    # ...but the late arrival is recorded as a sibling late-outcome row.
+    assert late["late_outcome"]["success"] is False
+    assert late["late_outcome"]["error"] == "late writer"
+    assert late["late_outcome"]["delivery_outcome"] is None
+    outcomes = executions.list_late_outcomes(record["id"])
+    assert len(outcomes) == 1
+    assert outcomes[0]["success"] == 0
+    assert outcomes[0]["error"] == "late writer"
+    assert outcomes[0]["observed_at"] > 0
+
+
+def test_late_outcome_not_recorded_for_genuine_claimed_running_race(monkeypatch, tmp_path):
+    """A second finish on a still-in-flight (non-terminal) execution is a
+    genuine CAS race, not a late outcome -- no late-outcome row is written."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("racey", source="builtin")
+
+    # Row is still 'claimed' (never marked running/finished) -- simulate two
+    # finishers racing: first wins, this represents the loser's view before
+    # its own UPDATE, but calling finish_execution on an unknown id also
+    # exercises the "row missing" no-op branch.
+    assert executions.finish_execution("does-not-exist", success=True) is None
+    assert executions.list_late_outcomes("does-not-exist") == []
+
+
+def test_execution_late_outcomes_table_created_against_existing_production_db(monkeypatch, tmp_path):
+    """The sibling table is created via CREATE TABLE IF NOT EXISTS the first
+    time it's touched, even against an executions.db that predates it."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    db_path = executions.EXECUTIONS_FILE
+    db_path.parent.mkdir(parents=True)
+    # Build a production-shaped executions.db using ONLY the pre-existing
+    # `executions` table -- no execution_late_outcomes table at all, as a
+    # real on-disk database from before this feature would look.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.execute(
+            "INSERT INTO executions (id, job_id, source, process_id, pid, "
+            "status, claimed_at) VALUES ('pre-existing', 'job-old', 'builtin', "
+            "'proc-old', 1, 'completed', 'now')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    late = executions.finish_execution(
+        "pre-existing", success=False, error="late after old-schema upgrade"
+    )
+    assert late is not None
+    assert late["late_outcome"]["error"] == "late after old-schema upgrade"
+    assert executions.list_late_outcomes("pre-existing")[0]["success"] == 0
 
 
 def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, tmp_path):
@@ -130,6 +208,107 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 
     assert executions.recover_interrupted_executions() == 0
     assert executions.latest_execution("still-live")["status"] == "running"
+
+
+def _orphan_execution(executions, job_id: str, *, running: bool = False) -> dict:
+    """Persist a claimed/running execution owned by a process that cannot be
+    proved live -- a fabricated pid/process_id combo, mirroring the dead-owner
+    fixture idiom in tests/cron/test_dead_owner_claim_reclaim.py."""
+    record = executions.create_execution(job_id, source="builtin")
+    if running:
+        executions.mark_execution_running(record["id"])
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='dead-owner', pid=999999999, "
+            "process_started_at=NULL WHERE id=?",
+            (record["id"],),
+        )
+    return record
+
+
+def test_recover_interrupted_executions_detailed_returns_recovered_rows(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_a, **_k: False)
+    first = _orphan_execution(executions, "detailed-job-a")
+    second = _orphan_execution(executions, "detailed-job-b", running=True)
+
+    detailed = executions.recover_interrupted_executions_detailed()
+
+    assert {row["id"] for row in detailed} == {first["id"], second["id"]}
+    assert all(row["status"] == "unknown" for row in detailed)
+
+
+def test_recover_interrupted_executions_detailed_does_not_emit_telemetry(monkeypatch, tmp_path):
+    """The detailed variant defers the projection emit to its caller (U4) --
+    unlike the int wrapper, it must not call emit_execution_state itself."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_a, **_k: False)
+    _orphan_execution(executions, "no-emit-job")
+
+    emitted = []
+    monkeypatch.setattr(executions, "_emit_execution_state", lambda *a, **k: emitted.append((a, k)))
+
+    detailed = executions.recover_interrupted_executions_detailed()
+
+    assert len(detailed) == 1
+    assert emitted == []
+
+
+def test_recover_interrupted_executions_int_wrapper_still_emits(monkeypatch, tmp_path):
+    """The pre-existing `-> int` function keeps emitting exactly as before,
+    for callers other than the scheduler reap site (e.g. cronjob_tools)."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_a, **_k: False)
+    _orphan_execution(executions, "wrapper-emit-job")
+
+    emitted = []
+    monkeypatch.setattr(executions, "_emit_execution_state", lambda *a, **k: emitted.append((a, k)))
+
+    assert executions.recover_interrupted_executions() == 1
+    assert len(emitted) == 1
+
+
+def test_double_reap_of_same_execution_is_a_cas_no_op(monkeypatch, tmp_path):
+    """A second detailed reap after the first already transitioned a row must
+    not return it again -- the CAS UPDATE + same-shaped SELECT excludes rows
+    no longer in ('claimed','running'). This is the double-delivery guard
+    the U4 reap-site relies on."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_a, **_k: False)
+    _orphan_execution(executions, "double-reap-job")
+
+    first_pass = executions.recover_interrupted_executions_detailed()
+    second_pass = executions.recover_interrupted_executions_detailed()
+
+    assert len(first_pass) == 1
+    assert second_pass == []
+
+
+def test_provider_protocol_recover_interrupted_signature_unchanged():
+    """scheduler_provider.CronScheduler.recover_interrupted stays a plain
+    `-> int` method (KTD9-adjacent protocol stability) -- U4 adds the
+    detailed variant alongside it, never in place of it."""
+    import inspect
+
+    from cron.scheduler_provider import CronScheduler
+
+    sig = inspect.signature(CronScheduler.recover_interrupted)
+    assert list(sig.parameters) == ["self"]
+    assert sig.return_annotation in (int, "int")
+
+
+def test_late_outcome_delivery_outcome_can_be_attached(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("late-delivery-job", source="builtin")
+    executions.finish_execution(record["id"], success=True)
+
+    late = executions.finish_execution(record["id"], success=False, error="late arrival")
+    assert late["late_outcome"]["delivery_outcome"] is None
+
+    executions.set_late_outcome_delivery_outcome(late["late_outcome"]["rowid"], "delivered")
+
+    stored = executions.list_late_outcomes(record["id"])[0]
+    assert stored["delivery_outcome"] == "delivered"
 
 
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
