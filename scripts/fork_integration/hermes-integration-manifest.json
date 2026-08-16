@@ -1,0 +1,349 @@
+{
+  "schema": 3,
+  "integration_branch": "fork-integration",
+  "upstream": {
+    "remote": "origin",
+    "ref": "refs/heads/main"
+  },
+  "upstream_foundations": [
+    {
+      "id": "inflight-journal-per-session",
+      "repository": "NousResearch/hermes-agent",
+      "pull_request": 82832,
+      "approved_head": "a0ab6446f1a73dee6421abd7c213a498097bce93",
+      "base_ref": "main",
+      "patches": [
+        {
+          "commit": "0664439532e6093c60847af4ca9ff0f0c1ee0de3",
+          "stable_patch_id": "682afff30c9d80fdb7e187e99fb16847477c9e72",
+          "accepted_output_patch_ids": [
+            "03731d0e70435ad91b20fad6bd1ddc1b95056cb8",
+            "d2b2a1134545ffdc919a18978b754626b09072b2"
+          ],
+          "reviewed_replacement": {
+            "commit": "a5d1061340c6feaabee4e7a2d246bc18f0ab7cb8",
+            "stable_patch_id": "03731d0e70435ad91b20fad6bd1ddc1b95056cb8"
+          },
+          "subject": "fix(desktop): bound inflight journal persistence (#63047)"
+        },
+        {
+          "commit": "a0ab6446f1a73dee6421abd7c213a498097bce93",
+          "stable_patch_id": "49a0eb90321965b4796a9b698dbdc6dbc219fafd",
+          "accepted_output_patch_ids": ["c2e1c94141c5ebd37b255b4dec807d0e02437557"],
+          "reviewed_replacement": {
+            "commit": "46042e30beee791834336be29f1bf62571e73538",
+            "stable_patch_id": "c2e1c94141c5ebd37b255b4dec807d0e02437557"
+          },
+          "subject": "test(desktop): spy on the active localStorage implementation (#82832)"
+        }
+      ]
+    }
+  ],
+  "fork": {
+    "remote": "fork",
+    "repository": "royalaid/hermes-agent"
+  },
+  "components": [
+    {
+      "id": "windows-host-path",
+      "source_ref": "205e59a813586e1e5bb644b11ce9b1b410b09867",
+      "patches": [
+        {
+          "commit": "205e59a813586e1e5bb644b11ce9b1b410b09867",
+          "stable_patch_id": "c8b43d1da72f518463132b4665b2da45c54ea612",
+          "accepted_output_patch_ids": ["060029828133d4bb146d5c056954424e15c2d3e6"],
+          "subject": "fix(desktop): preserve live Windows host PATH"
+        }
+      ]
+    },
+    {
+      "id": "reasoning-item-boundaries",
+      "source_ref": "fork/fix/installed-reasoning-summary-rows",
+      "patches": [
+        {
+          "commit": "eb723f2faa79e749ba7e05d81f1a08e664819634",
+          "stable_patch_id": "6a3f83308b6267066261c809df9721a2909c2b53",
+          "accepted_output_patch_ids": ["43b5189f4557e13364af4ec329400664eb8637a0"],
+          "subject": "fix(codex): preserve reasoning item boundaries"
+        },
+        {
+          "commit": "891b596006f1fc1101e079f4ea73fb01ddbe1015",
+          "stable_patch_id": "364d4a976831227d6d3732f3b6f159425e921cb4",
+          "subject": "test(desktop): isolate reasoning item layout"
+        },
+        {
+          "commit": "51962fc0fb0dc468b5c8ab66c43d9a6a0e3dce3a",
+          "stable_patch_id": "b998a4ce1bc857abd3c5cad0137055d543493216",
+          "accepted_output_patch_ids": ["becb1c416535b2bb48e3ac145061447a91bd707f"],
+          "subject": "[verified] fix(desktop): preserve native reasoning summaries"
+        },
+        {
+          "commit": "41f4621abec31afb7c82923a72a9f88a2075ea4b",
+          "stable_patch_id": "848e8bdbaa6f555a9a2474bbea85d0152d5f8791",
+          "subject": "fix(codex): preserve streamed reasoning summary rows"
+        }
+      ]
+    },
+    {
+      "id": "desktop-hitch-diagnostics",
+      "source_ref": "fork/feat/desktop-hitch-diagnostics",
+      "patches": [
+        {
+          "commit": "94454bf542b7a673423dd59d9139e9db16848e2e",
+          "stable_patch_id": "a6a828c29d5a792d5809b68554b763e67b2ad3ee",
+          "subject": "docs: plan for desktop hitching diagnostics and confirmed local fixes"
+        },
+        {
+          "commit": "4ff79eaa89dc1eba0565b937a9c3b707db7bc094",
+          "stable_patch_id": "cd436cf6d70095daebbeae217bb2717514d1fe15",
+          "accepted_output_patch_ids": ["c2c9059c6f282baa9306d3d3cbcf0d9a19a6e6ae"],
+          "subject": "feat(desktop): renderer diagnostics capture module (U2)"
+        },
+        {
+          "commit": "f22b305b8065c2243dbd9ffccbdc59f89c281b1d",
+          "stable_patch_id": "330f2003790b0b7e922eae882c52d2226c2c30ce",
+          "subject": "fix(kanban): stop delegated-child permission-error reconnect storm (U1)"
+        },
+        {
+          "commit": "6791a4816be1e10aaf58b583b0403b6f4333d38b",
+          "stable_patch_id": "7d1058747ec25f42f784d7cad44e00baee2e62ff",
+          "subject": "feat(desktop): main-process diagnostics capture controller (U3a)"
+        },
+        {
+          "commit": "d48f09f7b80688f5ec004e67d7aca5e2d50c0f15",
+          "stable_patch_id": "c271c1fa18d7ff37b6c03c19a903ee688e3237da",
+          "accepted_output_patch_ids": ["e7202872bd788a73dc0345794f9682c408e12d1c"],
+          "subject": "feat(gateway): armed diagnostics ring with sub-5s stall capture (U3b)"
+        },
+        {
+          "commit": "f5ecefb7d7c65023f34119209f078e063cc30a81",
+          "stable_patch_id": "c612111f63bc0c0eb6e003a56f2bfae4f574daf9",
+          "accepted_output_patch_ids": ["d8a8cd9dabd17149dad813c419766a8326f82418"],
+          "subject": "feat(desktop): capture UX, sanitized bundle export, hermes debug diagnose (U4)"
+        },
+        {
+          "commit": "471a3312f4412fc7d46dde78afba93e8d649bf0d",
+          "stable_patch_id": "11a4f4cd7f621e1217f17672cb90cc482d9fb6ca",
+          "subject": "test(perf): hitch-classify proof scenario for diagnostics capture (U5)"
+        },
+        {
+          "commit": "543f47a6b3d989b1427546ed0a96945749293727",
+          "stable_patch_id": "94032a920e6ede8dabe2d9b6646d5802fa73c932",
+          "subject": "docs: record closeout status and U6/U7 parking evidence in hitching plan"
+        }
+      ]
+    },
+    {
+      "id": "desktop-dropped-frames-containment",
+      "source_ref": "fork/fix/desktop-dropped-frames",
+      "patches": [
+        {
+          "commit": "9106e89cba03241830b7a9df7cbd6442769c2486",
+          "stable_patch_id": "68ad86ed69ddec42349958b0bdbfdefcc01e5bf4",
+          "subject": "docs(desktop): plan dropped-frames containment and coalescing fix"
+        },
+        {
+          "commit": "11486f587b72bb1c6e073086f4215f33da5c1e4d",
+          "stable_patch_id": "24ad22b5de0ca580a6ef1a8d8b87b3d0ca061b05",
+          "subject": "perf(desktop): contain hidden keep-alive pane content (U1)"
+        },
+        {
+          "commit": "1f45ed933cf9f936e40934f343315d4d1856c251",
+          "stable_patch_id": "8798d980803c5c3b32d449f7812b204d2b1a32dc",
+          "subject": "perf(desktop): apply reveal catch-up as a transition (U2)"
+        },
+        {
+          "commit": "5e58a7139f52fcf82ca8c57a3705daef5f97add4",
+          "stable_patch_id": "befe19bbc216d862edf697cc87a05067426104b0",
+          "subject": "perf(desktop): coalesce subagent and tool stream publishes (U3)"
+        },
+        {
+          "commit": "9a596a9c5b14d61bae0373970e23d3be34bd4591",
+          "stable_patch_id": "ca5f9b7bc465ba46720b748fd8f5b50536792e7a",
+          "subject": "perf(desktop): reuse tool args identity across no-op ticks (U4)"
+        },
+        {
+          "commit": "6646c60d9668072f0526991c91e455f3b9651116",
+          "stable_patch_id": "137c9cffbb66aded7e53282f7a4c40860978f26e",
+          "subject": "fix(desktop): flush queued tool rows for approvals and dead sessions"
+        },
+        {
+          "commit": "4118ab25b3ab9977b731fee99702dc2f29780016",
+          "stable_patch_id": "0b831a55a33f69722d6d5cbba292859634574813",
+          "subject": "fix(desktop): guard stick-to-bottom and clamp measurement for hidden panes"
+        }
+      ]
+    },
+    {
+      "id": "gateway-config-offloop",
+      "source_ref": "fork/feat/gateway-config-offloop",
+      "patches": [
+        {
+          "commit": "eb76ea16f022467c69f6e6e59d2d4688bd41e5e6",
+          "stable_patch_id": "d79c677c75d4c3515371e84f3f6818944f46c963",
+          "subject": "fix(gateway): move _profile_scope and config I/O off the event loop in async handlers"
+        },
+        {
+          "commit": "69103841736b72ed893e73fc8557b3cbc939a0b6",
+          "stable_patch_id": "92da96924c9668c77b77011cc5403090c1a4cf82",
+          "subject": "fix(gateway): serialize config mutations and finish the router off-loop sweep"
+        }
+      ]
+    },
+    {
+      "id": "thread-stream-instrumentation",
+      "source_ref": "fork/feat/thread-stream-instrumentation",
+      "patches": [
+        {
+          "commit": "5b03940559c7fcacd2ec861a016500d244e7c78e",
+          "stable_patch_id": "d4134d0928f41504394aebdb6bc4e5cb4dca50f5",
+          "subject": "feat(desktop): attribute multi-thread render cost in diagnostics captures"
+        }
+      ]
+    },
+
+    {
+      "id": "delegation-argv-classifier",
+      "source_ref": "fork/feat/delegation-argv-classifier",
+      "patches": [
+        {
+          "commit": "68030d40077b235da84db0005cac20e6dddfafb3",
+          "stable_patch_id": "28b927d6e9a09e78fffed15c7480b658be5d478a",
+          "subject": "fix(agent): never read option values as commands in is_server_role_argv"
+        }
+      ]
+    },
+    {
+      "id": "fork-update-status",
+      "source_ref": "fork/fix/fork-update-status",
+      "patches": [
+        {
+          "commit": "271dedb85ed0285b0944640e2b775a09274daa56",
+          "stable_patch_id": "478f889b8f7cd5cb723f8e9afa788ac883d44e13",
+          "accepted_output_patch_ids": ["339c07fdc1e2470fa0329b1e4f41a57a72d8c8ae"],
+          "subject": "fix(desktop): follow published fork branch for updates"
+        }
+      ]
+    },
+    {
+      "id": "codex-responses-native-compaction-rebased",
+      "source_ref": "fork/integrate/openai-native-compaction-rebased-20260809",
+      "patches": [
+        {
+          "commit": "8786aeca47be65e767a279e93791d89253a41cb7",
+          "stable_patch_id": "f86cff4f611c5b5f016260557cdabb57f75180e0",
+          "subject": "fix(compression): prune stale native replay safely"
+        },
+        {
+          "commit": "9b82e111bf4531d6a82bce905a94cbdcab47e647",
+          "stable_patch_id": "24e72bb4f36d99211d8adeed737bc79564da9c71",
+          "accepted_output_patch_ids": ["b24e113560e6101843dee500cacf4ac1b0acfa9b"],
+          "reviewed_replacement": {
+            "commit": "5c6feac7f57a2157fd96385e1c967cd74b74245f",
+            "stable_patch_id": "b24e113560e6101843dee500cacf4ac1b0acfa9b",
+            "source_ref": "fork/reconcile/fork-integration-20260814"
+          },
+          "subject": "fix(compression): bound stateless checkpoint replay"
+        },
+        {
+          "commit": "67541cb56afebee4fcbc1fa08dcfa2c1f9183b0c",
+          "stable_patch_id": "0d1a3112d4228bbdf0421ba97a29f074e9d2f130",
+          "subject": "fix(codex): preserve legacy reasoning summary boundaries"
+        },
+        {
+          "commit": "f6e3c6081fbe82084ff42605b7d27ab8d0af31f7",
+          "stable_patch_id": "36eea134ff23b4cc3414d98efa6a4ed97e1767a0",
+          "subject": "fix(diagnostics): honor requested test-block duration"
+        },
+        {
+          "commit": "adafd77fa07f68dcaf58d9b28466c0bdd4cb115c",
+          "stable_patch_id": "7e226e7568e9f8cda10123d6ba331c19abcc360e",
+          "accepted_output_patch_ids": ["344c9a5942f28cc1d5367ada2a91a9a77ede6f0e"],
+          "reviewed_replacement": {
+            "commit": "403e7dad2183c50c187210d2a4aeefb8bb77fabf",
+            "stable_patch_id": "344c9a5942f28cc1d5367ada2a91a9a77ede6f0e",
+            "source_ref": "fork/reconcile/fork-integration-20260814"
+          },
+          "subject": "fix(bootstrap): pin installer repository with build ref"
+        }
+      ]
+    },
+    {
+      "id": "windows-updater-force-drain",
+      "source_ref": "fork/reconcile/fork-integration-20260814",
+      "patches": [
+        {
+          "commit": "6c0aa98151857c9adf36a8d9b0cce8eedaadc3ad",
+          "stable_patch_id": "d06e25b471865c2cfda2b294942b26f71a22cabc",
+          "subject": "fix(desktop): force-drain Windows update blockers"
+        }
+      ]
+    },
+    {
+      "id": "fork-integration-authority-docs",
+      "source_ref": "fork/reconcile/fork-integration-20260814",
+      "patches": [
+        {
+          "commit": "e73758fe11e0522e1e8a7dfcc7ddb62bd519802a",
+          "stable_patch_id": "4e861038af3d2467bf1030e8572bfb46450ea024",
+          "subject": "docs(fork): clarify integration authority boundaries"
+        }
+      ]
+    },
+    {
+      "id": "inflight-journal-bounded-projection",
+      "source_ref": "fork/reconcile/fork-integration-20260814",
+      "patches": [
+        {
+          "commit": "a5d1061340c6feaabee4e7a2d246bc18f0ab7cb8",
+          "stable_patch_id": "03731d0e70435ad91b20fad6bd1ddc1b95056cb8",
+          "subject": "fix(desktop): keep journal projection traversal bounded"
+        }
+      ]
+    },
+    {
+      "id": "inflight-journal-portable-write-test",
+      "source_ref": "fork/reconcile/fork-integration-20260814",
+      "patches": [
+        {
+          "commit": "46042e30beee791834336be29f1bf62571e73538",
+          "stable_patch_id": "c2e1c94141c5ebd37b255b4dec807d0e02437557",
+          "subject": "test(desktop): restore portable journal write coverage"
+        }
+      ]
+    },
+    {
+      "id": "release-failure-investigator-context",
+      "source_ref": "fork/reconcile/fork-integration-20260814",
+      "patches": [
+        {
+          "commit": "899bd8a2d5079986e0a4dc53a9bd8702c157bb4f",
+          "stable_patch_id": "9a7d7dedde8aec38c44c09ea9e8af5ba08ede325",
+          "subject": "feat(gateway): mark release investigators as cron sessions"
+        }
+      ]
+    },
+    {
+      "id": "codex-native-compaction-route-safety",
+      "source_ref": "fork/reconcile/fork-integration-20260814",
+      "patches": [
+        {
+          "commit": "5c6feac7f57a2157fd96385e1c967cd74b74245f",
+          "stable_patch_id": "b24e113560e6101843dee500cacf4ac1b0acfa9b",
+          "subject": "fix(compression): reject custom relays for Codex compaction"
+        }
+      ]
+    },
+    {
+      "id": "bootstrap-fork-repository-provenance",
+      "source_ref": "fork/reconcile/fork-integration-20260814",
+      "patches": [
+        {
+          "commit": "403e7dad2183c50c187210d2a4aeefb8bb77fabf",
+          "stable_patch_id": "344c9a5942f28cc1d5367ada2a91a9a77ede6f0e",
+          "subject": "fix(bootstrap): preserve fork repository provenance"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+# Byte-pure import: these four files are copied verbatim from the operational
+# Hermes ops scripts directory and must remain byte-identical to that source
+# (see the import commit body for sha256s). The repo-root .gitattributes
+# forces `*.py`/`*.json` to `eol=lf`, which would silently rewrite the CRLF
+# manifest on checkin/checkout. Override that here so git stores and
+# checks these paths out unmodified.
+hermes-integration-release-windows.py -text
+hermes-release-failure-investigator.py -text
+hermes-integration-manifest.json -text
+test_hermes_integration_release_windows.py -text
