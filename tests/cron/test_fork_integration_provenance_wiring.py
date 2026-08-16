@@ -239,6 +239,43 @@ def test_fail_folds_canary_flag_when_canary_manifest_is_active(
     assert payload["canary"] is True
 
 
+# ── _emit_result(): the success-path choke point ────────────────────────────
+
+
+def test_emit_result_folds_provenance_into_a_success_shaped_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``_emit_result()`` is the choke point every SUCCESSFUL main() exit
+    passes through (the full release, both "already current" early returns,
+    and the dry-run report) -- proven directly here against a success-shaped
+    payload, matching the shape ``main()`` actually builds at those sites."""
+    repo = _init_repo(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(_minimal_manifest_document()), encoding="utf-8")
+
+    monkeypatch.setattr(release, "MANIFEST_PATH", manifest_path)
+    monkeypatch.setattr(release, "WORKTREE", repo)
+    monkeypatch.setattr(release, "BLOCKLIST_PATH", tmp_path / "blocklist.json")
+    monkeypatch.setenv(_HISTORY_ENV, str(tmp_path / "history.jsonl"))
+    release.reset_run_provenance_state()
+    release.reset_run_canary_state()
+
+    result = {
+        "ok": True, "changed": True, "branch": "fork-integration",
+        "head": "f" * 40, "upstream": "e" * 40, "parked_pins": [],
+    }
+    exit_code = release._emit_result(result, dry_run=False)
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["changed"] is True
+    assert "provenance" in payload
+    assert "canary" not in payload
+    # Non-dry-run success also appends the history line.
+    assert len(Path(tmp_path / "history.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
 # ── smoke: expected entry points exist ──────────────────────────────────────
 
 
