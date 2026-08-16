@@ -573,3 +573,476 @@ def test_main_scheduler_path_pushes_and_publishes_without_any_token(
     assert payload["ok"] is True
     # The nightly brief keeps its shape: no authority key on the sanctioned path.
     assert "authority" not in payload
+
+
+# ═══ Part 2: incident schema v2, heartbeat, one finisher per window ═════════
+
+# The exact shape of the live state file at
+# %HERMES_HOME%\cron\failure-investigators\1ab4c7013fef.json on 2026-08-15,
+# with the two incidents that have been open (and unfinishable) since 12:36.
+_LEGACY_STATE = {
+    "failed": {},
+    "job_id": JOB_ID,
+    "open": {
+        "4370ddbb651aa3907de2b236": {"occurrences": 1, "stage": "verify_manifest", "status": "admitted"},
+        "c8d5bd93ea9c315804034bfc": {"occurrences": 1, "stage": "apply_foundations", "status": "admitted"},
+    },
+    "schema": 1,
+}
+
+
+def _write_legacy_state(home: Path) -> Path:
+    path = home / "cron" / "failure-investigators" / f"{JOB_ID}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_LEGACY_STATE, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def _record(home: Path, *, stage: str = "verify_manifest", error: str = "boom") -> dict[str, Any]:
+    return investigator.record_failure(
+        job_id=JOB_ID, stage=stage, error=error, home=home, worktree=home / "worktree",
+        script_path=home / "release.py", log_path=home / "log.txt",
+        test_path=home / "tests.py", manifest_path=home / "manifest.json",
+    )
+
+
+# ── migration ───────────────────────────────────────────────────────────────
+
+
+def test_schema_one_open_incidents_migrate_to_superseded_closures() -> None:
+    state, migrated = investigator.migrate_incident_state(json.loads(json.dumps(_LEGACY_STATE)), JOB_ID)
+
+    assert migrated is True
+    assert state["schema"] == 2
+    assert state["open"] == {}
+    closures = {entry["signature"]: entry["closure"] for entry in state["closed"]}
+    assert set(closures) == {"4370ddbb651aa3907de2b236", "c8d5bd93ea9c315804034bfc"}
+    assert all(closure["state"] == "superseded" for closure in closures.values())
+    assert all(closure["reason"] == "schema-v2 migration" for closure in closures.values())
+    # The legacy facts survive the closure; nothing is invented.
+    stages = {entry["signature"]: entry["stage"] for entry in state["closed"]}
+    assert stages["4370ddbb651aa3907de2b236"] == "verify_manifest"
+    assert stages["c8d5bd93ea9c315804034bfc"] == "apply_foundations"
+    assert all(entry["token_sha256"] is None for entry in state["closed"])
+
+
+def test_migration_is_idempotent() -> None:
+    once, _ = investigator.migrate_incident_state(json.loads(json.dumps(_LEGACY_STATE)), JOB_ID)
+    twice, migrated_again = investigator.migrate_incident_state(json.loads(json.dumps(once)), JOB_ID)
+
+    assert migrated_again is False
+    assert twice == once
+
+
+def test_recording_a_failure_migrates_the_legacy_file_in_place(tmp_path: Path) -> None:
+    state_path = _write_legacy_state(tmp_path)
+
+    result = _record(tmp_path, stage="push", error="new failure")
+
+    written = json.loads(state_path.read_text(encoding="utf-8"))
+    assert written["schema"] == 2
+    assert list(written["open"]) == [result["signature"]]
+    assert {entry["signature"] for entry in written["closed"]} == set(_LEGACY_STATE["open"])
+    assert {entry["closure"]["state"] for entry in written["closed"]} == {"superseded"}
+    entry = written["open"][result["signature"]]
+    assert entry["session_id"] is None and entry["spawned_at"] is None
+    assert entry["heartbeat_at"] is None and entry["token_sha256"] is None
+    assert entry["closure"] is None
+
+
+def test_recurrence_of_an_open_signature_counts_occurrences_not_new_incidents(tmp_path: Path) -> None:
+    first = _record(tmp_path)
+    second = _record(tmp_path)
+
+    assert first["signature"] == second["signature"]
+    assert (first["spawn"], second["spawn"]) == (True, False)
+    assert second["occurrences"] == 2
+
+
+def test_resolve_success_closes_open_incidents_as_resolved(tmp_path: Path) -> None:
+    result = _record(tmp_path)
+    state_path = Path(result["state_path"])
+
+    investigator.resolve_success(JOB_ID, tmp_path)
+
+    written = json.loads(state_path.read_text(encoding="utf-8"))
+    assert written["open"] == {}
+    assert written["closed"][-1]["signature"] == result["signature"]
+    assert written["closed"][-1]["closure"]["state"] == "resolved"
+
+
+# ── heartbeat ───────────────────────────────────────────────────────────────
+
+
+def test_heartbeat_stamps_the_open_incident(tmp_path: Path) -> None:
+    result = _record(tmp_path)
+
+    outcome = investigator.heartbeat(home=tmp_path, job_id=JOB_ID, signature=result["signature"])
+
+    assert outcome["ok"] is True
+    state = json.loads(Path(result["state_path"]).read_text(encoding="utf-8"))
+    assert state["open"][result["signature"]]["heartbeat_at"] == outcome["heartbeat_at"]
+    artifact = json.loads(Path(result["artifact_path"]).read_text(encoding="utf-8"))
+    assert artifact["heartbeat_at"] == outcome["heartbeat_at"]
+
+
+def test_heartbeat_refuses_an_incident_that_is_not_open(tmp_path: Path) -> None:
+    _write_legacy_state(tmp_path)
+
+    outcome = investigator.heartbeat(home=tmp_path, job_id=JOB_ID, signature="4370ddbb651aa3907de2b236")
+
+    assert outcome == {"ok": False, "reason": "incident_not_open", "job_id": JOB_ID,
+                       "signature": "4370ddbb651aa3907de2b236"}
+
+
+def test_heartbeat_cli_reports_json_and_an_exit_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = _record(tmp_path)
+
+    code = investigator.main([
+        "heartbeat", "--job", JOB_ID, "--signature", result["signature"], "--home", str(tmp_path),
+    ])
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out.strip())["ok"] is True
+    assert investigator.main([
+        "heartbeat", "--job", JOB_ID, "--signature", "0" * 24, "--home", str(tmp_path),
+    ]) == 1
+
+
+# ── one finisher per window ─────────────────────────────────────────────────
+
+
+def _launch(home: Path, *, signature: str, now: datetime) -> dict[str, Any]:
+    return investigator.plan_investigator_launch(
+        home=home, job_id=JOB_ID, signature=signature, now=now,
+    )
+
+
+def test_first_failure_spawns_one_finisher_with_a_token(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=2)).isoformat())
+    result = _record(tmp_path)
+
+    decision = _launch(tmp_path, signature=result["signature"], now=now)
+
+    assert decision["action"] == "spawn"
+    assert decision["reason"] == "no_live_finisher"
+    entry = json.loads(Path(result["state_path"]).read_text(encoding="utf-8"))["open"][result["signature"]]
+    assert entry["token_sha256"] == decision["token_sha256"]
+    assert entry["spawned_at"] == now.isoformat()
+    # The evidence artifact points at the window the finisher was given.
+    artifact = json.loads(Path(result["artifact_path"]).read_text(encoding="utf-8"))
+    assert artifact["authority"]["token_path"] == decision["token_path"]
+    assert artifact["authority"]["allowed_actions"] == ["push", "publish"]
+
+
+def test_a_second_failure_inside_a_live_window_attaches_without_spawning(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=2)).isoformat())
+    first = _record(tmp_path, stage="verify_manifest", error="first")
+    _launch(tmp_path, signature=first["signature"], now=now)
+    second = _record(tmp_path, stage="apply_foundations", error="second, different failure")
+
+    decision = _launch(tmp_path, signature=second["signature"], now=now + timedelta(minutes=5))
+
+    assert decision["action"] == "attach"
+    assert decision["attached_to"] == first["signature"]
+    state = json.loads(Path(first["state_path"]).read_text(encoding="utf-8"))
+    assert state["open"][first["signature"]]["attached"][0]["signature"] == second["signature"]
+    # No second token was minted for the attached signature.
+    assert state["open"][second["signature"]]["token_sha256"] is None
+
+
+def test_a_stale_heartbeat_closes_abandoned_and_spawns_exactly_one_replacement(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=3)).isoformat())
+    first = _record(tmp_path, stage="verify_manifest", error="first")
+    original = _launch(tmp_path, signature=first["signature"], now=now)
+    later = now + timedelta(minutes=25)  # past the 20 minute heartbeat window
+    second = _record(tmp_path, stage="push", error="second failure, finisher is gone")
+
+    decision = _launch(tmp_path, signature=second["signature"], now=later)
+
+    assert decision["action"] == "spawn"
+    assert decision["reason"] == "replacement_for_abandoned_finisher"
+    assert decision["closed"] == [{"signature": first["signature"], "state": "abandoned"}]
+
+    state = json.loads(Path(first["state_path"]).read_text(encoding="utf-8"))
+    closed = [entry for entry in state["closed"] if entry["signature"] == first["signature"]][0]
+    assert closed["closure"]["state"] == "abandoned"
+    assert "heartbeat stale" in closed["closure"]["reason"]
+    # Exactly one finisher exists afterwards.
+    finishers = [sig for sig, entry in state["open"].items() if entry.get("token_sha256")]
+    assert finishers == [second["signature"]]
+    # The replacement inherits the abandoned finisher's window end: a
+    # die-and-replace cycle cannot walk the window forward.
+    assert decision["expires_at"] == original["expires_at"]
+    # And the abandoned finisher's own token is dead the moment it closed.
+    assert investigator.verify_authority(
+        token_path=original["token_path"], job_id=JOB_ID, action="push", home=tmp_path, now=later,
+    )["reason"] == "authority_incident_closed"
+
+
+def test_a_fresh_replacement_absorbs_the_next_failure_instead_of_spawning_again(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=3)).isoformat())
+    first = _record(tmp_path, stage="verify_manifest", error="first")
+    _launch(tmp_path, signature=first["signature"], now=now)
+    later = now + timedelta(minutes=25)
+    second = _record(tmp_path, stage="push", error="second")
+    _launch(tmp_path, signature=second["signature"], now=later)
+    third = _record(tmp_path, stage="publish", error="third")
+
+    decision = _launch(tmp_path, signature=third["signature"], now=later + timedelta(minutes=1))
+
+    assert decision["action"] == "attach"
+    assert decision["attached_to"] == second["signature"]
+
+
+def test_a_replacement_cannot_itself_be_replaced_while_its_heartbeat_is_fresh(tmp_path: Path) -> None:
+    """The heartbeat window is what damps a die-and-replace cycle: a fresh
+    replacement absorbs every subsequent failure for at least 20 minutes, so
+    no separate spawn-rate limiter is needed (or shipped)."""
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=3)).isoformat())
+    first = _record(tmp_path, stage="verify_manifest", error="first")
+    _launch(tmp_path, signature=first["signature"], now=now)
+    stale_moment = now + timedelta(minutes=21)
+    second = _record(tmp_path, stage="push", error="second")
+    _launch(tmp_path, signature=second["signature"], now=stale_moment)
+
+    spawns = []
+    for minute in range(1, 20):
+        third = _record(tmp_path, stage="publish", error=f"failure {minute}")
+        decision = _launch(tmp_path, signature=third["signature"], now=stale_moment + timedelta(minutes=minute))
+        spawns.append(decision["action"])
+
+    assert set(spawns) == {"attach"}
+
+
+def test_an_ended_window_closes_expired_and_refuses_a_powerless_replacement(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(minutes=10)).isoformat())
+    first = _record(tmp_path, stage="verify_manifest", error="first")
+    _launch(tmp_path, signature=first["signature"], now=now)
+    after_window = now + timedelta(minutes=11)
+    second = _record(tmp_path, stage="push", error="second, after the window")
+
+    decision = _launch(tmp_path, signature=second["signature"], now=after_window)
+
+    # A window that simply ran out closes `expired`, not `abandoned`.
+    assert decision["closed"] == [{"signature": first["signature"], "state": "expired"}]
+    # The schedule (now in the past) offers no new window, so replacing the
+    # finisher would only produce a powerless session on every later failure.
+    assert decision["action"] == "skip"
+    assert decision["reason"] == "window_unavailable"
+
+
+def test_an_ended_window_is_replaced_when_the_schedule_offers_a_new_one(tmp_path: Path) -> None:
+    """The normal nightly case: the window ended at the scheduled fire, the
+    run failed, and the next fire is a day out -- a fresh finisher spawns."""
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(minutes=10)).isoformat())
+    first = _record(tmp_path, stage="verify_manifest", error="first")
+    _launch(tmp_path, signature=first["signature"], now=now)
+    after_window = now + timedelta(minutes=11)
+    _write_jobs_store(tmp_path, next_run_at=(after_window + timedelta(days=1)).isoformat())
+    second = _record(tmp_path, stage="push", error="second, after the window")
+
+    decision = _launch(tmp_path, signature=second["signature"], now=after_window)
+
+    assert decision["closed"] == [{"signature": first["signature"], "state": "expired"}]
+    assert decision["action"] == "spawn"
+    # Capped at 4h by KTD5, not stretched to tomorrow's fire.
+    assert investigator.parse_timestamp(decision["expires_at"]) == after_window + timedelta(hours=4)
+
+
+def test_maybe_launch_investigator_spawns_detached_with_the_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_jobs_store(tmp_path, next_run_at=(datetime.now(timezone.utc) + timedelta(hours=2)).isoformat())
+    result = _record(tmp_path)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(investigator, "spawn_detached", spawned.append)
+
+    decision = investigator.maybe_launch_investigator(result)
+
+    assert decision["action"] == "spawn"
+    assert len(spawned) == 1
+    assert spawned[0][-4:] == ["--artifact", result["artifact_path"],
+                               "--authority-token", decision["token_path"]]
+
+
+def test_maybe_launch_investigator_attaches_without_spawning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_jobs_store(tmp_path, next_run_at=(datetime.now(timezone.utc) + timedelta(hours=2)).isoformat())
+    first = _record(tmp_path, stage="verify_manifest", error="first")
+    monkeypatch.setattr(investigator, "spawn_detached", lambda argv: None)
+    investigator.maybe_launch_investigator(first)
+    second = _record(tmp_path, stage="apply_foundations", error="second")
+    monkeypatch.setattr(
+        investigator, "spawn_detached",
+        lambda argv: (_ for _ in ()).throw(AssertionError("a live finisher must absorb the failure")),
+    )
+
+    decision = investigator.maybe_launch_investigator(second)
+
+    assert decision["action"] == "attach"
+    assert decision["attached_to"] == first["signature"]
+
+
+# ── the goal contract (R12) ─────────────────────────────────────────────────
+
+
+def _goal_for(tmp_path: Path) -> str:
+    artifact = json.loads(Path(_record(tmp_path)["artifact_path"]).read_text(encoding="utf-8"))
+    return investigator.build_goal(artifact, authority_token_path=tmp_path / "token.json")
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "orphan evidence",
+        "before ANY mutation",
+        "release lock",
+        "cron progress transcript",
+        "smallest local fix",
+        "sync.py deploy --from-sha <committed sha> --provisional",
+        "--authority-token",
+        "REAL RECONSTRUCTION CONFLICT",
+        "force-with-lease push, prerelease publish, public checksum verification",
+        "re-checked in code immediately before each privileged action",
+        "heartbeat --job",
+        "stale heartbeat closes this incident as abandoned",
+    ],
+)
+def test_goal_contract_states_the_allowed_path(tmp_path: Path, phrase: str) -> None:
+    assert phrase in _goal_for(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "running any installer",
+        "changing cron jobs, schedules, or creating any cron job (no recursive scheduling)",
+        "changing credentials",
+        "restarting the gateway or the Desktop app",
+        "deleting any release that is not an integration-* prerelease",
+        "approving a reconciliation proposal",
+        "refuses a non-TTY caller",
+        "PROPOSALS_ALLOW_NONINTERACTIVE",
+        "editing the operational copies under the Hermes scripts directory directly",
+    ],
+)
+def test_goal_contract_forbids_the_out_of_scope_actions(tmp_path: Path, phrase: str) -> None:
+    assert phrase in _goal_for(tmp_path)
+
+
+def test_goal_and_prompt_carry_the_minted_token_path(tmp_path: Path) -> None:
+    _write_jobs_store(tmp_path, next_run_at=(datetime.now(timezone.utc) + timedelta(hours=2)).isoformat())
+    result = _record(tmp_path)
+    decision = investigator.plan_investigator_launch(
+        home=tmp_path, job_id=JOB_ID, signature=result["signature"],
+        artifact_path=Path(result["artifact_path"]),
+    )
+    artifact = json.loads(Path(result["artifact_path"]).read_text(encoding="utf-8"))
+
+    assert decision["token_path"] in investigator.build_goal(artifact)
+    assert decision["token_path"] in investigator.build_prompt(artifact)
+
+
+def test_the_prompt_still_mandates_orphan_evidence_before_mutation(tmp_path: Path) -> None:
+    artifact = json.loads(Path(_record(tmp_path)["artifact_path"]).read_text(encoding="utf-8"))
+    prompt = investigator.build_prompt(artifact)
+
+    assert "orphan evidence" in prompt
+    assert "before any mutation" in prompt
+    assert "do not approve reconciliation proposals" in prompt
+
+
+# ── session identity + linkage (R11) ────────────────────────────────────────
+
+
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def poll(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        self.stopped = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def kill(self) -> None:
+        self.stopped = True
+
+
+class _FakeTransport:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((method, params))
+        if method == "session.create":
+            return {"result": {"session_id": "sess1234", "stored_session_id": "20260815_investigator"}}
+        if method == "slash.exec" and str(params.get("command", "")).startswith("goal status"):
+            return {"result": {"status": "done"}}
+        if method == "slash.exec":
+            return {"result": {"type": "send"}}
+        return {"result": {}}
+
+
+def test_session_create_params_carry_the_investigator_identity(tmp_path: Path) -> None:
+    artifact = json.loads(Path(_record(tmp_path)["artifact_path"]).read_text(encoding="utf-8"))
+
+    params = investigator.session_create_params(artifact)
+
+    assert params["source"] == "desktop"
+    assert params["cron_session"] == JOB_ID
+    assert params["close_on_disconnect"] is False
+    assert params["title"] == f"Release investigator · {JOB_ID} · {artifact['signature'][:8]}"
+
+
+def test_run_artifact_links_the_created_session_to_the_token_and_the_incident(
+    tmp_path: Path,
+) -> None:
+    _write_jobs_store(tmp_path, next_run_at=(datetime.now(timezone.utc) + timedelta(hours=2)).isoformat())
+    result = _record(tmp_path)
+    decision = investigator.plan_investigator_launch(
+        home=tmp_path, job_id=JOB_ID, signature=result["signature"],
+        artifact_path=Path(result["artifact_path"]),
+    )
+    transport = _FakeTransport()
+
+    assert investigator.run_artifact(
+        Path(result["artifact_path"]),
+        authority_token_path=Path(decision["token_path"]),
+        transport_factory=lambda: (_FakeProcess(), transport),
+        lifecycle_seconds=0.0,
+    ) is True
+
+    created = dict(transport.requests[0][1])
+    assert transport.requests[0][0] == "session.create"
+    assert created["source"] == "desktop"
+    assert created["title"].startswith("Release investigator · ")
+    # The session id the spawner could not know at mint is patched into both
+    # the authority record and the incident.
+    token = json.loads(Path(decision["token_path"]).read_text(encoding="utf-8"))
+    assert token["session_id"] == "sess1234"
+    state = json.loads(Path(result["state_path"]).read_text(encoding="utf-8"))
+    assert state["open"][result["signature"]]["session_id"] == "sess1234"
+    # Patching the session id leaves the token valid (digest is claim-only).
+    assert investigator.verify_authority(
+        token_path=decision["token_path"], job_id=JOB_ID, action="publish", home=tmp_path,
+    )["ok"] is True
+    goal_command = transport.requests[1][1]["command"]
+    assert goal_command.startswith("goal Finish or fail-closed")
+    assert decision["token_path"] in goal_command
