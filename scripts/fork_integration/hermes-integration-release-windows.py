@@ -2888,8 +2888,12 @@ def ensure_clean_identity() -> tuple[str, str]:
         fail(f"integration worktree is absent: {WORKTREE}")
     if git("branch", "--show-current") != BRANCH:
         fail(f"worktree is not on {BRANCH}")
-    if _real_dirt(git("status", "--porcelain").splitlines()):
-        fail("integration worktree is dirty; no rebase was attempted")
+    # Under the exclusive cron lock the scheduler worktree never carries
+    # human work — only dead runs' debris (e.g. run 12's case-collision
+    # aftermath left a tracked file deleted on disk). Self-heal instead of
+    # refusing; _ensure_pristine_tree still fails on anything it cannot
+    # restore.
+    _ensure_pristine_tree("run_start")
     old_head = git("rev-parse", "HEAD")
     # This checkout uses a deliberately narrow fork fetch refspec. Materialize
     # the configured integration branch explicitly so a branch rename does not
