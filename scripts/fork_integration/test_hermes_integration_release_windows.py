@@ -664,6 +664,36 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         ledger = json.loads(parked_path.read_text(encoding="utf-8"))
         self.assertEqual(ledger["entries"][0]["status"], "applied")
 
+    def test_upstream_pin_liveness_rules(self) -> None:
+        """File pin: honored while fresh, ignored+removed when expired."""
+        tip = self.base
+        pinned = self.write_and_commit("pin.txt", "pin\n", "pinned base commit")
+        old_pin_path = release.UPSTREAM_PIN_PATH
+        release.UPSTREAM_PIN_PATH = self.repo / ".git" / "upstream-pin.json"
+        try:
+            with chdir(self.repo):
+                # Fresh pin wins over the tip.
+                release.UPSTREAM_PIN_PATH.write_text(json.dumps({
+                    "sha": pinned,
+                    "expires_at": (release.datetime.now(release.timezone.utc)
+                                   + __import__("datetime").timedelta(hours=1)).isoformat(),
+                }), encoding="utf-8")
+                self.assertEqual(release._resolve_upstream_base(tip), pinned)
+                # Expired pin is ignored AND removed (self-cleaning).
+                release.UPSTREAM_PIN_PATH.write_text(json.dumps({
+                    "sha": pinned,
+                    "expires_at": (release.datetime.now(release.timezone.utc)
+                                   - __import__("datetime").timedelta(hours=1)).isoformat(),
+                }), encoding="utf-8")
+                self.assertEqual(release._resolve_upstream_base(tip), tip)
+                self.assertFalse(release.UPSTREAM_PIN_PATH.exists())
+                # A successful publish consumes a live pin.
+                release.UPSTREAM_PIN_PATH.write_text(json.dumps({"sha": pinned}), encoding="utf-8")
+                release._consume_upstream_pin_on_publish()
+                self.assertFalse(release.UPSTREAM_PIN_PATH.exists())
+        finally:
+            release.UPSTREAM_PIN_PATH = old_pin_path
+
     def test_ntfs_case_phantoms_are_tolerated_not_dirt(self) -> None:
         """Two index entries differing only by case can never both exist on
         NTFS; the perpetual 'modified' loser is a phantom (2026-08-17 11:39)."""

@@ -2717,6 +2717,60 @@ def _lock_is_reclaimable(info: dict[str, Any]) -> bool:
     return not _lock_holder_pid_alive(pid)
 
 
+# ── upstream base pin: single-shot, TTL-bounded, always-measured ────────────
+UPSTREAM_PIN_PATH = HERMES_HOME / "cron" / "fork-integration-upstream-pin.json"
+
+
+def _resolve_upstream_base(upstream_tip: str) -> str:
+    """Return the base for this run: a live, unexpired pin or the tip.
+
+    The pin's liveness rules mirror the exclusive lock's dead-PID doctrine:
+    - env pin (HERMES_UPSTREAM_PIN) is ephemeral by construction — it dies
+      with the operator's shell and can never reach the cron;
+    - the file pin is single-shot (deleted by a successful publish) and
+      TTL-bounded — an expired file is ignored loudly and removed, so a
+      crashed retry loop cannot wedge the base beyond its window.
+    """
+    env_pin = os.environ.get("HERMES_UPSTREAM_PIN", "").strip()
+    if env_pin:
+        if git("cat-file", "-t", env_pin, check=False) != "commit":
+            raise RuntimeError(f"HERMES_UPSTREAM_PIN is not a known commit: {env_pin}")
+        log(f"UPSTREAM_PINNED source=env pin={env_pin} tip_was={upstream_tip}")
+        return env_pin
+    try:
+        payload = json.loads(UPSTREAM_PIN_PATH.read_text(encoding="utf-8"))
+        sha = str(payload.get("sha", "")).strip()
+        expires_at = datetime.fromisoformat(str(payload.get("expires_at")))
+    except FileNotFoundError:
+        return upstream_tip
+    except Exception as exc:
+        log(f"WARNING unreadable upstream pin ignored and removed: {exc}")
+        UPSTREAM_PIN_PATH.unlink(missing_ok=True)
+        return upstream_tip
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) >= expires_at:
+        log(f"UPSTREAM_PIN_EXPIRED ignored and removed: sha={sha} expired_at={expires_at.isoformat()}")
+        UPSTREAM_PIN_PATH.unlink(missing_ok=True)
+        return upstream_tip
+    if git("cat-file", "-t", sha, check=False) != "commit":
+        log(f"WARNING upstream pin names unknown commit, ignored and removed: {sha}")
+        UPSTREAM_PIN_PATH.unlink(missing_ok=True)
+        return upstream_tip
+    log(f"UPSTREAM_PINNED source=file pin={sha} expires_at={expires_at.isoformat()} tip_was={upstream_tip}")
+    return sha
+
+
+def _consume_upstream_pin_on_publish() -> None:
+    """Single-shot: a successful publish retires the pin that produced it."""
+    try:
+        if UPSTREAM_PIN_PATH.exists():
+            UPSTREAM_PIN_PATH.unlink()
+            log("UPSTREAM_PIN_CONSUMED by successful publish")
+    except OSError as exc:
+        log(f"WARNING could not consume upstream pin: {exc}")
+
+
 def _clear_stale_worktree_index_lock() -> None:
     """Remove an index lock left in OUR worktree by a dead release run.
 
@@ -3237,17 +3291,20 @@ def main() -> int:
             git("fetch", UPSTREAM_REMOTE, "--prune", timeout=300)
             git("fetch", FORK_REMOTE, "--prune", timeout=300)
             stage = "resolve_refs"
-            upstream = git("rev-parse", f"{UPSTREAM_REMOTE}/{UPSTREAM_REF.removeprefix('refs/heads/')}")
+            upstream_tip = git("rev-parse", f"{UPSTREAM_REMOTE}/{UPSTREAM_REF.removeprefix('refs/heads/')}")
             # Retry-loop determinism (2026-08-17): chasing upstream's tip
             # across retries reshuffles conflicts and invalidates the
-            # resolution cache. An operator pin freezes the base until a
-            # publish lands; the next unpinned run catches the delta.
-            upstream_pin = os.environ.get("HERMES_UPSTREAM_PIN", "").strip()
-            if upstream_pin:
-                if git("cat-file", "-t", upstream_pin, check=False) != "commit":
-                    raise RuntimeError(f"HERMES_UPSTREAM_PIN is not a known commit: {upstream_pin}")
-                log(f"UPSTREAM_PINNED pin={upstream_pin} tip_was={upstream}")
-                upstream = upstream_pin
+            # resolution cache. A pin freezes the base until a publish lands.
+            # Liveness discipline mirrors the lock's dead-PID rule: the file
+            # pin is single-shot (deleted on successful publish), TTL-bounded
+            # (expired pins are ignored, loudly, and removed), and every run
+            # measures how far behind the live tip its base sits.
+            upstream = _resolve_upstream_base(upstream_tip)
+            upstream_behind_by = git(
+                "rev-list", "--count", f"{upstream}..{upstream_tip}", check=False
+            ) or "0"
+            if upstream != upstream_tip:
+                log(f"UPSTREAM_BASE_BEHIND_TIP behind_by={upstream_behind_by} base={upstream} tip={upstream_tip}")
             # R7: "this run's fetched upstream when available" for provenance
             # derivation -- recorded as soon as it is resolved so a failure
             # anywhere downstream (including inside fail()) still derives
@@ -3392,6 +3449,7 @@ def main() -> int:
             repaired_release = verify_existing_integration_release(rebased_output_head, expected_sha=checksum)
             if not repaired_release["complete"]:
                 raise RuntimeError(f"published release integrity verification failed: {repaired_release['reason']}")
+            _consume_upstream_pin_on_publish()
             stage = "sync_operational_copies"
             emit_stage("sync")
             sync_outcome = sync_operational_copies(rebased_output_head)
@@ -3405,6 +3463,7 @@ def main() -> int:
                 "branch_pushed": branch_pushed,
                 "head": rebased_output_head,
                 "upstream": upstream,
+                "upstream_behind_by": upstream_behind_by,
                 "release": release_url,
                 "tag": tag,
                 "launcher": public_asset,
