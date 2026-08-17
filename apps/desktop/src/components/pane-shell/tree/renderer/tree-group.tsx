@@ -228,13 +228,22 @@ function ZoneMenu({
  *  it (and its scroll position) stays exactly as it was. Which classes toggle,
  *  which are permanent, and the kill switch all live in pane-visibility.ts.
  *
- *  `grid min-h-full`, never `h-full`: pane bodies size themselves against the
- *  layer (`h-full` flex columns), so the wrapper has to hand its child a
- *  definite block size WITHOUT taking one itself — an extrinsic height would
- *  override the remembered-size placeholder the hidden state depends on. A
- *  stretched auto row does both: it fills the layer when the content is short
- *  and grows with the content when it isn't. */
-function PaneContent({ active, children, contained }: { active: boolean; children: ReactNode; contained: boolean }) {
+ *  Intrinsic panes keep `grid min-h-full`: they may legitimately use the pane
+ *  layer as their scroller. Viewport-bound app/page panes instead take the
+ *  layer's exact active height so their own nested scroll surfaces stay
+ *  constrained. Once hidden they return to intrinsic sizing before content is
+ *  skipped, preserving the remembered-size placeholder contract. */
+function PaneContent({
+  active,
+  children,
+  contained,
+  viewportBounded
+}: {
+  active: boolean
+  children: ReactNode
+  contained: boolean
+  viewportBounded: boolean
+}) {
   // Kill switch: no wrapper at all, so a disabled build is the pre-containment
   // DOM verbatim rather than a half-applied version of it.
   if (!contained) {
@@ -243,7 +252,11 @@ function PaneContent({ active, children, contained }: { active: boolean; childre
 
   return (
     <div
-      className={cn('grid min-h-full', PANE_CONTENT_INTRINSIC_SIZE_CLASS, !active && PANE_CONTENT_SKIPPED_CLASS)}
+      className={cn(
+        viewportBounded && active ? 'grid h-full min-h-0' : 'grid min-h-full',
+        PANE_CONTENT_INTRINSIC_SIZE_CLASS,
+        !active && PANE_CONTENT_SKIPPED_CLASS
+      )}
       data-pane-content=""
     >
       {children}
@@ -719,6 +732,7 @@ export function TreeGroup({
           ) : (
             keptPanes.map(paneId => {
               const pane = paneFor(paneId)
+              const chrome = paneChrome(pane)
               const isActive = paneId === activeId
 
               return (
@@ -739,7 +753,11 @@ export function TreeGroup({
                     <PaneGroupContext.Provider value={node.id}>
                       <PaneLifecycleContext.Provider value={paneLifecycle[paneId]?.lifecycle ?? 'visible'}>
                         <PaneVisibleContext.Provider value={isActive}>
-                          <PaneContent active={isActive} contained={containment}>
+                          <PaneContent
+                            active={isActive}
+                            contained={containment}
+                            viewportBounded={Boolean(chrome.placement && chrome.placement !== 'floating')}
+                          >
                             <ContribBoundary id={pane.id} key={paneEpochs[paneId] ?? 0}>
                               <ContribRender render={pane.render} />
                             </ContribBoundary>
