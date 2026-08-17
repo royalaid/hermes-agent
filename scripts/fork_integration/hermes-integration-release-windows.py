@@ -1983,7 +1983,17 @@ def _validate_required_records(
         # and never re-verified cannot silently drift from what output_commit
         # actually contains.
         recomputed = stable_patch_id(output_commit) if output_commit else None
-        if recomputed is None or recomputed not in accepted or recomputed != recorded_patch_id:
+        # An in-job conflict resolution's identity is by definition outside
+        # the accepted set; its recorded artifact is the approval evidence
+        # (user directive 2026-08-16). Internal consistency (recomputed ==
+        # recorded) is still mandatory for every record.
+        in_job_resolution = (
+            record.get("status") == "applied_in_job_resolution"
+            and bool(record.get("resolution_artifact"))
+        )
+        if recomputed is None or recomputed != recorded_patch_id or (
+            recomputed not in accepted and not in_job_resolution
+        ):
             raise RuntimeError(
                 f"required {label} application record identity does not match reconstructed output: "
                 f"source={patch['commit']} output={output_commit} recorded={recorded_patch_id} recomputed={recomputed}"
@@ -2086,7 +2096,15 @@ def validate_published_commit_preservation(
             # conflict-resolution portion (or to an already-represented empty).
             source_patch_id = _commit_patch_id(published)
             if source_patch_id is not None and record.get("output_patch_id") != source_patch_id:
-                raise RuntimeError(f"published commit was not preserved by patch identity: {published}")
+                # An in-job conflict resolution legitimately changes the
+                # patch identity; its artifact is the preservation evidence
+                # (user directive 2026-08-16/17 — reconcile in-job, do not
+                # stop the nightly for a mechanical identity mismatch).
+                if not (
+                    record.get("status") == "applied_in_job_resolution"
+                    and record.get("resolution_artifact")
+                ):
+                    raise RuntimeError(f"published commit was not preserved by patch identity: {published}")
         return
     commits = _represented_commits(upstream, rebased_head)
     identities = {patch_id for commit in commits if (patch_id := _commit_patch_id(commit)) is not None}

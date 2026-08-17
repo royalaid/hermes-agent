@@ -517,6 +517,13 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.assertEqual(record["resolution_artifact"], str(artifacts[0]))
         # No human review request was written: the job proved the resolution.
         self.assertEqual(list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json")), [])
+        # Regression (landmine found 2026-08-17): the preservation validator
+        # must accept the artifact-backed identity change instead of failing
+        # the run after a successful in-job resolution.
+        with chdir(self.repo):
+            release.validate_published_commit_preservation(
+                [conflict], upstream, head, records=records
+            )
 
     def test_generated_file_conflict_is_preresolved_not_sent_to_backend(self) -> None:
         """uv.lock never reaches the resolver: base side taken, regen deferred."""
@@ -855,6 +862,11 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         artifacts = list((self.repo / ".git" / "reviews").glob("reconstruction-resolution-*.json"))
         self.assertEqual(len(artifacts), 1)
         self.assertEqual(json.loads(artifacts[0].read_text(encoding="utf-8"))["kind"], "component")
+        # Regression (landmine found 2026-08-17): the required-record
+        # validator must accept the artifact-backed identity instead of
+        # rejecting it as unapproved after a successful in-job resolution.
+        with chdir(self.repo):
+            release._validate_required_records([patch], head, records, "component")
 
     def test_required_patch_conflict_falls_back_closed_when_backend_refuses(self) -> None:
         self.command("git", "checkout", "-qb", "required-source")
