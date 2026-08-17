@@ -1,17 +1,47 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, type Locator, type Page, test } from '@playwright/test'
 
-import { setupMockBackend, type MockBackendFixture, waitForAppReady } from './fixtures'
+import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
 
 interface SidebarLayout {
   contentOverflowY: string
   sectionsOverflowY: string
   sectionBodyOverflows: string[]
   navBottom: number
-  firstHeaderTop: number
-  lastHeaderBottom: number
+  sectionsTop: number
+  sectionsBottom: number
   profileTop: number
   sidebarTop: number
   sidebarBottom: number
+}
+
+async function scrollMetrics(
+  target: Locator
+): Promise<{ clientHeight: number; scrollHeight: number; scrollTop: number }> {
+  return target.first().evaluate(element => {
+    let owner: HTMLElement | null = element as HTMLElement
+
+    while (owner && !['auto', 'scroll'].includes(getComputedStyle(owner).overflowY)) {
+      owner = owner.parentElement
+    }
+
+    if (!owner) {
+      throw new Error('No vertical scroll owner found')
+    }
+
+    return { clientHeight: owner.clientHeight, scrollHeight: owner.scrollHeight, scrollTop: owner.scrollTop }
+  })
+}
+
+async function resetScroll(target: Locator): Promise<void> {
+  await target.first().evaluate(element => {
+    let owner: HTMLElement | null = element as HTMLElement
+
+    while (owner && !['auto', 'scroll'].includes(getComputedStyle(owner).overflowY)) {
+      owner = owner.parentElement
+    }
+
+    owner?.scrollTo({ top: 0 })
+  })
 }
 
 async function sidebarLayout(page: Page): Promise<SidebarLayout> {
@@ -21,19 +51,17 @@ async function sidebarLayout(page: Page): Promise<SidebarLayout> {
     const content = sections.closest<HTMLElement>('[data-sidebar="content"]')!
     const nav = content.firstElementChild as HTMLElement
     const profile = content.lastElementChild as HTMLElement
-    const headers = [...sections.querySelectorAll<HTMLElement>('div')].filter(element =>
-      element.classList.contains('group/section')
-    )
     const bodies = [...sections.querySelectorAll<HTMLElement>('[data-sidebar="group-content"]')]
     const sidebarRect = sidebar.getBoundingClientRect()
+    const sectionsRect = sections.getBoundingClientRect()
 
     return {
       contentOverflowY: getComputedStyle(content).overflowY,
       sectionsOverflowY: getComputedStyle(sections).overflowY,
       sectionBodyOverflows: bodies.map(body => getComputedStyle(body).overflowY),
       navBottom: nav.getBoundingClientRect().bottom,
-      firstHeaderTop: headers[0]?.getBoundingClientRect().top ?? sections.getBoundingClientRect().top,
-      lastHeaderBottom: headers.at(-1)?.getBoundingClientRect().bottom ?? sections.getBoundingClientRect().bottom,
+      sectionsTop: sectionsRect.top,
+      sectionsBottom: sectionsRect.bottom,
       profileTop: profile.getBoundingClientRect().top,
       sidebarTop: sidebarRect.top,
       sidebarBottom: sidebarRect.bottom
@@ -43,11 +71,11 @@ async function sidebarLayout(page: Page): Promise<SidebarLayout> {
 
 function expectAnchoredLayout(layout: SidebarLayout): void {
   expect(layout.contentOverflowY).toBe('hidden')
-  expect(layout.sectionsOverflowY).toBe('hidden')
+  expect(layout.sectionsOverflowY).toBe('auto')
   expect(layout.sectionBodyOverflows.length).toBeGreaterThan(0)
-  expect(layout.sectionBodyOverflows.every(overflow => overflow === 'auto')).toBe(true)
-  expect(layout.navBottom).toBeLessThanOrEqual(layout.firstHeaderTop)
-  expect(layout.lastHeaderBottom).toBeLessThanOrEqual(layout.profileTop)
+  expect(layout.sectionBodyOverflows.every(overflow => overflow === 'visible')).toBe(true)
+  expect(layout.navBottom).toBeLessThanOrEqual(layout.sectionsTop)
+  expect(layout.sectionsBottom).toBeLessThanOrEqual(layout.profileTop)
   expect(layout.profileTop).toBeGreaterThanOrEqual(layout.sidebarTop)
   expect(layout.profileTop).toBeLessThan(layout.sidebarBottom)
 }
@@ -66,7 +94,7 @@ test.describe('sidebar scroll containment', () => {
     await fixture?.cleanup()
   })
 
-  test('anchors shell chrome while section bodies own scrolling at normal and compact heights', async () => {
+  test('anchors shell chrome while the section stack scrolls from headers and rows', async () => {
     const { app, page } = fixture
 
     const composer = page.locator('[contenteditable="true"]').first()
@@ -83,12 +111,84 @@ test.describe('sidebar scroll containment', () => {
     await page.waitForTimeout(250)
     expectAnchoredLayout(await sidebarLayout(page))
 
-    // Exercise the actual section scroller while the compact geometry is on
-    // screen; the recorded Playwright video then proves the anchored chrome
-    // remains fixed through both the resize and scroll interaction.
-    const body = page.locator('[data-sidebar-sections] [data-sidebar="group-content"]').last()
-    await body.hover()
+    // Force the section stack to overflow without changing list behavior.
+    await page.locator('[data-sidebar-sections]').evaluate(sections => {
+      const filler = document.createElement('div')
+      filler.dataset.scrollFixture = ''
+      filler.style.flex = '0 0 800px'
+      sections.append(filler)
+    })
+    const row = page.locator('[data-sidebar-sections] [data-slot="row-button"]').last()
+    const header = page.locator('[data-sidebar-sections] button').first()
+    const beforeHeader = await scrollMetrics(header)
+
+    expect(beforeHeader.scrollHeight).toBeGreaterThan(beforeHeader.clientHeight)
+    await header.hover()
     await page.mouse.wheel(0, 500)
-    await page.waitForTimeout(750)
+    await expect.poll(async () => (await scrollMetrics(header)).scrollTop).toBeGreaterThan(beforeHeader.scrollTop)
+
+    await resetScroll(header)
+    await row.hover()
+    await page.mouse.wheel(0, 500)
+    await expect.poll(async () => (await scrollMetrics(row)).scrollTop).toBeGreaterThan(0)
+  })
+
+  test('scrolls Skills and Tools over controls and keeps MCP viewport-bound', async () => {
+    const { page } = fixture
+
+    await page.getByRole('button', { name: 'Capabilities' }).click()
+    const firstRow = page.getByRole('button', { name: /airtable Productivity/i })
+    await firstRow.waitFor({ state: 'visible' })
+
+    const beforeRow = await scrollMetrics(firstRow)
+
+    expect(beforeRow.scrollHeight).toBeGreaterThan(beforeRow.clientHeight)
+    await firstRow.hover()
+    await page.mouse.wheel(0, 500)
+    await expect.poll(async () => (await scrollMetrics(firstRow)).scrollTop).toBeGreaterThan(0)
+
+    await resetScroll(firstRow)
+    const firstSwitch = page.getByRole('switch', { name: 'airtable' })
+    const beforeSwitch = await scrollMetrics(firstSwitch)
+
+    await firstSwitch.hover()
+    await page.mouse.wheel(0, 500)
+    await expect.poll(async () => (await scrollMetrics(firstSwitch)).scrollTop).toBeGreaterThan(beforeSwitch.scrollTop)
+
+    await page.getByRole('button', { name: /^Tools/ }).click()
+    const firstToolSwitch = page.getByRole('switch').first()
+    await firstToolSwitch.waitFor({ state: 'visible' })
+    const beforeToolSwitch = await scrollMetrics(firstToolSwitch)
+
+    expect(beforeToolSwitch.scrollHeight).toBeGreaterThan(beforeToolSwitch.clientHeight)
+    await firstToolSwitch.hover()
+    await page.mouse.wheel(0, 500)
+    await expect.poll(async () => (await scrollMetrics(firstToolSwitch)).scrollTop).toBeGreaterThan(0)
+
+    await page.getByRole('button', { name: /^MCP/ }).click()
+    await page.getByRole('button', { name: 'Catalog', exact: true }).click()
+    const serversTab = page.getByRole('button', { name: 'Servers', exact: true })
+    await serversTab.waitFor({ state: 'visible' })
+
+    const mcpLayout = await serversTab.evaluate(element => {
+      const pane = element.closest<HTMLElement>('[data-pane-content]')
+      const list = element.parentElement?.nextElementSibling as HTMLElement | null
+
+      if (!pane?.parentElement || !list) {
+        throw new Error('MCP pane geometry is incomplete')
+      }
+
+      return {
+        listClientHeight: list.clientHeight,
+        listOverflowY: getComputedStyle(list).overflowY,
+        paneClientHeight: pane.clientHeight,
+        paneLayerClientHeight: pane.parentElement.clientHeight
+      }
+    })
+
+    expect(mcpLayout.paneClientHeight).toBe(mcpLayout.paneLayerClientHeight)
+    expect(mcpLayout.listOverflowY).toBe('auto')
+    expect(mcpLayout.listClientHeight).toBeGreaterThan(0)
+    expect(mcpLayout.listClientHeight).toBeLessThanOrEqual(mcpLayout.paneClientHeight)
   })
 })
