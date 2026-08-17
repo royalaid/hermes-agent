@@ -423,11 +423,24 @@ def _failure_investigator_settings() -> dict[str, str]:
         settings["profile"] = str(configured.get("profile") or "")
         runtime_config = config
         if settings["profile"]:
-            profile_config_path = HERMES_HOME / "profiles" / settings["profile"] / "config.yaml"
-            profile_config = yaml.safe_load(profile_config_path.read_text(encoding="utf-8")) or {}
-            if not isinstance(profile_config, dict):
-                raise ValueError("investigator profile config is not a mapping")
-            runtime_config = profile_config
+            try:
+                profile_config_path = HERMES_HOME / "profiles" / settings["profile"] / "config.yaml"
+                profile_config = yaml.safe_load(profile_config_path.read_text(encoding="utf-8")) or {}
+                if not isinstance(profile_config, dict):
+                    raise ValueError("investigator profile config is not a mapping")
+                runtime_config = profile_config
+            except Exception as profile_exc:
+                # A broken or renamed profile must never kill agent dispatch:
+                # every incident investigation AND parked-commit resolution
+                # brief flows through here (audit hole #2, 2026-08-17). Fall
+                # back to the default home, loudly, instead of pointing
+                # spawns at an unusable profile.
+                log(
+                    f"WARNING investigator profile {settings['profile']!r} unusable "
+                    f"({type(profile_exc).__name__}); dispatching in default home"
+                )
+                settings["profile"] = ""
+                runtime_config = config
         model_config = runtime_config.get("model", {}) if isinstance(runtime_config.get("model"), dict) else {}
         agent_config = runtime_config.get("agent", {}) if isinstance(runtime_config.get("agent"), dict) else {}
         settings["model"] = str(configured.get("model") or model_config.get("default") or "")

@@ -664,6 +664,25 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         ledger = json.loads(parked_path.read_text(encoding="utf-8"))
         self.assertEqual(ledger["entries"][0]["status"], "applied")
 
+    def test_broken_investigator_profile_falls_back_to_default_home(self) -> None:
+        """A missing/corrupt profile must never kill agent dispatch (audit #2)."""
+        home = self.repo / ".git" / "fake-home"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(
+            "release_failure_investigator:\n  profile: does-not-exist\n"
+            "model:\n  default: fallback-model\n  provider: fallback-provider\n",
+            encoding="utf-8",
+        )
+        old_home = release.HERMES_HOME
+        release.HERMES_HOME = home
+        try:
+            settings = release._failure_investigator_settings()
+        finally:
+            release.HERMES_HOME = old_home
+        self.assertEqual(settings["profile"], "")
+        self.assertEqual(settings["model"], "fallback-model")
+        self.assertEqual(settings["provider"], "fallback-provider")
+
     def test_upstream_pin_liveness_rules(self) -> None:
         """File pin: honored while fresh, ignored+removed when expired."""
         tip = self.base
