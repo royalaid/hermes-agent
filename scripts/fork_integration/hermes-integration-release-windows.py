@@ -2084,23 +2084,12 @@ def _ensure_pristine_tree(context: str) -> None:
     untracked debris, log loudly, and fail only if the tree still cannot be
     made pristine.
     """
-    porcelain = [line for line in git("status", "--porcelain").splitlines() if line]
+    porcelain = git("status", "--porcelain")
     if not porcelain:
         return
-    log(f"WORKTREE_INTERFERENCE context={context} entries={porcelain[:10]!r}")
-    tracked = [line[3:] for line in porcelain if not line.startswith("??")]
-    untracked = [line[3:] for line in porcelain if line.startswith("??")]
-    if tracked:
-        git("checkout", "--", *tracked, check=False)
-    for path in untracked:
-        target = WORKTREE / path
-        try:
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-        except OSError as exc:
-            log(f"WARNING could not remove untracked debris {path}: {exc}")
+    log(f"WORKTREE_INTERFERENCE context={context} entries={porcelain.splitlines()[:10]!r}")
+    _git_write_with_lock_retry("reset", "--hard", "HEAD", timeout=120)
+    git("clean", "-fd", timeout=120)
     remaining = git("status", "--porcelain")
     if remaining:
         raise RuntimeError(

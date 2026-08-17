@@ -667,7 +667,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
     def test_pristine_tree_self_heals_external_interference(self) -> None:
         """Mid-run deletion/edit of OUR files is interference to restore, not
         a run-killer (three live sightings on contributors/emails 2026-08-17)."""
-        (self.repo / "base.txt").write_text("tampered\n", encoding="utf-8")
+        (self.repo / "base.txt").unlink()
         (self.repo / "debris.txt").write_text("junk\n", encoding="utf-8")
         old_worktree = release.WORKTREE
         release.WORKTREE = self.repo
