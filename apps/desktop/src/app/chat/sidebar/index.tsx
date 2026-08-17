@@ -227,11 +227,14 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
 // Vertical scroll only — never a horizontal bar from glow bleed, long titles,
 // etc. The bar itself only shows while the pointer is in the list.
 const SCROLL_Y = 'overflow-y-auto overflow-x-hidden overscroll-contain scrollbar-fade'
+const NESTED_SCROLL_Y = 'overflow-y-auto overflow-x-hidden scrollbar-fade'
 
-// Every section body remains the scroll authority at compact heights. Reducing
-// the cap keeps every following header reachable without moving the navigation
-// or profile rail and without allowing one busy section to consume the stack.
-const GROUP_BODY = cn(SCROLL_Y, 'compact:max-h-16')
+// The section stack is the sidebar's one ordinary scroll authority. Individual
+// groups stay visible inside it so wheel input over rows, switches, or headers
+// all moves the same surface. The virtualized recents list remains the sole
+// exception and chains into this outer scroller at its boundaries.
+const SCROLL_GUTTER = '[scrollbar-gutter:stable]'
+const GROUP_BODY = 'max-h-none overflow-visible'
 
 // Section-header action icons stay hidden until the whole header row is hovered
 // (group/section lives on SidebarSectionHeader), mirroring the artifacts/file
@@ -1571,7 +1574,7 @@ export function ChatSidebar({
 
         {showSessionSections && (
           <div
-            className="flex min-h-0 flex-1 flex-col overflow-hidden pb-1.75"
+            className={cn('flex min-h-0 flex-1 flex-col pb-1.75', SCROLL_Y, SCROLL_GUTTER)}
             data-sessions-mode={sessionsMode}
             data-sessions-project={inProject ? (enteredProjectId ?? undefined) : undefined}
             data-sidebar-sections=""
@@ -1579,7 +1582,7 @@ export function ChatSidebar({
             {trimmedQuery && (
               <SidebarSessionsSection
                 activeSessionId={activeSidebarSessionId}
-                contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y)}
+                contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', NESTED_SCROLL_Y)}
                 emptyState={
                   searchPending ? (
                     <SidebarSessionSkeletons />
@@ -1638,11 +1641,7 @@ export function ChatSidebar({
                 // the overview previews all render the same card.
                 card={cardRows}
                 collapsible={!inProject}
-                contentClassName={cn(
-                  'flex min-h-0 flex-1 flex-col gap-px pb-1.75',
-                  SCROLL_Y,
-                  'compact:max-h-24'
-                )}
+                contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', NESTED_SCROLL_Y)}
                 dndSensors={dndSensors}
                 emptyState={
                   showSessionSkeletons ? (
@@ -1799,9 +1798,7 @@ export function ChatSidebar({
                 projectRepoWorktrees={inProject ? scopedRepoWorktrees : undefined}
                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
                 removedSessionIds={inProject ? removedSessionIds : undefined}
-                rootClassName={cn(
-                  'min-h-20 flex-1 overflow-hidden p-0 compact:min-h-0'
-                )}
+                rootClassName={cn('min-h-20 flex-1 overflow-hidden p-0 compact:min-h-0')}
                 sessions={displayAgentSessions}
                 sortable={!showAllProfiles && agentSessions.length > 1}
               />
