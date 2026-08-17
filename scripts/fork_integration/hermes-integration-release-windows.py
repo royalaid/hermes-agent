@@ -33,7 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1558,6 +1558,15 @@ IN_JOB_RECONCILIATION = True
 RESOLUTION_BACKEND = None  # tests inject a fake; None selects the claude backend
 
 
+#: Machine-generated files never reach the LLM resolver (witnessed 2026-08-17:
+#: a resolver burned its whole turn budget on a uv.lock conflict). They are
+#: pre-resolved to the reconstruction base's side and regenerated afterwards.
+MACHINE_GENERATED_CONFLICTS = ("uv.lock",)
+#: Regenerate uv.lock via ``uv lock`` after a resolution that pre-resolved it.
+#: Module-level so tests can disable the subprocess.
+UV_LOCK_REGEN = True
+
+
 def _claude_resolution_backend(prompt: str, conflicted: list[str]) -> str:
     """Run a bounded, non-interactive resolver inside the job's worktree."""
     result = run(
@@ -1565,10 +1574,25 @@ def _claude_resolution_backend(prompt: str, conflicted: list[str]) -> str:
         "--model", "opus", "--effort", "high",
         "--allowedTools", "Read,Edit,Grep,Glob",
         "--permission-mode", "acceptEdits",
-        "--max-turns", "25", "--output-format", "json",
-        timeout=1200,
+        "--max-turns", "60", "--output-format", "json",
+        timeout=1800,
     )
     return result.stdout
+
+
+def _conflict_markers_remain(paths: list[str]) -> bool:
+    """True when any listed file is missing or still carries git conflict markers."""
+    for path in paths:
+        file_path = WORKTREE / path
+        if not file_path.is_file():
+            return True
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        if any(
+            line.startswith(("<<<<<<<", ">>>>>>>")) or line.rstrip() == "======="
+            for line in text.splitlines()
+        ):
+            return True
+    return False
 
 
 def _conflicted_paths() -> list[str]:
@@ -1590,47 +1614,76 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "p
             return None  # not a content conflict: a real git failure stays fatal
         # Only both-modified content conflicts are provable here. Delete and
         # rename conflicts need human intent and stay on the review path.
-        before = git("status", "--porcelain").splitlines()
-        states = {line[3:]: line[:2] for line in before if line}
+        states_snapshot = git("status", "--porcelain").splitlines()
+        states = {line[3:]: line[:2] for line in states_snapshot if line}
         if any(states.get(path) != "UU" for path in conflicted):
             return None
-        prompt = (
-            "You are resolving one git cherry-pick conflict inside an automated "
-            f"Hermes integration release. Conflicted commit: {commit} ({subject}). "
-            f"Conflicted files (both-modified): {', '.join(conflicted)}. "
-            "Edit ONLY these files, and ONLY to reconcile the conflict markers: keep "
-            "both the upstream intent (HEAD side) and the fork intent (patch side) "
-            "wherever both apply — a union resolution. Never delete either side's "
-            "behavior just to make the conflict disappear. Do not stage, commit, or "
-            "run git commands; do not touch any other file. If the sides are "
-            "genuinely irreconcilable, change nothing and say so."
-        )
-        backend = RESOLUTION_BACKEND or _claude_resolution_backend
-        transcript = backend(prompt, list(conflicted))
-        # Job-owned proof, part 1: the backend touched nothing beyond editing
-        # the conflicted files in place (their porcelain lines stay "UU").
-        after = git("status", "--porcelain").splitlines()
-        if set(after) - set(before):
-            return None
-        for path in conflicted:
-            file_path = WORKTREE / path
-            if not file_path.is_file():
-                return None
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-            if any(
-                line.startswith(("<<<<<<<", ">>>>>>>")) or line.rstrip() == "======="
-                for line in text.splitlines()
-            ):
-                return None
-            if path.endswith(".py") and run(
-                sys.executable, "-m", "py_compile", str(file_path), check=False
-            ).returncode:
-                return None
-        git("add", "--", *conflicted)
+        # Machine-generated files never reach the resolver: take the
+        # reconstruction base's side now; regenerate after the semantic
+        # resolution lands.
+        generated = [path for path in conflicted if path in MACHINE_GENERATED_CONFLICTS]
+        editable = [path for path in conflicted if path not in MACHINE_GENERATED_CONFLICTS]
+        for path in generated:
+            git("checkout", "--ours", "--", path)
+            git("add", "--", path)
+        transcript = ""
+        if editable:
+            prompt = (
+                "You are resolving one git cherry-pick conflict inside an automated "
+                f"Hermes integration release. Conflicted commit: {commit} ({subject}). "
+                f"Conflicted files (both-modified): {', '.join(editable)}. "
+                "Your ONLY tools are Read, Edit, Grep, and Glob. Bash, PowerShell, "
+                "and every other tool are unavailable — a denied call only wastes a "
+                "turn, so never attempt one. Each conflicted file contains standard "
+                "inline git conflict markers (<<<<<<< HEAD / ======= / >>>>>>>): "
+                "Read the file, reconcile, and Edit it in place. Keep both the "
+                "upstream intent (HEAD side) and the fork intent (patch side) "
+                "wherever both apply — a union resolution. Never delete either "
+                "side's behavior just to make the conflict disappear. Do not stage, "
+                "commit, or touch any other file. If the sides are genuinely "
+                "irreconcilable, change nothing and say so."
+            )
+            backend = RESOLUTION_BACKEND or _claude_resolution_backend
+            before = git("status", "--porcelain").splitlines()
+            for attempt in (1, 2):
+                transcript = backend(prompt, list(editable))
+                # Job-owned proof, part 1: the backend touched nothing beyond
+                # editing the conflicted files in place (their porcelain lines
+                # stay "UU").
+                after = git("status", "--porcelain").splitlines()
+                if set(after) - set(before):
+                    return None
+                if not _conflict_markers_remain(editable):
+                    break
+                if attempt == 2:
+                    return None
+                prompt += (
+                    " NOTE: a previous attempt left unresolved conflict markers in "
+                    "at least one listed file — finish resolving every marker."
+                )
+            for path in editable:
+                if path.endswith(".py") and run(
+                    sys.executable, "-m", "py_compile", str(WORKTREE / path), check=False
+                ).returncode:
+                    return None
+            git("add", "--", *editable)
         if _conflicted_paths():
             return None
         if run("git", "diff", "--cached", "--check", check=False).returncode:
             return None
+        uv_lock_regenerated: bool | None = None
+        if generated and UV_LOCK_REGEN:
+            regen = run("uv", "lock", check=False, timeout=600)
+            uv_lock_regenerated = regen.returncode == 0
+            if uv_lock_regenerated:
+                git("add", "--", *generated)
+            else:
+                # Publish the base side rather than fail the nightly; the
+                # build gate downstream is the real check for a stale lock.
+                log(
+                    "WARNING uv.lock regeneration failed after conflict resolution: "
+                    + ((regen.stdout or "") + (regen.stderr or "")).strip().replace("\n", " ")[-400:]
+                )
         run(
             "git", "-c", "rerere.enabled=false", "-c", "core.editor=true",
             "cherry-pick", "--continue",
@@ -1646,6 +1699,8 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "p
             "source_commit": commit,
             "subject": subject,
             "conflicted_files": conflicted,
+            "generated_files": generated,
+            "uv_lock_regenerated": uv_lock_regenerated,
             "output_commit": output_commit,
             "resolved_delta": git("show", "--format=%H %s", output_commit, "--", *conflicted)[-20000:],
             "backend_transcript_tail": (transcript or "")[-8000:],
@@ -2069,9 +2124,6 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-LOCK_STALE_AFTER = timedelta(hours=6)
-
-
 def _lock_holder_pid_alive(pid: int) -> bool:
     """Cross-platform "is this PID alive" check that never sends a real signal.
 
@@ -2131,20 +2183,18 @@ def _read_lock_info() -> dict[str, Any]:
 
 
 def _lock_is_reclaimable(info: dict[str, Any]) -> bool:
-    """A stale lock is a dead holder pid whose lock predates the grace window."""
+    """Dead holder PID = dead lock; reclaim immediately.
+
+    User directive 2026-08-17 after two runs were blocked by locks whose
+    holders had died: the PID in the lock is the sole liveness authority.
+    A lock without a parseable PID (corrupt/legacy payload) has no provable
+    owner and is equally reclaimable. The old ``LOCK_STALE_AFTER`` age gate
+    is gone — it turned every crashed run into a six-hour outage.
+    """
     pid = info.get("pid")
-    started_at = info.get("started_at")
-    if not isinstance(pid, int) or not isinstance(started_at, str):
-        return False
-    try:
-        started = datetime.fromisoformat(started_at)
-    except ValueError:
-        return False
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=timezone.utc)
-    if _lock_holder_pid_alive(pid):
-        return False
-    return datetime.now(timezone.utc) - started > LOCK_STALE_AFTER
+    if not isinstance(pid, int):
+        return True
+    return not _lock_holder_pid_alive(pid)
 
 
 @contextmanager

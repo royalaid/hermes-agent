@@ -448,6 +448,42 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
                 release.RESOLUTION_BACKEND, release.WORKTREE,
             ) = old
 
+    def test_dead_holder_lock_is_reclaimed_immediately(self) -> None:
+        """User directive 2026-08-17: dead PID = dead lock, no age grace."""
+        recent = release.datetime.now(release.timezone.utc).isoformat()
+        # PID 4_000_000 exceeds Windows' practical PID space: reliably dead.
+        self.assertTrue(release._lock_is_reclaimable(
+            {"holder": "scheduler", "pid": 4_000_000, "started_at": recent}
+        ))
+        # A lock without a provable owner is equally reclaimable.
+        self.assertTrue(release._lock_is_reclaimable(
+            {"holder": "unknown holder", "pid": None, "started_at": None}
+        ))
+        # A live holder is never reclaimed.
+        self.assertFalse(release._lock_is_reclaimable(
+            {"holder": "scheduler", "pid": os.getpid(), "started_at": recent}
+        ))
+
+    def test_claude_resolution_backend_exceeds_observed_turn_exhaustion(self) -> None:
+        captured: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+        def recording_run(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0, stdout="resolved")
+
+        release.run = recording_run
+        try:
+            result = release._claude_resolution_backend("resolve", ["base.txt"])
+        finally:
+            release.run = self.local_run
+
+        self.assertEqual(result, "resolved")
+        self.assertEqual(len(captured), 1)
+        args, kwargs = captured[0]
+        max_turns = int(args[args.index("--max-turns") + 1])
+        self.assertGreater(max_turns, 25)
+        self.assertGreaterEqual(int(str(kwargs["timeout"])), 1200)
+
     def test_replay_conflict_is_reconciled_in_job_and_recorded(self) -> None:
         conflict, published, upstream = self._conflicting_published_range()
         calls: list[list[str]] = []
@@ -481,6 +517,53 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.assertEqual(record["resolution_artifact"], str(artifacts[0]))
         # No human review request was written: the job proved the resolution.
         self.assertEqual(list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json")), [])
+
+    def test_generated_file_conflict_is_preresolved_not_sent_to_backend(self) -> None:
+        """uv.lock never reaches the resolver: base side taken, regen deferred."""
+        # uv.lock must exist in the shared base: a real repo's lock file is
+        # tracked history, so the conflict presents as both-modified (UU).
+        self.write_and_commit("uv.lock", "base lock\n", "add base lock")
+        lock_base = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.command("git", "checkout", "-qb", "published", lock_base)
+        (self.repo / "uv.lock").write_text("fork lock\n", encoding="utf-8")
+        (self.repo / "base.txt").write_text("published\n", encoding="utf-8")
+        self.command("git", "add", "uv.lock", "base.txt")
+        self.command("git", "commit", "-qm", "fork change with lock")
+        conflict = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        published = conflict
+        self.command("git", "checkout", "-q", self.initial_branch)
+        (self.repo / "uv.lock").write_text("upstream lock\n", encoding="utf-8")
+        (self.repo / "base.txt").write_text("upstream\n", encoding="utf-8")
+        self.command("git", "add", "uv.lock", "base.txt")
+        self.command("git", "commit", "-qm", "upstream change with lock")
+        upstream = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.command("git", "checkout", "-q", "published")
+
+        seen_by_backend: list[list[str]] = []
+
+        def backend(prompt: str, files: list[str]) -> str:
+            seen_by_backend.append(list(files))
+            (self.repo / "base.txt").write_text("published\nupstream\n", encoding="utf-8")
+            return "resolved editable only"
+
+        old_regen = release.UV_LOCK_REGEN
+        release.UV_LOCK_REGEN = False
+        try:
+            with self._reconciliation(backend):
+                records = release.replay_published_integration_range(published, upstream, return_records=True)
+        finally:
+            release.UV_LOCK_REGEN = old_regen
+
+        self.assertEqual(seen_by_backend, [["base.txt"]])
+        resolved = [record for record in records if record["status"] == "applied_in_job_resolution"]
+        self.assertEqual(len(resolved), 1)
+        # The generated file carries the reconstruction base's (upstream) side.
+        self.assertEqual(self.command("git", "show", "HEAD:uv.lock").stdout, "upstream lock\n")
+        self.assertEqual(self.command("git", "show", "HEAD:base.txt").stdout, "published\nupstream\n")
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+        artifacts = list((self.repo / ".git" / "reviews").glob("reconstruction-resolution-*.json"))
+        payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["generated_files"], ["uv.lock"])
 
     def test_replay_conflict_backend_leaving_markers_falls_back_closed(self) -> None:
         conflict, published, upstream = self._conflicting_published_range()
