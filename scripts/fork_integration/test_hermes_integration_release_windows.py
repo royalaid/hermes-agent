@@ -57,8 +57,12 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         release.REVIEW_DIR = self.repo / "reviews"
         release.launch_failure_investigator = lambda **_kwargs: None
         release.resolve_failure_investigator_success = lambda: None
+        # Parking must never touch the machine's real ledger from a test.
+        self.original_parked_path = release.PARKED_COMMITS_PATH
+        release.PARKED_COMMITS_PATH = self.repo / ".git" / "parked-commits.json"
 
     def tearDown(self) -> None:
+        release.PARKED_COMMITS_PATH = self.original_parked_path
         release.run = self.original_run
         release.git = self.original_git
         release.LOG_PATH = self.original_log_path
@@ -393,32 +397,29 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.assertNotEqual(self.command("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode, 0)
         self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
 
-    def test_complete_range_conflict_aborts_restores_published_head_and_writes_review(self) -> None:
+    def test_conflict_with_reconciliation_disabled_parks_and_continues(self) -> None:
+        """Even with the resolver off, content never halts the rebase (2026-08-17)."""
         self.command("git", "checkout", "-qb", "published", self.base)
         conflict = self.write_and_commit("base.txt", "published\n", "direct conflicting user fix")
         published = self.command("git", "rev-parse", "HEAD").stdout.strip()
         self.command("git", "checkout", "-q", self.initial_branch)
         upstream = self.write_and_commit("base.txt", "upstream\n", "new upstream conflict")
         self.command("git", "checkout", "-q", "published")
-        old_review_dir = release.REVIEW_DIR
-        release.REVIEW_DIR = self.repo / "reviews"
-        # Reconciliation disabled: the fail-closed review path must be intact.
         old_reconcile = release.IN_JOB_RECONCILIATION
         release.IN_JOB_RECONCILIATION = False
         try:
-            with chdir(self.repo), self.assertRaisesRegex(RuntimeError, re.escape(conflict)):
-                release.replay_published_integration_range(published, upstream)
+            with chdir(self.repo):
+                records = release.replay_published_integration_range(published, upstream, return_records=True)
         finally:
-            release.REVIEW_DIR = old_review_dir
             release.IN_JOB_RECONCILIATION = old_reconcile
 
-        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
-        status = [line for line in self.command("git", "status", "--porcelain").stdout.splitlines() if line != "?? reviews/"]
-        self.assertEqual(status, [])
+        parked = [record for record in records if record["status"] == "parked_unresolved"]
+        self.assertEqual([record["source_commit"] for record in parked], [conflict])
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), upstream)
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
         self.assertNotEqual(self.command("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode, 0)
-        reviews = list((self.repo / "reviews").glob("reconstruction-*.json"))
-        self.assertEqual(len(reviews), 1)
-        self.assertEqual(json.loads(reviews[0].read_text(encoding="utf-8"))["failed_patch"]["commit"], conflict)
+        ledger = json.loads((self.repo / ".git" / "parked-commits.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger["entries"][0]["commit"], conflict)
 
     def _conflicting_published_range(self) -> tuple[str, str, str]:
         self.command("git", "checkout", "-qb", "published", self.base)
@@ -605,21 +606,97 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
         self.assertEqual(payload["generated_files"], ["uv.lock"])
 
-    def test_replay_conflict_backend_leaving_markers_falls_back_closed(self) -> None:
+    def test_unresolvable_conflict_parks_and_replay_continues(self) -> None:
+        """Content never halts the rebase: the commit parks, the run goes on."""
+        conflict, published, upstream = self._conflicting_published_range()
+        old_parked = release.PARKED_COMMITS_PATH
+        release.PARKED_COMMITS_PATH = self.repo / ".git" / "parked-commits.json"
+        try:
+            with self._reconciliation(lambda _prompt, _files: "refused"):
+                records = release.replay_published_integration_range(published, upstream, return_records=True)
+        finally:
+            parked_path = release.PARKED_COMMITS_PATH
+            release.PARKED_COMMITS_PATH = old_parked
+
+        parked = [record for record in records if record["status"] == "parked_unresolved"]
+        self.assertEqual(len(parked), 1)
+        self.assertEqual(parked[0]["source_commit"], conflict)
+        # The rebase moved on: HEAD is the upstream reconstruction, clean.
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), upstream)
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+        # The object is pinned and the ledger carries an open retry entry.
+        self.assertEqual(
+            self.command("git", "rev-parse", parked[0]["keep_ref"]).stdout.strip(), conflict
+        )
+        ledger = json.loads(parked_path.read_text(encoding="utf-8"))
+        self.assertEqual(ledger["entries"][0]["commit"], conflict)
+        self.assertEqual(ledger["entries"][0]["status"], "open")
+        # The preservation validator accepts the parked record as evidence.
+        with chdir(self.repo):
+            release.validate_published_commit_preservation([conflict], upstream, upstream, records=records)
+
+    def test_agent_resolved_parked_commit_is_applied_on_retry(self) -> None:
+        """An agent's out-of-band resolution in the ledger wins the retry."""
+        self.command("git", "checkout", "-qb", "agent-side", self.base)
+        resolved = self.write_and_commit("agent.txt", "agent resolution\n", "agent resolved fix")
+        self.command("git", "checkout", "-q", self.initial_branch)
+        old_parked = release.PARKED_COMMITS_PATH
+        release.PARKED_COMMITS_PATH = self.repo / ".git" / "parked-commits.json"
+        release.PARKED_COMMITS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        release.PARKED_COMMITS_PATH.write_text(json.dumps({"schema": 1, "entries": [{
+            "commit": "0" * 40, "subject": "original parked", "attempts": 1,
+            "keep_ref": "refs/pinned/parked/000000000000", "status": "open",
+            "resolved_commit": resolved,
+        }]}), encoding="utf-8")
+        try:
+            with self._reconciliation(lambda _prompt, _files: "unused"):
+                records = release.retry_parked_commits()
+        finally:
+            parked_path = release.PARKED_COMMITS_PATH
+            release.PARKED_COMMITS_PATH = old_parked
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "applied_from_parked")
+        self.assertEqual(self.command("git", "show", "HEAD:agent.txt").stdout, "agent resolution\n")
+        ledger = json.loads(parked_path.read_text(encoding="utf-8"))
+        self.assertEqual(ledger["entries"][0]["status"], "applied")
+
+    def test_resolution_collapsing_to_empty_records_already_present(self) -> None:
+        """A union that equals HEAD is presence, not failure (2026-08-17 05:52)."""
+        conflict, published, upstream = self._conflicting_published_range()
+
+        def backend(prompt: str, files: list[str]) -> str:
+            # Resolve by taking exactly the upstream side: the pick collapses
+            # to an empty delta.
+            (self.repo / "base.txt").write_text("upstream\n", encoding="utf-8")
+            return "took upstream side"
+
+        with self._reconciliation(backend):
+            records = release.replay_published_integration_range(published, upstream, return_records=True)
+
+        statuses = [record["status"] for record in records]
+        self.assertEqual(statuses, ["resolved_as_already_present"])
+        self.assertEqual(records[0]["source_commit"], conflict)
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), upstream)
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+        with chdir(self.repo):
+            release.validate_published_commit_preservation([conflict], upstream, upstream, records=records)
+
+    def test_replay_conflict_backend_leaving_markers_parks_the_commit(self) -> None:
+        """An unprovable resolution parks the commit; the rebase never stops."""
         conflict, published, upstream = self._conflicting_published_range()
 
         with self._reconciliation(lambda prompt, files: "changed nothing"):
-            with self.assertRaisesRegex(RuntimeError, re.escape(conflict)):
-                release.replay_published_integration_range(published, upstream)
+            records = release.replay_published_integration_range(published, upstream, return_records=True)
 
-        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
+        parked = [record for record in records if record["status"] == "parked_unresolved"]
+        self.assertEqual([record["source_commit"] for record in parked], [conflict])
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), upstream)
         self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
         self.assertNotEqual(self.command("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode, 0)
-        reviews = list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json"))
-        self.assertEqual(len(reviews), 1)
-        self.assertEqual(json.loads(reviews[0].read_text(encoding="utf-8"))["failed_patch"]["commit"], conflict)
 
-    def test_replay_conflict_backend_touching_extra_files_falls_back_closed(self) -> None:
+    def test_replay_conflict_backend_touching_extra_files_parks_and_scrubs(self) -> None:
+        """Backend overreach parks the commit AND its debris never survives."""
         conflict, published, upstream = self._conflicting_published_range()
 
         def backend(prompt: str, files: list[str]) -> str:
@@ -628,14 +705,13 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
             return "overreached"
 
         with self._reconciliation(backend):
-            with self.assertRaisesRegex(RuntimeError, re.escape(conflict)):
-                release.replay_published_integration_range(published, upstream)
+            records = release.replay_published_integration_range(published, upstream, return_records=True)
 
-        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
+        parked = [record for record in records if record["status"] == "parked_unresolved"]
+        self.assertEqual([record["source_commit"] for record in parked], [conflict])
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), upstream)
         self.assertFalse((self.repo / "rogue.txt").exists())
         self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
-        reviews = list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json"))
-        self.assertEqual(len(reviews), 1)
 
     def test_merge_conflict_restoration_clears_index_and_worktree(self) -> None:
         self.command("git", "checkout", "-qb", "published", self.base)
@@ -650,24 +726,22 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.command("git", "checkout", "-q", self.initial_branch)
         upstream = self.write_and_commit("resolution.txt", "upstream resolution\n", "upstream resolution")
         self.command("git", "checkout", "-q", "published")
-        old_review_dir = release.REVIEW_DIR
-        release.REVIEW_DIR = self.repo / "reviews"
         old_reconcile = release.IN_JOB_RECONCILIATION
         release.IN_JOB_RECONCILIATION = False
         try:
-            with chdir(self.repo), self.assertRaisesRegex(RuntimeError, r"published merge resolution"):
-                release.replay_published_integration_range(published, upstream)
+            with chdir(self.repo):
+                records = release.replay_published_integration_range(published, upstream, return_records=True)
         finally:
-            release.REVIEW_DIR = old_review_dir
             release.IN_JOB_RECONCILIATION = old_reconcile
 
-        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
-        self.assertEqual(self.command("git", "diff", "--cached", "--name-only").stdout.strip(), "")
-        self.assertEqual(self.command("git", "diff", "--name-only").stdout.strip(), "")
+        # The side-parent commit replays; the conflicted merge delta parks
+        # with its mainline bookkeeping intact; the rebase finishes clean.
+        parked = [record for record in records if record["status"] == "parked_unresolved"]
+        self.assertEqual([record["source_commit"] for record in parked], [published])
+        self.assertEqual(parked[0]["mainline"], 1)
+        self.assertEqual(self.command("git", "show", "HEAD:side.txt").stdout, "side\n")
         self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
         self.assertNotEqual(self.command("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode, 0)
-        self.assertEqual(self.command("git", "show", "HEAD:side.txt").stdout, "side\n")
-        self.assertEqual(side, self.command("git", "rev-parse", "HEAD^2").stdout.strip())
 
     def test_clean_reconstruction_failure_writes_a_two_reviewer_brief(self) -> None:
         old_review_dir = release.REVIEW_DIR
@@ -901,7 +975,8 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         with chdir(self.repo):
             release._validate_required_records([patch], head, records, "component")
 
-    def test_required_patch_conflict_falls_back_closed_when_backend_refuses(self) -> None:
+    def test_required_patch_conflict_parks_pin_when_backend_refuses(self) -> None:
+        """An unresolvable pin parks and the reconstruction continues (2026-08-17)."""
         self.command("git", "checkout", "-qb", "required-source")
         source = self.write_and_commit("base.txt", "required fix\n", "required component fix")
         patch_id = release.stable_patch_id(source)
@@ -909,16 +984,26 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         published = self.write_and_commit("base.txt", "upstream drift\n", "conflicting upstream drift")
         patch = {"commit": source, "subject": "required component fix", "stable_patch_id": patch_id}
 
-        with self._reconciliation(lambda _prompt, _files: "changed nothing"):
-            with self.assertRaisesRegex(RuntimeError, re.escape(source)):
-                release.apply_required_patches(
+        dispatched: list[str] = []
+        old_launch = release.launch_failure_investigator
+        release.launch_failure_investigator = lambda **kwargs: dispatched.append(kwargs.get("stage", ""))
+        try:
+            with self._reconciliation(lambda _prompt, _files: "changed nothing"):
+                records = release.apply_required_patches(
                     [patch], published_input_head=published, upstream_head=published, kind="component"
                 )
+        finally:
+            release.launch_failure_investigator = old_launch
 
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "parked_unresolved")
+        self.assertEqual(records[0]["source_commit"], source)
+        self.assertEqual(dispatched, ["parked_pin_resolution"])
         self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
         self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
-        reviews = list((self.repo / ".git" / "reviews").glob("reconstruction-[0-9]*.json"))
-        self.assertEqual(len(reviews), 1)
+        # The required-record validator accepts the parked record.
+        with chdir(self.repo):
+            release._validate_required_records([patch], published, records, "component")
 
     def test_required_patch_already_present_as_an_empty_cherry_pick_is_recorded(self) -> None:
         """A clean empty pick proves the required patch is already in the target tree."""
@@ -1057,26 +1142,27 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.assertEqual(absorbed[0]["upstream_commit"], foundation_records[0]["output_commit"])
         self.assertEqual(absorbed[0]["output_patch_id"], replacement_patch_id)
 
-    def test_required_patch_conflict_restores_published_input_and_writes_review(self) -> None:
+    def test_required_foundation_conflict_parks_and_continues(self) -> None:
+        """Foundation pins follow the same park-not-stop directive (2026-08-17)."""
         self.command("git", "checkout", "-qb", "required-conflict-source")
         source = self.write_and_commit("base.txt", "required\n", "conflicting required foundation")
         self.command("git", "checkout", "-q", self.initial_branch)
         published = self.write_and_commit("base.txt", "published\n", "published direct change")
         patch = {"commit": source, "subject": "conflicting required foundation", "stable_patch_id": release.stable_patch_id(source)}
-        old_review_dir = release.REVIEW_DIR
-        release.REVIEW_DIR = self.repo / "reviews"
+        old_reconcile = release.IN_JOB_RECONCILIATION
+        release.IN_JOB_RECONCILIATION = False
         try:
-            with chdir(self.repo), self.assertRaisesRegex(RuntimeError, re.escape(source)):
-                release.apply_required_patches(
+            with chdir(self.repo):
+                records = release.apply_required_patches(
                     [patch], published_input_head=published, upstream_head=published, kind="foundation"
                 )
         finally:
-            release.REVIEW_DIR = old_review_dir
+            release.IN_JOB_RECONCILIATION = old_reconcile
+        self.assertEqual([record["status"] for record in records], ["parked_unresolved"])
+        self.assertEqual(records[0]["kind"], "foundation")
         self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), published)
         self.assertNotEqual(self.command("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode, 0)
-        reviews = list((self.repo / "reviews").glob("reconstruction-*.json"))
-        self.assertEqual(len(reviews), 1)
-        self.assertEqual(json.loads(reviews[0].read_text(encoding="utf-8"))["failed_patch"]["commit"], source)
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
 
     def test_reviewed_component_replacement_bypasses_source_conflict(self) -> None:
         self.command("git", "checkout", "-qb", "component-conflict-source")

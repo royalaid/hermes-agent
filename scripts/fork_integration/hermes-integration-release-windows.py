@@ -1413,7 +1413,9 @@ def apply_required_patches(
             if prior_application is not None:
                 output_patch_id = prior_application["output_patch_id"]
                 if output_patch_id not in _accepted_output_patch_ids(patch) and (
-                    prior_application.get("status") != "applied_in_job_resolution"
+                    prior_application.get("status") not in {
+                        "applied_in_job_resolution", "resolved_as_already_present", "parked_unresolved",
+                    }
                 ):
                     raise RuntimeError(
                         f"prior {kind} application identity was not approved: "
@@ -1450,7 +1452,14 @@ def apply_required_patches(
                     applied_commit, str(patch.get("subject", "")), kind=kind,
                 )
                 if resolution is None:
-                    raise
+                    # Content never halts the reconstruction (user directive
+                    # 2026-08-17): park the pin, dispatch it to an agent, and
+                    # keep applying everything else.
+                    parked_pin = park_unresolvable_required_patch(patch, kind)
+                    if parked_pin is None:
+                        raise  # parking machinery broke: infrastructure
+                    records.append({**parked_pin, **parked})
+                    continue
                 # The resolved output identity is by definition not in the pin's
                 # accepted set; the resolution artifact IS the approval evidence
                 # (user directive 2026-08-16: reconcile in-job instead of
@@ -1709,6 +1718,22 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "p
                     "WARNING uv.lock regeneration failed after conflict resolution: "
                     + ((regen.stdout or "") + (regen.stderr or "")).strip().replace("\n", " ")[-400:]
                 )
+        if run("git", "diff", "--cached", "--quiet", check=False).returncode == 0:
+            # The proven resolution collapsed to the current tree: the patch
+            # is already represented (witnessed live 2026-08-17 05:52 —
+            # `cherry-pick --continue` refuses the now-empty pick). Conclude
+            # as a skip and record presence, not failure.
+            git("cherry-pick", "--skip", timeout=120)
+            log(f"RECONSTRUCTION_RESOLVED_AS_PRESENT commit={commit} kind={kind}")
+            return {
+                "kind": kind,
+                "status": "resolved_as_already_present",
+                "source_commit": commit,
+                "output_commit": git("rev-parse", "HEAD"),
+                "output_patch_id": None,
+                "conflicted_files": conflicted,
+                "resolution_artifact": None,
+            }
         run(
             "git", "-c", "rerere.enabled=false", "-c", "core.editor=true",
             "cherry-pick", "--continue",
@@ -1765,6 +1790,203 @@ def _git_write_with_lock_retry(*args: str, timeout: int = 900) -> str:
         time.sleep(2)
         _clear_stale_worktree_index_lock()
         return git(*args, timeout=timeout)
+
+
+# ── park-and-continue for unresolvable published commits (2026-08-17) ───────
+# A content conflict must never halt the rebase: an unprovable resolution
+# parks the one commit (object kept alive under refs/pinned/parked/) and the
+# reconstruction keeps going. Every later run retries the parked queue —
+# upstream drift routinely dissolves these without any human touch.
+PARKED_COMMITS_PATH = HERMES_HOME / "cron" / "fork-integration-parked-commits.json"
+
+
+def _load_parked_commits() -> dict[str, Any]:
+    try:
+        data = json.loads(PARKED_COMMITS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("entries"), list):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"WARNING parked-commit ledger unreadable, starting fresh: {exc}")
+    return {"schema": 1, "entries": []}
+
+
+def _save_parked_commits(data: dict[str, Any]) -> None:
+    PARKED_COMMITS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PARKED_COMMITS_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def park_unresolvable_published_commit(commit: str, subject: str) -> dict[str, Any] | None:
+    """Skip one unresolvable commit and keep the rebase moving.
+
+    Returns ``None`` only when the parking machinery itself fails — the
+    caller treats that as infrastructure breakage and fails closed. Content
+    never fails closed.
+    """
+    try:
+        keep_ref = f"refs/pinned/parked/{commit[:12]}"
+        # Abort the stopped pick and scrub any debris a refused resolver
+        # attempt left behind (edits, stray files): the replay must continue
+        # from a pristine pre-pick tree.
+        git("cherry-pick", "--abort", check=False)
+        _git_write_with_lock_retry("reset", "--hard", "HEAD", timeout=120)
+        git("clean", "-fd", timeout=120)
+        git("update-ref", keep_ref, commit)
+        data = _load_parked_commits()
+        now = datetime.now(timezone.utc).isoformat()
+        entry = next((item for item in data["entries"] if item.get("commit") == commit), None)
+        if entry is None:
+            entry = {
+                "commit": commit, "subject": subject, "first_parked_at": now,
+                "attempts": 0, "keep_ref": keep_ref, "status": "open",
+            }
+            data["entries"].append(entry)
+        entry.update({
+            "last_parked_at": now,
+            "attempts": int(entry.get("attempts", 0)) + 1,
+            "status": "open",
+        })
+        _save_parked_commits(data)
+        log(
+            f"PUBLISHED_COMMIT_PARKED commit={commit} attempts={entry['attempts']} "
+            f"subject={subject!r} ledger={PARKED_COMMITS_PATH}"
+        )
+        # The parked commit goes to an agent for out-of-band resolution: the
+        # rebase keeps moving, the investigator session reviews the conflict
+        # in its own workspace and writes `resolved_commit` back into the
+        # ledger entry; the next run's retry loop consumes it automatically.
+        launch_failure_investigator(
+            stage="parked_commit_resolution",
+            error=(
+                f"Published commit {commit} ({subject!r}) was parked after in-job "
+                f"resolution could not be proven; the rebase continued without it. "
+                f"AGENT BRIEF: resolve this commit against current upstream in your "
+                f"OWN worktree (never the scheduler worktree at {WORKTREE}), commit "
+                f"the resolved result there, make it reachable (push a ref or fetch "
+                f"it into the scheduler clone), then set 'resolved_commit' on the "
+                f"matching entry in {PARKED_COMMITS_PATH} (status stays 'open'). "
+                f"The original object is pinned at {keep_ref}. The next release run "
+                f"applies your resolution automatically."
+            ),
+        )
+        return {
+            "kind": "published",
+            "status": "parked_unresolved",
+            "source_commit": commit,
+            "output_commit": git("rev-parse", "HEAD"),
+            "output_patch_id": None,
+            "keep_ref": keep_ref,
+            "parked_ledger": str(PARKED_COMMITS_PATH),
+        }
+    except Exception as exc:
+        log(f"WARNING parking machinery failed for {commit}: {exc}")
+        return None
+
+
+def park_unresolvable_required_patch(patch: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    """Skip one unresolvable pin application and keep the reconstruction moving.
+
+    Pins need no retry ledger: every run re-applies the manifest, so a parked
+    pin is retried nightly by construction. The dispatch below hands the
+    conflict to an agent for out-of-band resolution (reviewed_replacement or
+    accepted-identity proposal).
+    """
+    try:
+        git("cherry-pick", "--abort", check=False)
+        _git_write_with_lock_retry("reset", "--hard", "HEAD", timeout=120)
+        git("clean", "-fd", timeout=120)
+        log(
+            f"REQUIRED_PATCH_PARKED kind={kind} commit={patch['commit']} "
+            f"subject={str(patch.get('subject', ''))!r}"
+        )
+        launch_failure_investigator(
+            stage="parked_pin_resolution",
+            error=(
+                f"Required {kind} patch {patch['commit']} "
+                f"({str(patch.get('subject', ''))!r}) was parked after in-job "
+                f"resolution could not be proven; the reconstruction continued "
+                f"without it and every nightly retries it by construction. "
+                f"AGENT BRIEF: resolve the conflict against current upstream in "
+                f"your OWN worktree (never the scheduler worktree at {WORKTREE}), "
+                f"then either add a reviewed_replacement for this pin or extend "
+                f"its accepted_output_patch_ids via the manifest approval flow."
+            ),
+        )
+        return {
+            "kind": kind,
+            "status": "parked_unresolved",
+            "source_commit": patch["commit"],
+            "output_commit": git("rev-parse", "HEAD"),
+            "output_patch_id": None,
+        }
+    except Exception as exc:
+        log(f"WARNING pin parking machinery failed for {patch['commit']}: {exc}")
+        return None
+
+
+def retry_parked_commits(exclude: set[str] | None = None) -> list[dict[str, Any]]:
+    """Re-attempt open parked commits at the end of a replay.
+
+    ``exclude`` carries the commits of the range that just replayed: an
+    entry parked seconds ago by THIS run must not be immediately re-fought
+    (it would re-run the resolver and re-create whatever debris parked it).
+    """
+    exclude = exclude or set()
+    data = _load_parked_commits()
+    records: list[dict[str, Any]] = []
+    changed = False
+    for entry in data["entries"]:
+        if entry.get("status") != "open":
+            continue
+        commit = str(entry.get("commit", ""))
+        if commit in exclude:
+            continue
+        subject = str(entry.get("subject", ""))
+        # An agent may have resolved this out-of-band: its resolved commit
+        # takes precedence over re-fighting the original conflict.
+        resolved = str(entry.get("resolved_commit", "") or "")
+        pick_target = next(
+            (
+                candidate for candidate in (resolved, commit)
+                if candidate and git("cat-file", "-t", candidate, check=False) == "commit"
+            ),
+            None,
+        )
+        if pick_target is None:
+            continue
+        try:
+            _git_write_with_lock_retry("cherry-pick", "--allow-empty", pick_target)
+            resolution: dict[str, Any] | None = None
+        except Exception:
+            resolution = attempt_in_job_conflict_resolution(commit, subject)
+            if resolution is None:
+                # Scrub exactly like parking does: no conflict state or
+                # resolver debris may leak into the rest of the run.
+                git("cherry-pick", "--abort", check=False)
+                _git_write_with_lock_retry("reset", "--hard", "HEAD", timeout=120)
+                git("clean", "-fd", timeout=120)
+                entry.update({
+                    "last_parked_at": datetime.now(timezone.utc).isoformat(),
+                    "attempts": int(entry.get("attempts", 0)) + 1,
+                })
+                changed = True
+                log(f"PARKED_COMMIT_STILL_UNRESOLVED commit={commit} attempts={entry['attempts']}")
+                continue
+        entry.update({"status": "applied", "applied_at": datetime.now(timezone.utc).isoformat()})
+        changed = True
+        output_commit = git("rev-parse", "HEAD")
+        records.append(resolution or {
+            "kind": "published",
+            "status": "applied_from_parked",
+            "source_commit": commit,
+            "output_commit": output_commit,
+            "output_patch_id": _commit_patch_id(output_commit),
+        })
+        log(f"PARKED_COMMIT_APPLIED commit={commit}")
+    if changed:
+        _save_parked_commits(data)
+    return records
 
 
 def _restore_replay_checkout(published_input_head: str) -> tuple[bool, bool, str, Exception | None]:
@@ -1852,7 +2074,19 @@ def replay_published_integration_range(
                     continue
                 resolution = attempt_in_job_conflict_resolution(commit, subject)
                 if resolution is None:
-                    raise
+                    # A content conflict must NEVER halt the rebase (user
+                    # directive 2026-08-17): park this one commit — keep its
+                    # object alive, record it loudly, skip it — and keep
+                    # rebuilding everything else. Fail-closed is reserved
+                    # for infrastructure failures, not content.
+                    parked = park_unresolvable_published_commit(commit, subject)
+                    if parked is None:
+                        raise  # parking machinery itself broke: infrastructure
+                    records.append({
+                        **parked,
+                        **({"parent_count": len(parents), "mainline": 1} if is_merge else {}),
+                    })
+                    continue
                 replayed.append(commit)
                 records.append({
                     **resolution,
@@ -1869,6 +2103,9 @@ def replay_published_integration_range(
                 "output_patch_id": _commit_patch_id(output_commit),
                 **({"parent_count": len(parents), "mainline": 1} if is_merge else {}),
             })
+        # After the range replays, re-attempt anything parked by earlier
+        # runs — including agent-resolved commits waiting in the ledger.
+        records.extend(retry_parked_commits(exclude=set(commits)))
     except Exception as exc:
         in_progress, dirty, actual_head, restore_error = _restore_replay_checkout(published_input_head)
         # Operational review records may be configured inside a fixture/worktree.
@@ -2060,6 +2297,11 @@ def _validate_required_records(
                 f"missing or ambiguous required {label} application record: source={patch['commit']} records={len(matches)}"
             )
         record = matches[0]
+        if record.get("status") in {"parked_unresolved", "resolved_as_already_present"}:
+            # Parked by directive (honestly absent, retried every run) or
+            # proven already-represented by a collapsed-empty resolution:
+            # neither carries a fresh identity to verify.
+            continue
         output_commit = record.get("output_commit", "")
         recorded_patch_id = record.get("output_patch_id")
         accepted = _accepted_output_patch_ids(patch)
@@ -2170,7 +2412,11 @@ def validate_published_commit_preservation(
                 if record.get("parent_count") != len(parents) or record.get("mainline") != 1:
                     raise RuntimeError(f"published merge has invalid mainline preservation record: {published}")
                 merge_status = record.get("status")
-                if merge_status not in {"applied_merge_mainline", "merge_delta_already_represented"}:
+                if merge_status not in {
+                    "applied_merge_mainline", "merge_delta_already_represented",
+                    "applied_in_job_resolution", "parked_unresolved",
+                    "resolved_as_already_present",
+                }:
                     raise RuntimeError(f"published merge has invalid preservation status: {published}")
                 if merge_status == "applied_merge_mainline" and record.get("output_patch_id") is None:
                     raise RuntimeError(f"published merge delta produced no recorded output identity: {published}")
@@ -2184,11 +2430,20 @@ def validate_published_commit_preservation(
                 # An in-job conflict resolution legitimately changes the
                 # patch identity; its artifact is the preservation evidence
                 # (user directive 2026-08-16/17 — reconcile in-job, do not
-                # stop the nightly for a mechanical identity mismatch).
-                if not (
+                # stop the nightly for a mechanical identity mismatch). A
+                # parked commit is honestly absent by directive: the ledger
+                # entry plus keep-ref is its preservation evidence and the
+                # retry loop is its road back in.
+                in_job = (
                     record.get("status") == "applied_in_job_resolution"
                     and record.get("resolution_artifact")
-                ):
+                )
+                parked = (
+                    record.get("status") == "parked_unresolved"
+                    and record.get("parked_ledger")
+                )
+                already_present = record.get("status") == "resolved_as_already_present"
+                if not (in_job or parked or already_present):
                     raise RuntimeError(f"published commit was not preserved by patch identity: {published}")
         return
     commits = _represented_commits(upstream, rebased_head)
