@@ -448,6 +448,20 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
                 release.RESOLUTION_BACKEND, release.WORKTREE,
             ) = old
 
+    def test_batch_patch_ids_match_single_computation(self) -> None:
+        """One pipeline must produce byte-identical identities to per-commit calls."""
+        first = self.write_and_commit("a.txt", "alpha\n", "first change")
+        second = self.write_and_commit("b.txt", "beta\n", "second change")
+        self.command("git", "commit", "-q", "--allow-empty", "-m", "authored empty")
+        empty = self.command("git", "rev-parse", "HEAD").stdout.strip()
+
+        with chdir(self.repo):
+            batch = release._batch_patch_ids([first, second, empty])
+            self.assertEqual(batch[first], release.stable_patch_id(first))
+            self.assertEqual(batch[second], release.stable_patch_id(second))
+            self.assertIsNone(batch[empty])
+            self.assertEqual(release._batch_patch_ids([]), {})
+
     def test_dead_holder_lock_is_reclaimed_immediately(self) -> None:
         """User directive 2026-08-17: dead PID = dead lock, no age grace."""
         recent = release.datetime.now(release.timezone.utc).isoformat()

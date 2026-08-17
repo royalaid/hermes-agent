@@ -1890,6 +1890,46 @@ def _commit_patch_id(commit: str) -> str | None:
         return None
 
 
+def _batch_patch_ids(commits: list[str]) -> dict[str, str | None]:
+    """Stable patch-ids for many commits in one git pipeline per chunk.
+
+    The per-commit ``git show | git patch-id`` pair costs seconds of process
+    spawn on Windows; across a 500-commit validation scan that added up to a
+    ~45-minute stall (witnessed 2026-08-16). ``git log --no-walk -p`` emits
+    every requested commit in one stream and ``git patch-id --stable`` keys
+    each diff to its ``commit <sha>`` header, so one subprocess pair covers a
+    whole chunk. Empty commits produce no diff and stay ``None``, matching
+    ``_commit_patch_id``.
+    """
+    ids: dict[str, str | None] = {commit: None for commit in commits}
+    unique = list(dict.fromkeys(commits))
+    # 400 x 40-char SHAs stays far under the Windows 32k command-line limit.
+    for start in range(0, len(unique), 400):
+        chunk = unique[start:start + 400]
+        stream = run(
+            "git", "log", "--no-walk=unsorted", "-p", "--binary",
+            "--format=commit %H", *chunk, timeout=900,
+        ).stdout
+        result = subprocess.run(
+            [resolve_executable("git"), "patch-id", "--stable"],
+            input=stream,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+            **windows_subprocess_kwargs(),
+        )
+        if result.returncode:
+            raise RuntimeError(f"batch patch identity computation failed: {(result.stderr or '')[-400:]}")
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] in ids:
+                ids[parts[1]] = parts[0]
+    return ids
+
+
 def _accepted_output_patch_ids(patch: dict[str, Any]) -> set[str]:
     """Return source plus explicitly reviewed conflict-resolution identities."""
     return {patch["stable_patch_id"], *patch.get("accepted_output_patch_ids", [])}
@@ -1908,12 +1948,13 @@ def _resolution_records(absorbed: list[dict[str, str]], kind: str) -> list[dict[
 
 def _exact_published_records(published_commits: list[str]) -> list[dict[str, Any]]:
     """Record authoritative published commits retained by exact ancestry."""
+    patch_ids = _batch_patch_ids(published_commits)
     return [{
         "kind": "published",
         "status": "exact_reachable",
         "source_commit": commit,
         "output_commit": commit,
-        "output_patch_id": _commit_patch_id(commit),
+        "output_patch_id": patch_ids[commit],
     } for commit in published_commits]
 
 
@@ -1952,7 +1993,7 @@ def _required_patch_statuses(
         commits = _represented_commits(upstream, rebased_head)
         if len(commits) <= 500:
             identities = {
-                patch_id for commit in commits if (patch_id := _commit_patch_id(commit)) is not None
+                patch_id for patch_id in _batch_patch_ids(commits).values() if patch_id is not None
             }
             for patch, same_subject_seen in unresolved:
                 statuses.append((patch, bool(_accepted_output_patch_ids(patch) & identities), same_subject_seen))
@@ -2107,14 +2148,16 @@ def validate_published_commit_preservation(
                     raise RuntimeError(f"published commit was not preserved by patch identity: {published}")
         return
     commits = _represented_commits(upstream, rebased_head)
-    identities = {patch_id for commit in commits if (patch_id := _commit_patch_id(commit)) is not None}
+    commit_ids = _batch_patch_ids(commits)
+    identities = {patch_id for patch_id in commit_ids.values() if patch_id is not None}
     empty_subjects = {
         git("show", "-s", "--format=%s", commit)
-        for commit in commits
-        if _commit_patch_id(commit) is None
+        for commit, patch_id in commit_ids.items()
+        if patch_id is None
     }
+    published_ids = _batch_patch_ids(published_commits)
     for published in published_commits:
-        patch_id = _commit_patch_id(published)
+        patch_id = published_ids[published]
         if patch_id is not None:
             if patch_id not in identities:
                 raise RuntimeError(f"published commit was not preserved by patch identity: {published}")
