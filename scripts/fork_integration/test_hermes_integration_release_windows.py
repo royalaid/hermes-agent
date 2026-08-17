@@ -664,6 +664,27 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         ledger = json.loads(parked_path.read_text(encoding="utf-8"))
         self.assertEqual(ledger["entries"][0]["status"], "applied")
 
+    def test_ntfs_case_phantoms_are_tolerated_not_dirt(self) -> None:
+        """Two index entries differing only by case can never both exist on
+        NTFS; the perpetual 'modified' loser is a phantom (2026-08-17 11:39)."""
+        blob = subprocess.run(
+            ("git", "hash-object", "-w", "--stdin"), cwd=self.repo, input="x\n",
+            text=True, capture_output=True,
+        ).stdout.strip()
+        self.command("git", "update-index", "--add", "--cacheinfo", f"100644,{blob},Case.txt")
+        self.command("git", "update-index", "--add", "--cacheinfo", f"100644,{blob},case.txt")
+        old_worktree = release.WORKTREE
+        release.WORKTREE = self.repo
+        try:
+            with chdir(self.repo):
+                self.assertTrue(self.command("git", "status", "--porcelain").stdout.strip())
+                self.assertEqual(release._real_dirt(
+                    self.command("git", "status", "--porcelain").stdout.splitlines()
+                ), [])
+                release._ensure_pristine_tree("phantom-test")  # must not raise
+        finally:
+            release.WORKTREE = old_worktree
+
     def test_pristine_tree_self_heals_external_interference(self) -> None:
         """Mid-run deletion/edit of OUR files is interference to restore, not
         a run-killer (three live sightings on contributors/emails 2026-08-17)."""

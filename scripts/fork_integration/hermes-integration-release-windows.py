@@ -2087,14 +2087,19 @@ def _ensure_pristine_tree(context: str) -> None:
     porcelain = git("status", "--porcelain")
     if not porcelain:
         return
+    if not _real_dirt(porcelain.splitlines()):
+        log(f"NTFS_CASE_PHANTOMS tolerated context={context} entries={porcelain.splitlines()[:6]!r}")
+        return
     log(f"WORKTREE_INTERFERENCE context={context} entries={porcelain.splitlines()[:10]!r}")
     _git_write_with_lock_retry("reset", "--hard", "HEAD", timeout=120)
     git("clean", "-fd", timeout=120)
-    remaining = git("status", "--porcelain")
+    remaining = _real_dirt(git("status", "--porcelain").splitlines())
     if remaining:
         raise RuntimeError(
-            f"worktree is dirty after integration reconstruction: {remaining[:300]}"
+            f"worktree is dirty after integration reconstruction: {str(remaining)[:300]}"
         )
+    if git("status", "--porcelain"):
+        log(f"NTFS_CASE_PHANTOMS tolerated context={context} after-reset")
 
 
 def _restore_replay_checkout(published_input_head: str) -> tuple[bool, bool, str, Exception | None]:
@@ -2253,10 +2258,41 @@ def replay_published_integration_range(
     return records if return_records else replayed
 
 
+def _ntfs_phantom_paths() -> set[str]:
+    """Index paths that collide case-insensitively with another entry.
+
+    A case-insensitive filesystem can materialize only one casing, so git
+    perpetually reports the loser as modified or deleted — dirt that no
+    reset can ever clear. Witnessed 2026-08-17: upstream main carries BOTH
+    contributors/emails/agent@Agents-Mac-mini.local and
+    contributors/emails/agent@agents-Mac-mini.local. These are filesystem
+    phantoms, never evidence of interference or loss.
+    """
+    seen: dict[str, str] = {}
+    phantoms: set[str] = set()
+    for path in git("ls-files").splitlines():
+        key = path.lower()
+        if key in seen:
+            phantoms.add(path)
+            phantoms.add(seen[key])
+        else:
+            seen[key] = path
+    return phantoms
+
+
+def _real_dirt(porcelain_lines: list[str]) -> list[str]:
+    """Porcelain entries that are NOT case-collision phantoms."""
+    entries = [line for line in porcelain_lines if line]
+    if not entries:
+        return []
+    phantoms = _ntfs_phantom_paths()
+    return [line for line in entries if line[3:].strip('"') not in phantoms]
+
+
 def cherry_pick_is_cleanly_aborted() -> tuple[bool, bool]:
     """Return whether a failed single cherry-pick left state or changes behind."""
     in_progress = run("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode == 0
-    dirty = bool(git("status", "--porcelain"))
+    dirty = bool(_real_dirt(git("status", "--porcelain").splitlines()))
     return in_progress, dirty
 
 
@@ -2852,7 +2888,7 @@ def ensure_clean_identity() -> tuple[str, str]:
         fail(f"integration worktree is absent: {WORKTREE}")
     if git("branch", "--show-current") != BRANCH:
         fail(f"worktree is not on {BRANCH}")
-    if git("status", "--porcelain"):
+    if _real_dirt(git("status", "--porcelain").splitlines()):
         fail("integration worktree is dirty; no rebase was attempted")
     old_head = git("rev-parse", "HEAD")
     # This checkout uses a deliberately narrow fork fetch refspec. Materialize
