@@ -2258,6 +2258,26 @@ def _lock_is_reclaimable(info: dict[str, Any]) -> bool:
     return not _lock_holder_pid_alive(pid)
 
 
+def _clear_stale_worktree_locks() -> None:
+    """Remove git transaction locks left in OUR worktree by dead runs.
+
+    Only ever called while holding the exclusive cron lock, which makes this
+    process the sole sanctioned user of the scheduler worktree — a surviving
+    ``index.lock`` at that point is by definition debris from a killed run,
+    not a live competitor.
+    """
+    for name in ("index.lock", "MERGE_HEAD.lock", "HEAD.lock"):
+        lock = WORKTREE / ".git" / name
+        try:
+            if lock.exists():
+                lock.unlink()
+                log(f"removed stale git lock left by a dead run: {lock}")
+        except OSError as exc:
+            # A removal failure surfaces on the next git write anyway; log
+            # the earlier, clearer story now.
+            log(f"WARNING could not remove stale git lock {lock}: {exc}")
+
+
 @contextmanager
 def exclusive_lock(holder: str = "scheduler") -> Any:
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2747,6 +2767,12 @@ def main() -> int:
     stage = "prepare"
     with exclusive_lock(args.holder):
         try:
+            # Under the exclusive cron lock this process is the worktree's
+            # only sanctioned owner: any leftover git transaction lock
+            # belongs to a dead run and must not wedge this one (witnessed
+            # 2026-08-16 and 2026-08-17: killed runs left .git/index.lock,
+            # which blocked both the replay AND its restoration path).
+            _clear_stale_worktree_locks()
             stage = "identity"
             pre_run_local_head, _pre_fetch_remote_head = ensure_clean_identity()
             stage = "fetch"

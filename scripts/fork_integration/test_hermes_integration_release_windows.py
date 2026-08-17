@@ -448,6 +448,18 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
                 release.RESOLUTION_BACKEND, release.WORKTREE,
             ) = old
 
+    def test_stale_worktree_git_locks_are_cleared_under_exclusive_lock(self) -> None:
+        """A dead run's index.lock must not wedge the next run (2026-08-17)."""
+        stale = self.repo / ".git" / "index.lock"
+        stale.write_text("", encoding="utf-8")
+        old_worktree = release.WORKTREE
+        release.WORKTREE = self.repo
+        try:
+            release._clear_stale_worktree_locks()
+        finally:
+            release.WORKTREE = old_worktree
+        self.assertFalse(stale.exists())
+
     def test_batch_patch_ids_match_single_computation(self) -> None:
         """One pipeline must produce byte-identical identities to per-commit calls."""
         first = self.write_and_commit("a.txt", "alpha\n", "first change")
