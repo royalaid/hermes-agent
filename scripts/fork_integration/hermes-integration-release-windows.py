@@ -3238,6 +3238,16 @@ def main() -> int:
             git("fetch", FORK_REMOTE, "--prune", timeout=300)
             stage = "resolve_refs"
             upstream = git("rev-parse", f"{UPSTREAM_REMOTE}/{UPSTREAM_REF.removeprefix('refs/heads/')}")
+            # Retry-loop determinism (2026-08-17): chasing upstream's tip
+            # across retries reshuffles conflicts and invalidates the
+            # resolution cache. An operator pin freezes the base until a
+            # publish lands; the next unpinned run catches the delta.
+            upstream_pin = os.environ.get("HERMES_UPSTREAM_PIN", "").strip()
+            if upstream_pin:
+                if git("cat-file", "-t", upstream_pin, check=False) != "commit":
+                    raise RuntimeError(f"HERMES_UPSTREAM_PIN is not a known commit: {upstream_pin}")
+                log(f"UPSTREAM_PINNED pin={upstream_pin} tip_was={upstream}")
+                upstream = upstream_pin
             # R7: "this run's fetched upstream when available" for provenance
             # derivation -- recorded as soon as it is resolved so a failure
             # anywhere downstream (including inside fail()) still derives
