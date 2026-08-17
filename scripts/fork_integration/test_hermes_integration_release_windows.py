@@ -664,6 +664,22 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         ledger = json.loads(parked_path.read_text(encoding="utf-8"))
         self.assertEqual(ledger["entries"][0]["status"], "applied")
 
+    def test_pristine_tree_self_heals_external_interference(self) -> None:
+        """Mid-run deletion/edit of OUR files is interference to restore, not
+        a run-killer (three live sightings on contributors/emails 2026-08-17)."""
+        (self.repo / "base.txt").write_text("tampered\n", encoding="utf-8")
+        (self.repo / "debris.txt").write_text("junk\n", encoding="utf-8")
+        old_worktree = release.WORKTREE
+        release.WORKTREE = self.repo
+        try:
+            with chdir(self.repo):
+                release._ensure_pristine_tree("test")
+        finally:
+            release.WORKTREE = old_worktree
+        self.assertEqual((self.repo / "base.txt").read_text(encoding="utf-8"), "base\n")
+        self.assertFalse((self.repo / "debris.txt").exists())
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+
     def test_applied_record_with_context_drifted_patch_id_passes_preservation(self) -> None:
         """A clean pick whose patch-id drifted from neighboring resolutions is
         preserved by construction, never a validation failure (2026-08-17 09:32)."""

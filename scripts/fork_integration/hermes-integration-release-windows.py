@@ -2074,6 +2074,40 @@ def retry_parked_commits(exclude: set[str] | None = None) -> list[dict[str, Any]
     return records
 
 
+def _ensure_pristine_tree(context: str) -> None:
+    """Self-heal external interference with OUR worktree (exclusive lock held).
+
+    Something on this host intermittently deletes or edits checked-out files
+    mid-run (witnessed three times on contributors/emails/*.local paths, run
+    killers on 2026-08-17). Under the exclusive cron lock every unexplained
+    change is interference, not work: restore tracked paths, remove
+    untracked debris, log loudly, and fail only if the tree still cannot be
+    made pristine.
+    """
+    porcelain = [line for line in git("status", "--porcelain").splitlines() if line]
+    if not porcelain:
+        return
+    log(f"WORKTREE_INTERFERENCE context={context} entries={porcelain[:10]!r}")
+    tracked = [line[3:] for line in porcelain if not line.startswith("??")]
+    untracked = [line[3:] for line in porcelain if line.startswith("??")]
+    if tracked:
+        git("checkout", "--force", "--", *tracked, check=False)
+    for path in untracked:
+        target = WORKTREE / path
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except OSError as exc:
+            log(f"WARNING could not remove untracked debris {path}: {exc}")
+    remaining = git("status", "--porcelain")
+    if remaining:
+        raise RuntimeError(
+            f"worktree is dirty after integration reconstruction: {remaining[:300]}"
+        )
+
+
 def _restore_replay_checkout(published_input_head: str) -> tuple[bool, bool, str, Exception | None]:
     """Abort replay and remove all owned tracked/untracked transaction debris."""
     _clear_stale_worktree_index_lock()
@@ -2481,6 +2515,9 @@ def validate_published_commit_preservation(
     """
     if records is not None:
         by_source = {record["source_commit"]: record for record in records}
+        # One pipeline instead of a per-commit subprocess pair: the identity
+        # walk over ~100 records cost 20+ minutes serially (2026-08-17).
+        source_ids = _batch_patch_ids(published_commits)
         for published in published_commits:
             record = by_source.get(published)
             if record is None:
@@ -2510,7 +2547,7 @@ def validate_published_commit_preservation(
             # merge path above is separate because replaying all parents first
             # can reduce a merge's first-parent delta to only its unique
             # conflict-resolution portion (or to an already-represented empty).
-            source_patch_id = _commit_patch_id(published)
+            source_patch_id = source_ids[published]
             if source_patch_id is not None and record.get("output_patch_id") != source_patch_id:
                 # An in-job conflict resolution legitimately changes the
                 # patch identity; its artifact is the preservation evidence
@@ -3222,8 +3259,7 @@ def main() -> int:
             validate_published_commit_preservation(
                 published_commits, upstream, rebased_output_head, records=published_records
             )
-            if git("status", "--porcelain"):
-                raise RuntimeError("worktree is dirty after integration reconstruction")
+            _ensure_pristine_tree("post_reconstruction")
             needs_push = rebased_output_head != published_input_head
             recovering_unchanged_output = recovering_current_output and not needs_push
             stage = "verify_build"
