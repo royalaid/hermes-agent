@@ -1099,10 +1099,28 @@ def run(
 def git(*args: str, timeout: int = 900, check: bool = True, log_failure: bool | None = None) -> str:
     # Never replay a previous manual conflict resolution in this automated
     # force-push/release workflow.
-    return run(
-        "git", "-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false", *args,
-        timeout=timeout, check=check, log_failure=log_failure,
-    ).stdout.strip()
+    command = ("git", "-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false", *args)
+    try:
+        return run(
+            *command, timeout=timeout, check=check, log_failure=log_failure,
+        ).stdout.strip()
+    except RuntimeError as exc:
+        detail = str(exc)
+        if (
+            not check
+            or "index.lock" not in detail
+            or "File exists" not in detail
+            or _read_lock_info().get("pid") != os.getpid()
+        ):
+            raise
+        # A completed git child cannot still own its failed lock.  Retrying is
+        # safe only while this process owns the release lock, which excludes
+        # every other sanctioned user of the scheduler worktree.
+        _clear_stale_worktree_index_lock()
+        log(f"retrying git command after reclaiming stale index.lock: {args[0] if args else '<none>'}")
+        return run(
+            *command, timeout=timeout, check=check, log_failure=log_failure,
+        ).stdout.strip()
 
 
 def public_github_json(url: str) -> dict[str, Any]:
@@ -1412,7 +1430,7 @@ def apply_required_patches(
                 })
                 continue
             try:
-                git("cherry-pick", applied_commit, timeout=900)
+                _git_write_with_lock_retry("cherry-pick", applied_commit)
             except Exception:
                 if _cherry_pick_stopped_empty():
                     # Git has applied no delta and reports a clean index/worktree.
@@ -1568,7 +1586,13 @@ UV_LOCK_REGEN = True
 
 
 def _claude_resolution_backend(prompt: str, conflicted: list[str]) -> str:
-    """Run a bounded, non-interactive resolver inside the job's worktree."""
+    """Run a bounded, non-interactive resolver inside the job's worktree.
+
+    GIT_OPTIONAL_LOCKS=0: the agent harness runs its own git introspection
+    in its cwd (the scheduler worktree), and an optional index.lock from a
+    straggling child collided with the run's next cherry-pick (witnessed
+    2026-08-17 03:48, one pick after a successful resolution).
+    """
     result = run(
         "claude", "-p", prompt,
         "--model", "opus", "--effort", "high",
@@ -1576,6 +1600,7 @@ def _claude_resolution_backend(prompt: str, conflicted: list[str]) -> str:
         "--permission-mode", "acceptEdits",
         "--max-turns", "60", "--output-format", "json",
         timeout=1800,
+        extra_env={"GIT_OPTIONAL_LOCKS": "0"},
     )
     return result.stdout
 
@@ -1724,12 +1749,31 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "p
         return None
 
 
+def _git_write_with_lock_retry(*args: str, timeout: int = 900) -> str:
+    """Run a mutating git command, retrying once after clearing our own debris.
+
+    Under the exclusive cron lock every index.lock in the worktree is either
+    a dead run's leftover or a straggler from a resolver child that already
+    exited — both clearable. One bounded retry converts that race from a
+    run-killer into a log line (witnessed 2026-08-17 03:48).
+    """
+    try:
+        return git(*args, timeout=timeout)
+    except Exception as exc:
+        if "index.lock" not in str(exc):
+            raise
+        time.sleep(2)
+        _clear_stale_worktree_locks()
+        return git(*args, timeout=timeout)
+
+
 def _restore_replay_checkout(published_input_head: str) -> tuple[bool, bool, str, Exception | None]:
     """Abort replay and remove all owned tracked/untracked transaction debris."""
+    _clear_stale_worktree_locks()
     git("cherry-pick", "--abort", check=False)
     restore_error: Exception | None = None
     try:
-        git("reset", "--hard", published_input_head, timeout=120)
+        _git_write_with_lock_retry("reset", "--hard", published_input_head, timeout=120)
         git("clean", "-fd", timeout=120)
     except Exception as exc:
         restore_error = exc
@@ -1788,7 +1832,7 @@ def replay_published_integration_range(
                 # after all parent commits have been replayed topologically.
                 cherry_pick_args.extend(["-m", "1"])
             try:
-                git(*cherry_pick_args, commit, timeout=900)
+                _git_write_with_lock_retry(*cherry_pick_args, commit)
             except Exception:
                 if is_merge and _cherry_pick_stopped_empty():
                     # The side-parent commits can already represent the whole
@@ -2493,10 +2537,11 @@ def restore_pre_push_checkout(published_input_head: str) -> None:
     # never cleaned by a failed transaction.
     if git("branch", "--show-current") != BRANCH:
         raise RuntimeError(f"pre-push restoration refused outside {BRANCH}")
+    _clear_stale_worktree_locks()
     abort = git("cherry-pick", "--abort", check=False)
     reset_error: Exception | None = None
     try:
-        git("reset", "--hard", published_input_head, timeout=120)
+        _git_write_with_lock_retry("reset", "--hard", published_input_head, timeout=120)
         # This transaction owns only the known integration worktree and has
         # already verified its branch above.  Remove *untracked* build/replay
         # debris, but deliberately retain ignored caches (no -x).
@@ -2766,12 +2811,6 @@ def main() -> int:
     stage = "prepare"
     with exclusive_lock(args.holder):
         try:
-            # Under the exclusive cron lock this process is the worktree's
-            # only sanctioned owner: any leftover git transaction lock
-            # belongs to a dead run and must not wedge this one (witnessed
-            # 2026-08-16 and 2026-08-17: killed runs left .git/index.lock,
-            # which blocked both the replay AND its restoration path).
-            _clear_stale_worktree_index_lock()
             stage = "identity"
             pre_run_local_head, _pre_fetch_remote_head = ensure_clean_identity()
             stage = "fetch"
