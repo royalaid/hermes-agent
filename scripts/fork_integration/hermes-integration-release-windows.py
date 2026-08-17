@@ -2091,7 +2091,7 @@ def _ensure_pristine_tree(context: str) -> None:
     tracked = [line[3:] for line in porcelain if not line.startswith("??")]
     untracked = [line[3:] for line in porcelain if line.startswith("??")]
     if tracked:
-        git("checkout", "--force", "--", *tracked, check=False)
+        git("checkout", "--", *tracked, check=False)
     for path in untracked:
         target = WORKTREE / path
         try:
