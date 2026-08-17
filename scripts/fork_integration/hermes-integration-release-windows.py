@@ -2138,15 +2138,32 @@ def replay_published_integration_range(
     if not commits:
         return []
     absorbed_commits = _absorbed_published_commits(upstream_head, published_input_head, base)
+    # One metadata pass for the whole range: per-commit subject/parent
+    # subprocesses added ~4s x 100+ commits of pure spawn overhead to every
+    # replay on Windows (user question 2026-08-17: "why is a cache hit
+    # taking so long?").
+    metadata: dict[str, tuple[list[str], str]] = {}
+    for chunk_start in range(0, len(commits), 400):
+        chunk = commits[chunk_start:chunk_start + 400]
+        for line in git(
+            "log", "--no-walk=unsorted", "--format=%H%x00%P%x00%s", *chunk, timeout=300
+        ).splitlines():
+            parts = line.split("\x00")
+            if len(parts) == 3:
+                metadata[parts[0]] = ([p for p in parts[1].split() if p], parts[2])
+    absorbed_ids = _batch_patch_ids([c for c in commits if c in absorbed_commits])
     git("reset", "--hard", upstream_head, timeout=120)
     replayed: list[str] = []
     records: list[dict[str, Any]] = []
     failed_patch: dict[str, str] | None = None
     try:
         for commit in commits:
-            subject = git("show", "-s", "--format=%s", commit)
+            if commit in metadata:
+                parents, subject = metadata[commit]
+            else:
+                subject = git("show", "-s", "--format=%s", commit)
+                parents = _commit_parents(commit)
             failed_patch = {"commit": commit, "subject": subject}
-            parents = _commit_parents(commit)
             is_merge = len(parents) > 1
             if not is_merge and commit in absorbed_commits:
                 records.append({
@@ -2154,7 +2171,7 @@ def replay_published_integration_range(
                     "status": "absorbed_patch_equivalent",
                     "source_commit": commit,
                     "output_commit": upstream_head,
-                    "output_patch_id": _commit_patch_id(commit),
+                    "output_patch_id": absorbed_ids.get(commit),
                 })
                 continue
             # --allow-empty preserves authored marker/empty direct commits.  A
@@ -2213,9 +2230,17 @@ def replay_published_integration_range(
                 "status": "applied_merge_mainline" if is_merge else "applied",
                 "source_commit": commit,
                 "output_commit": output_commit,
-                "output_patch_id": _commit_patch_id(output_commit),
+                "output_patch_id": None,
+                "_pending_patch_id": True,
                 **({"parent_count": len(parents), "mainline": 1} if is_merge else {}),
             })
+        # Batch-fill applied outputs' identities in one pipeline instead of a
+        # subprocess pair per pick.
+        pending = [record for record in records if record.pop("_pending_patch_id", False)]
+        if pending:
+            output_ids = _batch_patch_ids([record["output_commit"] for record in pending])
+            for record in pending:
+                record["output_patch_id"] = output_ids.get(record["output_commit"])
         # After the range replays, re-attempt anything parked by earlier
         # runs — including agent-resolved commits waiting in the ledger.
         records.extend(retry_parked_commits(exclude=set(commits)))
@@ -3461,7 +3486,20 @@ def main() -> int:
             public_asset = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{urllib.parse.quote(launcher.name)}"
             verify_public_asset(public_asset, checksum)
             stage = "verify_published_release"
-            repaired_release = verify_existing_integration_release(rebased_output_head, expected_sha=checksum)
+            # GitHub's API is read-after-write laggy: run 15 published a
+            # complete release at :07/:09 and the :13 probe still saw
+            # release_missing, failing a fully successful run. Give
+            # propagation up to a minute before believing a negative.
+            repaired_release: dict[str, Any] = {"complete": False, "reason": "unverified"}
+            for attempt in range(5):
+                repaired_release = verify_existing_integration_release(rebased_output_head, expected_sha=checksum)
+                if repaired_release["complete"]:
+                    break
+                log(
+                    f"PUBLISH_VERIFY_RETRY attempt={attempt + 1} "
+                    f"reason={repaired_release['reason']} (API propagation grace)"
+                )
+                time.sleep(15)
             if not repaired_release["complete"]:
                 raise RuntimeError(f"published release integrity verification failed: {repaired_release['reason']}")
             _consume_upstream_pin_on_publish()
