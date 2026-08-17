@@ -1763,13 +1763,13 @@ def _git_write_with_lock_retry(*args: str, timeout: int = 900) -> str:
         if "index.lock" not in str(exc):
             raise
         time.sleep(2)
-        _clear_stale_worktree_locks()
+        _clear_stale_worktree_index_lock()
         return git(*args, timeout=timeout)
 
 
 def _restore_replay_checkout(published_input_head: str) -> tuple[bool, bool, str, Exception | None]:
     """Abort replay and remove all owned tracked/untracked transaction debris."""
-    _clear_stale_worktree_locks()
+    _clear_stale_worktree_index_lock()
     git("cherry-pick", "--abort", check=False)
     restore_error: Exception | None = None
     try:
@@ -2537,7 +2537,7 @@ def restore_pre_push_checkout(published_input_head: str) -> None:
     # never cleaned by a failed transaction.
     if git("branch", "--show-current") != BRANCH:
         raise RuntimeError(f"pre-push restoration refused outside {BRANCH}")
-    _clear_stale_worktree_locks()
+    _clear_stale_worktree_index_lock()
     abort = git("cherry-pick", "--abort", check=False)
     reset_error: Exception | None = None
     try:
