@@ -2916,7 +2916,7 @@ def inspect_dry_run() -> dict[str, Any]:
         raise RuntimeError(f"integration worktree is absent: {WORKTREE}")
     if git("branch", "--show-current") != BRANCH:
         raise RuntimeError(f"worktree is not on {BRANCH}")
-    if git("status", "--porcelain"):
+    if _real_dirt(_porcelain_lines()):
         raise RuntimeError("integration worktree is dirty; dry-run made no changes")
     pre_run_local_head = git("rev-parse", "HEAD")
     published_ref = f"refs/heads/{BRANCH}"
@@ -3007,7 +3007,10 @@ def synchronize_to_published_head(local_head: str, published_head: str) -> str:
     published_ref = f"refs/remotes/{FORK_REMOTE}/{BRANCH}"
     if git("branch", "--show-current") != BRANCH:
         raise RuntimeError(f"checked out branch must be {BRANCH}")
-    if git("status", "--porcelain"):
+    # Phantom-aware: since the 2026-08-17 publish the published tree itself
+    # carries upstream's case-collision pair, so every NTFS checkout is
+    # permanently "dirty" by one phantom line. Only real dirt refuses.
+    if _real_dirt(_porcelain_lines()):
         raise RuntimeError("dirty working tree; refusing to synchronize published head")
 
     resolved_published = git("rev-parse", "--verify", published_ref, check=False)
@@ -3028,7 +3031,7 @@ def synchronize_to_published_head(local_head: str, published_head: str) -> str:
     safety_ref = f"safety/{safe_branch}-{datetime.now(timezone.utc):%Y%m%d-%H%M%S-%f}-{local_head[:12]}"
     git("branch", safety_ref, local_head)
     git("reset", "--hard", published_head, timeout=120)
-    if git("status", "--porcelain"):
+    if _real_dirt(_porcelain_lines()):
         raise RuntimeError("worktree is dirty after synchronizing published head")
     synchronized_head = git("rev-parse", "HEAD")
     if synchronized_head != published_head:
