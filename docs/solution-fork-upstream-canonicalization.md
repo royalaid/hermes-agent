@@ -574,3 +574,30 @@ pick) and records the outcome as `applied_in_job_resolution` plus a
 `resolved_in_job` artifact. The fail-closed review-request stop is retained
 strictly as the fallback for unprovable cases. Authority, integrity, and
 restoration gates are unchanged.
+
+### 2026-08-17 v2 doctrine: the branch IS the system (holistic simplification)
+
+User directive after watching the machine live for 48 hours: "upstream with
+our changes on top" is the entire contract. Holistic evaluation concluded:
+
+- The replay engine was the only part that never lied and never wedged:
+  fetch upstream -> retire what upstream absorbed (git cherry patch-identity,
+  automatic, logged, no approvals) -> replay the branch's own commits on top
+  -> in-job resolver on conflicts -> park+agent-dispatch for the unprovable
+  -> validate preservation -> build -> force-with-lease push -> publish.
+  It replayed 106 commits with 12 autonomous conflict resolutions in one run.
+- The manifest pin machinery (components/foundations/source-refs/accepted
+  identities/reviewed replacements) was a SECOND representation of the same
+  commits, and keeping it consistent with the branch generated most real
+  failures (pins re-picked stale copies of work the branch already carried).
+  main() no longer verifies or applies pins; the manifest file remains as
+  inert reference data until fully retired.
+- Proposals remain only where a human decision is real (a retirement the
+  human wants to veto); pin-churn approval ceremony is gone with the pins.
+- The investigator's role collapses to what the user named: a simple
+  reconciliation agent, dispatched on parked commits and infrastructure
+  failures, whose sole goal is returning the branch to "upstream with our
+  changes on top." Finisher tokens/incident choreography are no longer
+  load-bearing (the idempotent nightly is the finisher).
+- Fail-closed applies to infrastructure only (git/build/push breakage),
+  never to content.

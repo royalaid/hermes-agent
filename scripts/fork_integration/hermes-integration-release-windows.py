@@ -1585,6 +1585,85 @@ IN_JOB_RECONCILIATION = True
 RESOLUTION_BACKEND = None  # tests inject a fake; None selects the claude backend
 
 
+#: Resolution cache: every proven in-job resolution is pinned and reusable,
+#: so a failed run's resolver work is never re-derived from scratch by the
+#: next attempt (user directive 2026-08-17: "why is it rerunning?!").
+RESOLUTION_CACHE_PATH = HERMES_HOME / "cron" / "fork-integration-resolution-cache.json"
+
+
+def _load_resolution_cache() -> dict[str, Any]:
+    try:
+        data = json.loads(RESOLUTION_CACHE_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"WARNING resolution cache unreadable, starting fresh: {exc}")
+    return {}
+
+
+def _record_cached_resolution(source_commit: str, resolved_commit: str) -> None:
+    """Best-effort: a cache write failure must never taint a real resolution."""
+    try:
+        keep_ref = f"refs/pinned/resolved/{source_commit[:12]}"
+        git("update-ref", keep_ref, resolved_commit)
+        cache = _load_resolution_cache()
+        cache[source_commit] = {
+            "resolved_commit": resolved_commit,
+            "keep_ref": keep_ref,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        RESOLUTION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RESOLUTION_CACHE_PATH.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log(f"WARNING could not record cached resolution for {source_commit}: {exc}")
+
+
+def _try_cached_resolution(commit: str, kind: str) -> dict[str, Any] | None:
+    """Replay a prior proven resolution of this exact commit, if one exists.
+
+    Called from inside a stopped cherry-pick. On cache miss or a cache pick
+    that no longer applies, the original conflicted state is re-created so
+    the backend path proceeds exactly as before. Never raises.
+    """
+    try:
+        entry = _load_resolution_cache().get(commit)
+        if not isinstance(entry, dict):
+            return None
+        resolved = str(entry.get("resolved_commit", ""))
+        if git("cat-file", "-t", resolved, check=False) != "commit":
+            return None
+        git("cherry-pick", "--abort", check=False)
+        try:
+            _git_write_with_lock_retry("cherry-pick", "--allow-empty", resolved)
+        except Exception:
+            # The cached resolution drifted (upstream moved again): restore
+            # the original conflict and let the live resolver take over.
+            git("cherry-pick", "--abort", check=False)
+            _git_write_with_lock_retry("reset", "--hard", "HEAD", timeout=120)
+            git("clean", "-fd", timeout=120)
+            try:
+                git("cherry-pick", "--allow-empty", commit, timeout=900)
+            except Exception:
+                pass  # conflicted again, as expected — backend path resumes
+            return None
+        output_commit = git("rev-parse", "HEAD")
+        log(f"RESOLUTION_CACHE_HIT commit={commit} resolved={resolved}")
+        return {
+            "kind": kind,
+            "status": "applied_in_job_resolution",
+            "source_commit": commit,
+            "output_commit": output_commit,
+            "output_patch_id": _commit_patch_id(output_commit),
+            "conflicted_files": [],
+            "resolution_artifact": str(entry.get("keep_ref", "")),
+        }
+    except Exception as exc:
+        log(f"WARNING cached-resolution replay failed for {commit}: {exc}")
+        return None
+
+
 #: Machine-generated files never reach the LLM resolver (witnessed 2026-08-17:
 #: a resolver burned its whole turn budget on a uv.lock conflict). They are
 #: pre-resolved to the reconstruction base's side and regenerated afterwards.
@@ -1652,6 +1731,11 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "p
         states = {line[3:]: line[:2] for line in states_snapshot if line}
         if any(states.get(path) != "UU" for path in conflicted):
             return None
+        # A prior attempt may already have proven this exact resolution:
+        # replay it in seconds instead of re-deriving it.
+        cached = _try_cached_resolution(commit, kind)
+        if cached is not None:
+            return cached
         # Machine-generated files never reach the resolver: take the
         # reconstruction base's side now; regenerate after the semantic
         # resolution lands.
@@ -1740,6 +1824,7 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "p
             timeout=300, extra_env={"GIT_EDITOR": "true"},
         )
         output_commit = git("rev-parse", "HEAD")
+        _record_cached_resolution(commit, output_commit)
         REVIEW_DIR.mkdir(parents=True, exist_ok=True)
         artifact_path = REVIEW_DIR / f"reconstruction-resolution-{datetime.now():%Y%m%d-%H%M%S}.json"
         artifact_path.write_text(json.dumps({
@@ -3084,11 +3169,6 @@ def main() -> int:
             published_input_head = git("rev-parse", f"refs/remotes/{FORK_REMOTE}/{BRANCH}")
             if not args.dry_run:
                 synchronize_to_published_head(pre_run_local_head, published_input_head)
-            stage = "verify_foundations"
-            verified_foundations = verify_upstream_foundations()
-            stage = "verify_manifest"
-            emit_stage("verify_manifest")
-            verify_manifest_sources()
             stage = "reconstruct"
             emit_stage("reconstruct")
             published_base, published_commits = published_integration_range(published_input_head, upstream)
@@ -3105,55 +3185,32 @@ def main() -> int:
                     published_input_head, upstream, return_records=True
                 )
 
-            current_output = git("rev-parse", "HEAD")
-            stage = "apply_foundations"
-            foundation_to_apply, absorbed_foundations = patch_resolution(
-                current_output, FOUNDATION_PATCHES, records=published_records, upstream_tip=upstream
-            )
-            foundation_records = _resolution_records(absorbed_foundations, "foundation")
-            foundation_records.extend(apply_required_patches(
-                foundation_to_apply,
-                published_input_head=published_input_head,
-                upstream_head=upstream,
-                kind="foundation",
-            ))
-
-            # Resolve components after foundations are present: a foundation may
-            # itself represent a required component patch, and components are
-            # required invariants rather than an exclusive published allow-list.
-            current_output = git("rev-parse", "HEAD")
-            stage = "apply_components"
-            patches_to_apply, absorbed_components = upstream_patch_resolution(
-                current_output, records=[*published_records, *foundation_records], upstream_tip=upstream
-            )
-            # Emitted on completion (not entry): the parked-pin count is the
-            # reason this stage is worth a progress line at all (KTD13/R19).
-            emit_stage(
-                "resolve",
-                detail=(
-                    f"parked={len(PARKED_PINS)} "
-                    f"absorbed={len(absorbed_foundations) + len(absorbed_components)} "
-                    f"to_apply={len(foundation_to_apply) + len(patches_to_apply)}"
-                ),
-            )
-            component_records = _resolution_records(absorbed_components, "component")
-            component_records.extend(apply_required_patches(
-                patches_to_apply,
-                published_input_head=published_input_head,
-                upstream_head=upstream,
-                kind="component",
-            ))
-
             rebased_output_head = git("rev-parse", "HEAD")
+            # The branch is the single source of truth (2026-08-17 directive:
+            # "upstream with our changes on top" is the entire contract).
+            # Retired = patch already absorbed upstream, no longer monitored;
+            # everything else replayed, resolved in-job, or parked to an
+            # agent. One tally line tells the whole story.
+            tally: dict[str, int] = {}
+            for record in published_records:
+                tally[str(record["status"])] = tally.get(str(record["status"]), 0) + 1
+            emit_stage(
+                "retire",
+                detail=" ".join(
+                    f"{status}={count}" for status, count in sorted(tally.items())
+                ) or "nothing_to_replay",
+            )
+            for record in published_records:
+                if record["status"] == "absorbed_patch_equivalent":
+                    log(f"RETIRED commit={record['source_commit']} reason=already_upstream")
+
             stage = "validate_output"
             emit_stage("validate")
-            validate_required_components(upstream, rebased_output_head, records=component_records)
-            validate_required_foundations(upstream, rebased_output_head, records=foundation_records)
             validate_published_commit_preservation(
                 published_commits, upstream, rebased_output_head, records=published_records
             )
             if git("status", "--porcelain"):
-                raise RuntimeError("worktree is dirty after integration reconstruction/application")
+                raise RuntimeError("worktree is dirty after integration reconstruction")
             needs_push = rebased_output_head != published_input_head
             recovering_unchanged_output = recovering_current_output and not needs_push
             stage = "verify_build"

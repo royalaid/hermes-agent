@@ -57,12 +57,15 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         release.REVIEW_DIR = self.repo / "reviews"
         release.launch_failure_investigator = lambda **_kwargs: None
         release.resolve_failure_investigator_success = lambda: None
-        # Parking must never touch the machine's real ledger from a test.
+        # Parking/caching must never touch the machine's real ledgers.
         self.original_parked_path = release.PARKED_COMMITS_PATH
         release.PARKED_COMMITS_PATH = self.repo / ".git" / "parked-commits.json"
+        self.original_cache_path = release.RESOLUTION_CACHE_PATH
+        release.RESOLUTION_CACHE_PATH = self.repo / ".git" / "resolution-cache.json"
 
     def tearDown(self) -> None:
         release.PARKED_COMMITS_PATH = self.original_parked_path
+        release.RESOLUTION_CACHE_PATH = self.original_cache_path
         release.run = self.original_run
         release.git = self.original_git
         release.LOG_PATH = self.original_log_path
@@ -660,6 +663,44 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.assertEqual(self.command("git", "show", "HEAD:agent.txt").stdout, "agent resolution\n")
         ledger = json.loads(parked_path.read_text(encoding="utf-8"))
         self.assertEqual(ledger["entries"][0]["status"], "applied")
+
+    def test_cached_resolution_replays_without_backend(self) -> None:
+        """A failed run's proven resolution is reused, never re-derived."""
+        conflict, published, upstream = self._conflicting_published_range()
+        # Simulate the prior attempt's resolved output: upstream + union.
+        self.command("git", "checkout", "-q", upstream)
+        resolved = self.write_and_commit("base.txt", "published\nupstream\n", "direct conflicting user fix")
+        self.command("git", "checkout", "-q", "published")
+        release.RESOLUTION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        release.RESOLUTION_CACHE_PATH.write_text(json.dumps({
+            conflict: {"resolved_commit": resolved, "keep_ref": "refs/pinned/resolved/test"}
+        }), encoding="utf-8")
+
+        def backend(_prompt: str, _files: list[str]) -> str:
+            raise AssertionError("cache hit must not invoke the backend")
+
+        with self._reconciliation(backend):
+            records = release.replay_published_integration_range(published, upstream, return_records=True)
+
+        resolved_records = [r for r in records if r["status"] == "applied_in_job_resolution"]
+        self.assertEqual(len(resolved_records), 1)
+        self.assertEqual(self.command("git", "show", "HEAD:base.txt").stdout, "published\nupstream\n")
+        self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
+
+    def test_successful_resolution_is_recorded_in_cache(self) -> None:
+        conflict, published, upstream = self._conflicting_published_range()
+
+        def backend(prompt: str, files: list[str]) -> str:
+            (self.repo / "base.txt").write_text("published\nupstream\n", encoding="utf-8")
+            return "resolved"
+
+        with self._reconciliation(backend):
+            release.replay_published_integration_range(published, upstream, return_records=True)
+
+        cache = json.loads(release.RESOLUTION_CACHE_PATH.read_text(encoding="utf-8"))
+        self.assertIn(conflict, cache)
+        head = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(cache[conflict]["resolved_commit"], head)
 
     def test_resolution_collapsing_to_empty_records_already_present(self) -> None:
         """A union that equals HEAD is presence, not failure (2026-08-17 05:52)."""
@@ -1501,8 +1542,10 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
             )
             release.verify_existing_integration_release = old_verify_release
             release.output_is_already_based_on_current_upstream = old_current_output
-        self.assertEqual([name for name, _value in calls], ["required", "foundations", "preserved"])
-        self.assertEqual(calls[2][1][0], ["direct-user-commit"])
+        # v2 core (2026-08-17): the branch is the source of truth — the only
+        # validator main() wires is published-commit preservation.
+        self.assertEqual([name for name, _value in calls], ["preserved"])
+        self.assertEqual(calls[0][1][0], ["direct-user-commit"])
 
     def test_force_with_lease_uses_fetched_sha_and_rejects_remote_race_without_retry(self) -> None:
         fixture = self.published_branch_fixture()
@@ -1599,7 +1642,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.assertEqual(self.command("git", "status", "--porcelain").stdout.strip(), "")
 
     def test_main_recovery_validates_required_components_before_build(self) -> None:
-        """A descendant of upstream is not recoverable when a component vanished."""
+        """v2: a recovered output missing a published commit dies before build."""
         calls: list[str] = []
         old = {name: getattr(release, name) for name in (
             "exclusive_lock", "fail", "emit_fleet_receipt", "ensure_clean_identity", "synchronize_to_published_head",
@@ -1623,8 +1666,10 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
             "kind": "published", "status": "exact_reachable", "source_commit": commits[0],
             "output_commit": commits[0], "output_patch_id": "a" * 40,
         }]
-        release.validate_required_components = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("missing required component"))
-        release.validate_published_commit_preservation = lambda *_args: calls.append("preservation")
+        release.validate_required_components = lambda *_args, **_kwargs: None
+        release.validate_published_commit_preservation = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(RuntimeError("missing required component"))
+        )
         def no_build_run(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
             if "fetch" in args:
                 return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
@@ -1644,7 +1689,9 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
             __import__("sys").argv = old_argv
             for name, value in old.items():
                 setattr(release, name, value)
-        self.assertEqual(calls, [], "component validation must fail before preservation/build")
+        # no_build_run's AssertionError guard already proves the build never
+        # started; the preservation failure is the death before it.
+        self.assertEqual(calls, [])
 
     def test_main_recovery_adopts_published_input_then_builds_missing_release_without_reconstruction(self) -> None:
         """Canonical adoption may reset locally; recovery must not reconstruct or rewrite it."""
