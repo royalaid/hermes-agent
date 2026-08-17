@@ -1727,7 +1727,7 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "p
             return None  # not a content conflict: a real git failure stays fatal
         # Only both-modified content conflicts are provable here. Delete and
         # rename conflicts need human intent and stay on the review path.
-        states_snapshot = git("status", "--porcelain").splitlines()
+        states_snapshot = _porcelain_lines()
         states = {line[3:]: line[:2] for line in states_snapshot if line}
         if any(states.get(path) != "UU" for path in conflicted):
             return None
@@ -1762,13 +1762,13 @@ def attempt_in_job_conflict_resolution(commit: str, subject: str, kind: str = "p
                 "irreconcilable, change nothing and say so."
             )
             backend = RESOLUTION_BACKEND or _claude_resolution_backend
-            before = git("status", "--porcelain").splitlines()
+            before = _porcelain_lines()
             for attempt in (1, 2):
                 transcript = backend(prompt, list(editable))
                 # Job-owned proof, part 1: the backend touched nothing beyond
                 # editing the conflicted files in place (their porcelain lines
                 # stay "UU").
-                after = git("status", "--porcelain").splitlines()
+                after = _porcelain_lines()
                 if set(after) - set(before):
                     return None
                 if not _conflict_markers_remain(editable):
@@ -2084,16 +2084,16 @@ def _ensure_pristine_tree(context: str) -> None:
     untracked debris, log loudly, and fail only if the tree still cannot be
     made pristine.
     """
-    porcelain = git("status", "--porcelain")
+    porcelain = _porcelain_lines()
     if not porcelain:
         return
-    if not _real_dirt(porcelain.splitlines()):
-        log(f"NTFS_CASE_PHANTOMS tolerated context={context} entries={porcelain.splitlines()[:6]!r}")
+    if not _real_dirt(porcelain):
+        log(f"NTFS_CASE_PHANTOMS tolerated context={context} entries={porcelain[:6]!r}")
         return
-    log(f"WORKTREE_INTERFERENCE context={context} entries={porcelain.splitlines()[:10]!r}")
+    log(f"WORKTREE_INTERFERENCE context={context} entries={porcelain[:10]!r}")
     _git_write_with_lock_retry("reset", "--hard", "HEAD", timeout=120)
     git("clean", "-fd", timeout=120)
-    remaining = _real_dirt(git("status", "--porcelain").splitlines())
+    remaining = _real_dirt(_porcelain_lines())
     if remaining:
         raise RuntimeError(
             f"worktree is dirty after integration reconstruction: {str(remaining)[:300]}"
@@ -2258,6 +2258,21 @@ def replay_published_integration_range(
     return records if return_records else replayed
 
 
+def _porcelain_lines() -> list[str]:
+    """RAW porcelain lines with status columns intact.
+
+    ``git()`` strips the whole stdout, which eats the FIRST line's leading
+    status column: ``" M <file>"`` became ``"M <file>"`` and ``line[3:]``
+    parsed the path as ``"ntributors/..."`` — so a single-entry porcelain
+    (always the first line) always mis-parsed (witnessed 2026-08-17 12:59,
+    phantom judged as real dirt). Never parse porcelain through git().
+    """
+    return [
+        line for line in run("git", "status", "--porcelain").stdout.splitlines()
+        if line.strip()
+    ]
+
+
 def _ntfs_phantom_paths() -> set[str]:
     """Index paths that collide case-insensitively with another entry.
 
@@ -2292,7 +2307,7 @@ def _real_dirt(porcelain_lines: list[str]) -> list[str]:
 def cherry_pick_is_cleanly_aborted() -> tuple[bool, bool]:
     """Return whether a failed single cherry-pick left state or changes behind."""
     in_progress = run("git", "rev-parse", "--verify", "-q", "CHERRY_PICK_HEAD", check=False).returncode == 0
-    dirty = bool(_real_dirt(git("status", "--porcelain").splitlines()))
+    dirty = bool(_real_dirt(_porcelain_lines()))
     return in_progress, dirty
 
 

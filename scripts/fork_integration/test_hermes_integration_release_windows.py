@@ -703,6 +703,10 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         ).stdout.strip()
         self.command("git", "update-index", "--add", "--cacheinfo", f"100644,{blob},Case.txt")
         self.command("git", "update-index", "--add", "--cacheinfo", f"100644,{blob},case.txt")
+        # COMMIT the collision: reset --hard must not be able to clear it,
+        # exactly like upstream main's contributors/emails pair (the live
+        # failure shape of runs 12 and 14).
+        self.command("git", "commit", "-qm", "case collision commit")
         old_worktree = release.WORKTREE
         release.WORKTREE = self.repo
         try:
@@ -712,6 +716,9 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
                     self.command("git", "status", "--porcelain").stdout.splitlines()
                 ), [])
                 release._ensure_pristine_tree("phantom-test")  # must not raise
+                # The phantom persists (tolerated, not "fixed") — that is
+                # the only possible steady state on this filesystem.
+                self.assertTrue(self.command("git", "status", "--porcelain").stdout.strip())
         finally:
             release.WORKTREE = old_worktree
 
