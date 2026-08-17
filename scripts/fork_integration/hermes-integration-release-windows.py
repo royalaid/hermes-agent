@@ -412,7 +412,7 @@ def redact_process_output(text: str) -> str:
 
 def _failure_investigator_settings() -> dict[str, str]:
     """Use configured model settings without creating another user-facing env var."""
-    settings = {"model": "", "provider": "", "reasoning_effort": ""}
+    settings = {"profile": "", "model": "", "provider": "", "reasoning_effort": ""}
     config_path = HERMES_HOME / "config.yaml"
     try:
         import yaml
@@ -420,8 +420,16 @@ def _failure_investigator_settings() -> dict[str, str]:
         configured = config.get("release_failure_investigator", {})
         if not isinstance(configured, dict):
             configured = {}
-        model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-        agent_config = config.get("agent", {}) if isinstance(config.get("agent"), dict) else {}
+        settings["profile"] = str(configured.get("profile") or "")
+        runtime_config = config
+        if settings["profile"]:
+            profile_config_path = HERMES_HOME / "profiles" / settings["profile"] / "config.yaml"
+            profile_config = yaml.safe_load(profile_config_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(profile_config, dict):
+                raise ValueError("investigator profile config is not a mapping")
+            runtime_config = profile_config
+        model_config = runtime_config.get("model", {}) if isinstance(runtime_config.get("model"), dict) else {}
+        agent_config = runtime_config.get("agent", {}) if isinstance(runtime_config.get("agent"), dict) else {}
         settings["model"] = str(configured.get("model") or model_config.get("default") or "")
         settings["provider"] = str(configured.get("provider") or model_config.get("provider") or "")
         settings["reasoning_effort"] = str(configured.get("reasoning_effort") or agent_config.get("reasoning_effort") or "")

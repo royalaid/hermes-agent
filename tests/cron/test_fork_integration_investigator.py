@@ -17,6 +17,7 @@ Part 1 -- authority token (this file's first half):
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -598,11 +599,18 @@ def _write_legacy_state(home: Path) -> Path:
     return path
 
 
-def _record(home: Path, *, stage: str = "verify_manifest", error: str = "boom") -> dict[str, Any]:
+def _record(
+    home: Path,
+    *,
+    stage: str = "verify_manifest",
+    error: str = "boom",
+    profile: str | None = None,
+) -> dict[str, Any]:
     return investigator.record_failure(
         job_id=JOB_ID, stage=stage, error=error, home=home, worktree=home / "worktree",
         script_path=home / "release.py", log_path=home / "log.txt",
         test_path=home / "tests.py", manifest_path=home / "manifest.json",
+        investigator={"profile": profile} if profile else None,
     )
 
 
@@ -979,6 +987,39 @@ def test_the_prompt_still_mandates_orphan_evidence_before_mutation(tmp_path: Pat
     assert "do not approve reconciliation proposals" in prompt
 
 
+def test_heartbeat_command_targets_the_incident_home_not_the_profile_home(tmp_path: Path) -> None:
+    artifact = json.loads(Path(_record(tmp_path, profile="release-investigator")["artifact_path"]).read_text(encoding="utf-8"))
+
+    command = investigator.heartbeat_command(artifact)
+
+    assert f'--home "{tmp_path}"' in command
+
+
+def test_release_job_reads_runtime_settings_from_the_investigator_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  default: wrong-default\n  provider: wrong-provider\n"
+        "release_failure_investigator:\n  profile: release-investigator\n",
+        encoding="utf-8",
+    )
+    profile_home = tmp_path / "profiles" / "release-investigator"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: profile-model\n  provider: profile-provider\n"
+        "agent:\n  reasoning_effort: high\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(release, "HERMES_HOME", tmp_path)
+
+    assert release._failure_investigator_settings() == {
+        "profile": "release-investigator",
+        "model": "profile-model",
+        "provider": "profile-provider",
+        "reasoning_effort": "high",
+    }
+
+
 # ── session identity + linkage (R11) ────────────────────────────────────────
 
 
@@ -1060,6 +1101,30 @@ def test_run_artifact_links_the_created_session_to_the_token_and_the_incident(
     goal_command = transport.requests[1][1]["command"]
     assert goal_command.startswith("goal Finish or fail-closed")
     assert decision["token_path"] in goal_command
+
+
+def test_run_artifact_starts_the_gateway_inside_the_configured_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile_home = tmp_path / "profiles" / "release-investigator"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    result = _record(tmp_path, profile="release-investigator")
+    transport = _FakeTransport()
+    observed: dict[str, str | None] = {}
+
+    def factory() -> tuple[_FakeProcess, _FakeTransport]:
+        observed["hermes_home"] = os.environ.get("HERMES_HOME")
+        return _FakeProcess(), transport
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert investigator.run_artifact(
+        Path(result["artifact_path"]),
+        transport_factory=factory,
+        lifecycle_seconds=0.0,
+    ) is True
+
+    assert observed["hermes_home"] == str(profile_home)
 
 
 # ═══ Part 3: sidebar visibility (R11) ═══════════════════════════════════════

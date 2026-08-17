@@ -817,7 +817,8 @@ def session_title(artifact: dict[str, Any]) -> str:
 def heartbeat_command(artifact: dict[str, Any]) -> str:
     return (
         f'"{python_executable()}" "{Path(__file__)}" heartbeat '
-        f'--job {artifact.get("job_id", "")} --signature {artifact.get("signature", "")}'
+        f'--job {artifact.get("job_id", "")} --signature {artifact.get("signature", "")} '
+        f'--home "{artifact.get("home", "")}"'
     )
 
 
@@ -916,6 +917,27 @@ def _default_transport() -> tuple[subprocess.Popen[str], StdioTransport]:
         stderr=subprocess.DEVNULL, text=True, encoding="utf-8", **_windows_hidden_kwargs(detached=False),
     )
     return process, StdioTransport(process)
+
+
+def configured_profile_home(artifact: dict[str, Any]) -> Path | None:
+    """Resolve the dedicated profile selected by the release job.
+
+    The incident remains owned by the scheduler's default Hermes home. Only
+    the private TUI gateway is moved into the profile home, so sessions,
+    SOUL, tools, and memory stay isolated without moving dedupe or authority
+    state away from the cron owner.
+    """
+    cfg = artifact.get("investigator") if isinstance(artifact.get("investigator"), dict) else {}
+    profile = str(cfg.get("profile", "")).strip()
+    if not profile:
+        return None
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", profile):
+        raise ValueError("invalid investigator profile name")
+    scheduler_home = Path(str(artifact.get("home", "")))
+    profile_home = scheduler_home / "profiles" / profile
+    if not (profile_home / "config.yaml").is_file():
+        raise FileNotFoundError(f"investigator profile is unavailable: {profile}")
+    return profile_home
 
 
 def _result(response: dict[str, Any]) -> dict[str, Any] | None:
@@ -1020,6 +1042,11 @@ def run_artifact(artifact_path: Path, *, authority_token_path: Path | None = Non
         if not isinstance(artifact, dict):
             return False
         artifact["artifact_path"] = str(artifact_path)
+        profile_home = configured_profile_home(artifact)
+        if profile_home is not None:
+            # This helper is a detached one-incident process. Setting its own
+            # environment is safe and makes the gateway inherit the profile.
+            os.environ["HERMES_HOME"] = str(profile_home)
     except Exception:
         return False
     try:
