@@ -20,9 +20,12 @@
  *   AND the element is rendering its contents unskipped — applying it at hide
  *   time would record nothing and collapse every hide to the static fallback.
  *   Only `content-visibility: hidden` toggles.
- * - The wrapper grows intrinsically (`min-h-full`), never `h-full`: an
- *   extrinsic height would override the remembered-size placeholder, collapse
- *   the scroller's `scrollHeight` and clamp `scrollTop` to 0 on every hide.
+ * - Intrinsic panes keep a `min-h-full` wrapper. Registered tiling panes are
+ *   viewport-bound while active so their own nested scroll surfaces stay
+ *   constrained, then return to intrinsic sizing before they are hidden.
+ *   Hidden wrappers must not keep an extrinsic height: that would override the
+ *   remembered-size placeholder, collapse the layer scroller's `scrollHeight`,
+ *   and clamp `scrollTop` to 0 on every hide.
  * - The wrapper is INSIDE the scroller, never the scroller itself, for the same
  *   reason — the scroll box and its `data-pane-hidden` marker stay exactly as
  *   they were, so the lookups below are unaffected.
