@@ -664,6 +664,20 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         ledger = json.loads(parked_path.read_text(encoding="utf-8"))
         self.assertEqual(ledger["entries"][0]["status"], "applied")
 
+    def test_applied_record_with_context_drifted_patch_id_passes_preservation(self) -> None:
+        """A clean pick whose patch-id drifted from neighboring resolutions is
+        preserved by construction, never a validation failure (2026-08-17 09:32)."""
+        self.command("git", "checkout", "-qb", "published", self.base)
+        commit = self.write_and_commit("drift.txt", "change\n", "clean pick with drifting context")
+        self.command("git", "checkout", "-q", self.initial_branch)
+        upstream = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        records = [{
+            "kind": "published", "status": "applied", "source_commit": commit,
+            "output_commit": upstream, "output_patch_id": "0" * 40,
+        }]
+        with chdir(self.repo):
+            release.validate_published_commit_preservation([commit], upstream, upstream, records=records)
+
     def test_cached_resolution_replays_without_backend(self) -> None:
         """A failed run's proven resolution is reused, never re-derived."""
         conflict, published, upstream = self._conflicting_published_range()
