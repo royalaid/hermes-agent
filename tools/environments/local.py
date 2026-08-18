@@ -680,6 +680,10 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
         for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
             env.pop(key, None)
 
+    # Credential inheritance may preserve unrelated provider keys, but it can
+    # never bypass the exact managed-host boundary for Buzz's CLI identity.
+    _enforce_managed_buzz_terminal_identity_boundary(env, os.environ)
+
     # Windows UTF-8 safety for spawned processes (#31420).
     env.setdefault("PYTHONUTF8", "1")
 

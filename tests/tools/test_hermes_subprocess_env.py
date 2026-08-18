@@ -122,6 +122,51 @@ class TestInheritCredentials:
         for var, val in _PROVIDER_SAMPLE.items():
             assert result.get(var) == val, f"{var} should survive inherit_credentials=True"
 
+    def test_buzz_identity_stripped_when_inheriting_without_managed_agent_marker(self):
+        """Credential inheritance cannot bypass the managed Buzz host boundary."""
+        buzz_identity = {
+            "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result = _build(buzz_identity, inherit_credentials=True)
+
+        for key in buzz_identity:
+            assert key not in result
+
+    def test_buzz_identity_preserved_when_inheriting_with_exact_managed_agent_marker(self):
+        """The exact managed Buzz host keeps its scoped CLI identity."""
+        buzz_identity = {
+            "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result = _build(
+            {"BUZZ_MANAGED_AGENT": "xyz.block.buzz.app", **buzz_identity},
+            inherit_credentials=True,
+        )
+
+        for key, value in buzz_identity.items():
+            assert result.get(key) == value
+
+    def test_buzz_identity_stripped_when_inheriting_with_wrong_managed_agent_marker(self):
+        """Partial and lookalike markers do not establish managed-host trust."""
+        buzz_identity = {
+            "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        for marker in ("xyz.block.buzz", "xyz.block.buzz.app.evil"):
+            result = _build(
+                {"BUZZ_MANAGED_AGENT": marker, **buzz_identity},
+                inherit_credentials=True,
+            )
+            for key in buzz_identity:
+                assert key not in result
+
     def test_tier1_secrets_stripped_even_when_inheriting(self):
         """The whole point of Tier 1: gateway/GitHub/infra secrets never reach
         a child, even a model-driving CLI that legitimately needs provider keys."""
