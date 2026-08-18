@@ -158,10 +158,9 @@ class TestDelegateSeedsChildRecord:
 class TestReapedEnvFallbackIsFillOnly:
     """file_tools' reaped-env rescue (#26211) must not overwrite the record.
 
-    The cached file_ops' ``cwd`` is a snapshot of the SHARED env, so it can
-    belong to another session — the same class of error as the
-    interrupted-command bug (#85658). The rescue may only fill an ABSENT
-    record.
+    The cached file_ops' ``cwd`` is a snapshot of that session's environment.
+    The rescue remains fill-only so it never overwrites a record that a
+    completed command already wrote for the session.
     """
 
     def _reap(self, monkeypatch, tmp_path, task_id, stale_cwd):
@@ -170,19 +169,19 @@ class TestReapedEnvFallbackIsFillOnly:
         class _StaleFileOps:
             cwd = stale_cwd
 
-        # Cached file_ops whose env was reaped: cache entry present,
-        # _active_environments empty. The cache is keyed by the COLLAPSED
-        # container id ("default" for plain sessions) — that collapse is
-        # exactly why the snapshot can belong to another session.
-        container_id = tt._resolve_container_task_id(task_id)
-        monkeypatch.setattr(ft, "_file_ops_cache", {container_id: _StaleFileOps()})
+        config = {
+            "env_type": "local",
+            "cwd": str(tmp_path),
+            "timeout": 60,
+            "lifetime_seconds": 3600,
+        }
+        # Cached file_ops whose env was reaped: cache entry present and
+        # _active_environments empty. Local caches use the exact session key.
+        environment_id = tt._resolve_environment_task_id(task_id, config)
+        monkeypatch.setattr(ft, "_file_ops_cache", {environment_id: _StaleFileOps()})
         monkeypatch.setattr(tt, "_active_environments", {})
         monkeypatch.setattr(tt, "_last_activity", {})
-        monkeypatch.setattr(
-            tt, "_get_env_config",
-            lambda: {"env_type": "local", "cwd": str(tmp_path), "timeout": 60,
-                     "lifetime_seconds": 3600},
-        )
+        monkeypatch.setattr(tt, "_get_env_config", lambda: config)
         ft._get_file_ops(task_id)
 
     def test_existing_record_survives_the_rescue(self, tmp_path, monkeypatch):

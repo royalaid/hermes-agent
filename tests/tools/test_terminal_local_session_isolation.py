@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+import tools.code_execution_tool as code_execution_tool
+import tools.file_tools as file_tools
 import tools.terminal_tool as terminal_tool
 
 
@@ -50,6 +52,35 @@ def _exercise_two_sessions(monkeypatch, env_type):
     return created_task_ids, terminal_tool._active_environments
 
 
+def _configure_direct_creation_paths(monkeypatch, env_type):
+    created_task_ids = []
+    config = {
+        "env_type": env_type,
+        "cwd": ".",
+        "timeout": 30,
+        "local_persistent": False,
+        "container_persistent": True,
+        "docker_image": "docker-image",
+        "singularity_image": "singularity-image",
+        "modal_image": "modal-image",
+        "daytona_image": "daytona-image",
+    }
+
+    def fake_create_environment(*, cwd, task_id, **_kwargs):
+        created_task_ids.append(task_id)
+        return _FakeEnvironment(cwd)
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+    return created_task_ids
+
+
 def test_local_backend_keeps_each_session_task_id(monkeypatch):
     created_task_ids, active_environments = _exercise_two_sessions(
         monkeypatch, "local"
@@ -85,6 +116,50 @@ def test_get_active_env_falls_back_to_collapsed_default(monkeypatch):
     )
 
     assert terminal_tool.get_active_env("session-a") is default_env
+
+
+def test_code_execution_local_backend_keeps_session_environment_keys(monkeypatch):
+    created_task_ids = _configure_direct_creation_paths(monkeypatch, "local")
+
+    env_a, _ = code_execution_tool._get_or_create_env("session-a")
+    env_b, _ = code_execution_tool._get_or_create_env("session-b")
+
+    assert env_a is not env_b
+    assert created_task_ids == ["session-a", "session-b"]
+    assert set(terminal_tool._active_environments) == {"session-a", "session-b"}
+    assert set(terminal_tool._creation_locks) == {"session-a", "session-b"}
+
+
+def test_file_tools_local_backend_keeps_session_cache_and_creation_keys(monkeypatch):
+    created_task_ids = _configure_direct_creation_paths(monkeypatch, "local")
+
+    file_ops_a = file_tools._get_file_ops("session-a")
+    file_ops_b = file_tools._get_file_ops("session-b")
+
+    assert file_ops_a is not file_ops_b
+    assert created_task_ids == ["session-a", "session-b"]
+    assert set(terminal_tool._active_environments) == {"session-a", "session-b"}
+    assert set(terminal_tool._creation_locks) == {"session-a", "session-b"}
+    assert set(file_tools._file_ops_cache) == {"session-a", "session-b"}
+
+
+@pytest.mark.parametrize("caller", ["code_execution", "file_tools"])
+def test_direct_creation_paths_keep_container_default_sharing(monkeypatch, caller):
+    created_task_ids = _configure_direct_creation_paths(monkeypatch, "docker")
+
+    if caller == "code_execution":
+        first, _ = code_execution_tool._get_or_create_env("session-a")
+        second, _ = code_execution_tool._get_or_create_env("session-b")
+    else:
+        first = file_tools._get_file_ops("session-a")
+        second = file_tools._get_file_ops("session-b")
+
+    assert first is second
+    assert created_task_ids == ["default"]
+    assert set(terminal_tool._active_environments) == {"default"}
+    assert set(terminal_tool._creation_locks) == {"default"}
+    if caller == "file_tools":
+        assert set(file_tools._file_ops_cache) == {"default"}
 
 
 @pytest.mark.parametrize(

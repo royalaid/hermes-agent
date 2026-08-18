@@ -1389,6 +1389,20 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     return "default"
 
 
+def _resolve_environment_task_id(
+    task_id: Optional[str], config: Dict[str, Any]
+) -> str:
+    """Return the cache/creation key for the configured terminal backend.
+
+    Local environments carry mutable per-session cwd and process state, so an
+    explicit session id must remain exact. Non-local backends retain the
+    existing container alias and isolation policy unchanged.
+    """
+    if config.get("env_type") == "local":
+        return task_id or "default"
+    return _resolve_container_task_id(task_id)
+
+
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     """Return the env overrides for *task_id*, raw key first then collapsed.
 
@@ -2662,19 +2676,9 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
-        # Use task_id for environment isolation. Container backends deliberately
-        # collapse ordinary child task IDs to "default" so they can share one
-        # long-lived sandbox. The local backend is different: LocalEnvironment
-        # carries mutable cwd/session snapshots and is used by concurrent ACP
-        # sessions. Sharing it under "default" lets one ACP session overwrite
-        # another session's cwd or hold the creation lock while its terminal
-        # call is stuck. Keep local environments session-scoped; preserve the
-        # existing collapsed-key behavior for container backends.
-        effective_task_id = (
-            task_id
-            if env_type == "local" and task_id
-            else _resolve_container_task_id(task_id)
-        )
+        # Keep local state session-scoped while preserving the established
+        # alias/isolation policy for every non-local backend.
+        effective_task_id = _resolve_environment_task_id(task_id, config)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``

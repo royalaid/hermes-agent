@@ -1406,17 +1406,16 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     Thread-safe: uses the same per-task creation locks as terminal_tool to
     prevent duplicate sandbox creation from concurrent tool calls.
 
-    Note: subagent task_ids are collapsed to "default" via
-    ``_resolve_container_task_id`` so delegate_task children share the
-    parent's container and its cached file_ops. RL/benchmark task_ids with
-    a registered env override keep their isolation.
+    Local backends keep exact session keys. Non-local subagent task_ids retain
+    the established container alias/isolation policy so delegate_task children
+    share the parent's container and cached file_ops where configured.
     """
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
-        _resolve_container_task_id,
+        _resolve_environment_task_id,
         _resolve_task_host_cwd,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
@@ -1424,7 +1423,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     import time
 
     raw_task_id = task_id or "default"
-    task_id = _resolve_container_task_id(raw_task_id)
+    config = _get_env_config()
+    task_id = _resolve_environment_task_id(raw_task_id, config)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
@@ -1480,7 +1480,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         if terminal_env is None:
             from tools.terminal_tool import resolve_task_overrides
 
-            config = _get_env_config()
             env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
 
