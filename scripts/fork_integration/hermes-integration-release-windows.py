@@ -633,6 +633,14 @@ def integration_scripts_integrity_check(*, dry_run: bool) -> dict[str, Any]:
     return result
 
 
+def _best_effort_sync_log(message: str) -> None:
+    """Keep post-publish diagnostics from changing the release outcome."""
+    try:
+        log(message)
+    except Exception:
+        pass
+
+
 def sync_operational_copies(
     release_system_source_sha: str | None, published_product_sha: str,
 ) -> dict[str, Any]:
@@ -652,7 +660,7 @@ def sync_operational_copies(
     """
     if not release_system_source_sha:
         error = "verified release-system source SHA unavailable"
-        log(
+        _best_effort_sync_log(
             "WARNING post-publish sync refused: "
             f"source_sha={release_system_source_sha} "
             f"published_product_sha={published_product_sha} error={error}"
@@ -667,7 +675,7 @@ def sync_operational_copies(
         outcome = _sync_module().sync(
             release_system_source_sha, WORKTREE, HERMES_HOME / "scripts"
         )
-        log(
+        _best_effort_sync_log(
             "POST_PUBLISH_SYNC ok=true "
             f"source_sha={release_system_source_sha} "
             f"published_product_sha={published_product_sha}"
@@ -679,7 +687,7 @@ def sync_operational_copies(
             "published_product_sha": published_product_sha,
         }
     except Exception as exc:
-        log(
+        _best_effort_sync_log(
             "WARNING post-publish sync failed: "
             f"source_sha={release_system_source_sha} "
             f"published_product_sha={published_product_sha} "

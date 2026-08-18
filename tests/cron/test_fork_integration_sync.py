@@ -505,6 +505,84 @@ def test_sync_operational_copies_never_raises_and_reports_failure_honestly(
     assert any("post-publish sync failed" in line for line in logs)
 
 
+def test_sync_operational_copies_missing_source_survives_logging_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A diagnostic failure cannot retroactively fail a published release."""
+    from scripts.fork_integration.release import mod as release
+
+    sync_calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        release,
+        "_sync_module",
+        lambda: SimpleNamespace(sync=lambda *args: sync_calls.append(args)),
+    )
+    monkeypatch.setattr(
+        release,
+        "log",
+        lambda _message: (_ for _ in ()).throw(OSError("log unavailable")),
+    )
+
+    outcome = release.sync_operational_copies(None, "b" * 40)
+
+    assert outcome["ok"] is False
+    assert outcome["source_sha"] is None
+    assert outcome["published_product_sha"] == "b" * 40
+    assert "verified release-system source SHA" in outcome["error"]
+    assert sync_calls == []
+
+
+def test_sync_operational_copies_sync_failure_survives_logging_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The original sync error remains the result when logging also fails."""
+    from scripts.fork_integration.release import mod as release
+
+    monkeypatch.setattr(
+        release,
+        "_sync_module",
+        lambda: (_ for _ in ()).throw(RuntimeError("sync unavailable")),
+    )
+    monkeypatch.setattr(
+        release,
+        "log",
+        lambda _message: (_ for _ in ()).throw(OSError("log unavailable")),
+    )
+
+    outcome = release.sync_operational_copies("a" * 40, "b" * 40)
+
+    assert outcome["ok"] is False
+    assert outcome["error"] == "sync unavailable"
+    assert outcome["source_sha"] == "a" * 40
+    assert outcome["published_product_sha"] == "b" * 40
+
+
+def test_sync_operational_copies_success_survives_logging_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful sync remains successful when only its diagnostic fails."""
+    from scripts.fork_integration.release import mod as release
+
+    monkeypatch.setattr(
+        release,
+        "_sync_module",
+        lambda: SimpleNamespace(
+            sync=lambda source, _repo, _dest: {"source_sha": source, "files": {}}
+        ),
+    )
+    monkeypatch.setattr(
+        release,
+        "log",
+        lambda _message: (_ for _ in ()).throw(OSError("log unavailable")),
+    )
+
+    outcome = release.sync_operational_copies("a" * 40, "b" * 40)
+
+    assert outcome["ok"] is True
+    assert outcome["source_sha"] == "a" * 40
+    assert outcome["published_product_sha"] == "b" * 40
+
+
 # ── restamp_manifest(): accepts matching fragment, refuses otherwise ────
 
 
