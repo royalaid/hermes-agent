@@ -427,6 +427,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_IGNORED_CHANNELS",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_FREE_RESPONSE_AUTO_THREAD",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
@@ -6718,6 +6719,26 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_free_response_auto_thread(self) -> bool:
+        """Return whether free-response channels should still auto-thread.
+
+        Default False preserves the lightweight-chat contract: listing a
+        channel in ``free_response_channels`` replies inline. Set True when
+        an inbox-style channel should accept unmentioned messages *and*
+        still spawn a thread per drop. ``no_thread_channels`` still wins.
+        """
+        configured = self.config.extra.get("free_response_auto_thread")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return self._gate_env("DISCORD_FREE_RESPONSE_AUTO_THREAD", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
 
@@ -8069,6 +8090,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Config (all settable via discord.* in config.yaml or DISCORD_* env vars):
         #   discord.require_mention: Require @mention in server channels (default: true)
         #   discord.free_response_channels: Channel IDs where bot responds without mention
+        #   discord.free_response_auto_thread: If True, free-response channels still auto-thread
         #   discord.ignored_channels: Channel IDs where bot NEVER responds (even when mentioned)
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
@@ -8159,7 +8181,10 @@ class DiscordAdapter(BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_free_response_thread = (
+                is_free_channel and not self._discord_free_response_auto_thread()
+            )
+            skip_thread = bool(channel_keys & no_thread_channels) or skip_free_response_thread
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -10402,6 +10427,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+    if "free_response_auto_thread" in discord_cfg:
+        seeded_extra["free_response_auto_thread"] = str(
+            discord_cfg["free_response_auto_thread"]
+        ).lower()
+        if not _skip_env_bridge and not os.getenv("DISCORD_FREE_RESPONSE_AUTO_THREAD"):
+            os.environ["DISCORD_FREE_RESPONSE_AUTO_THREAD"] = str(
+                discord_cfg["free_response_auto_thread"]
+            ).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     backfill_cfg = discord_cfg.get("missed_message_backfill")
