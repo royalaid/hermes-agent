@@ -335,6 +335,7 @@ discord:
   require_mention: true           # Require @mention in server channels
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
+  free_response_auto_thread: false # If true, free-response channels still auto-thread
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
@@ -400,7 +401,7 @@ discord:
 
 If a thread's parent channel is in this list, the thread also becomes mention-free.
 
-Free-response channels also **skip auto-threading** — the bot replies inline rather than spinning off a new thread per message. This keeps the channel usable as a lightweight chat surface. If you want threading behavior, don't list the channel as free-response (use normal `@mention` flow instead).
+Free-response channels also **skip auto-threading** by default — the bot replies inline rather than spinning off a new thread per message. This keeps the channel usable as a lightweight chat surface. Set [`free_response_auto_thread`](#discordfree_response_auto_thread) to `true` if you want an inbox-style channel that accepts unmentioned messages *and* still opens a thread per drop.
 
 #### `discord.auto_thread`
 
@@ -408,7 +409,23 @@ Free-response channels also **skip auto-threading** — the bot replies inline r
 
 When enabled, every `@mention` in a regular text channel automatically creates a new thread for the conversation. This keeps the main channel clean and gives each conversation its own isolated session history. Once a thread is created, subsequent messages in that thread don't require `@mention` — the bot knows it's already participating. Set [`thread_require_mention`](#discordthread_require_mention) to `true` to disable this in-thread shortcut for multi-bot setups.
 
-Messages sent in existing threads or DMs are unaffected by this setting. Channels listed in `discord.free_response_channels` or `discord.no_thread_channels` also bypass auto-threading and get inline replies instead.
+Messages sent in existing threads or DMs are unaffected by this setting. Channels listed in `discord.no_thread_channels` bypass auto-threading and get inline replies instead. Channels listed in `discord.free_response_channels` also reply inline unless [`free_response_auto_thread`](#discordfree_response_auto_thread) is `true`.
+
+#### `discord.free_response_auto_thread`
+
+**Type:** boolean — **Default:** `false`
+
+When `false` (the default), channels in `free_response_channels` reply inline and do not spawn a thread per message.
+
+When `true`, those same channels still accept unmentioned messages, but `auto_thread` applies as usual. Use this for an inbox / mailbox channel where you want a new thread per drop without `@mention`. `no_thread_channels` still wins and keeps those channels inline.
+
+```yaml
+discord:
+  require_mention: true
+  free_response_channels:
+    - 123456789012345678  # inbox / mailbox channel
+  free_response_auto_thread: true
+```
 
 #### `discord.reactions`
 

@@ -109,6 +109,7 @@ def adapter(monkeypatch):
         "DISCORD_REQUIRE_MENTION",
         "DISCORD_THREAD_REQUIRE_MENTION",
         "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_FREE_RESPONSE_AUTO_THREAD",
         "DISCORD_AUTO_THREAD",
         "DISCORD_NO_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
@@ -305,6 +306,33 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "casual chat in free-response channel"
     assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_auto_thread_opt_in(adapter, monkeypatch):
+    """Inbox-style free-response channels can keep auto-threading."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_AUTO_THREAD", "true")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    parent = FakeTextChannel(channel_id=789)
+    thread = FakeThread(channel_id=790, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+
+    message = make_message(
+        channel=parent,
+        content="drop this in the mailbox",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "drop this in the mailbox"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "790"
 
 
 @pytest.mark.asyncio
