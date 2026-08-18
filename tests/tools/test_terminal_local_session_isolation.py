@@ -12,9 +12,13 @@ import tools.terminal_tool as terminal_tool
 class _FakeEnvironment:
     def __init__(self, cwd):
         self.cwd = cwd
+        self.cleanup_count = 0
 
     def execute(self, _command, **_kwargs):
         return {"output": "ok", "returncode": 0}
+
+    def cleanup(self):
+        self.cleanup_count += 1
 
 
 def _exercise_two_sessions(monkeypatch, env_type):
@@ -139,6 +143,86 @@ def test_get_active_env_container_backend_keeps_collapsed_default_fallback(monke
     )
 
     assert terminal_tool.get_active_env("session-a") is default_env
+
+
+def test_degraded_local_eviction_only_removes_exact_session(monkeypatch):
+    default_env = _FakeEnvironment("default-cwd")
+    session_env = _FakeEnvironment("session-a-cwd")
+    sibling_env = _FakeEnvironment("session-b-cwd")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {
+            "default": default_env,
+            "session-a": session_env,
+            "session-b": sibling_env,
+        },
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_last_activity",
+        {"default": 1.0, "session-a": 2.0, "session-b": 3.0},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "local"}
+    )
+
+    terminal_tool._evict_environment_for_task("session-a")
+
+    assert terminal_tool._active_environments == {
+        "default": default_env,
+        "session-b": sibling_env,
+    }
+    assert terminal_tool._last_activity == {"default": 1.0, "session-b": 3.0}
+    assert session_env.cleanup_count == 1
+    assert default_env.cleanup_count == 0
+    assert sibling_env.cleanup_count == 0
+
+
+def test_degraded_container_eviction_removes_resolved_shared_default(monkeypatch):
+    default_env = _FakeEnvironment("default-cwd")
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"default": default_env}
+    )
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 1.0})
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+
+    terminal_tool._evict_environment_for_task("session-a")
+
+    assert terminal_tool._active_environments == {}
+    assert terminal_tool._last_activity == {}
+    assert default_env.cleanup_count == 1
+
+
+def test_degraded_container_eviction_deduplicates_aliased_environment_cleanup(
+    monkeypatch,
+):
+    shared_env = _FakeEnvironment("shared-cwd")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"default": shared_env, "session-a": shared_env},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_last_activity", {"default": 1.0, "session-a": 2.0}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+
+    terminal_tool._evict_environment_for_task("session-a")
+
+    assert terminal_tool._active_environments == {}
+    assert terminal_tool._last_activity == {}
+    assert shared_env.cleanup_count == 1
 
 
 def test_cwd_override_local_backend_does_not_mutate_default_environment(monkeypatch):

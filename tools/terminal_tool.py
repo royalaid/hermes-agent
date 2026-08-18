@@ -3681,23 +3681,26 @@ def terminal_tool(
 
 
 def _evict_environment_for_task(task_id: Optional[str]) -> None:
-    """Drop any cached environment for *task_id* (and its collapsed key).
+    """Drop the cached environment for *task_id*'s backend-aware key.
 
     Used when a backend reports an infrastructure failure: keeping the dead
     env cached would make every subsequent call fail against a stale
     connection, defeating automatic recovery.
     """
-    keys = {_resolve_container_task_id(task_id)}
-    if task_id:
+    config = _get_env_config()
+    resolved_key = _resolve_environment_task_id(task_id, config)
+    keys = {resolved_key}
+    if config.get("env_type") != "local" and task_id:
         keys.add(task_id)
-    evicted = []
+
+    evicted = {}
     with _env_lock:
         for key in keys:
             env = _active_environments.pop(key, None)
             _last_activity.pop(key, None)
             if env is not None:
-                evicted.append(env)
-    for env in evicted:
+                evicted[id(env)] = env
+    for env in evicted.values():
         try:
             env.cleanup()
         except Exception:
