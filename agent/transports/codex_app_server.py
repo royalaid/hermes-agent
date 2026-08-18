@@ -32,6 +32,15 @@ from tools.environments.local import hermes_subprocess_env
 MIN_CODEX_VERSION = (0, 125, 0)
 
 
+def _toml_single_string_array(value: str) -> str:
+    """Encode one string as a TOML-compatible array for a Codex ``-c`` value."""
+    # JSON string syntax is compatible with TOML basic strings for the escapes
+    # json.dumps emits for C0 controls, quotes, and backslashes. Keep non-BMP
+    # characters literal (TOML rejects JSON's UTF-16 surrogate-pair escapes),
+    # but explicitly escape DEL, which JSON permits and TOML forbids literally.
+    return json.dumps([value], ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
 @dataclass
 class CodexAppServerError(RuntimeError):
     """Raised on JSON-RPC errors from the app-server."""
@@ -119,7 +128,7 @@ class CodexAppServerClient:
                     "-c",
                     (
                         "sandbox_workspace_write.writable_roots="
-                        f"{json.dumps([kanban_root], ensure_ascii=False)}"
+                        f"{_toml_single_string_array(kanban_root)}"
                     ),
                     "-c",
                     "sandbox_workspace_write.network_access=false",

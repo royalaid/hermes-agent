@@ -338,6 +338,44 @@ class TestSpawnEnvIsolation:
             writable_root
         ]
 
+    def test_kanban_writable_root_round_trips_del(self, monkeypatch):
+        """The generated TOML must escape DEL while preserving the exact root."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_del_root")
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        writable_root = "C:\\boards\\team\x7farchive\\nested"
+        monkeypatch.setenv("HERMES_KANBAN_ROOT", writable_root)
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        prefix = "sandbox_workspace_write.writable_roots="
+        value = next(
+            part.removeprefix(prefix)
+            for part in captured["cmd"]
+            if part.startswith(prefix)
+        )
+        assert tomllib.loads(f"writable_roots = {value}")["writable_roots"] == [
+            writable_root
+        ]
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
