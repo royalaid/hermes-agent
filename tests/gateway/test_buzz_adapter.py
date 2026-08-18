@@ -2,9 +2,10 @@
 
 import asyncio
 import json
+import os
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -537,9 +538,12 @@ class TestBuzzCliSpawnEnv:
 
         from tools.environments.local import build_subprocess_env
 
-        grandchild_env = build_subprocess_env(env)
+        with patch.dict(os.environ, env, clear=True):
+            grandchild_env = build_subprocess_env(env)
         assert "BUZZ_PRIVATE_KEY" not in grandchild_env
         assert "BUZZ_RELAY_URL" not in grandchild_env
+        assert "BUZZ_MANAGED_AGENT" not in grandchild_env
+        assert grandchild_env["REQUIRED_ADAPTER_VAR"] == "required"
 
 
 # ── Env enablement / registration / standalone send ──────────────────────
