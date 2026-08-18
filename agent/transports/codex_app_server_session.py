@@ -493,7 +493,7 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
-        except (CodexAppServerError, TimeoutError) as exc:
+        except (CodexAppServerError, OSError, TimeoutError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
             )
@@ -804,7 +804,7 @@ class CodexAppServerSession:
         result = TurnResult()
         try:
             self.ensure_started()
-        except (CodexAppServerError, TimeoutError) as exc:
+        except (CodexAppServerError, OSError, TimeoutError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
             )

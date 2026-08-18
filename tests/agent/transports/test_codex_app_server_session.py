@@ -186,6 +186,19 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_spawn_file_not_found_is_a_retirable_startup_result(self):
+        def spawn_failure(**_kwargs):
+            raise FileNotFoundError(2, "The system cannot find the file specified")
+
+        session = CodexAppServerSession(cwd="/tmp", client_factory=spawn_failure)
+
+        result = session.run_turn("hello")
+
+        assert result.should_retire is True
+        assert result.error is not None
+        assert "codex app-server startup failed" in result.error
+        assert "cannot find the file" in result.error.lower()
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -392,6 +405,19 @@ class TestRunTurn:
 
 
 class TestCompactThread:
+    def test_spawn_os_error_is_a_retirable_startup_result(self):
+        def spawn_failure(**_kwargs):
+            raise OSError(8, "Not enough memory to start process")
+
+        session = CodexAppServerSession(cwd="/tmp", client_factory=spawn_failure)
+
+        result = session.compact_thread()
+
+        assert result.should_retire is True
+        assert result.error is not None
+        assert "codex app-server startup failed" in result.error
+        assert "not enough memory" in result.error.lower()
+
     def test_compact_thread_sends_rpc_and_waits_for_completion(self):
         client = FakeClient()
         client.queue_notification(
