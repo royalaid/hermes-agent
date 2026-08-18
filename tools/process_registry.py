@@ -2469,15 +2469,17 @@ class ProcessRegistry:
         self,
         task_id: Optional[str] = None,
         *,
+        session_key: Optional[str] = None,
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
     ) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill running processes matching optional task and session filters."""
         with self._lock:
             targets = [
                 s for s in self._running.values()
                 if (task_id is None or s.task_id == task_id)
+                and (session_key is None or s.session_key == session_key)
                 and s.id not in exclude_ids
                 and not s.exited
             ]

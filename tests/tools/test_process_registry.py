@@ -45,6 +45,7 @@ def _make_session(
     sid="proc_test123",
     command="echo hello",
     task_id="t1",
+    session_key="",
     exited=False,
     exit_code=None,
     output="",
@@ -55,6 +56,7 @@ def _make_session(
         id=sid,
         command=command,
         task_id=task_id,
+        session_key=session_key,
         started_at=started_at or time.time(),
         exited=exited,
         exit_code=exit_code,
@@ -132,6 +134,34 @@ def test_kill_all_backward_compat_and_exclude_ids(registry):
     calls.clear()
     assert registry.kill_all("session-a") == 2
     assert sorted(c[0] for c in calls) == ["proc_a", "proc_b"]
+
+
+def test_kill_all_filters_shared_task_by_logical_session_key(registry):
+    session_a = _make_session(
+        sid="proc_a", task_id="default", session_key="session-a"
+    )
+    session_b = _make_session(
+        sid="proc_b", task_id="default", session_key="session-b"
+    )
+    local_a = _make_session(
+        sid="proc_local_a", task_id="session-a", session_key="session-a"
+    )
+    registry._running = {
+        session_a.id: session_a,
+        session_b.id: session_b,
+        local_a.id: local_a,
+    }
+    calls = []
+    registry.kill_process = lambda session_id, **kwargs: (
+        calls.append((session_id, kwargs)) or {"status": "killed"}
+    )
+
+    assert registry.kill_all(session_key="session-a") == 2
+    assert [call[0] for call in calls] == ["proc_a", "proc_local_a"]
+
+    calls.clear()
+    assert registry.kill_all(task_id="default", session_key="session-a") == 1
+    assert [call[0] for call in calls] == ["proc_a"]
 
 
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:

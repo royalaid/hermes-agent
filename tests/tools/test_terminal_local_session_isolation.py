@@ -1,6 +1,7 @@
 """Regression coverage for terminal environment cache-key isolation."""
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -384,6 +385,7 @@ def test_terminal_background_container_attributes_process_to_selected_environmen
     assert result["exit_code"] == 0
     assert spawn_calls[0]["env"] is expected_env
     assert spawn_calls[0]["task_id"] == expected_key
+    assert spawn_calls[0]["session_key"] == "session-a"
 
     terminal_tool._last_activity[expected_key] = 0.0
     monkeypatch.setattr(terminal_tool.time, "time", lambda: 100.0)
@@ -433,6 +435,162 @@ def test_terminal_background_local_attributes_process_to_exact_environment(
 
     assert result["exit_code"] == 0
     assert spawn_calls[0]["task_id"] == "session-a"
+    assert spawn_calls[0]["session_key"] == "session-a"
+
+
+def test_terminal_background_sessions_share_default_task_not_logical_session(
+    monkeypatch,
+):
+    from tools.process_registry import process_registry
+
+    default_env = _FakeEnvironment("default-cwd")
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "timeout": 30,
+        "docker_image": "docker-image",
+        "singularity_image": "singularity-image",
+        "modal_image": "modal-image",
+        "daytona_image": "daytona-image",
+    }
+    spawn_calls = []
+
+    def fake_spawn_via_env(**kwargs):
+        spawn_calls.append(kwargs)
+        return SimpleNamespace(id=f"proc-{len(spawn_calls)}", pid=1234)
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"default": default_env}
+    )
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(process_registry, "spawn_via_env", fake_spawn_via_env)
+
+    for session_key in ("session-a", "session-b"):
+        result = json.loads(
+            terminal_tool.terminal_tool(
+                "sleep 30", task_id=session_key, background=True, force=True
+            )
+        )
+        assert result["exit_code"] == 0
+
+    assert [call["task_id"] for call in spawn_calls] == ["default", "default"]
+    assert [call["session_key"] for call in spawn_calls] == [
+        "session-a",
+        "session-b",
+    ]
+
+
+def test_agent_close_reaps_only_its_process_from_shared_default_environment(
+    monkeypatch,
+):
+    import run_agent
+    from tools.process_registry import ProcessSession, process_registry
+
+    default_env = _FakeEnvironment("default-cwd")
+    default_ops = object()
+    default_lock = object()
+    proc_a = ProcessSession(
+        id="proc-a", command="sleep 30", task_id="default", session_key="session-a"
+    )
+    proc_b = ProcessSession(
+        id="proc-b", command="sleep 30", task_id="default", session_key="session-b"
+    )
+    killed = []
+
+    def fake_kill_process(process_id, **_kwargs):
+        killed.append(process_id)
+        process_registry._running[process_id].exited = True
+        return {"status": "killed"}
+
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"default": default_env}
+    )
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 1.0})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {"default": default_lock})
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {"default": default_ops})
+    monkeypatch.setattr(process_registry, "_running", {proc_a.id: proc_a, proc_b.id: proc_b})
+    monkeypatch.setattr(process_registry, "kill_process", fake_kill_process)
+    monkeypatch.setattr(run_agent, "cleanup_browser", lambda _task_id: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.computer_use",
+        SimpleNamespace(release_computer_use_session=lambda _task_id: None),
+    )
+    agent = SimpleNamespace(
+        session_id="session-a",
+        shutdown_memory_provider=lambda _messages=None: None,
+    )
+
+    run_agent.AIAgent.close(agent)
+
+    assert killed == ["proc-a"]
+    assert proc_a.exited is True
+    assert proc_b.exited is False
+    assert terminal_tool._active_environments == {"default": default_env}
+    assert terminal_tool._last_activity == {"default": 1.0}
+    assert terminal_tool._creation_locks == {"default": default_lock}
+    assert file_tools._file_ops_cache == {"default": default_ops}
+    assert default_env.cleanup_count == 0
+
+
+def test_agent_close_reaps_process_and_environment_for_exact_local_session(
+    monkeypatch,
+):
+    import run_agent
+    from tools.process_registry import ProcessSession, process_registry
+
+    local_env = _FakeEnvironment("local-cwd")
+    local_ops = object()
+    local_lock = object()
+    proc = ProcessSession(
+        id="proc-local",
+        command="sleep 30",
+        task_id="session-local",
+        session_key="session-local",
+    )
+    killed = []
+
+    def fake_kill_process(process_id, **_kwargs):
+        killed.append(process_id)
+        proc.exited = True
+        return {"status": "killed"}
+
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"session-local": local_env}
+    )
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"session-local": 1.0})
+    monkeypatch.setattr(
+        terminal_tool, "_creation_locks", {"session-local": local_lock}
+    )
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {"session-local": local_ops})
+    monkeypatch.setattr(process_registry, "_running", {proc.id: proc})
+    monkeypatch.setattr(process_registry, "kill_process", fake_kill_process)
+    monkeypatch.setattr(run_agent, "cleanup_browser", lambda _task_id: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.computer_use",
+        SimpleNamespace(release_computer_use_session=lambda _task_id: None),
+    )
+    agent = SimpleNamespace(
+        session_id="session-local",
+        shutdown_memory_provider=lambda _messages=None: None,
+    )
+
+    run_agent.AIAgent.close(agent)
+
+    assert killed == ["proc-local"]
+    assert proc.exited is True
+    assert terminal_tool._active_environments == {}
+    assert terminal_tool._last_activity == {}
+    assert terminal_tool._creation_locks == {}
+    assert file_tools._file_ops_cache == {}
+    assert local_env.cleanup_count == 1
 
 
 def test_degraded_local_eviction_only_removes_exact_session_and_file_cache(

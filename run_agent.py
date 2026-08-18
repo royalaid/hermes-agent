@@ -4488,24 +4488,29 @@ class AIAgent:
         except Exception:
             pass
 
-        task_id = getattr(self, "session_id", None) or ""
+        session_key = getattr(self, "session_id", None) or ""
 
-        # 1. Kill background processes for this task
+        # 1. Kill background processes owned by this logical session. The
+        # process task_id identifies its selected environment and may be shared
+        # (for example, the persistent default container), so it is not an
+        # ownership boundary.
         try:
             from tools.process_registry import process_registry
-            process_registry.kill_all(task_id=task_id)
+            process_registry.kill_all(session_key=session_key)
         except Exception:
             pass
 
-        # 2. Clean terminal sandbox environments
+        # 2. Clean only an environment stored under the exact raw session key.
+        # A raw session that fell back to a shared default environment must not
+        # tear that environment down.
         try:
-            cleanup_vm(task_id)
+            cleanup_vm(session_key)
         except Exception:
             pass
 
         # 3. Clean browser daemon sessions
         try:
-            cleanup_browser(task_id)
+            cleanup_browser(session_key)
         except Exception:
             pass
 
@@ -4517,7 +4522,7 @@ class AIAgent:
         try:
             from tools.computer_use import release_computer_use_session
 
-            release_computer_use_session(task_id)
+            release_computer_use_session(session_key)
         except Exception:
             pass
 
