@@ -14,6 +14,8 @@ full credential environment. Two tiers:
 import os
 from unittest.mock import patch
 
+import pytest
+
 from tools.environments.local import (
     build_subprocess_env,
     hermes_subprocess_env,
@@ -60,6 +62,33 @@ _BUZZ_IDENTITY = {
     "BUZZ_AUTH_TAG": "synthetic-auth-tag",
 }
 
+_BUZZ_CHILD_ENV_BUILDERS = (
+    "build_subprocess_env_no_scrub",
+    "build_subprocess_env_scrubbed",
+    "sanitize_subprocess_env",
+    "hermes_subprocess_env",
+    "make_run_env",
+)
+
+
+def _build_buzz_child_env(builder, source):
+    if builder == "build_subprocess_env_no_scrub":
+        return build_subprocess_env(
+            source,
+            scrub_secrets=False,
+            inherit_profile_home=False,
+        )
+    if builder == "build_subprocess_env_scrubbed":
+        return build_subprocess_env(source)
+    if builder == "sanitize_subprocess_env":
+        return _sanitize_subprocess_env(source)
+    with patch.dict(os.environ, source, clear=True):
+        if builder == "hermes_subprocess_env":
+            return hermes_subprocess_env(inherit_credentials=True)
+        if builder == "make_run_env":
+            return _make_run_env({})
+    raise AssertionError(f"unknown builder: {builder}")
+
 
 class TestBuildSubprocessEnvManagedBuzzBoundary:
     def test_no_scrub_strips_buzz_identity_without_host_marker(self):
@@ -88,7 +117,7 @@ class TestBuildSubprocessEnvManagedBuzzBoundary:
             assert key not in result
         assert "BUZZ_MANAGED_AGENT" not in result
 
-    def test_no_scrub_preserves_buzz_identity_with_exact_host_marker(self):
+    def test_no_scrub_consumes_exact_host_marker_after_authorizing_buzz_identity(self):
         result = build_subprocess_env(
             {
                 **_SAFE_SAMPLE,
@@ -99,9 +128,26 @@ class TestBuildSubprocessEnvManagedBuzzBoundary:
             inherit_profile_home=False,
         )
 
-        assert result["BUZZ_MANAGED_AGENT"] == "xyz.block.buzz.app"
+        assert "BUZZ_MANAGED_AGENT" not in result
         for key, value in _BUZZ_IDENTITY.items():
             assert result[key] == value
+
+    @pytest.mark.parametrize("builder", _BUZZ_CHILD_ENV_BUILDERS)
+    def test_exact_host_authority_is_consumed_at_first_child_boundary(self, builder):
+        host_env = {
+            **_SAFE_SAMPLE,
+            "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+            **_BUZZ_IDENTITY,
+        }
+
+        child_env = _build_buzz_child_env(builder, host_env)
+        grandchild_env = _build_buzz_child_env(builder, child_env)
+
+        for key, value in _BUZZ_IDENTITY.items():
+            assert child_env.get(key) == value
+            assert key not in grandchild_env
+        assert "BUZZ_MANAGED_AGENT" not in child_env
+        assert "BUZZ_MANAGED_AGENT" not in grandchild_env
 
     def test_no_scrub_extra_marker_cannot_unlock_base_buzz_identity(self):
         result = build_subprocess_env(
@@ -208,6 +254,7 @@ class TestStripByDefault:
         for forced_key, value in forced_buzz_identity.items():
             assert result[forced_key.removeprefix(_HERMES_PROVIDER_ENV_FORCE_PREFIX)] == value
             assert forced_key not in result
+        assert "BUZZ_MANAGED_AGENT" not in result
 
 
     def test_pythonutf8_set(self):
@@ -249,6 +296,7 @@ class TestInheritCredentials:
 
         for key, value in buzz_identity.items():
             assert result.get(key) == value
+        assert "BUZZ_MANAGED_AGENT" not in result
 
     def test_buzz_identity_stripped_when_inheriting_with_wrong_managed_agent_marker(self):
         """Partial and lookalike markers do not establish managed-host trust."""

@@ -338,8 +338,9 @@ def _build_provider_env_blocklist() -> frozenset:
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
 # Buzz Desktop launches Hermes as a managed ACP worker and injects an
-# agent-scoped identity specifically for the ``buzz`` CLI. Keep the exception
-# exact and narrow: ordinary Hermes terminals continue to scrub these values.
+# agent-scoped identity specifically for the ``buzz`` CLI. The exact marker is
+# a host-only authorization assertion: it permits the first child to receive
+# the scoped credentials, but is consumed rather than inherited by that child.
 _BUZZ_MANAGED_AGENT_MARKER = "xyz.block.buzz.app"
 _BUZZ_MANAGED_TERMINAL_ENV_VARS = frozenset({
     "BUZZ_PRIVATE_KEY",
@@ -359,9 +360,9 @@ def _is_managed_buzz_terminal_env_var(key: str, source_env: Mapping[str, str]) -
 def _enforce_managed_buzz_terminal_identity_boundary(
     env: dict[str, str], source_env: Mapping[str, str]
 ) -> None:
-    """Remove Buzz managed identity unless the authoritative host established it."""
+    """Consume managed-host authority and remove unauthorized Buzz identity."""
+    env.pop("BUZZ_MANAGED_AGENT", None)
     if source_env.get("BUZZ_MANAGED_AGENT") != _BUZZ_MANAGED_AGENT_MARKER:
-        env.pop("BUZZ_MANAGED_AGENT", None)
         for key in _BUZZ_MANAGED_TERMINAL_ENV_VARS:
             env.pop(key, None)
 
@@ -745,8 +746,9 @@ def build_subprocess_env(
       home propagation is inherent — ``inherit_profile_home`` is ignored
       (always applied), exactly matching today's sanitize semantics.
     * ``scrub_secrets=False`` — preserve the base env content byte-for-byte
-      except for managed Buzz CLI identity, which is removed unless the
-      authoritative base environment carries the exact managed-host marker.
+      except for managed Buzz CLI identity. The scoped credentials are removed
+      unless the authoritative base environment carries the exact managed-host
+      marker, and the marker itself is always consumed at the child boundary.
       Use for children that intentionally receive other secrets (git
       credential flows, ``bws``/``op`` secret CLIs) or where broad scrubbing
       could change behavior.  The site is still a win: it becomes grep-able
