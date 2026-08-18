@@ -23291,6 +23291,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
+    # A connected platform normally returns within seconds after the gateway
+    # restarts. Keep the completed result available for a generous window, but
+    # persist the start so repeated gateway restarts cannot reset the bound.
+    _UPDATE_NOTIFICATION_RECONNECT_TIMEOUT_SECONDS = 1800.0
+
 
 
     def _schedule_update_notification_watch(self) -> None:
@@ -23561,36 +23566,112 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _up_timeout_state.persistent.update_prompt_pending = False
 
     async def _send_update_notification(self) -> bool:
-        """If an update finished, notify the user.
+        """Deliver a completed update result or persist a bounded disposition.
 
-        Returns False when the update is still running so a caller can retry
-        later. Returns True after a definitive send/skip decision.
-
-        This is the legacy notification path used when the streaming watcher
-        cannot resolve the adapter (e.g. after a gateway restart where the
-        platform hasn't reconnected yet).
+        ``False`` means a transient condition remains retryable. ``True`` means
+        the notification was delivered or retired into an explicit terminal
+        disposition. Claims are processed before newer pending markers so a
+        concurrent update cannot overwrite an in-flight result.
         """
         pending_path = _hermes_home / ".update_pending.json"
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        disposition_path = _hermes_home / ".update_notification_undelivered.json"
 
         if not pending_path.exists() and not claimed_path.exists():
             return False
 
-        cleanup = True
-        active_pending_path = claimed_path
+        cleanup = False
+        pending: Dict[str, Any] = {}
+        exit_code: Optional[int] = None
+
+        def _restore_claim() -> None:
+            """Return the claim without overwriting a newer pending marker."""
+            if claimed_path.exists() and not pending_path.exists():
+                claimed_path.replace(pending_path)
+
+        def _terminal_disposition(reason: str) -> bool:
+            """Archive one bounded undelivered result and retire active state."""
+            nonlocal cleanup
+            output_tail = ""
+            if output_path.exists():
+                output_tail = output_path.read_bytes().decode(
+                    "utf-8", errors="replace"
+                )[-3500:]
+            record = dict(pending)
+            record.update({
+                "notification_disposition": "undeliverable",
+                "notification_reason": reason,
+                "notification_disposed_at": datetime.now(timezone.utc).isoformat(),
+                "update_exit_code": exit_code,
+                "update_output_tail": output_tail,
+            })
+            temp_path = disposition_path.with_suffix(".json.tmp")
+            temp_path.write_text(
+                json.dumps(record, ensure_ascii=False), encoding="utf-8"
+            )
+            temp_path.replace(disposition_path)
+            cleanup = True
+            logger.warning(
+                "Post-update notification terminally undeliverable for %s:%s "
+                "(%s); saved disposition to %s",
+                pending.get("platform"),
+                pending.get("chat_id"),
+                reason,
+                disposition_path,
+            )
+            return True
+
+        def _defer(reason: str) -> bool:
+            """Persist a deduplicated transient deferral across restarts."""
+            deferred_at = pending.get("notification_deferred_at")
+            now = datetime.now(timezone.utc)
+            if deferred_at:
+                try:
+                    started = datetime.fromisoformat(str(deferred_at))
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    elapsed = (now - started).total_seconds()
+                    if elapsed >= self._UPDATE_NOTIFICATION_RECONNECT_TIMEOUT_SECONDS:
+                        return _terminal_disposition("adapter_reconnect_timeout")
+                except (TypeError, ValueError):
+                    deferred_at = None
+
+            if not deferred_at:
+                pending["notification_deferred_at"] = now.isoformat()
+                pending["notification_deferred_reason"] = reason
+                claimed_path.write_text(
+                    json.dumps(pending, ensure_ascii=False), encoding="utf-8"
+                )
+                logger.info(
+                    "Update notification deferred: %s adapter not connected yet",
+                    pending.get("platform"),
+                )
+            _restore_claim()
+            return False
+
         try:
-            if pending_path.exists():
+            if claimed_path.exists():
+                pass
+            elif pending_path.exists():
                 try:
                     pending_path.replace(claimed_path)
                 except FileNotFoundError:
                     if not claimed_path.exists():
                         return True
-            elif not claimed_path.exists():
+            else:
                 return True
 
-            pending = json.loads(claimed_path.read_text(encoding="utf-8"))
+            try:
+                pending = json.loads(claimed_path.read_text(encoding="utf-8"))
+                if not isinstance(pending, dict):
+                    pending = {"invalid_marker": pending}
+                    return _terminal_disposition("invalid_marker")
+            except (json.JSONDecodeError, OSError) as exc:
+                pending = {"invalid_marker_error": str(exc)}
+                return _terminal_disposition("invalid_marker")
+
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
             chat_type = pending.get("chat_type")
@@ -23599,85 +23680,96 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not exit_code_path.exists():
                 logger.info("Update notification deferred: update still running")
-                cleanup = False
-                active_pending_path = pending_path
-                claimed_path.replace(pending_path)
+                _restore_claim()
                 return False
 
             exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
             exit_code = int(exit_code_raw)
 
-            # Read the captured update output
             output = ""
             if output_path.exists():
                 output = output_path.read_bytes().decode("utf-8", errors="replace")
 
-            # Resolve adapter
-            platform = Platform(platform_str)
+            try:
+                platform = Platform(platform_str)
+            except (TypeError, ValueError):
+                return _terminal_disposition("unknown_platform")
             adapter = self.adapters.get(platform)
 
             if not adapter and chat_id:
-                # The update finished, but the target platform has not
-                # reconnected yet (common right after the restart that
-                # `hermes update` triggers). Treating "adapter missing" as a
-                # definitive skip would delete the markers and silently lose the
-                # completion notification — the user never learns whether the
-                # update succeeded or timed out. Preserve the markers instead so
-                # a later retry (the watcher poll loop, or the next gateway
-                # startup) can deliver the result once the adapter is back.
-                logger.info(
-                    "Update notification deferred: %s adapter not connected yet",
-                    platform_str,
-                )
-                cleanup = False
-                active_pending_path = pending_path
-                claimed_path.replace(pending_path)
-                return False
+                config = getattr(self, "config", None)
+                configured_platforms = getattr(config, "platforms", None)
+                if isinstance(configured_platforms, dict):
+                    platform_config = configured_platforms.get(platform)
+                    if platform_config is None or not platform_config.enabled:
+                        return _terminal_disposition("platform_disabled")
+                return _defer("adapter_reconnecting")
 
-            if adapter and chat_id:
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    chat_id,
-                    thread_id,
-                    chat_type=chat_type,
-                    reply_to_message_id=message_id,
-                    adapter=adapter,
-                )
-                # Strip ANSI escape codes for clean display
-                from tools.ansi_strip import strip_ansi
-                output = strip_ansi(output).strip()
-                if output:
-                    if len(output) > 3500:
-                        output = "…" + output[-3500:]
-                    if exit_code == 0:
-                        msg = f"✅ Hermes update finished.\n\n```\n{output}\n```"
-                    else:
-                        msg = f"❌ Hermes update failed.\n\n```\n{output}\n```"
-                elif exit_code == 0:
-                    msg = "✅ Hermes update finished successfully."
+            if not chat_id:
+                return _terminal_disposition("missing_chat_id")
+
+            metadata = self._thread_metadata_for_target(
+                platform,
+                chat_id,
+                thread_id,
+                chat_type=chat_type,
+                reply_to_message_id=message_id,
+                adapter=adapter,
+            )
+            from tools.ansi_strip import strip_ansi
+            output = strip_ansi(output).strip()
+            if output:
+                if len(output) > 3500:
+                    output = "…" + output[-3500:]
+                if exit_code == 0:
+                    msg = f"✅ Hermes update finished.\n\n```\n{output}\n```"
                 else:
-                    msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
-                    chat_id,
-                    msg,
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
-                logger.info(
-                    "Sent post-update notification to %s:%s (exit=%s)",
+                    msg = f"❌ Hermes update failed.\n\n```\n{output}\n```"
+            elif exit_code == 0:
+                msg = "✅ Hermes update finished successfully."
+            else:
+                msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
+            result = await adapter.send(
+                chat_id,
+                msg,
+                metadata=_non_conversational_metadata(metadata, platform=platform),
+            )
+            if result is not None and getattr(result, "success", True) is False:
+                logger.warning(
+                    "Post-update notification was not delivered to %s:%s: %s",
                     platform_str,
                     chat_id,
-                    exit_code,
+                    getattr(result, "error", "send returned success=False"),
                 )
-        except Exception as e:
-            logger.warning("Post-update notification failed: %s", e)
+                return _defer("adapter_send_failed")
+            logger.info(
+                "Sent post-update notification to %s:%s (exit=%s)",
+                platform_str,
+                chat_id,
+                exit_code,
+            )
+            cleanup = True
+        except Exception as exc:
+            logger.warning("Post-update notification failed: %s", exc)
+            try:
+                return _defer("adapter_send_failed")
+            except Exception as defer_error:
+                logger.warning(
+                    "Could not preserve failed post-update notification: %s",
+                    defer_error,
+                )
+                return False
         finally:
             if cleanup:
-                active_pending_path.unlink(missing_ok=True)
                 claimed_path.unlink(missing_ok=True)
-                output_path.unlink(missing_ok=True)
-                exit_code_path.unlink(missing_ok=True)
+                # A newer pending marker may have appeared while this claim was
+                # being delivered. Its producer owns the shared output/exit
+                # artifacts, so retire them only when no next marker remains.
+                if not pending_path.exists():
+                    output_path.unlink(missing_ok=True)
+                    exit_code_path.unlink(missing_ok=True)
 
-        return True
+        return cleanup
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""

@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -348,8 +348,8 @@ class TestSendUpdateNotification:
 
 
     @pytest.mark.asyncio
-    async def test_cleans_up_on_error(self, tmp_path):
-        """Files are cleaned up even if notification fails."""
+    async def test_send_error_preserves_notification_for_retry(self, tmp_path):
+        """A transient adapter send error must not silently lose the result."""
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -369,9 +369,19 @@ class TestSendUpdateNotification:
         runner.adapters = {Platform.TELEGRAM: mock_adapter}
 
         with patch("gateway.run._hermes_home", hermes_home):
-            await runner._send_update_notification()
+            first = await runner._send_update_notification()
 
-        # Files should still be cleaned up (finally block)
+        assert first is False
+        assert pending_path.exists()
+        assert output_path.exists()
+        assert exit_code_path.exists()
+
+        mock_adapter.send.side_effect = None
+        with patch("gateway.run._hermes_home", hermes_home):
+            second = await runner._send_update_notification()
+
+        assert second is True
+        assert mock_adapter.send.await_count == 2
         assert not pending_path.exists()
         assert not output_path.exists()
         assert not exit_code_path.exists()
@@ -459,6 +469,158 @@ class TestSendUpdateNotification:
         assert not output_path.exists()
         assert not exit_code_path.exists()
         assert not (hermes_home / ".update_pending.claimed.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_disabled_target_gets_terminal_undelivered_disposition(
+        self, tmp_path, caplog
+    ):
+        """A disabled adapter cannot keep a completed update active forever."""
+        runner = _make_runner()
+        runner.config = GatewayConfig(platforms={
+            Platform.HOMEASSISTANT: PlatformConfig(enabled=False),
+        })
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "homeassistant",
+            "chat_id": "conversation-1",
+            "user_id": "operator",
+        }))
+        (hermes_home / ".update_output.txt").write_text("update complete")
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home), caplog.at_level("INFO"):
+            await runner._watch_update_progress(poll_interval=0.001, timeout=0.02)
+
+        assert not (hermes_home / ".update_pending.json").exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+        disposition = json.loads(
+            (hermes_home / ".update_notification_undelivered.json").read_text()
+        )
+        assert disposition["notification_disposition"] == "undeliverable"
+        assert disposition["notification_reason"] == "platform_disabled"
+        assert disposition["platform"] == "homeassistant"
+        assert sum(
+            "Update notification deferred" in record.getMessage()
+            for record in caplog.records
+        ) <= 1
+
+    @pytest.mark.asyncio
+    async def test_missing_enabled_adapter_deferral_log_is_deduplicated(
+        self, tmp_path, caplog
+    ):
+        """A transient reconnect remains retryable without logging every poll."""
+        runner = _make_runner()
+        runner.config = GatewayConfig(platforms={
+            Platform.DISCORD: PlatformConfig(enabled=True, token="test"),
+        })
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "discord", "chat_id": "111", "user_id": "222",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home), caplog.at_level("INFO"):
+            assert await runner._send_update_notification() is False
+            assert await runner._send_update_notification() is False
+
+        deferred = [
+            record for record in caplog.records
+            if "Update notification deferred" in record.getMessage()
+        ]
+        assert len(deferred) == 1
+        marker = json.loads(pending_path.read_text())
+        assert marker["notification_deferred_at"]
+
+    @pytest.mark.asyncio
+    async def test_expired_transient_reconnect_gets_terminal_disposition(self, tmp_path):
+        """Persisted reconnect age bounds retries across gateway restarts."""
+        runner = _make_runner()
+        runner.config = GatewayConfig(platforms={
+            Platform.DISCORD: PlatformConfig(enabled=True, token="test"),
+        })
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "discord",
+            "chat_id": "111",
+            "notification_deferred_at": "2000-01-01T00:00:00+00:00",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is True
+        assert not (hermes_home / ".update_pending.json").exists()
+        disposition = json.loads(
+            (hermes_home / ".update_notification_undelivered.json").read_text()
+        )
+        assert disposition["notification_reason"] == "adapter_reconnect_timeout"
+
+    @pytest.mark.asyncio
+    async def test_unknown_platform_gets_terminal_disposition(self, tmp_path):
+        """An obsolete/unknown platform value is explicit, not silently dropped."""
+        runner = _make_runner()
+        runner.config = GatewayConfig()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "removed-platform", "chat_id": "111",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is True
+        disposition = json.loads(
+            (hermes_home / ".update_notification_undelivered.json").read_text()
+        )
+        assert disposition["notification_reason"] == "unknown_platform"
+        assert disposition["platform"] == "removed-platform"
+
+    @pytest.mark.asyncio
+    async def test_existing_claim_is_delivered_before_new_pending_marker(self, tmp_path):
+        """A concurrent update marker must not overwrite an in-flight claim."""
+        runner = _make_runner()
+        runner.config = GatewayConfig(platforms={
+            Platform.DISCORD: PlatformConfig(enabled=True, token="discord"),
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="telegram"),
+        })
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        claimed_path = hermes_home / ".update_pending.claimed.json"
+        claimed_path.write_text(json.dumps({
+            "platform": "discord", "chat_id": "old-chat",
+        }))
+        pending_path.write_text(json.dumps({
+            "platform": "telegram", "chat_id": "new-chat",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        discord = AsyncMock()
+        telegram = AsyncMock()
+        runner.adapters = {
+            Platform.DISCORD: discord,
+            Platform.TELEGRAM: telegram,
+        }
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            assert await runner._send_update_notification() is True
+
+        discord.send.assert_awaited_once()
+        telegram.send.assert_not_awaited()
+        assert pending_path.exists()
+        assert json.loads(pending_path.read_text())["chat_id"] == "new-chat"
+        assert (hermes_home / ".update_output.txt").exists()
+        assert (hermes_home / ".update_exit_code").exists()
 
     @pytest.mark.asyncio
     async def test_completion_notification_tolerates_invalid_utf8_output(self, tmp_path):
