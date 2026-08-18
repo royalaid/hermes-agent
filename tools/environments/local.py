@@ -349,21 +349,46 @@ _BUZZ_MANAGED_TERMINAL_ENV_VARS = frozenset({
 })
 
 
-def _is_managed_buzz_terminal_env_var(key: str, source_env: Mapping[str, str]) -> bool:
+def _managed_buzz_host_authorized(source_env: Mapping[str, str]) -> bool:
+    """Return whether the host snapshot carries one unambiguous exact marker."""
+    marker_values = [
+        value
+        for key, value in source_env.items()
+        if key.upper() == "BUZZ_MANAGED_AGENT"
+    ]
+    return bool(marker_values) and all(
+        value == _BUZZ_MANAGED_AGENT_MARKER for value in marker_values
+    )
+
+
+def _is_managed_buzz_terminal_env_var(key: str, authority_env: Mapping[str, str]) -> bool:
     """Allow only Buzz's scoped CLI identity in its exact managed ACP host."""
     return (
-        source_env.get("BUZZ_MANAGED_AGENT") == _BUZZ_MANAGED_AGENT_MARKER
-        and key in _BUZZ_MANAGED_TERMINAL_ENV_VARS
+        _managed_buzz_host_authorized(authority_env)
+        and key.upper() in _BUZZ_MANAGED_TERMINAL_ENV_VARS
     )
 
 
 def _enforce_managed_buzz_terminal_identity_boundary(
-    env: dict[str, str], source_env: Mapping[str, str]
+    env: dict[str, str], authority_env: Mapping[str, str]
 ) -> None:
-    """Consume managed-host authority and remove unauthorized Buzz identity."""
-    env.pop("BUZZ_MANAGED_AGENT", None)
-    if source_env.get("BUZZ_MANAGED_AGENT") != _BUZZ_MANAGED_AGENT_MARKER:
-        for key in _BUZZ_MANAGED_TERMINAL_ENV_VARS:
+    """Consume every marker alias and remove unauthorized Buzz identity."""
+    authorized = _managed_buzz_host_authorized(authority_env)
+    for key in list(env):
+        normalized = key.upper()
+        forced_name = None
+        if normalized.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+            forced_name = normalized[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+        if normalized == "BUZZ_MANAGED_AGENT":
+            env.pop(key, None)
+        elif (
+            forced_name == "BUZZ_MANAGED_AGENT"
+            or forced_name in _BUZZ_MANAGED_TERMINAL_ENV_VARS
+        ):
+            # Force-prefixed aliases are control keys, never child output. The
+            # scrub paths consume authorized exact-prefix forms before here.
+            env.pop(key, None)
+        elif not authorized and normalized in _BUZZ_MANAGED_TERMINAL_ENV_VARS:
             env.pop(key, None)
 
 
@@ -509,18 +534,20 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
-    source_env = base_env or {}
+    # Managed Buzz authority is process-host provenance. A caller-prepared
+    # base/extra mapping is child content only and can never assert it.
+    authority_env = os.environ.copy()
 
     for key, value in (base_env or {}).items():
-        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+        if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if _is_hermes_internal_secret(key):
             continue
         passthrough = _is_passthrough(key)
         if (
-            key in _HERMES_PROVIDER_ENV_BLOCKLIST
+            key.upper() in _HERMES_PROVIDER_ENV_BLOCKLIST
             and not passthrough
-            and not _is_managed_buzz_terminal_env_var(key, source_env)
+            and not _is_managed_buzz_terminal_env_var(key, authority_env)
         ):
             continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
@@ -528,7 +555,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             sanitized[key] = resolved
 
     for key, value in (extra_env or {}).items():
-        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+        if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             if _is_hermes_internal_secret(real_key):
                 continue
@@ -538,16 +565,16 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         else:
             passthrough = _is_passthrough(key)
             if (
-                key in _HERMES_PROVIDER_ENV_BLOCKLIST
+                key.upper() in _HERMES_PROVIDER_ENV_BLOCKLIST
                 and not passthrough
-                and not _is_managed_buzz_terminal_env_var(key, source_env)
+                and not _is_managed_buzz_terminal_env_var(key, authority_env)
             ):
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
                 sanitized[key] = resolved
 
-    _enforce_managed_buzz_terminal_identity_boundary(sanitized, source_env)
+    _enforce_managed_buzz_terminal_identity_boundary(sanitized, authority_env)
 
     _inject_context_hermes_home(sanitized)
 
@@ -670,24 +697,26 @@ def hermes_subprocess_env(
     if extra:
         env.update(extra)
 
-    # Tier 1 — always strip.
-    for key in _ALWAYS_STRIP_KEYS:
-        env.pop(key, None)
+    # Tier 1 — always strip (case-insensitive for Windows-equivalent aliases).
+    for key in list(env):
+        if key.upper() in _ALWAYS_STRIP_KEYS:
+            env.pop(key, None)
     # Internal routing hints and Hermes-internal dynamic secrets
     # (``AUXILIARY_<TASK>_API_KEY`` / ``_BASE_URL`` side-LLM credentials,
     # ``GATEWAY_RELAY_*`` relay-auth material) must never reach a child,
     # regardless of ``inherit_credentials`` — a model-driving CLI has no
     # legitimate use for them. See :func:`_is_hermes_internal_secret`.
     for key in list(env):
-        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+        if key.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             env.pop(key, None)
         elif _is_hermes_internal_secret(key):
             env.pop(key, None)
 
     if not inherit_credentials:
         # Tier 2 — strip provider/tool credentials unless explicitly inherited.
-        for key in _HERMES_PROVIDER_ENV_BLOCKLIST:
-            env.pop(key, None)
+        for key in list(env):
+            if key.upper() in _HERMES_PROVIDER_ENV_BLOCKLIST:
+                env.pop(key, None)
 
     # Credential inheritance may preserve unrelated provider keys, but it can
     # never bypass the exact managed-host boundary for Buzz's CLI identity.
@@ -754,7 +783,7 @@ def build_subprocess_env(
       (always applied), exactly matching today's sanitize semantics.
     * ``scrub_secrets=False`` — preserve the base env content byte-for-byte
       except for managed Buzz CLI identity. The scoped credentials are removed
-      unless the authoritative base environment carries the exact managed-host
+      unless a snapshot of host ``os.environ`` carries the exact managed-host
       marker, and the marker itself is always consumed at the child boundary.
       Use for children that intentionally receive other secrets (git
       credential flows, ``bws``/``op`` secret CLIs) or where broad scrubbing
@@ -771,6 +800,7 @@ def build_subprocess_env(
       ``extra_env`` (same force-prefix / blocklist handling as today).
     """
     source_env = dict(base) if base is not None else os.environ.copy()
+    authority_env = os.environ.copy()
     if scrub_secrets:
         # _sanitize_subprocess_env already performs HERMES_HOME override
         # bridging + apply_subprocess_home_env unconditionally; delegating
@@ -787,7 +817,7 @@ def build_subprocess_env(
         apply_subprocess_home_env(env)
     if extra:
         env.update(extra)
-    _enforce_managed_buzz_terminal_identity_boundary(env, source_env)
+    _enforce_managed_buzz_terminal_identity_boundary(env, authority_env)
     return env
 
 
@@ -1405,10 +1435,11 @@ def _make_run_env(env: dict) -> dict:
         _is_passthrough = lambda _: False  # noqa: E731
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
-    merged = _merge_windows_path_env(os.environ, env)
+    authority_env = os.environ.copy()
+    merged = _merge_windows_path_env(authority_env, env)
     run_env = {}
     for k, v in merged.items():
-        if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+        if k.upper().startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             if _is_hermes_internal_secret(real_key):
                 continue
@@ -1418,16 +1449,16 @@ def _make_run_env(env: dict) -> dict:
         else:
             passthrough = _is_passthrough(k)
             if (
-                k in _HERMES_PROVIDER_ENV_BLOCKLIST
+                k.upper() in _HERMES_PROVIDER_ENV_BLOCKLIST
                 and not passthrough
-                and not _is_managed_buzz_terminal_env_var(k, os.environ)
+                and not _is_managed_buzz_terminal_env_var(k, authority_env)
             ):
                 continue
             value = _resolve_passthrough_value(k, v) if passthrough else v
             if value is not None:
                 run_env[k] = value
 
-    _enforce_managed_buzz_terminal_identity_boundary(run_env, os.environ)
+    _enforce_managed_buzz_terminal_identity_boundary(run_env, authority_env)
 
     path_key = _path_env_key(run_env)
     if path_key is not None:

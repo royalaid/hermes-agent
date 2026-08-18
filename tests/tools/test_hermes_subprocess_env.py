@@ -72,17 +72,19 @@ _BUZZ_CHILD_ENV_BUILDERS = (
 
 
 def _build_buzz_child_env(builder, source):
-    if builder == "build_subprocess_env_no_scrub":
-        return build_subprocess_env(
-            source,
-            scrub_secrets=False,
-            inherit_profile_home=False,
-        )
-    if builder == "build_subprocess_env_scrubbed":
-        return build_subprocess_env(source)
-    if builder == "sanitize_subprocess_env":
-        return _sanitize_subprocess_env(source)
-    with patch.dict(os.environ, source, clear=True):
+    # Use a plain mapping so case-variant aliases are exercised identically on
+    # Windows and POSIX rather than being collapsed by Windows os._Environ.
+    with patch.object(os, "environ", dict(source)):
+        if builder == "build_subprocess_env_no_scrub":
+            return build_subprocess_env(
+                source,
+                scrub_secrets=False,
+                inherit_profile_home=False,
+            )
+        if builder == "build_subprocess_env_scrubbed":
+            return build_subprocess_env(source)
+        if builder == "sanitize_subprocess_env":
+            return _sanitize_subprocess_env(source)
         if builder == "hermes_subprocess_env":
             return hermes_subprocess_env(inherit_credentials=True)
         if builder == "make_run_env":
@@ -91,6 +93,118 @@ def _build_buzz_child_env(builder, source):
 
 
 class TestBuildSubprocessEnvManagedBuzzBoundary:
+    @pytest.mark.parametrize("scrub_secrets", [False, True])
+    @pytest.mark.parametrize("host_marker", [None, "xyz.block.buzz.app.evil"])
+    def test_explicit_base_marker_cannot_establish_host_authority(
+        self, scrub_secrets, host_marker
+    ):
+        host = dict(_SAFE_SAMPLE)
+        if host_marker is not None:
+            host["BUZZ_MANAGED_AGENT"] = host_marker
+        base = {
+            **_SAFE_SAMPLE,
+            "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+            **_BUZZ_IDENTITY,
+        }
+
+        with patch.dict(os.environ, host, clear=True):
+            result = build_subprocess_env(
+                base,
+                scrub_secrets=scrub_secrets,
+                inherit_profile_home=False,
+            )
+
+        assert not (_BUZZ_IDENTITY.keys() & result.keys())
+        assert "BUZZ_MANAGED_AGENT" not in result
+
+    @pytest.mark.parametrize("scrub_secrets", [False, True])
+    def test_exact_host_marker_authorizes_explicit_base_without_marker(self, scrub_secrets):
+        host = {**_SAFE_SAMPLE, "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"}
+        base = {**_SAFE_SAMPLE, **_BUZZ_IDENTITY}
+
+        with patch.dict(os.environ, host, clear=True):
+            result = build_subprocess_env(
+                base,
+                scrub_secrets=scrub_secrets,
+                inherit_profile_home=False,
+            )
+
+        for key, value in _BUZZ_IDENTITY.items():
+            assert result[key] == value
+        assert "BUZZ_MANAGED_AGENT" not in result
+
+    @pytest.mark.parametrize("builder", _BUZZ_CHILD_ENV_BUILDERS)
+    def test_conflicting_host_marker_case_aliases_fail_closed(self, builder):
+        host = {
+            **_SAFE_SAMPLE,
+            "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+            "buzz_managed_agent": "xyz.block.buzz.app.evil",
+            **_BUZZ_IDENTITY,
+        }
+
+        result = _build_buzz_child_env(builder, host)
+
+        assert not (_BUZZ_IDENTITY.keys() & result.keys())
+        assert not any(key.upper() == "BUZZ_MANAGED_AGENT" for key in result)
+
+    @pytest.mark.parametrize("builder", _BUZZ_CHILD_ENV_BUILDERS)
+    def test_case_variant_host_and_identity_names_are_matched_without_respelling(self, builder):
+        identity = {
+            "buzz_private_key": "synthetic-private-key",
+            "Buzz_Relay_Url": "wss://synthetic.invalid",
+            "bUzZ_aUtH_tAg": "synthetic-auth-tag",
+        }
+        host = {
+            **_SAFE_SAMPLE,
+            "bUzZ_mAnAgEd_AgEnT": "xyz.block.buzz.app",
+            **identity,
+            "Ordinary_Var": "Preserve-Me",
+        }
+
+        result = _build_buzz_child_env(builder, host)
+
+        for key, value in identity.items():
+            assert result[key] == value
+        assert result["Ordinary_Var"] == "Preserve-Me"
+        assert not any(key.upper() == "BUZZ_MANAGED_AGENT" for key in result)
+
+    @pytest.mark.parametrize("builder", _BUZZ_CHILD_ENV_BUILDERS)
+    def test_unauthorized_case_variant_identity_and_force_prefix_are_removed(self, builder):
+        source = {
+            **_SAFE_SAMPLE,
+            "buzz_managed_agent": "xyz.block.buzz.app.evil",
+            "bUzZ_pRiVaTe_KeY": "synthetic-private-key",
+            "_hErMeS_FoRcE_bUzZ_aUtH_tAg": "synthetic-auth-tag",
+            "Ordinary_Var": "Preserve-Me",
+        }
+
+        result = _build_buzz_child_env(builder, source)
+
+        restricted = {
+            "BUZZ_MANAGED_AGENT",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+            "_HERMES_FORCE_BUZZ_AUTH_TAG",
+        }
+        assert not any(key.upper() in restricted for key in result)
+        assert result["Ordinary_Var"] == "Preserve-Me"
+
+    @pytest.mark.parametrize(
+        "builder",
+        [
+            "build_subprocess_env_scrubbed",
+            "sanitize_subprocess_env",
+            "hermes_subprocess_env",
+            "make_run_env",
+        ],
+    )
+    def test_case_variant_tier1_name_is_blocked_on_windows_neutral_mapping(self, builder):
+        source = {**_SAFE_SAMPLE, "gH_tOkEn": "synthetic-secret"}
+
+        result = _build_buzz_child_env(builder, source)
+
+        assert not any(key.upper() == "GH_TOKEN" for key in result)
+
     def test_no_scrub_strips_buzz_identity_without_host_marker(self):
         result = build_subprocess_env(
             {**_SAFE_SAMPLE, **_BUZZ_IDENTITY, "UNRELATED_CREDENTIAL": "keep-me"},
@@ -118,15 +232,13 @@ class TestBuildSubprocessEnvManagedBuzzBoundary:
         assert "BUZZ_MANAGED_AGENT" not in result
 
     def test_no_scrub_consumes_exact_host_marker_after_authorizing_buzz_identity(self):
-        result = build_subprocess_env(
-            {
-                **_SAFE_SAMPLE,
-                "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
-                **_BUZZ_IDENTITY,
-            },
-            scrub_secrets=False,
-            inherit_profile_home=False,
-        )
+        host = {**_SAFE_SAMPLE, "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"}
+        with patch.dict(os.environ, host, clear=True):
+            result = build_subprocess_env(
+                {**_SAFE_SAMPLE, **_BUZZ_IDENTITY},
+                scrub_secrets=False,
+                inherit_profile_home=False,
+            )
 
         assert "BUZZ_MANAGED_AGENT" not in result
         for key, value in _BUZZ_IDENTITY.items():
@@ -238,18 +350,17 @@ class TestStripByDefault:
             assert forced_key not in result
             assert forced_key.removeprefix(_HERMES_PROVIDER_ENV_FORCE_PREFIX) not in result
 
-    def test_forced_extra_buzz_identity_allowed_by_exact_base_managed_agent_marker(self):
-        """The authoritative base marker still permits forced Buzz CLI identity."""
+    def test_forced_extra_buzz_identity_allowed_by_exact_host_managed_agent_marker(self):
+        """The authoritative host marker permits forced Buzz CLI identity."""
         forced_buzz_identity = {
             f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_PRIVATE_KEY": "synthetic-private-key",
             f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_RELAY_URL": "wss://synthetic.invalid",
             f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_AUTH_TAG": "synthetic-auth-tag",
         }
 
-        result = _sanitize_subprocess_env(
-            {**_SAFE_SAMPLE, "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"},
-            forced_buzz_identity,
-        )
+        host = {**_SAFE_SAMPLE, "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"}
+        with patch.dict(os.environ, host, clear=True):
+            result = _sanitize_subprocess_env(_SAFE_SAMPLE, forced_buzz_identity)
 
         for forced_key, value in forced_buzz_identity.items():
             assert result[forced_key.removeprefix(_HERMES_PROVIDER_ENV_FORCE_PREFIX)] == value
@@ -263,6 +374,29 @@ class TestStripByDefault:
 
 
 class TestHermesSubprocessEnvExtra:
+    def test_case_variant_restricted_extra_names_cannot_bypass_host_boundary(self):
+        host = {**_SAFE_SAMPLE, "REQUIRED_PARENT_VAR": "required"}
+        extra = {
+            "bUzZ_mAnAgEd_AgEnT": "xyz.block.buzz.app",
+            "buzz_private_key": "synthetic-private-key",
+            "gH_tOkEn": "synthetic-gh-secret",
+            "_hErMeS_fOrCe_bUzZ_aUtH_tAg": "synthetic-auth-tag",
+            "Ordinary_Extra": "Preserve-Me",
+        }
+
+        with patch.object(os, "environ", host):
+            result = hermes_subprocess_env(inherit_credentials=True, extra=extra)
+
+        restricted = {
+            "BUZZ_MANAGED_AGENT",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+            "GH_TOKEN",
+            "_HERMES_FORCE_BUZZ_AUTH_TAG",
+        }
+        assert not any(key.upper() in restricted for key in result)
+        assert result["Ordinary_Extra"] == "Preserve-Me"
+
     @pytest.mark.parametrize(
         ("host_marker", "expected_buzz"),
         [
