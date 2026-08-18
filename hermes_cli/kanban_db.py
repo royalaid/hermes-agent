@@ -10924,12 +10924,13 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    except OSError:
-        if not _IS_WINDOWS:
+    except OSError as exc:
+        if not _IS_WINDOWS or getattr(exc, "winerror", None) != 5:
             log_f.close()
             raise
-        # Restrictive Windows job objects can reject BREAKAWAY. Retry once
-        # without it while preserving the hidden/process-group behavior.
+        # Restrictive Windows job objects can reject BREAKAWAY with
+        # ERROR_ACCESS_DENIED. Retry once without it while preserving the
+        # hidden/process-group behavior.
         popen_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
         try:
             proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
