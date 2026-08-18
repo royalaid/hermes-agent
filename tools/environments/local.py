@@ -766,7 +766,7 @@ def _find_bash() -> str:
             # The configured installation is an explicit user choice.  Do not
             # let a health-probe false negative silently redirect it to WSL.
             return sibling_usr
-        return custom
+        candidates.append(custom)
 
     # Prefer our own portable Git install — a broken or partially-uninstalled
     # system Git (or a stale HERMES_GIT_BASH_PATH pointing at one) must not
