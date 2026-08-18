@@ -734,6 +734,12 @@ def build_subprocess_env(
     return env
 
 
+def _is_system32_bash(path: str) -> bool:
+    """Return whether *path* is the Windows System32 bash shim on any host."""
+    parent = ntpath.basename(ntpath.dirname(ntpath.normpath(path)))
+    return parent.casefold() == "system32"
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:
@@ -795,10 +801,7 @@ def _find_bash() -> str:
     found = shutil.which("bash")
     # PATH commonly resolves bash.exe to WSL's System32 shim.  It is not Git
     # Bash and cannot consume the MSYS working directories used below.
-    if found and not (
-        _IS_WINDOWS
-        and os.path.normcase(os.path.basename(os.path.dirname(found))) == "system32"
-    ) and found not in candidates:
+    if found and not (_IS_WINDOWS and _is_system32_bash(found)) and found not in candidates:
         candidates.append(found)
 
     # Prefer the first candidate that can actually start.  A stale

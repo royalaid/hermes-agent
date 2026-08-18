@@ -357,6 +357,11 @@ class TestWrapCommandWindowsNativeCwd:
 # ---------------------------------------------------------------------------
 
 class TestBashDiscoveryFailureHandling:
+    def test_system32_bash_detection_uses_windows_path_semantics_on_any_host(self):
+        """System32 matching must not depend on the review host's normcase."""
+        assert local_mod._is_system32_bash(r"C:\WINDOWS\SyStEm32/bash.exe") is True
+        assert local_mod._is_system32_bash(r"C:\WINDOWS\SysWOW64/bash.exe") is False
+
     def test_explicit_git_path_uses_usr_bin_without_running_probe(
         self, monkeypatch, tmp_path
     ):

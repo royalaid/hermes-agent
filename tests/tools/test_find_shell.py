@@ -7,7 +7,6 @@ when ``~/.bash_profile`` contained ``exec /bin/zsh -l``.
 
 import os
 import platform
-import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -136,23 +135,37 @@ class TestGitBashExternalProgramProbe:
     """The Windows health check must exercise MSYS child-process creation."""
 
     def test_probe_runs_external_msys_programs(self, monkeypatch):
-        """``_bash_starts`` builds the same external-program probe argv on
-        every host, so this stays on the Linux runner with ``subprocess.run``
-        mocked — no platform faking needed."""
+        """``_bash_starts`` probes external programs with a bounded Popen wait."""
         import tools.environments.local as local_mod
 
         local_mod._bash_starts_cache.clear()
         local_mod._bash_probe_details_cache.clear()
-        calls = []
+        calls = {}
 
-        def fake_run(argv, **kwargs):
-            calls.append((argv, kwargs))
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        class FakeProcess:
+            returncode = 0
 
-        monkeypatch.setattr(local_mod.subprocess, "run", fake_run)
+            def communicate(self, *, timeout):
+                calls["timeout"] = timeout
+                return "", ""
 
-        assert local_mod._bash_starts(r"C:\Git\bin\bash.exe") is True
-        assert calls[0][0][-1] == "/usr/bin/true; /usr/bin/cat --version >/dev/null"
+        def fake_popen(argv, **kwargs):
+            calls["argv"] = argv
+            calls["kwargs"] = kwargs
+            return FakeProcess()
+
+        monkeypatch.setattr(local_mod.subprocess, "Popen", fake_popen)
+
+        bash = r"C:\Git\bin\bash.exe"
+        assert local_mod._bash_starts(bash) is True
+        assert calls["argv"] == [
+            bash,
+            "--noprofile",
+            "--norc",
+            "-c",
+            "/usr/bin/true; /usr/bin/cat --version >/dev/null",
+        ]
+        assert calls["timeout"] == 15
 
     @pytest.mark.windows_only
     def test_aslr_failure_surfaces_targeted_windows_command(
