@@ -1961,6 +1961,132 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.assertEqual(result["push_lease_head"], fixture["published"])
         self.assertEqual(result["upstream_provenance"], "local_tracking_matches_remote")
 
+    def _run_mocked_publication_main(
+        self, *, post_verification_fault: str | None = None, verification_complete: bool = True,
+    ) -> tuple[int | str, list[str], list[dict[str, object]]]:
+        """Exercise main's publish path without touching remotes, locks, or live copies."""
+        failures: list[str] = []
+        emitted_results: list[dict[str, object]] = []
+        verification_calls = 0
+        old = {name: getattr(release, name) for name in (
+            "exclusive_lock", "fail", "emit_fleet_receipt", "ensure_clean_identity",
+            "synchronize_to_published_head", "published_integration_range",
+            "replay_published_integration_range", "validate_published_commit_preservation",
+            "output_is_already_based_on_current_upstream", "resolve_built_launcher", "sha256",
+            "git", "run", "push_rebased_output", "publish_release", "verify_public_asset",
+            "verify_existing_integration_release", "integration_scripts_integrity_check",
+            "require_authority", "emit_stage", "sync_operational_copies",
+            "_consume_upstream_pin_on_publish", "parked_pin_summary", "log", "_emit_result",
+            "resolve_failure_investigator_success", "launch_failure_investigator", "time",
+        )}
+        old_argv = __import__("sys").argv
+        old_urlopen = release.urllib.request.urlopen
+        launcher = self.repo / "Hermes-Setup.exe"
+        launcher.write_bytes(b"x" * 1_000_001)
+
+        def fake_git(*args: str, **_kwargs: object) -> str:
+            if args[:2] == ("rev-parse", "origin/main"):
+                return "upstream"
+            if args[:2] == ("rev-parse", "refs/remotes/fork/fork-integration"):
+                return "published-input"
+            if args[:2] == ("rev-parse", "HEAD"):
+                return "rebased-output"
+            if args[:2] == ("ls-remote", release.FORK_REMOTE):
+                return "rebased-output\trefs/heads/fork-integration"
+            return "0"
+
+        def verify_release(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal verification_calls
+            verification_calls += 1
+            complete = verification_calls > 1 and verification_complete
+            return {"complete": complete, "reason": "release_complete" if complete else "release_missing"}
+
+        def emit_stage(name: str, **_kwargs: object) -> None:
+            if name == "sync" and post_verification_fault == "sync_stage":
+                raise RuntimeError("sync stage emission failed")
+
+        def log(message: str) -> None:
+            if post_verification_fault == "result_log" and message.startswith("{"):
+                raise RuntimeError("final result log failed")
+
+        def emit_result(result: dict[str, object], **_kwargs: object) -> int:
+            emitted_results.append(dict(result))
+            if post_verification_fault == "result_emit":
+                raise RuntimeError("final result emission failed")
+            return 0
+
+        release.exclusive_lock = nullcontext
+        release.fail = lambda message, code=1: (
+            failures.append(str(message)), (_ for _ in ()).throw(SystemExit(code))
+        )[1]
+        release.emit_fleet_receipt = lambda *_args, **_kwargs: None
+        release.ensure_clean_identity = lambda: ("pre-run-local", "published-input")
+        release.synchronize_to_published_head = lambda *_args: "published-input"
+        release.published_integration_range = lambda *_args: ("base", ["published-commit"])
+        release.replay_published_integration_range = lambda *_args, **_kwargs: []
+        release.validate_published_commit_preservation = lambda *_args, **_kwargs: None
+        release.output_is_already_based_on_current_upstream = lambda *_args: False
+        release.resolve_built_launcher = lambda: launcher
+        release.sha256 = lambda _path: "checksum"
+        release.git = fake_git
+        release.run = lambda *args, **_kwargs: subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        release.push_rebased_output = lambda *_args: None
+        release.publish_release = lambda *_args: ("https://public/release", [])
+        release.verify_public_asset = lambda *_args: None
+        release.verify_existing_integration_release = verify_release
+        release.integration_scripts_integrity_check = lambda **_kwargs: {
+            "ok": True, "source_sha": "release-source", "stamped_source_sha": "release-source", "files": {},
+        }
+        release.require_authority = lambda *_args, **_kwargs: None
+        release.emit_stage = emit_stage
+        release.sync_operational_copies = lambda *_args: {"ok": True}
+        release._consume_upstream_pin_on_publish = lambda: None
+        release.parked_pin_summary = lambda: []
+        release.log = log
+        release._emit_result = emit_result
+        release.resolve_failure_investigator_success = lambda: None
+        release.launch_failure_investigator = lambda **_kwargs: None
+        release.time = SimpleNamespace(sleep=lambda _seconds: None)
+        release.urllib.request.urlopen = lambda *_args, **_kwargs: nullcontext(SimpleNamespace(status=200))
+        try:
+            __import__("sys").argv = [str(SCRIPT)]
+            try:
+                outcome: int | str = release.main()
+            except SystemExit as exc:
+                outcome = f"SystemExit({exc.code})"
+        finally:
+            __import__("sys").argv = old_argv
+            release.urllib.request.urlopen = old_urlopen
+            for name, value in old.items():
+                setattr(release, name, value)
+        return outcome, failures, emitted_results
+
+    def test_main_sync_stage_failure_after_public_verification_remains_success(self) -> None:
+        outcome, failures, results = self._run_mocked_publication_main(
+            post_verification_fault="sync_stage",
+        )
+        self.assertEqual(outcome, 0)
+        self.assertEqual(failures, [])
+        self.assertTrue(results[0]["ok"])
+        self.assertTrue(results[0]["warnings"])
+
+    def test_main_final_reporting_failures_after_public_verification_remain_success(self) -> None:
+        for fault in ("result_log", "result_emit"):
+            with self.subTest(fault=fault):
+                outcome, failures, results = self._run_mocked_publication_main(
+                    post_verification_fault=fault,
+                )
+                self.assertEqual(outcome, 0)
+                self.assertEqual(failures, [])
+                self.assertTrue(results[0]["ok"])
+
+    def test_main_public_verification_failure_still_fails(self) -> None:
+        outcome, failures, _results = self._run_mocked_publication_main(
+            verification_complete=False,
+        )
+        self.assertEqual(outcome, "SystemExit(1)")
+        self.assertIn("published release integrity verification failed", failures[0])
+
     def test_main_post_push_failure_never_resets_or_rewrites_backwards(self) -> None:
         commands: list[tuple[str, ...]] = []
         failures: list[str] = []

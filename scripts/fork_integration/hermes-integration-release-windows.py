@@ -3333,6 +3333,78 @@ def verify_public_asset(url: str, expected_sha: str) -> None:
         raise RuntimeError("public GitHub download checksum did not match uploaded installer")
 
 
+def _finish_verified_publication(
+    result: dict[str, Any],
+    *,
+    started_at: datetime,
+    release_system_source_sha: str | None,
+    published_product_sha: str,
+) -> int:
+    """Finish local work after public integrity verification has committed success.
+
+    A complete public release is the irreversible transaction boundary. Every
+    operation here is local bookkeeping, diagnostics, or reporting; an
+    ``Exception`` from any one is retained as a structured warning and cannot
+    retroactively turn the verified publication into a failed run. Deliberate
+    process-control exceptions remain outside this boundary.
+    """
+    warnings: list[dict[str, str]] = []
+
+    def record_warning(operation: str, exc: Exception) -> None:
+        warning = {
+            "operation": operation,
+            "error": redact_process_output(f"{type(exc).__name__}: {exc}"),
+        }
+        warnings.append(warning)
+        result["warnings"] = warnings
+        try:
+            log(
+                "WARNING verified publication post-commit operation failed: "
+                f"operation={operation} error={warning['error']}"
+            )
+        except Exception:
+            pass
+
+    def best_effort(operation: str, action: Any, default: Any = None) -> Any:
+        try:
+            return action()
+        except Exception as exc:
+            record_warning(operation, exc)
+            return default
+
+    best_effort("consume_upstream_pin", _consume_upstream_pin_on_publish)
+    best_effort("emit_sync_stage", lambda: emit_stage("sync"))
+    result["sync"] = best_effort(
+        "sync_operational_copies",
+        lambda: sync_operational_copies(release_system_source_sha, published_product_sha),
+        {
+            "ok": False,
+            "error": "post-publication sync raised before returning an outcome",
+            "source_sha": release_system_source_sha,
+            "published_product_sha": published_product_sha,
+        },
+    )
+    result["parked_pins"] = best_effort("parked_pin_summary", parked_pin_summary, [])
+    best_effort("result_log", lambda: log(json.dumps(result, sort_keys=True)))
+    best_effort("resolve_failure_investigator_success", resolve_failure_investigator_success)
+    best_effort(
+        "emit_fleet_receipt",
+        lambda: emit_fleet_receipt(started_at, outcome="produced", changed=True),
+    )
+    try:
+        return _emit_result(result, dry_run=False)
+    except Exception as exc:
+        record_warning("emit_result", exc)
+        # _emit_result may have failed while deriving provenance, serializing,
+        # or writing stdout. Make one minimal structured-output attempt; if no
+        # reporting channel remains, the verified publication still exits 0.
+        try:
+            print(json.dumps(result, ensure_ascii=False, default=str))
+        except Exception:
+            pass
+        return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="inspect only; do not modify GitHub or the worktree")
@@ -3391,6 +3463,8 @@ def main() -> int:
     published_input_head: str | None = None
     rebased_output_head: str | None = None
     branch_pushed = False
+    public_integrity_verified = False
+    publication_result: dict[str, Any] | None = None
     stage = "prepare"
     with exclusive_lock(args.holder):
         try:
@@ -3572,13 +3646,12 @@ def main() -> int:
                 time.sleep(15)
             if not repaired_release["complete"]:
                 raise RuntimeError(f"published release integrity verification failed: {repaired_release['reason']}")
-            _consume_upstream_pin_on_publish()
-            stage = "sync_operational_copies"
-            emit_stage("sync")
-            sync_outcome = sync_operational_copies(
-                sync_integrity.get("source_sha"), rebased_output_head
-            )
-            result = {
+            public_integrity_verified = True
+
+            # A checksum-backed public verification is the irreversible commit
+            # boundary. Nothing local or diagnostic after this point may
+            # retroactively report the published release as failed.
+            publication_result = {
                 "ok": True,
                 "changed": True,
                 "branch": BRANCH,
@@ -3594,18 +3667,47 @@ def main() -> int:
                 "launcher": public_asset,
                 "sha256": checksum,
                 "retention_deleted": removed,
-                "sync": sync_outcome,
-                "parked_pins": parked_pin_summary(),
             }
             if args.holder != "scheduler":
                 # Audit trail for a token-gated finish; absent (not empty) on
                 # the scheduler path so the nightly brief keeps its shape.
-                result["authority"] = list(AUTHORITY_GRANTS)
-            log(json.dumps(result, sort_keys=True))
-            resolve_failure_investigator_success()
-            emit_fleet_receipt(started_at, outcome="produced", changed=True)
-            return _emit_result(result, dry_run=False)
+                publication_result["authority"] = list(AUTHORITY_GRANTS)
+            return _finish_verified_publication(
+                publication_result,
+                started_at=started_at,
+                release_system_source_sha=sync_integrity.get("source_sha"),
+                published_product_sha=rebased_output_head,
+            )
         except Exception as exc:
+            if public_integrity_verified:
+                # Belt-and-suspenders around the entire post-commit region:
+                # even an unexpected bug in its coordinator cannot fall
+                # through to restoration, failure investigation, a failed
+                # Fleet receipt, or fail().
+                message = redact_process_output(f"{type(exc).__name__}: {exc}")
+                committed = publication_result or {
+                    "ok": True,
+                    "changed": True,
+                    "branch": BRANCH,
+                    "head": rebased_output_head,
+                    "release_integrity_verified": True,
+                }
+                committed.setdefault("warnings", []).append({
+                    "operation": "post_commit_boundary",
+                    "error": message,
+                })
+                try:
+                    log(
+                        "WARNING verified publication post-commit coordinator failed: "
+                        f"{message}"
+                    )
+                except Exception:
+                    pass
+                try:
+                    return _emit_result(committed, dry_run=False)
+                except Exception:
+                    return 0
+
             restoration_error = ""
             if published_input_head and not branch_pushed:
                 try:
