@@ -15,6 +15,7 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -208,9 +209,10 @@ class TestRunJobScript:
         assert spawned["VIRTUAL_ENV"] == "/synthetic/uv-venv"
         assert spawned["PYTHONPATH"] == "/synthetic/uv-site-packages"
 
-        grandchild = build_subprocess_env(
-            spawned, scrub_secrets=False, inherit_profile_home=False
-        )
+        with patch.dict(os.environ, spawned, clear=True):
+            grandchild = build_subprocess_env(
+                spawned, scrub_secrets=False, inherit_profile_home=False
+            )
         assert "BUZZ_MANAGED_AGENT" not in grandchild
         assert "BUZZ_PRIVATE_KEY" not in grandchild
         assert "BUZZ_RELAY_URL" not in grandchild

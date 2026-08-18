@@ -7,6 +7,9 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import os
+from unittest.mock import patch
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -386,9 +389,10 @@ class TestSpawnEnvSecretStripping:
 
         from tools.environments.local import build_subprocess_env
 
-        grandchild = build_subprocess_env(
-            spawned, scrub_secrets=False, inherit_profile_home=False
-        )
+        with patch.dict(os.environ, spawned, clear=True):
+            grandchild = build_subprocess_env(
+                spawned, scrub_secrets=False, inherit_profile_home=False
+            )
         assert "BUZZ_MANAGED_AGENT" not in grandchild
         assert "BUZZ_PRIVATE_KEY" not in grandchild
         assert "BUZZ_RELAY_URL" not in grandchild
