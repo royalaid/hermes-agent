@@ -1,6 +1,7 @@
 """Regression coverage for terminal environment cache-key isolation."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -334,6 +335,104 @@ def test_terminal_execute_container_selects_raw_then_collapsed_environment(
     assert raw_env.execute_count == int(raw_present)
     assert default_env.execute_count == int(not raw_present)
     assert set(terminal_tool._last_activity) == {expected_key}
+
+
+@pytest.mark.parametrize("raw_present", [True, False])
+def test_terminal_background_container_attributes_process_to_selected_environment(
+    monkeypatch, raw_present
+):
+    from tools.process_registry import process_registry
+
+    raw_env = _FakeEnvironment("raw-cwd")
+    default_env = _FakeEnvironment("default-cwd")
+    active = {"default": default_env}
+    if raw_present:
+        active["session-a"] = raw_env
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "timeout": 30,
+        "docker_image": "docker-image",
+        "singularity_image": "singularity-image",
+        "modal_image": "modal-image",
+        "daytona_image": "daytona-image",
+    }
+    spawn_calls = []
+
+    def fake_spawn_via_env(**kwargs):
+        spawn_calls.append(kwargs)
+        return SimpleNamespace(id="proc-test", pid=1234)
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", active)
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(process_registry, "spawn_via_env", fake_spawn_via_env)
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            "sleep 30", task_id="session-a", background=True, force=True
+        )
+    )
+
+    expected_key = "session-a" if raw_present else "default"
+    expected_env = raw_env if raw_present else default_env
+    assert result["exit_code"] == 0
+    assert spawn_calls[0]["env"] is expected_env
+    assert spawn_calls[0]["task_id"] == expected_key
+
+    terminal_tool._last_activity[expected_key] = 0.0
+    monkeypatch.setattr(terminal_tool.time, "time", lambda: 100.0)
+    monkeypatch.setattr(
+        process_registry,
+        "has_active_processes",
+        lambda task_id: task_id == spawn_calls[0]["task_id"],
+    )
+    terminal_tool._cleanup_inactive_envs(lifetime_seconds=1)
+
+    assert terminal_tool._active_environments[expected_key] is expected_env
+    assert terminal_tool._last_activity[expected_key] == 100.0
+
+
+def test_terminal_background_local_attributes_process_to_exact_environment(
+    monkeypatch
+):
+    from tools.process_registry import process_registry
+
+    session_env = _FakeEnvironment("session-cwd")
+    config = {
+        "env_type": "local",
+        "cwd": ".",
+        "timeout": 30,
+        "local_persistent": False,
+    }
+    spawn_calls = []
+
+    def fake_spawn_local(**kwargs):
+        spawn_calls.append(kwargs)
+        return SimpleNamespace(id="proc-test", pid=1234)
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"session-a": session_env}
+    )
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(process_registry, "spawn_local", fake_spawn_local)
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            "sleep 30", task_id="session-a", background=True, force=True
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert spawn_calls[0]["task_id"] == "session-a"
 
 
 def test_degraded_local_eviction_only_removes_exact_session_and_file_cache(

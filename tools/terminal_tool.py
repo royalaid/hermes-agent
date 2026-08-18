@@ -3097,7 +3097,7 @@ def terminal_tool(
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=selected_key,
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
@@ -3107,7 +3107,7 @@ def terminal_tool(
                         env=env,
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=selected_key,
                         session_key=session_key,
                     )
 
