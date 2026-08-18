@@ -497,8 +497,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
-    source_env = dict(base_env or {})
-    source_env.update(extra_env or {})
+    source_env = base_env or {}
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -1391,7 +1390,7 @@ def _make_run_env(env: dict) -> dict:
             if (
                 k in _HERMES_PROVIDER_ENV_BLOCKLIST
                 and not passthrough
-                and not _is_managed_buzz_terminal_env_var(k, merged)
+                and not _is_managed_buzz_terminal_env_var(k, os.environ)
             ):
                 continue
             value = _resolve_passthrough_value(k, v) if passthrough else v

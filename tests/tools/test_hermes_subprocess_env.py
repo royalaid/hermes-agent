@@ -18,6 +18,7 @@ from tools.environments.local import (
     hermes_subprocess_env,
     _ALWAYS_STRIP_KEYS,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
+    _sanitize_subprocess_env,
 )
 
 
@@ -61,6 +62,22 @@ class TestStripByDefault:
         result = _build(_TIER1_SAMPLE)
         for var in _TIER1_SAMPLE:
             assert var not in result, f"{var} leaked (Tier-1) with inherit_credentials=False"
+
+    def test_extra_marker_does_not_unlock_base_buzz_identity(self):
+        """A subprocess overlay cannot assert managed-host trust for base credentials."""
+        buzz_identity = {
+            "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result = _sanitize_subprocess_env(
+            {**_SAFE_SAMPLE, **buzz_identity},
+            {"BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"},
+        )
+
+        for key in buzz_identity:
+            assert key not in result
 
 
     def test_pythonutf8_set(self):

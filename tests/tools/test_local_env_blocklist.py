@@ -268,6 +268,22 @@ class TestProviderEnvBlocklist:
         for key in unrelated_secrets:
             assert key not in result_env
 
+    def test_terminal_overlay_marker_does_not_unlock_host_buzz_identity(self):
+        """A caller-controlled terminal overlay cannot assert managed-host trust."""
+        buzz_identity = {
+            "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result_env = _run_with_env(
+            extra_os_env=buzz_identity,
+            self_env={"BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"},
+        )
+
+        for key in buzz_identity:
+            assert key not in result_env
+
     @pytest.mark.parametrize("lookalike", [
         "XYZ.BLOCK.BUZZ.APP",
         "xyz.block.buzz.app ",
