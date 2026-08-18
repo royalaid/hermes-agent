@@ -264,6 +264,40 @@ class TestSpawnEnvIsolation:
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
 
+    def test_kanban_writable_root_is_json_escaped(self, monkeypatch):
+        """Quotes and backslashes in the root must remain one valid JSON value."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_escaped_root")
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.setenv(
+            "HERMES_KANBAN_ROOT", 'C:\\boards\\team "alpha"\\nested'
+        )
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        assert (
+            'sandbox_workspace_write.writable_roots=["C:\\\\boards\\\\team \\"alpha\\"\\\\nested"]'
+            in captured["cmd"]
+        )
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
