@@ -3691,26 +3691,21 @@ def terminal_tool(
 
 
 def _evict_environment_for_task(task_id: Optional[str]) -> None:
-    """Drop the cached environment for *task_id*'s backend-aware key.
-
-    Used when a backend reports an infrastructure failure: keeping the dead
-    env cached would make every subsequent call fail against a stale
-    connection, defeating automatic recovery.
-    """
+    """Drop the selected cached environment and matching file-ops cache."""
     config = _get_env_config()
-    resolved_key = _resolve_environment_task_id(task_id, config)
-    keys = {resolved_key}
-    if config.get("env_type") != "local" and task_id:
-        keys.add(task_id)
-
-    evicted = {}
     with _env_lock:
-        for key in keys:
-            env = _active_environments.pop(key, None)
-            _last_activity.pop(key, None)
-            if env is not None:
-                evicted[id(env)] = env
-    for env in evicted.values():
+        selected_key, env = _lookup_active_environment_locked(task_id, config)
+        _active_environments.pop(selected_key, None)
+        _last_activity.pop(selected_key, None)
+
+    try:
+        from tools.file_tools import clear_file_ops_cache
+
+        clear_file_ops_cache(selected_key, exact=True)
+    except Exception:
+        logger.debug("degraded file-ops cache eviction failed", exc_info=True)
+
+    if env is not None:
         try:
             env.cleanup()
         except Exception:

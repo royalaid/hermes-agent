@@ -336,10 +336,15 @@ def test_terminal_execute_container_selects_raw_then_collapsed_environment(
     assert set(terminal_tool._last_activity) == {expected_key}
 
 
-def test_degraded_local_eviction_only_removes_exact_session(monkeypatch):
+def test_degraded_local_eviction_only_removes_exact_session_and_file_cache(
+    monkeypatch,
+):
     default_env = _FakeEnvironment("default-cwd")
     session_env = _FakeEnvironment("session-a-cwd")
     sibling_env = _FakeEnvironment("session-b-cwd")
+    default_ops = object()
+    session_ops = object()
+    sibling_ops = object()
     monkeypatch.setattr(
         terminal_tool,
         "_active_environments",
@@ -355,6 +360,15 @@ def test_degraded_local_eviction_only_removes_exact_session(monkeypatch):
         {"default": 1.0, "session-a": 2.0, "session-b": 3.0},
     )
     monkeypatch.setattr(
+        file_tools,
+        "_file_ops_cache",
+        {
+            "default": default_ops,
+            "session-a": session_ops,
+            "session-b": sibling_ops,
+        },
+    )
+    monkeypatch.setattr(
         terminal_tool, "_get_env_config", lambda: {"env_type": "local"}
     )
 
@@ -365,18 +379,67 @@ def test_degraded_local_eviction_only_removes_exact_session(monkeypatch):
         "session-b": sibling_env,
     }
     assert terminal_tool._last_activity == {"default": 1.0, "session-b": 3.0}
+    assert file_tools._file_ops_cache == {
+        "default": default_ops,
+        "session-b": sibling_ops,
+    }
     assert session_env.cleanup_count == 1
     assert default_env.cleanup_count == 0
     assert sibling_env.cleanup_count == 0
 
 
-def test_degraded_container_eviction_removes_resolved_shared_default(monkeypatch):
+def test_degraded_container_eviction_prefers_raw_environment_and_file_cache(
+    monkeypatch,
+):
+    raw_env = _FakeEnvironment("raw-cwd")
     default_env = _FakeEnvironment("default-cwd")
+    raw_ops = object()
+    default_ops = object()
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"session-a": raw_env, "default": default_env},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_last_activity", {"session-a": 1.0, "default": 2.0}
+    )
+    monkeypatch.setattr(
+        file_tools,
+        "_file_ops_cache",
+        {"session-a": raw_ops, "default": default_ops},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+
+    terminal_tool._evict_environment_for_task("session-a")
+
+    assert terminal_tool._active_environments == {"default": default_env}
+    assert terminal_tool._last_activity == {"default": 2.0}
+    assert file_tools._file_ops_cache == {"default": default_ops}
+    assert raw_env.cleanup_count == 1
+    assert default_env.cleanup_count == 0
+
+
+def test_degraded_container_eviction_falls_back_to_shared_environment_and_file_cache(
+    monkeypatch,
+):
+    default_env = _FakeEnvironment("default-cwd")
+    raw_ops = object()
+    default_ops = object()
     monkeypatch.setattr(
         terminal_tool, "_active_environments", {"default": default_env}
     )
     monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 1.0})
     monkeypatch.setattr(
+        file_tools,
+        "_file_ops_cache",
+        {"session-a": raw_ops, "default": default_ops},
+    )
+    monkeypatch.setattr(
         terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
     )
     monkeypatch.setattr(
@@ -387,33 +450,8 @@ def test_degraded_container_eviction_removes_resolved_shared_default(monkeypatch
 
     assert terminal_tool._active_environments == {}
     assert terminal_tool._last_activity == {}
+    assert file_tools._file_ops_cache == {"session-a": raw_ops}
     assert default_env.cleanup_count == 1
-
-
-def test_degraded_container_eviction_deduplicates_aliased_environment_cleanup(
-    monkeypatch,
-):
-    shared_env = _FakeEnvironment("shared-cwd")
-    monkeypatch.setattr(
-        terminal_tool,
-        "_active_environments",
-        {"default": shared_env, "session-a": shared_env},
-    )
-    monkeypatch.setattr(
-        terminal_tool, "_last_activity", {"default": 1.0, "session-a": 2.0}
-    )
-    monkeypatch.setattr(
-        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
-    )
-    monkeypatch.setattr(
-        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
-    )
-
-    terminal_tool._evict_environment_for_task("session-a")
-
-    assert terminal_tool._active_environments == {}
-    assert terminal_tool._last_activity == {}
-    assert shared_env.cleanup_count == 1
 
 
 def test_cwd_override_local_backend_does_not_mutate_default_environment(monkeypatch):
