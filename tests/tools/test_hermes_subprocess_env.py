@@ -15,6 +15,7 @@ import os
 from unittest.mock import patch
 
 from tools.environments.local import (
+    build_subprocess_env,
     hermes_subprocess_env,
     _ALWAYS_STRIP_KEYS,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
@@ -50,6 +51,69 @@ def _build(extra=None, *, inherit_credentials=False):
         env.update(extra)
     with patch.dict(os.environ, env, clear=True):
         return hermes_subprocess_env(inherit_credentials=inherit_credentials)
+
+
+_BUZZ_IDENTITY = {
+    "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+    "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+    "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+}
+
+
+class TestBuildSubprocessEnvManagedBuzzBoundary:
+    def test_no_scrub_strips_buzz_identity_without_host_marker(self):
+        result = build_subprocess_env(
+            {**_SAFE_SAMPLE, **_BUZZ_IDENTITY, "UNRELATED_CREDENTIAL": "keep-me"},
+            scrub_secrets=False,
+            inherit_profile_home=False,
+        )
+
+        for key in _BUZZ_IDENTITY:
+            assert key not in result
+        assert result["UNRELATED_CREDENTIAL"] == "keep-me"
+
+    def test_no_scrub_strips_buzz_identity_with_wrong_host_marker(self):
+        result = build_subprocess_env(
+            {
+                **_SAFE_SAMPLE,
+                "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app.evil",
+                **_BUZZ_IDENTITY,
+            },
+            scrub_secrets=False,
+            inherit_profile_home=False,
+        )
+
+        for key in _BUZZ_IDENTITY:
+            assert key not in result
+
+    def test_no_scrub_preserves_buzz_identity_with_exact_host_marker(self):
+        result = build_subprocess_env(
+            {
+                **_SAFE_SAMPLE,
+                "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+                **_BUZZ_IDENTITY,
+            },
+            scrub_secrets=False,
+            inherit_profile_home=False,
+        )
+
+        for key, value in _BUZZ_IDENTITY.items():
+            assert result[key] == value
+
+    def test_no_scrub_extra_marker_cannot_unlock_base_buzz_identity(self):
+        result = build_subprocess_env(
+            {**_SAFE_SAMPLE, **_BUZZ_IDENTITY},
+            scrub_secrets=False,
+            inherit_profile_home=False,
+            extra={
+                "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+                "MY_APP_VAR": "extra-wins",
+            },
+        )
+
+        for key in _BUZZ_IDENTITY:
+            assert key not in result
+        assert result["MY_APP_VAR"] == "extra-wins"
 
 
 class TestStripByDefault:

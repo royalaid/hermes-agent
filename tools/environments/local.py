@@ -744,10 +744,12 @@ def build_subprocess_env(
       home propagation is inherent — ``inherit_profile_home`` is ignored
       (always applied), exactly matching today's sanitize semantics.
     * ``scrub_secrets=False`` — preserve the base env content byte-for-byte
-      (no key is removed).  Use for children that intentionally receive
-      secrets (git credential flows, ``bws``/``op`` secret CLIs) or where
-      scrubbing could change behavior.  The site is still a win: it becomes
-      grep-able and future-fixable.
+      except for managed Buzz CLI identity, which is removed unless the
+      authoritative base environment carries the exact managed-host marker.
+      Use for children that intentionally receive other secrets (git
+      credential flows, ``bws``/``op`` secret CLIs) or where broad scrubbing
+      could change behavior.  The site is still a win: it becomes grep-able
+      and future-fixable.
     * ``inherit_profile_home`` — on the non-scrub path, when True, bridge the
       context-local Hermes home override into ``HERMES_HOME`` and apply the
       subprocess HOME contract (``hermes_constants.apply_subprocess_home_env``).
@@ -758,22 +760,24 @@ def build_subprocess_env(
       scrub path it is forwarded as ``_sanitize_subprocess_env``'s
       ``extra_env`` (same force-prefix / blocklist handling as today).
     """
+    source_env = dict(base) if base is not None else os.environ.copy()
     if scrub_secrets:
         # _sanitize_subprocess_env already performs HERMES_HOME override
         # bridging + apply_subprocess_home_env unconditionally; delegating
         # wholesale keeps one owner and zero drift.
         return _sanitize_subprocess_env(
-            dict(base) if base is not None else os.environ.copy(),
+            dict(source_env),
             dict(extra) if extra else None,
         )
 
-    env: dict[str, str] = dict(base) if base is not None else os.environ.copy()
+    env: dict[str, str] = dict(source_env)
     if inherit_profile_home:
         _inject_context_hermes_home(env)
         from hermes_constants import apply_subprocess_home_env
         apply_subprocess_home_env(env)
     if extra:
         env.update(extra)
+    _enforce_managed_buzz_terminal_identity_boundary(env, source_env)
     return env
 
 
