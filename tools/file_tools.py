@@ -1581,9 +1581,15 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
 def clear_file_ops_cache(task_id: str = None):
     """Clear the file operations cache."""
+    cache_task_id = None
+    if task_id:
+        from tools.terminal_tool import _get_env_config, _resolve_environment_task_id
+
+        config = _get_env_config()
+        cache_task_id = _resolve_environment_task_id(task_id, config)
     with _file_ops_lock:
-        if task_id:
-            _file_ops_cache.pop(task_id, None)
+        if cache_task_id:
+            _file_ops_cache.pop(cache_task_id, None)
         else:
             _file_ops_cache.clear()
 

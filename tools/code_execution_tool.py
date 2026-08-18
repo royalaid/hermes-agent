@@ -791,7 +791,7 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
+        _creation_locks, _creation_locks_lock, resolve_task_overrides,
         _resolve_environment_task_id, _resolve_task_host_cwd,
     )
 
@@ -817,7 +817,7 @@ def _get_or_create_env(task_id: str):
                 return _active_environments[effective_task_id], config["env_type"]
 
         env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        overrides = resolve_task_overrides(task_id, config)
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]

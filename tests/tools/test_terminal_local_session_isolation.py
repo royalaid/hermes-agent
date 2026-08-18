@@ -125,6 +125,35 @@ def _configure_override_creation_path(monkeypatch, tmp_path):
     return created_cwds, str(config_cwd)
 
 
+def _configure_code_execution_override_path(monkeypatch, env_type, overrides):
+    created = []
+    config = {
+        "env_type": env_type,
+        "cwd": "config-cwd",
+        "timeout": 30,
+        "local_persistent": False,
+        "container_persistent": True,
+        "docker_image": "config-image",
+        "singularity_image": "singularity-image",
+        "modal_image": "modal-image",
+        "daytona_image": "daytona-image",
+    }
+
+    def fake_create_environment(**kwargs):
+        created.append(kwargs)
+        return _FakeEnvironment(kwargs["cwd"])
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", overrides)
+    return created
+
+
 def test_local_backend_keeps_each_session_task_id(monkeypatch):
     created_task_ids, active_environments = _exercise_two_sessions(
         monkeypatch, "local"
@@ -377,6 +406,78 @@ def test_code_execution_local_backend_keeps_session_environment_keys(monkeypatch
     assert created_task_ids == ["session-a", "session-b"]
     assert set(terminal_tool._active_environments) == {"session-a", "session-b"}
     assert set(terminal_tool._creation_locks) == {"session-a", "session-b"}
+
+
+def test_code_execution_container_prefers_raw_session_overrides(monkeypatch):
+    created = _configure_code_execution_override_path(
+        monkeypatch,
+        "docker",
+        {
+            "session-a": {"cwd": "/workspace/session-a", "docker_image": "raw-image"},
+            "default": {"cwd": "/workspace/default", "docker_image": "default-image"},
+        },
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+
+    code_execution_tool._get_or_create_env("session-a")
+
+    assert created[0]["task_id"] == "default"
+    assert created[0]["cwd"] == "/workspace/session-a"
+    assert created[0]["image"] == "raw-image"
+
+
+def test_code_execution_local_absent_exact_override_does_not_inherit_default(
+    monkeypatch,
+):
+    created = _configure_code_execution_override_path(
+        monkeypatch,
+        "local",
+        {"default": {"cwd": "default-cwd"}},
+    )
+
+    code_execution_tool._get_or_create_env("session-a")
+
+    assert created[0]["task_id"] == "session-a"
+    assert created[0]["cwd"] == "config-cwd"
+
+
+def test_clear_file_ops_cache_local_removes_only_exact_session(monkeypatch):
+    raw_ops = object()
+    default_ops = object()
+    monkeypatch.setattr(
+        file_tools,
+        "_file_ops_cache",
+        {"session-a": raw_ops, "default": default_ops},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "local"}
+    )
+
+    file_tools.clear_file_ops_cache("session-a")
+
+    assert file_tools._file_ops_cache == {"default": default_ops}
+
+
+def test_clear_file_ops_cache_container_removes_collapsed_default(monkeypatch):
+    raw_ops = object()
+    default_ops = object()
+    monkeypatch.setattr(
+        file_tools,
+        "_file_ops_cache",
+        {"session-a": raw_ops, "default": default_ops},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+
+    file_tools.clear_file_ops_cache("session-a")
+
+    assert file_tools._file_ops_cache == {"session-a": raw_ops}
 
 
 def test_file_tools_local_backend_keeps_session_cache_and_creation_keys(monkeypatch):

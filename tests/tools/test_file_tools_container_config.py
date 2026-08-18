@@ -58,7 +58,7 @@ class TestFileToolsContainerConfig:
     def test_cwd_only_raw_task_override_reaches_file_environment(self):
         """CWD-only task overrides collapse to default but must keep their cwd."""
         captured = self._run(
-            _make_env_config(env_type="local", cwd="/config-cwd"),
+            _make_env_config(env_type="docker", cwd="/config-cwd"),
             "desktop-session-cwd",
             task_env_overrides={"desktop-session-cwd": {"cwd": "/workspace/session"}},
         )
