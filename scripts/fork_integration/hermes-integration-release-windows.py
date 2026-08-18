@@ -3339,6 +3339,9 @@ def _finish_verified_publication(
     started_at: datetime,
     release_system_source_sha: str | None,
     published_product_sha: str,
+    changed: bool,
+    consume_pin: bool,
+    perform_sync: bool,
 ) -> int:
     """Finish local work after public integrity verification has committed success.
 
@@ -3372,24 +3375,26 @@ def _finish_verified_publication(
             record_warning(operation, exc)
             return default
 
-    best_effort("consume_upstream_pin", _consume_upstream_pin_on_publish)
-    best_effort("emit_sync_stage", lambda: emit_stage("sync"))
-    result["sync"] = best_effort(
-        "sync_operational_copies",
-        lambda: sync_operational_copies(release_system_source_sha, published_product_sha),
-        {
-            "ok": False,
-            "error": "post-publication sync raised before returning an outcome",
-            "source_sha": release_system_source_sha,
-            "published_product_sha": published_product_sha,
-        },
-    )
+    if consume_pin:
+        best_effort("consume_upstream_pin", _consume_upstream_pin_on_publish)
+    if perform_sync:
+        best_effort("emit_sync_stage", lambda: emit_stage("sync"))
+        result["sync"] = best_effort(
+            "sync_operational_copies",
+            lambda: sync_operational_copies(release_system_source_sha, published_product_sha),
+            {
+                "ok": False,
+                "error": "post-publication sync raised before returning an outcome",
+                "source_sha": release_system_source_sha,
+                "published_product_sha": published_product_sha,
+            },
+        )
     result["parked_pins"] = best_effort("parked_pin_summary", parked_pin_summary, [])
     best_effort("result_log", lambda: log(json.dumps(result, sort_keys=True)))
     best_effort("resolve_failure_investigator_success", resolve_failure_investigator_success)
     best_effort(
         "emit_fleet_receipt",
-        lambda: emit_fleet_receipt(started_at, outcome="produced", changed=True),
+        lambda: emit_fleet_receipt(started_at, outcome="produced", changed=changed),
     )
     try:
         return _emit_result(result, dry_run=False)
@@ -3587,17 +3592,29 @@ def main() -> int:
                 release_exists=bool(existing_release["complete"]),
             )
             if recovering_unchanged_output and not recovery["publish_release"]:
-                result = {"ok": True, "changed": False, "reason": recovery["reason"], "head": rebased_output_head, "upstream": upstream, "parked_pins": parked_pin_summary()}
-                log(json.dumps(result, sort_keys=True))
-                resolve_failure_investigator_success()
-                emit_fleet_receipt(started_at, outcome="produced", changed=False)
-                return _emit_result(result, dry_run=False)
+                publication_result = {"ok": True, "changed": False, "reason": recovery["reason"], "head": rebased_output_head, "upstream": upstream}
+                public_integrity_verified = True
+                return _finish_verified_publication(
+                    publication_result,
+                    started_at=started_at,
+                    release_system_source_sha=sync_integrity.get("source_sha"),
+                    published_product_sha=rebased_output_head,
+                    changed=False,
+                    consume_pin=False,
+                    perform_sync=False,
+                )
             if not recovering_current_output and not needs_push and existing_release["complete"]:
-                result = {"ok": True, "changed": False, "reason": "integration_and_release_already_current", "head": rebased_output_head, "upstream": upstream, "parked_pins": parked_pin_summary()}
-                log(json.dumps(result, sort_keys=True))
-                resolve_failure_investigator_success()
-                emit_fleet_receipt(started_at, outcome="produced", changed=False)
-                return _emit_result(result, dry_run=False)
+                publication_result = {"ok": True, "changed": False, "reason": "integration_and_release_already_current", "head": rebased_output_head, "upstream": upstream}
+                public_integrity_verified = True
+                return _finish_verified_publication(
+                    publication_result,
+                    started_at=started_at,
+                    release_system_source_sha=sync_integrity.get("source_sha"),
+                    published_product_sha=rebased_output_head,
+                    changed=False,
+                    consume_pin=False,
+                    perform_sync=False,
+                )
 
             if needs_push:
                 stage = "push"
@@ -3677,6 +3694,9 @@ def main() -> int:
                 started_at=started_at,
                 release_system_source_sha=sync_integrity.get("source_sha"),
                 published_product_sha=rebased_output_head,
+                changed=True,
+                consume_pin=True,
+                perform_sync=True,
             )
         except Exception as exc:
             if public_integrity_verified:

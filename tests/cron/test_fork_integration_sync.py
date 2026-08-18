@@ -424,24 +424,27 @@ def test_sync_hook_call_site_is_inside_the_publish_success_branch() -> None:
 
     main = function_node(release.main)
     helper_calls = named_calls(main, "_finish_verified_publication")
-    assert len(helper_calls) == 1, "main() must have one verified-publication finish path"
-    helper_call = helper_calls[0]
+    assert len(helper_calls) == 3, "all three checksum-verified success routes must use the finalizer"
 
     parents = {
         child: parent
         for parent in ast.walk(main)
         for child in ast.iter_child_nodes(parent)
     }
-    return_node = parents[helper_call]
-    assert isinstance(return_node, ast.Return)
-    outer_try = parents[return_node]
-    assert isinstance(outer_try, ast.Try), "helper return must remain in the real-run try body"
-    assert any(
-        isinstance(handler.type, ast.Name)
-        and handler.type.id == "Exception"
-        and handler.name == "exc"
-        for handler in outer_try.handlers
+    outer_try = next(
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(handler.type, ast.Name)
+            and handler.type.id == "Exception"
+            and handler.name == "exc"
+            for handler in node.handlers
+        )
+        and len(named_calls(node, "_finish_verified_publication")) == 3
     )
+    for helper_call in helper_calls:
+        assert isinstance(parents[helper_call], ast.Return)
     assert all(
         not named_calls(handler, "_finish_verified_publication")
         for handler in outer_try.handlers
@@ -463,7 +466,7 @@ def test_sync_hook_call_site_is_inside_the_publish_success_branch() -> None:
 
     verified_assignments = [
         statement
-        for statement in outer_try.body
+        for statement in ast.walk(ast.Module(body=outer_try.body, type_ignores=[]))
         if isinstance(statement, ast.Assign)
         and any(
             isinstance(target, ast.Name) and target.id == "public_integrity_verified"
@@ -472,25 +475,36 @@ def test_sync_hook_call_site_is_inside_the_publish_success_branch() -> None:
         and isinstance(statement.value, ast.Constant)
         and statement.value.value is True
     ]
-    assert len(verified_assignments) == 1
-    assert verified_assignments[0].lineno < helper_call.lineno
-
-    keywords = {keyword.arg: keyword.value for keyword in helper_call.keywords}
-    release_source = keywords["release_system_source_sha"]
-    assert (
-        isinstance(release_source, ast.Call)
-        and isinstance(release_source.func, ast.Attribute)
-        and isinstance(release_source.func.value, ast.Name)
-        and release_source.func.value.id == "sync_integrity"
-        and release_source.func.attr == "get"
-        and len(release_source.args) == 1
-        and isinstance(release_source.args[0], ast.Constant)
-        and release_source.args[0].value == "source_sha"
+    assert len(verified_assignments) == 3
+    assert all(
+        any(assignment.lineno < helper_call.lineno for assignment in verified_assignments)
+        for helper_call in helper_calls
     )
-    published_product = keywords["published_product_sha"]
-    assert isinstance(published_product, ast.Name)
-    assert published_product.id == "rebased_output_head"
-    assert ast.dump(release_source) != ast.dump(published_product)
+
+    configurations: list[tuple[bool, bool, bool]] = []
+    for helper_call in helper_calls:
+        keywords = {keyword.arg: keyword.value for keyword in helper_call.keywords}
+        release_source = keywords["release_system_source_sha"]
+        assert (
+            isinstance(release_source, ast.Call)
+            and isinstance(release_source.func, ast.Attribute)
+            and isinstance(release_source.func.value, ast.Name)
+            and release_source.func.value.id == "sync_integrity"
+            and release_source.func.attr == "get"
+            and len(release_source.args) == 1
+            and isinstance(release_source.args[0], ast.Constant)
+            and release_source.args[0].value == "source_sha"
+        )
+        published_product = keywords["published_product_sha"]
+        assert isinstance(published_product, ast.Name)
+        assert published_product.id == "rebased_output_head"
+        assert ast.dump(release_source) != ast.dump(published_product)
+        configurations.append(tuple(
+            bool(keywords[name].value)
+            for name in ("changed", "consume_pin", "perform_sync")
+            if isinstance(keywords[name], ast.Constant)
+        ))
+    assert sorted(configurations) == [(False, False, False), (False, False, False), (True, True, True)]
 
     helper = function_node(release._finish_verified_publication)
     sync_calls = named_calls(helper, "sync_operational_copies")
