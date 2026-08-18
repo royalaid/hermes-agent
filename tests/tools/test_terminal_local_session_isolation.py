@@ -85,6 +85,46 @@ def _configure_direct_creation_paths(monkeypatch, env_type):
     return created_task_ids
 
 
+def _configure_override_creation_path(monkeypatch, tmp_path):
+    created_cwds = []
+    config_cwd = tmp_path / "session-fallback"
+    leaked_default_cwd = tmp_path / "default-workspace"
+    config_cwd.mkdir()
+    leaked_default_cwd.mkdir()
+    config = {
+        "env_type": "local",
+        "cwd": str(config_cwd),
+        "timeout": 30,
+        "local_persistent": False,
+        "container_persistent": True,
+        "docker_image": "docker-image",
+        "singularity_image": "singularity-image",
+        "modal_image": "modal-image",
+        "daytona_image": "daytona-image",
+    }
+
+    def fake_create_environment(*, cwd, **_kwargs):
+        created_cwds.append(cwd)
+        return _FakeEnvironment(cwd)
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_container_config_from_config", lambda _config: {})
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_task_env_overrides",
+        {"default": {"cwd": str(leaked_default_cwd)}},
+    )
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+    return created_cwds, str(config_cwd)
+
+
 def test_local_backend_keeps_each_session_task_id(monkeypatch):
     created_task_ids, active_environments = _exercise_two_sessions(
         monkeypatch, "local"
@@ -93,6 +133,68 @@ def test_local_backend_keeps_each_session_task_id(monkeypatch):
     assert created_task_ids == ["session-a", "session-b"]
     assert set(active_environments) == {"session-a", "session-b"}
     assert active_environments["session-a"] is not active_environments["session-b"]
+
+
+def test_resolve_task_overrides_local_backend_does_not_fall_back_to_default(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        terminal_tool, "_task_env_overrides", {"default": {"cwd": "default-cwd"}}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "local"}
+    )
+
+    assert terminal_tool.resolve_task_overrides("session-a") == {}
+
+
+def test_resolve_task_overrides_local_backend_uses_exact_session_override(
+    monkeypatch,
+):
+    exact = {"cwd": "session-a-cwd"}
+    monkeypatch.setattr(
+        terminal_tool,
+        "_task_env_overrides",
+        {"default": {"cwd": "default-cwd"}, "session-a": exact},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "local"}
+    )
+
+    assert terminal_tool.resolve_task_overrides("session-a") is exact
+
+
+@pytest.mark.parametrize("resolved_key", ["default", "parent-session"])
+def test_resolve_task_overrides_container_backend_keeps_resolved_fallback(
+    monkeypatch, resolved_key
+):
+    fallback = {"docker_image": "shared-image"}
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {resolved_key: fallback})
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: resolved_key
+    )
+
+    assert terminal_tool.resolve_task_overrides("child-session") is fallback
+
+
+@pytest.mark.parametrize("caller", ["terminal", "file_tools"])
+def test_local_creation_does_not_inherit_default_cwd_override(
+    monkeypatch, tmp_path, caller
+):
+    created_cwds, config_cwd = _configure_override_creation_path(monkeypatch, tmp_path)
+
+    if caller == "terminal":
+        result = json.loads(
+            terminal_tool.terminal_tool("pwd", task_id="session-a", force=True)
+        )
+        assert result["exit_code"] == 0
+    else:
+        file_tools._get_file_ops("session-a")
+
+    assert created_cwds == [config_cwd]
 
 
 def test_get_active_env_prefers_exact_session_over_collapsed_default(monkeypatch):

@@ -1400,24 +1400,27 @@ def _resolve_environment_task_id(
     return _resolve_container_task_id(task_id)
 
 
-def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
-    """Return the env overrides for *task_id*, raw key first then collapsed.
+def resolve_task_overrides(
+    task_id: Optional[str], config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Return the backend-appropriate env overrides for *task_id*.
 
     ``register_task_env_overrides`` writes under the *raw* task/session id, but
     a CWD-only override collapses (:func:`_resolve_container_task_id`) to the
     shared ``"default"`` container so per-session surfaces (ACP/gateway/
-    dashboard) don't each spin up their own sandbox. Callers that need the
-    override (terminal command setup, file-tool cwd resolution) must therefore
-    read the raw id FIRST and only fall back to the collapsed container id, or
-    the originating session's override is silently dropped. This is the single
-    source of that lookup so the terminal and file layers can't drift apart.
+    dashboard) don't each spin up their own sandbox. Non-local backends
+    therefore read the raw id first and then the resolved container id. Local
+    environments are session-keyed, so they read only the exact raw id and
+    never inherit another session's collapsed/default override. This is the
+    single source of that lookup so the terminal and file layers can't drift.
     """
     raw = task_id or "default"
-    return (
-        _task_env_overrides.get(raw)
-        or _task_env_overrides.get(_resolve_container_task_id(raw))
-        or {}
-    )
+    exact = _task_env_overrides.get(raw)
+    if exact:
+        return exact
+    if (config or _get_env_config()).get("env_type") == "local":
+        return {}
+    return _task_env_overrides.get(_resolve_container_task_id(raw)) or {}
 
 
 def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Optional[str]:
@@ -1449,7 +1452,7 @@ def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Op
     if _resolve_container_task_id(task_id) == "default":
         # Top-level CLI parent — single-session process, legacy behavior.
         return config.get("host_cwd")
-    overrides = resolve_task_overrides(task_id)
+    overrides = resolve_task_overrides(task_id, config)
     if overrides.get("cwd_source") == "process":
         return None
     candidate = overrides.get("cwd")
@@ -2091,7 +2094,7 @@ def ensure_task_env(task_id: Optional[str] = None):
             _last_activity[effective_task_id] = time.time()
         return existing
 
-    overrides = resolve_task_overrides(task_id)
+    overrides = resolve_task_overrides(task_id, config)
     if env_type == "docker":
         image = overrides.get("docker_image") or config["docker_image"]
     elif env_type == "singularity":
@@ -2678,11 +2681,9 @@ def terminal_tool(
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
-        # reads the raw task id first then the collapsed container id, so a
-        # CWD-only override (which collapses ``effective_task_id`` to
-        # ``"default"``) is still found under its originating session id while
-        # isolation-keyed RL/benchmark overrides keep resolving as before.
-        overrides = resolve_task_overrides(task_id)
+        # keeps local lookup exact while preserving raw-first then resolved-key
+        # fallback for container/remote backends.
+        overrides = resolve_task_overrides(task_id, config)
         
         # Select image based on env type, with per-task override support
         if env_type == "docker":
