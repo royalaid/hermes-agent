@@ -126,8 +126,45 @@ class TestCodexAppServerModule:
         assert cas.resolve_codex_binary(explicit, {"PATH": r"C:\stale"}) == explicit
 
     @pytest.mark.windows_only
-    def test_check_and_spawn_execute_same_path_resolved_cmd(
+    def test_extensionful_codex_name_uses_child_pathext(
         self, monkeypatch, tmp_path
+    ) -> None:
+        from agent.transports import codex_app_server as cas
+
+        shim_dir = tmp_path / "synthetic-codex"
+        shim_dir.mkdir()
+        shim = shim_dir / "codex.cmd"
+        shim.write_text("@echo off\r\n", encoding="utf-8")
+        monkeypatch.setenv("PATHEXT", ".EXE")
+        child_env = {"PATH": str(shim_dir), "PATHEXT": ".CMD"}
+
+        resolved = cas.resolve_codex_binary("codex.cmd", child_env)
+
+        assert os.path.samefile(resolved, shim)
+
+    @pytest.mark.windows_only
+    def test_extensionless_codex_name_honors_child_pathext_order_and_case(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from agent.transports import codex_app_server as cas
+
+        shim_dir = tmp_path / "synthetic-codex"
+        shim_dir.mkdir()
+        cmd_shim = shim_dir / "codex.cmd"
+        exe_shim = shim_dir / "codex.exe"
+        cmd_shim.write_text("@echo off\r\n", encoding="utf-8")
+        exe_shim.write_bytes(b"synthetic")
+        monkeypatch.setenv("PATHEXT", ".EXE")
+        child_env = {"PATH": str(shim_dir), "PATHEXT": ".cMd;.EXE"}
+
+        resolved = cas.resolve_codex_binary("codex", child_env)
+
+        assert os.path.samefile(resolved, cmd_shim)
+
+    @pytest.mark.windows_only
+    @pytest.mark.parametrize("codex_bin", ["codex", "codex.cmd"])
+    def test_check_and_spawn_execute_same_path_resolved_cmd(
+        self, monkeypatch, tmp_path, codex_bin
     ) -> None:
         from agent.transports import codex_app_server as cas
 
@@ -158,10 +195,10 @@ class TestCodexAppServerModule:
         # child rather than accidentally borrowing the test runner's PATHEXT.
         monkeypatch.setenv("PATHEXT", ".EXE")
 
-        ok, version = cas.check_codex_binary(env=child_env)
+        ok, version = cas.check_codex_binary(codex_bin=codex_bin, env=child_env)
         assert (ok, version) == (True, "0.130.0")
 
-        client = cas.CodexAppServerClient(env=child_env)
+        client = cas.CodexAppServerClient(codex_bin=codex_bin, env=child_env)
         try:
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:

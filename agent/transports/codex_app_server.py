@@ -54,19 +54,30 @@ def resolve_codex_binary(codex_bin: str, env: dict[str, str]) -> str:
         return codex_bin
 
     resolved = None
-    if os.name == "nt" and not os.path.splitext(codex_bin)[1]:
+    if os.name == "nt":
         # shutil.which(command, path=...) still reads PATHEXT from the parent
-        # process on Python 3.11. Resolve extensions from the exact environment
-        # that will be passed to the child so check and spawn cannot disagree.
-        search_path = env.get("PATH", "")
+        # process on Python 3.11. Resolve names and extensions from the exact
+        # environment passed to the child so check and spawn cannot disagree.
+        extensions = []
         for extension in env.get("PATHEXT", "").split(os.pathsep):
             extension = extension.strip()
             if not extension:
                 continue
             if not extension.startswith("."):
                 extension = f".{extension}"
-            candidate_name = f"{codex_bin}{extension}"
-            for directory in search_path.split(os.pathsep):
+            extensions.append(extension)
+
+        command_extension = os.path.splitext(codex_bin)[1]
+        if command_extension and any(
+            command_extension.lower() == extension.lower()
+            for extension in extensions
+        ):
+            candidate_names = [codex_bin]
+        else:
+            candidate_names = [f"{codex_bin}{extension}" for extension in extensions]
+
+        for directory in env.get("PATH", "").split(os.pathsep):
+            for candidate_name in candidate_names:
                 candidate = os.path.join(directory or os.curdir, candidate_name)
                 if os.path.isfile(candidate):
                     return candidate
