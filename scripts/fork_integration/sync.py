@@ -301,6 +301,7 @@ def sync(
     reason: str | None = None,
     actor: str | None = None,
     runtime_repo: Path | str | None = None,
+    published_product_sha: str | None = None,
 ) -> dict[str, Any]:
     """Staged, atomic, tree-verified deploy of ``TRACKED_SET`` from
     ``repo_dir``'s git history at ``from_sha`` into ``dest_dir``.
@@ -342,6 +343,8 @@ def sync(
 
             stamp = {
                 "source_sha": resolved_sha,
+                "release_system_source_sha": resolved_sha,
+                "published_product_sha": published_product_sha,
                 "files": {name: digest for name, (_p, digest) in staged.items()},
                 "provisional": bool(provisional),
                 "reason": reason,
@@ -529,6 +532,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     deploy.add_argument("--reason", default=None, help="Required context for a provisional deploy; recorded in the stamp.")
     deploy.add_argument("--actor", default=None, help="Identity performing this deploy; recorded in the stamp.")
     deploy.add_argument(
+        "--published-product-sha", default=None, dest="published_product_sha",
+        help="Published product commit associated with this deploy, when one exists.",
+    )
+    deploy.add_argument(
         "--runtime-repo", default=None, type=Path, dest="runtime_repo",
         help="Runtime verifier clone (the scheduler worktree). When given, the deployed "
              "SHA is made resolvable there (local fetch into refs/pinned/deploy/) so the "
@@ -575,6 +582,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.from_sha, args.repo, args.dest,
                 provisional=args.provisional, reason=args.reason, actor=args.actor,
                 runtime_repo=args.runtime_repo,
+                published_product_sha=args.published_product_sha,
             )
             print(json.dumps({"ok": True, "command": "deploy", **stamp}, indent=2, sort_keys=True))
             return 0

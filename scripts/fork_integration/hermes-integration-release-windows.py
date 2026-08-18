@@ -673,7 +673,10 @@ def sync_operational_copies(
         }
     try:
         outcome = _sync_module().sync(
-            release_system_source_sha, WORKTREE, HERMES_HOME / "scripts"
+            release_system_source_sha,
+            WORKTREE,
+            HERMES_HOME / "scripts",
+            published_product_sha=published_product_sha,
         )
         _best_effort_sync_log(
             "POST_PUBLISH_SYNC ok=true "
@@ -2932,6 +2935,11 @@ def exclusive_lock(holder: str = "scheduler") -> Any:
             LOCK_PATH.unlink()
         except FileNotFoundError:
             pass
+        except Exception as exc:
+            try:
+                log(f"WARNING could not remove release lock {LOCK_PATH}: {exc}")
+            except Exception:
+                pass
 
 
 def _sanitized_command_tail(text: str) -> str:

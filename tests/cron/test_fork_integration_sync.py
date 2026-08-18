@@ -103,6 +103,8 @@ def test_sync_copies_exact_tracked_set_and_writes_stamp(tmp_path: Path) -> None:
     on_disk_names = {f.name for f in dest.iterdir() if f.name != sync.SYNC_STAMP_FILENAME}
     assert on_disk_names == set(sync.TRACKED_SET)
     assert stamp["source_sha"] == sha
+    assert stamp["release_system_source_sha"] == sha
+    assert stamp["published_product_sha"] is None
     assert set(stamp["files"]) == set(sync.TRACKED_SET)
     assert stamp["provisional"] is False
     assert stamp["reason"] is None
@@ -113,6 +115,30 @@ def test_sync_copies_exact_tracked_set_and_writes_stamp(tmp_path: Path) -> None:
     assert stamp_on_disk == stamp
     for name in sync.TRACKED_SET:
         assert (dest / name).read_text(encoding="utf-8") == f"# {name} content v1\n"
+
+
+def test_sync_stamps_release_source_and_published_product_as_distinct_lineage(
+    tmp_path: Path,
+) -> None:
+    repo = _init_repo(tmp_path)
+    _write_tracked_files(repo, variant="v1")
+    release_system_source_sha = _commit(repo, "v1")
+    published_product_sha = "b" * 40
+    dest = tmp_path / "dest"
+
+    stamp = sync.sync(
+        release_system_source_sha,
+        repo,
+        dest,
+        published_product_sha=published_product_sha,
+    )
+
+    assert stamp["source_sha"] == release_system_source_sha
+    assert stamp["release_system_source_sha"] == release_system_source_sha
+    assert stamp["published_product_sha"] == published_product_sha
+    assert json.loads(
+        (dest / sync.SYNC_STAMP_FILENAME).read_text(encoding="utf-8")
+    ) == stamp
 
 
 # ── sync(): idempotent re-sync ───────────────────────────────────────────
@@ -523,11 +549,22 @@ def test_sync_operational_copies_deploys_verified_release_source_and_records_pro
 
     release_system_source_sha = "a" * 40
     published_product_sha = "b" * 40
-    sync_calls: list[tuple[str, Path, Path]] = []
+    sync_calls: list[tuple[str, Path, Path, str | None]] = []
 
-    def sync_from_verified_source(from_sha: str, repo: Path, dest: Path) -> dict[str, Any]:
-        sync_calls.append((from_sha, repo, dest))
-        return {"source_sha": from_sha, "files": {}}
+    def sync_from_verified_source(
+        from_sha: str,
+        repo: Path,
+        dest: Path,
+        *,
+        published_product_sha: str | None = None,
+    ) -> dict[str, Any]:
+        sync_calls.append((from_sha, repo, dest, published_product_sha))
+        return {
+            "source_sha": from_sha,
+            "release_system_source_sha": from_sha,
+            "published_product_sha": published_product_sha,
+            "files": {},
+        }
 
     monkeypatch.setattr(release, "_sync_module", lambda: SimpleNamespace(sync=sync_from_verified_source))
     monkeypatch.setattr(release, "log", lambda message: None)
@@ -535,7 +572,12 @@ def test_sync_operational_copies_deploys_verified_release_source_and_records_pro
     outcome = release.sync_operational_copies(release_system_source_sha, published_product_sha)
 
     assert sync_calls == [
-        (release_system_source_sha, release.WORKTREE, release.HERMES_HOME / "scripts")
+        (
+            release_system_source_sha,
+            release.WORKTREE,
+            release.HERMES_HOME / "scripts",
+            published_product_sha,
+        )
     ]
     assert sync_calls[0][0] != published_product_sha
     assert outcome["ok"] is True
@@ -655,7 +697,7 @@ def test_sync_operational_copies_success_survives_logging_failure(
         release,
         "_sync_module",
         lambda: SimpleNamespace(
-            sync=lambda source, _repo, _dest: {"source_sha": source, "files": {}}
+            sync=lambda source, _repo, _dest, **_kwargs: {"source_sha": source, "files": {}}
         ),
     )
     monkeypatch.setattr(
@@ -793,6 +835,8 @@ class TestCli:
         payload = json.loads(deploy.stdout)
         assert payload["ok"] is True
         assert payload["source_sha"] == sha
+        assert payload["release_system_source_sha"] == sha
+        assert payload["published_product_sha"] is None
 
         verify_run = subprocess.run(
             [sys.executable, str(SYNC_SCRIPT_PATH), "verify", "--repo", str(repo), "--dest", str(dest)],
@@ -800,6 +844,27 @@ class TestCli:
         )
         assert verify_run.returncode == 0, verify_run.stderr
         assert json.loads(verify_run.stdout)["ok"] is True
+
+    def test_deploy_accepts_explicit_published_product_sha(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path)
+        _write_tracked_files(repo, variant="v1")
+        sha = _commit(repo, "v1")
+        product_sha = "b" * 40
+        dest = tmp_path / "dest"
+
+        deploy = subprocess.run(
+            [
+                sys.executable, str(SYNC_SCRIPT_PATH), "deploy",
+                "--from-sha", sha, "--repo", str(repo), "--dest", str(dest),
+                "--published-product-sha", product_sha,
+            ],
+            capture_output=True, text=True, check=False,
+        )
+
+        assert deploy.returncode == 0, deploy.stderr
+        payload = json.loads(deploy.stdout)
+        assert payload["release_system_source_sha"] == sha
+        assert payload["published_product_sha"] == product_sha
 
     def test_verify_exit_code_2_on_mismatch(self, tmp_path: Path) -> None:
         repo = _init_repo(tmp_path)

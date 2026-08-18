@@ -32,6 +32,14 @@ def chdir(path: Path):
         os.chdir(before)
 
 
+def path_with_unlink_fault(path: Path, error: BaseException) -> Path:
+    class FaultingPath(type(Path())):
+        def unlink(self, *args: object, **kwargs: object) -> None:
+            raise error
+
+    return FaultingPath(path)
+
+
 class IntegrationReleaseRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="hermes-integration-release-test-")
@@ -1963,9 +1971,10 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
 
     def _run_mocked_publication_main(
         self, *, post_verification_fault: str | None = None, verification_complete: bool = True,
-        route: str = "new_publication",
+        route: str = "new_publication", lock_unlink_fault: BaseException | None = None,
+        lock_warning_fault: BaseException | None = None,
     ) -> tuple[int | str, list[str], list[dict[str, object]], list[tuple[str, object]]]:
-        """Exercise main's publish path without touching remotes, locks, or live copies."""
+        """Exercise main's publish path without touching remotes or live copies."""
         failures: list[str] = []
         emitted_results: list[dict[str, object]] = []
         operations: list[tuple[str, object]] = []
@@ -1983,6 +1992,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         )}
         old_argv = __import__("sys").argv
         old_urlopen = release.urllib.request.urlopen
+        old_lock_path = release.LOCK_PATH
         launcher = self.repo / "Hermes-Setup.exe"
         launcher.write_bytes(b"x" * 1_000_001)
 
@@ -2012,6 +2022,8 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
 
         def log(message: str) -> None:
             operations.append(("log", message))
+            if lock_warning_fault is not None and "could not remove release lock" in message:
+                raise lock_warning_fault
             if post_verification_fault == "result_log" and message.startswith("{"):
                 raise RuntimeError("final result log failed")
 
@@ -2044,7 +2056,13 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
             if post_verification_fault == "receipt":
                 raise RuntimeError("receipt emission failed")
 
-        release.exclusive_lock = nullcontext
+        release.exclusive_lock = (
+            old["exclusive_lock"] if lock_unlink_fault is not None else nullcontext
+        )
+        if lock_unlink_fault is not None:
+            release.LOCK_PATH = path_with_unlink_fault(
+                self.repo / ".git" / "release-main.lock", lock_unlink_fault
+            )
         release.fail = lambda message, code=1: (
             failures.append(str(message)), (_ for _ in ()).throw(SystemExit(code))
         )[1]
@@ -2087,6 +2105,7 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         finally:
             __import__("sys").argv = old_argv
             release.urllib.request.urlopen = old_urlopen
+            release.LOCK_PATH = old_lock_path
             for name, value in old.items():
                 setattr(release, name, value)
         return outcome, failures, emitted_results, operations
@@ -2116,6 +2135,51 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         )
         self.assertEqual(outcome, "SystemExit(1)")
         self.assertIn("published release integrity verification failed", failures[0])
+
+    def test_checksum_verified_main_success_survives_lock_teardown_and_warning_failure(self) -> None:
+        outcome, failures, results, _operations = self._run_mocked_publication_main(
+            lock_unlink_fault=PermissionError("lock remains busy"),
+            lock_warning_fault=OSError("log unavailable"),
+        )
+
+        self.assertEqual(outcome, 0)
+        self.assertEqual(failures, [])
+        self.assertTrue(results[0]["ok"])
+
+    def test_preverification_main_failure_remains_fail_closed_when_lock_teardown_fails(self) -> None:
+        outcome, failures, _results, _operations = self._run_mocked_publication_main(
+            verification_complete=False,
+            lock_unlink_fault=PermissionError("lock remains busy"),
+        )
+
+        self.assertEqual(outcome, "SystemExit(1)")
+        self.assertIn("published release integrity verification failed", failures[0])
+
+    def test_lock_teardown_deliberate_baseexceptions_still_propagate(self) -> None:
+        old_lock_path = release.LOCK_PATH
+        old_log = release.log
+        try:
+            release.LOCK_PATH = path_with_unlink_fault(
+                self.repo / ".git" / "release-unlink-interrupt.lock",
+                KeyboardInterrupt("stop unlink"),
+            )
+            with self.assertRaisesRegex(KeyboardInterrupt, "stop unlink"):
+                with release.exclusive_lock():
+                    pass
+
+            release.LOCK_PATH = path_with_unlink_fault(
+                self.repo / ".git" / "release-log-interrupt.lock",
+                PermissionError("busy"),
+            )
+            release.log = lambda _message: (_ for _ in ()).throw(
+                KeyboardInterrupt("stop logging")
+            )
+            with self.assertRaisesRegex(KeyboardInterrupt, "stop logging"):
+                with release.exclusive_lock():
+                    pass
+        finally:
+            release.LOCK_PATH = old_lock_path
+            release.log = old_log
 
     def test_main_recovering_unchanged_verified_release_finalization_never_reopens_success(self) -> None:
         self._assert_existing_release_finalization_is_no_throw("recovering_unchanged")
