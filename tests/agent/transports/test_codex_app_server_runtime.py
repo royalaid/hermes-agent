@@ -280,7 +280,7 @@ class TestSpawnEnvSecretStripping:
     """
 
     @staticmethod
-    def _capture_spawn_env(monkeypatch):
+    def _capture_spawn_env(monkeypatch, *, env=None, codex_home=None):
         import subprocess
         from agent.transports import codex_app_server as cas
 
@@ -308,7 +308,9 @@ class TestSpawnEnvSecretStripping:
                 pass
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
-        client = cas.CodexAppServerClient(codex_bin="codex")
+        client = cas.CodexAppServerClient(
+            codex_bin="codex", env=env, codex_home=codex_home
+        )
         client._closed = True
         return captured["env"]
 
@@ -339,4 +341,55 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
+
+    @pytest.mark.parametrize(
+        ("host_marker", "expect_buzz_identity"),
+        [
+            (None, False),
+            ("xyz.block.buzz.app", True),
+            ("xyz.block.buzz.app.evil", False),
+        ],
+    )
+    def test_caller_overlay_is_sanitized_at_final_spawn_boundary(
+        self, monkeypatch, host_marker, expect_buzz_identity
+    ):
+        monkeypatch.delenv("BUZZ_MANAGED_AGENT", raising=False)
+        if host_marker is not None:
+            monkeypatch.setenv("BUZZ_MANAGED_AGENT", host_marker)
+
+        spawned = self._capture_spawn_env(
+            monkeypatch,
+            codex_home="/synthetic/codex-home",
+            env={
+                "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+                "BUZZ_PRIVATE_KEY": "overlay-buzz-key",
+                "BUZZ_RELAY_URL": "wss://overlay.invalid",
+                "GH_TOKEN": "overlay-gh-token",
+                "AUXILIARY_VISION_API_KEY": "overlay-internal-key",
+                "OPENAI_API_KEY": "overlay-provider-key",
+                "ORDINARY_CALLER_VAR": "overlay-ordinary",
+            },
+        )
+
+        assert "BUZZ_MANAGED_AGENT" not in spawned
+        assert (
+            spawned.get("BUZZ_PRIVATE_KEY") == "overlay-buzz-key"
+        ) is expect_buzz_identity
+        assert (
+            spawned.get("BUZZ_RELAY_URL") == "wss://overlay.invalid"
+        ) is expect_buzz_identity
+        assert "GH_TOKEN" not in spawned
+        assert "AUXILIARY_VISION_API_KEY" not in spawned
+        assert spawned["OPENAI_API_KEY"] == "overlay-provider-key"
+        assert spawned["ORDINARY_CALLER_VAR"] == "overlay-ordinary"
+        assert spawned["CODEX_HOME"] == "/synthetic/codex-home"
+
+        from tools.environments.local import build_subprocess_env
+
+        grandchild = build_subprocess_env(
+            spawned, scrub_secrets=False, inherit_profile_home=False
+        )
+        assert "BUZZ_MANAGED_AGENT" not in grandchild
+        assert "BUZZ_PRIVATE_KEY" not in grandchild
+        assert "BUZZ_RELAY_URL" not in grandchild
 

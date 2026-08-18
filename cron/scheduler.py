@@ -3489,8 +3489,19 @@ def _run_job_script(
                 "encoding": "utf-8",
                 "errors": "replace",
             }
-        env = build_subprocess_env()
-        env.update(env_overlay)
+        sanitized_env = build_subprocess_env(extra=env_overlay)
+        # The centralized sanitizer intentionally removes inherited runtime
+        # markers.  This overlay is scheduler-owned, so restore only the two
+        # non-secret uv runtime values rather than applying the arbitrary
+        # mapping after the security boundary.
+        env = {
+            **sanitized_env,
+            **{
+                key: env_overlay[key]
+                for key in ("VIRTUAL_ENV", "PYTHONPATH")
+                if key in env_overlay
+            },
+        }
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into

@@ -131,6 +131,90 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    @pytest.mark.parametrize(
+        ("host_marker", "expect_buzz_identity"),
+        [
+            (None, False),
+            ("xyz.block.buzz.app", True),
+            ("xyz.block.buzz.app.evil", False),
+        ],
+    )
+    def test_python_overlay_is_sanitized_at_final_spawn_boundary(
+        self, cron_env, monkeypatch, host_marker, expect_buzz_identity
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+        from tools.environments.local import build_subprocess_env
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("ok")\n', encoding="utf-8")
+        monkeypatch.delenv("BUZZ_MANAGED_AGENT", raising=False)
+        if host_marker is not None:
+            monkeypatch.setenv("BUZZ_MANAGED_AGENT", host_marker)
+
+        overlay = {
+            "VIRTUAL_ENV": "/synthetic/uv-venv",
+            "PYTHONPATH": "/synthetic/uv-site-packages",
+            "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+            "BUZZ_PRIVATE_KEY": "overlay-buzz-key",
+            "BUZZ_RELAY_URL": "wss://overlay.invalid",
+            "GH_TOKEN": "overlay-gh-token",
+            "AUXILIARY_VISION_API_KEY": "overlay-internal-key",
+            "OPENAI_API_KEY": "overlay-provider-key",
+            "ORDINARY_OVERLAY_VAR": "overlay-ordinary",
+        }
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def __init__(self, argv, **kwargs):
+                captured["env"] = kwargs["env"].copy()
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return ("ok\n", "")
+
+        monkeypatch.setattr(
+            sched_mod,
+            "_windows_cron_python_invocation",
+            lambda python_exe: (python_exe, overlay),
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_windows_cron_bootstrap_argv",
+            lambda python_exe, env_overlay, script_path: [python_exe, script_path],
+        )
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakeProc)
+
+        success, output = _run_job_script("probe.py")
+
+        assert success is True
+        assert output == "ok"
+        spawned = captured["env"]
+        assert "BUZZ_MANAGED_AGENT" not in spawned
+        assert (
+            spawned.get("BUZZ_PRIVATE_KEY") == "overlay-buzz-key"
+        ) is expect_buzz_identity
+        assert (
+            spawned.get("BUZZ_RELAY_URL") == "wss://overlay.invalid"
+        ) is expect_buzz_identity
+        assert "GH_TOKEN" not in spawned
+        assert "AUXILIARY_VISION_API_KEY" not in spawned
+        assert "OPENAI_API_KEY" not in spawned
+        assert spawned["ORDINARY_OVERLAY_VAR"] == "overlay-ordinary"
+        assert spawned["VIRTUAL_ENV"] == "/synthetic/uv-venv"
+        assert spawned["PYTHONPATH"] == "/synthetic/uv-site-packages"
+
+        grandchild = build_subprocess_env(
+            spawned, scrub_secrets=False, inherit_profile_home=False
+        )
+        assert "BUZZ_MANAGED_AGENT" not in grandchild
+        assert "BUZZ_PRIVATE_KEY" not in grandchild
+        assert "BUZZ_RELAY_URL" not in grandchild
+
     @pytest.mark.windows_only
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         # Windows-only: the fake ``sys.platform`` could not reproduce the

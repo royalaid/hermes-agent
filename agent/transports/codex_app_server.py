@@ -87,11 +87,13 @@ class CodexAppServerClient:
         # centralized helper so Tier-1 + dynamic-internal secrets are always
         # stripped while provider creds still flow, matching copilot_acp_client
         # (#29157 sibling spawn-site gap).
-        spawn_env = hermes_subprocess_env(inherit_credentials=True)
-        if env:
-            spawn_env.update(env)
+        extra = dict(env or {})
         if codex_home:
-            spawn_env["CODEX_HOME"] = codex_home
+            extra["CODEX_HOME"] = codex_home
+        spawn_env = hermes_subprocess_env(
+            inherit_credentials=True,
+            extra=extra,
+        )
 
         app_server_args = list(extra_args or [])
         # Kanban workers must be able to write their handoff/status back to
