@@ -195,6 +195,25 @@ class TestStreamDeltaDispatch:
         ]
         agent._fire_reasoning_delta.assert_not_called()
 
+    def test_current_reasoning_delta_methods_preserve_item_ids(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"itemId": "reasoning-summary", "delta": "summary"},
+        })
+        bridge({
+            "method": "item/reasoning/textDelta",
+            "params": {"itemId": "reasoning-raw", "delta": "raw"},
+        })
+
+        assert agent.reasoning_event_callback.call_args_list == [
+            (("delta", "reasoning-summary", "summary"), {}),
+            (("delta", "reasoning-raw", "raw"), {}),
+        ]
+        agent._fire_reasoning_delta.assert_not_called()
+
     def test_reasoning_delta_uses_the_active_item_when_the_delta_omits_its_id(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)

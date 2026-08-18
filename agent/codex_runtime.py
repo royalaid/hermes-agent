@@ -682,7 +682,15 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if method == "item/agentMessage/delta":
             _fire_text_delta(params)
             return
-        if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
+        # Current Codex app-server protocol names the readable and raw
+        # reasoning streams summaryTextDelta and textDelta respectively.
+        # Keep the older delta/summaryDelta aliases for older clients.
+        if method in {
+            "item/reasoning/summaryTextDelta",
+            "item/reasoning/textDelta",
+            "item/reasoning/delta",
+            "item/reasoning/summaryDelta",
+        }:
             _fire_reasoning_delta(params)
             return
         item = params.get("item")
