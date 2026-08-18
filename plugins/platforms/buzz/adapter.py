@@ -290,7 +290,9 @@ async def _exec_buzz(
     The private key travels via the subprocess environment only — it never
     appears in argv, so process listings and error logs stay clean.
     """
-    env = os.environ.copy()
+    from tools.environments.local import hermes_subprocess_env
+
+    env = hermes_subprocess_env(inherit_credentials=False)
     env["BUZZ_RELAY_URL"] = relay_url
     env["BUZZ_PRIVATE_KEY"] = private_key
     proc = await asyncio.create_subprocess_exec(

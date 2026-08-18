@@ -245,6 +245,56 @@ class TestTranscribeLocalCommand:
         assert "OPENAI_API_KEY" not in env
         assert env["MY_SAFE_STT_VAR"] == "keep"
 
+    def test_command_env_passthrough_is_sanitized_before_popen(self, monkeypatch):
+        monkeypatch.setenv("MY_STT_API_KEY", "sk-provider")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        monkeypatch.setenv("GH_TOKEN", "gh-secret")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "buzz-secret")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://buzz.invalid")
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "xyz.block.buzz.app.evil")
+        captured = {}
+
+        class _Stream:
+            def read(self, size):
+                return ""
+
+        class Proc:
+            returncode = 0
+            stdout = _Stream()
+            stderr = _Stream()
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(command, **kwargs):
+            captured["env"] = kwargs["env"]
+            return Proc()
+
+        monkeypatch.setattr("tools.transcription_tools.subprocess.Popen", fake_popen)
+        from tools.transcription_tools import _run_command_stt
+
+        result = _run_command_stt(
+            "echo hi",
+            timeout=1,
+            env_passthrough=[
+                "MY_STT_API_KEY",
+                "OPENAI_API_KEY",
+                "GH_TOKEN",
+                "BUZZ_PRIVATE_KEY",
+                "BUZZ_RELAY_URL",
+                "BUZZ_MANAGED_AGENT",
+            ],
+        )
+
+        assert result.returncode == 0
+        env = captured["env"]
+        assert env["MY_STT_API_KEY"] == "sk-provider"
+        assert "OPENAI_API_KEY" not in env
+        assert "GH_TOKEN" not in env
+        assert "BUZZ_PRIVATE_KEY" not in env
+        assert "BUZZ_RELAY_URL" not in env
+        assert "BUZZ_MANAGED_AGENT" not in env
+
     def test_local_whisper_subprocess_uses_sanitized_env(
         self, monkeypatch, sample_wav, tmp_path
     ):

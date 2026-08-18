@@ -629,7 +629,11 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
-def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+def hermes_subprocess_env(
+    *,
+    inherit_credentials: bool = False,
+    extra: "Mapping[str, str] | None" = None,
+) -> dict[str, str]:
     """Build a sanitized environment dict for a spawned subprocess.
 
     Centralized helper for the **non-terminal** spawn surface (browser,
@@ -656,12 +660,15 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     flag is grep-able for audit: ``grep -rn 'inherit_credentials=True'`` lists
     every spawn site that still receives provider credentials.
 
-    Callers that need a *specific* non-provider secret (e.g. the browser worker
-    needs ``BROWSERBASE_API_KEY`` / ``FIRECRAWL_API_KEY``) should call with
-    ``inherit_credentials=False`` and copy just those keys back from
-    ``os.environ`` into the returned dict.
+    ``extra`` overlays explicit caller values before every Tier-1, Tier-2,
+    internal, Buzz, session, and home sanitization step.  It cannot establish
+    managed-Buzz trust: only the original ``os.environ`` snapshot is
+    authoritative for the exact host marker.
     """
-    env = os.environ.copy()
+    source_env = os.environ.copy()
+    env = dict(source_env)
+    if extra:
+        env.update(extra)
 
     # Tier 1 — always strip.
     for key in _ALWAYS_STRIP_KEYS:
@@ -684,7 +691,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
 
     # Credential inheritance may preserve unrelated provider keys, but it can
     # never bypass the exact managed-host boundary for Buzz's CLI identity.
-    _enforce_managed_buzz_terminal_identity_boundary(env, os.environ)
+    _enforce_managed_buzz_terminal_identity_boundary(env, source_env)
 
     # Windows UTF-8 safety for spawned processes (#31420).
     env.setdefault("PYTHONUTF8", "1")

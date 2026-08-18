@@ -262,6 +262,46 @@ class TestStripByDefault:
         assert result.get("PYTHONUTF8") == "1"
 
 
+class TestHermesSubprocessEnvExtra:
+    @pytest.mark.parametrize(
+        ("host_marker", "expected_buzz"),
+        [
+            (None, False),
+            ("xyz.block.buzz", False),
+            ("xyz.block.buzz.app.evil", False),
+            ("xyz.block.buzz.app", True),
+        ],
+    )
+    def test_extra_is_sanitized_using_only_authoritative_host_trust(
+        self, host_marker, expected_buzz
+    ):
+        parent = {**_SAFE_SAMPLE, "REQUIRED_PARENT_VAR": "required"}
+        if host_marker is not None:
+            parent["BUZZ_MANAGED_AGENT"] = host_marker
+
+        with patch.dict(os.environ, parent, clear=True):
+            result = hermes_subprocess_env(
+                inherit_credentials=True,
+                extra={
+                    "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+                    "BUZZ_PRIVATE_KEY": "extra-private-key",
+                    "BUZZ_RELAY_URL": "https://extra.relay",
+                    "GH_TOKEN": "extra-gh-token",
+                    "OPENAI_API_KEY": "extra-openai-key",
+                    "ORDINARY_PASSTHROUGH": "allowed",
+                },
+            )
+
+        assert result["REQUIRED_PARENT_VAR"] == "required"
+        assert result["ORDINARY_PASSTHROUGH"] == "allowed"
+        assert result["PYTHONUTF8"] == "1"
+        assert "GH_TOKEN" not in result
+        assert result["OPENAI_API_KEY"] == "extra-openai-key"
+        assert "BUZZ_MANAGED_AGENT" not in result
+        assert ("BUZZ_PRIVATE_KEY" in result) is expected_buzz
+        assert ("BUZZ_RELAY_URL" in result) is expected_buzz
+
+
 class TestInheritCredentials:
     def test_provider_keys_preserved_when_inheriting(self):
         result = _build(_PROVIDER_SAMPLE, inherit_credentials=True)

@@ -500,11 +500,15 @@ class TestCheckTtsRequirements:
 
 
 class TestCommandTtsEnvPassthrough:
-    def test_env_passthrough_restores_named_keys(self, monkeypatch):
-        """A provider's env_passthrough allowlist re-adds its own API key
-        without unscrubbing everything else."""
+    def test_env_passthrough_is_sanitized_before_popen(self, monkeypatch):
+        """Named ordinary values reach Popen, but blocked/Buzz keys cannot be
+        restored after the final child-boundary sanitizer."""
         monkeypatch.setenv("MY_TTS_API_KEY", "sk-provider")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        monkeypatch.setenv("GH_TOKEN", "gh-secret")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "buzz-secret")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://buzz.invalid")
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "xyz.block.buzz.app.evil")
 
         captured = {}
 
@@ -527,13 +531,26 @@ class TestCommandTtsEnvPassthrough:
         monkeypatch.setattr("tools.tts_tool.subprocess.Popen", fake_popen)
 
         result = _run_command_tts(
-            "echo hi", timeout=1, env_passthrough=["MY_TTS_API_KEY"]
+            "echo hi",
+            timeout=1,
+            env_passthrough=[
+                "MY_TTS_API_KEY",
+                "OPENAI_API_KEY",
+                "GH_TOKEN",
+                "BUZZ_PRIVATE_KEY",
+                "BUZZ_RELAY_URL",
+                "BUZZ_MANAGED_AGENT",
+            ],
         )
 
         assert result.returncode == 0
         env = captured["env"]
         assert env["MY_TTS_API_KEY"] == "sk-provider"
         assert "OPENAI_API_KEY" not in env
+        assert "GH_TOKEN" not in env
+        assert "BUZZ_PRIVATE_KEY" not in env
+        assert "BUZZ_RELAY_URL" not in env
+        assert "BUZZ_MANAGED_AGENT" not in env
 
     def test_allowlist_parsed_from_provider_config(self):
         from tools.tts_tool import _command_provider_env_passthrough

@@ -1186,14 +1186,17 @@ def _run_command_tts(
     Child env is scrubbed of Hermes secrets (salvage of #56332) while still
     propagating delegated-child lineage markers when applicable.
     """
-    from agent.delegation_context import delegated_child_subprocess_env
     from tools.environments.local import hermes_subprocess_env
 
-    scrubbed = hermes_subprocess_env(inherit_credentials=False)
-    for key in env_passthrough or []:
-        value = os.environ.get(key)
-        if value is not None:
-            scrubbed[key] = value
+    passthrough = {
+        key: os.environ[key]
+        for key in env_passthrough or []
+        if key in os.environ
+    }
+    scrubbed = hermes_subprocess_env(
+        inherit_credentials=False,
+        extra=passthrough,
+    )
     popen_kwargs: Dict[str, Any] = {
         "shell": True,
         "stdout": subprocess.PIPE,
@@ -1203,7 +1206,7 @@ def _run_command_tts(
         # must not raise in the reader threads on non-UTF-8 Windows (#45099).
         "encoding": "utf-8",
         "errors": "replace",
-        "env": delegated_child_subprocess_env(scrubbed),
+        "env": scrubbed,
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

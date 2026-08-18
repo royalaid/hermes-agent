@@ -19,6 +19,7 @@ npub_to_hex = _buzz_mod.npub_to_hex
 _normalize_user_ref = _buzz_mod._normalize_user_ref
 _cli_error_message = _buzz_mod._cli_error_message
 _resolve_private_key = _buzz_mod._resolve_private_key
+_exec_buzz = _buzz_mod._exec_buzz
 check_requirements = _buzz_mod.check_requirements
 validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
@@ -45,6 +46,8 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_AUTH_TAG",
+    "BUZZ_MANAGED_AGENT",
 )
 
 
@@ -480,6 +483,63 @@ class TestCredentialResolution:
         creds.write_text(json.dumps({"nsec": "nsec1fromfile", "npub": "npub1x"}), encoding="utf-8")
         monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
         assert _resolve_private_key() == "nsec1fromfile"
+
+
+class TestBuzzCliSpawnEnv:
+    @pytest.mark.asyncio
+    async def test_exec_buzz_sanitizes_then_adds_only_runtime_identity(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", "xyz.block.buzz.app")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "ambient-private-key")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://ambient.relay")
+        monkeypatch.setenv("BUZZ_AUTH_TAG", "ambient-auth-tag")
+        monkeypatch.setenv("GH_TOKEN", "gh-secret")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+        monkeypatch.setenv("REQUIRED_ADAPTER_VAR", "required")
+        captured = {}
+
+        class Proc:
+            returncode = 0
+
+            async def communicate(self, input_data):
+                return b"{}", b""
+
+            def kill(self):
+                raise AssertionError("unexpected timeout")
+
+            async def wait(self):
+                return 0
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured["env"] = kwargs["env"]
+            return Proc()
+
+        monkeypatch.setattr(
+            _buzz_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+
+        code, stdout, stderr = await _exec_buzz(
+            "/fake/buzz",
+            ["channels", "list"],
+            relay_url="https://runtime.relay",
+            private_key="runtime-private-key",
+        )
+
+        assert (code, stdout, stderr) == (0, "{}", "")
+        env = captured["env"]
+        assert env["BUZZ_RELAY_URL"] == "https://runtime.relay"
+        assert env["BUZZ_PRIVATE_KEY"] == "runtime-private-key"
+        assert env["REQUIRED_ADAPTER_VAR"] == "required"
+        assert env["PYTHONUTF8"] == "1"
+        assert "BUZZ_AUTH_TAG" not in env
+        assert "BUZZ_MANAGED_AGENT" not in env
+        assert "GH_TOKEN" not in env
+        assert "OPENAI_API_KEY" not in env
+
+        from tools.environments.local import build_subprocess_env
+
+        grandchild_env = build_subprocess_env(env)
+        assert "BUZZ_PRIVATE_KEY" not in grandchild_env
+        assert "BUZZ_RELAY_URL" not in grandchild_env
 
 
 # ── Env enablement / registration / standalone send ──────────────────────
