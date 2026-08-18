@@ -2048,7 +2048,8 @@ def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        exact = _active_environments.get(task_id)
+        return exact if exact is not None else _active_environments.get(lookup)
 
 
 def ensure_task_env(task_id: Optional[str] = None):

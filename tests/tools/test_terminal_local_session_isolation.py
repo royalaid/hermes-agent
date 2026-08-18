@@ -60,6 +60,33 @@ def test_local_backend_keeps_each_session_task_id(monkeypatch):
     assert active_environments["session-a"] is not active_environments["session-b"]
 
 
+def test_get_active_env_prefers_exact_session_over_collapsed_default(monkeypatch):
+    default_env = _FakeEnvironment("default-cwd")
+    session_env = _FakeEnvironment("session-a-cwd")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"default": default_env, "session-a": session_env},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+
+    assert terminal_tool.get_active_env("session-a") is session_env
+
+
+def test_get_active_env_falls_back_to_collapsed_default(monkeypatch):
+    default_env = _FakeEnvironment("default-cwd")
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"default": default_env}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+
+    assert terminal_tool.get_active_env("session-a") is default_env
+
+
 @pytest.mark.parametrize(
     "env_type",
     ["docker", "modal", "singularity", "daytona", "vercel_sandbox"],
