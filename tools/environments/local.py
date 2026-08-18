@@ -359,8 +359,9 @@ def _is_managed_buzz_terminal_env_var(key: str, source_env: Mapping[str, str]) -
 def _enforce_managed_buzz_terminal_identity_boundary(
     env: dict[str, str], source_env: Mapping[str, str]
 ) -> None:
-    """Remove Buzz CLI identity unless the authoritative host marked itself managed."""
+    """Remove Buzz managed identity unless the authoritative host established it."""
     if source_env.get("BUZZ_MANAGED_AGENT") != _BUZZ_MANAGED_AGENT_MARKER:
+        env.pop("BUZZ_MANAGED_AGENT", None)
         for key in _BUZZ_MANAGED_TERMINAL_ENV_VARS:
             env.pop(key, None)
 

@@ -19,6 +19,7 @@ from tools.environments.local import (
     hermes_subprocess_env,
     _ALWAYS_STRIP_KEYS,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
+    _make_run_env,
     _sanitize_subprocess_env,
 )
 
@@ -85,6 +86,7 @@ class TestBuildSubprocessEnvManagedBuzzBoundary:
 
         for key in _BUZZ_IDENTITY:
             assert key not in result
+        assert "BUZZ_MANAGED_AGENT" not in result
 
     def test_no_scrub_preserves_buzz_identity_with_exact_host_marker(self):
         result = build_subprocess_env(
@@ -97,6 +99,7 @@ class TestBuildSubprocessEnvManagedBuzzBoundary:
             inherit_profile_home=False,
         )
 
+        assert result["BUZZ_MANAGED_AGENT"] == "xyz.block.buzz.app"
         for key, value in _BUZZ_IDENTITY.items():
             assert result[key] == value
 
@@ -113,7 +116,27 @@ class TestBuildSubprocessEnvManagedBuzzBoundary:
 
         for key in _BUZZ_IDENTITY:
             assert key not in result
+        assert "BUZZ_MANAGED_AGENT" not in result
         assert result["MY_APP_VAR"] == "extra-wins"
+
+    def test_no_scrub_extra_marker_cannot_launder_trust_into_second_generation(self):
+        first_generation = build_subprocess_env(
+            _SAFE_SAMPLE,
+            scrub_secrets=False,
+            inherit_profile_home=False,
+            extra={"BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"},
+        )
+
+        second_generation = build_subprocess_env(
+            {**first_generation, **_BUZZ_IDENTITY},
+            scrub_secrets=False,
+            inherit_profile_home=False,
+        )
+
+        for key in _BUZZ_IDENTITY:
+            assert key not in second_generation
+        assert "BUZZ_MANAGED_AGENT" not in first_generation
+        assert "BUZZ_MANAGED_AGENT" not in second_generation
 
 
 class TestStripByDefault:
@@ -142,10 +165,22 @@ class TestStripByDefault:
 
         for key in buzz_identity:
             assert key not in result
+        assert "BUZZ_MANAGED_AGENT" not in result
+
+    def test_make_run_env_drops_overlay_marker_without_authoritative_host_marker(self):
+        with patch.dict(os.environ, _SAFE_SAMPLE, clear=True):
+            result = _make_run_env(
+                {"BUZZ_MANAGED_AGENT": "xyz.block.buzz.app", **_BUZZ_IDENTITY}
+            )
+
+        assert "BUZZ_MANAGED_AGENT" not in result
+        for key in _BUZZ_IDENTITY:
+            assert key not in result
 
     def test_forced_extra_buzz_identity_requires_base_managed_agent_marker(self):
         """Force-prefixed overlays cannot create managed Buzz host trust."""
         forced_buzz_identity = {
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
             f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_PRIVATE_KEY": "synthetic-private-key",
             f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_RELAY_URL": "wss://synthetic.invalid",
             f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_AUTH_TAG": "synthetic-auth-tag",
