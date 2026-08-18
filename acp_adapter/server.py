@@ -496,6 +496,27 @@ def _extract_text(
     return "\n".join(parts)
 
 
+def _extract_command_text(
+    prompt: list[
+        TextContentBlock
+        | ImageContentBlock
+        | AudioContentBlock
+        | ResourceContentBlock
+        | EmbeddedResourceContentBlock
+    ],
+) -> str:
+    """Return the first text block used by ACP clients for slash commands.
+
+    Clients such as Buzz send the bare command as the first content block and
+    append conversation context in later text blocks. Command parsing must not
+    treat that context as command arguments; ordinary prompts still use
+    :func:`_extract_text` and preserve every block.
+    """
+    if prompt and isinstance(prompt[0], TextContentBlock):
+        return prompt[0].text.strip()
+    return ""
+
+
 def _image_block_to_openai_part(block: ImageContentBlock) -> dict[str, Any] | None:
     """Convert an ACP image content block to OpenAI-style multimodal content."""
     data = str(getattr(block, "data", "") or "").strip()
@@ -1644,6 +1665,7 @@ class HermesACPAgent(acp.Agent):
             return PromptResponse(stop_reason="refusal")
 
         user_text = _extract_text(prompt).strip()
+        command_text = _extract_command_text(prompt)
         user_content = _content_blocks_to_openai_user_content(prompt)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         has_content = bool(user_text) or (
@@ -1664,8 +1686,8 @@ class HermesACPAgent(acp.Agent):
         #      silently append to state.queued_prompts and respond with
         #      "No active turn — queued for the next turn", which looks like
         #      /queue even though the user never typed /queue.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/steer"):
-            steer_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
+        if text_only_prompt and isinstance(user_content, str) and command_text.startswith("/steer"):
+            steer_text = command_text.split(maxsplit=1)[1].strip() if len(command_text.split(maxsplit=1)) > 1 else ""
             interrupted_prompt = ""
             rewrite_idle = False
             with state.runtime_lock:
@@ -1687,7 +1709,7 @@ class HermesACPAgent(acp.Agent):
         elif (
             text_only_prompt
             and isinstance(user_content, str)
-            and not user_text.startswith("/")
+            and not command_text.startswith("/")
         ):
             # Some ACP clients implement "stop and send" as two protocol calls:
             # cancel the active prompt, then submit plain correction text. Keep
@@ -1709,8 +1731,8 @@ class HermesACPAgent(acp.Agent):
         # Slash commands are text-only; if the client included images/resources,
         # send the whole multimodal prompt to the agent instead of treating it as
         # an ACP command.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
-            response_text = self._handle_slash_command(user_text, state)
+        if text_only_prompt and isinstance(user_content, str) and command_text.startswith("/"):
+            response_text = self._handle_slash_command(command_text, state)
             if response_text is not None:
                 if self._conn:
                     update = acp.update_agent_message_text(response_text)

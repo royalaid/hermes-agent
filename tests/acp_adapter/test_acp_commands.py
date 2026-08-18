@@ -135,10 +135,28 @@ async def test_acp_steer_slash_command_injects_into_running_agent():
     assert fake.runs == []
 
 
+@pytest.mark.asyncio
+async def test_acp_slash_command_uses_first_text_block_not_buzz_context():
+    acp_agent, state, fake, conn = make_agent_and_state()
 
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[
+            TextContentBlock(type="text", text="/model"),
+            TextContentBlock(
+                type="text",
+                text="[Base]\nBuzz conversation context that is not a model argument.",
+            ),
+        ],
+    )
 
-
-
+    assert response.stop_reason == "end_turn"
+    assert state.model == "fake-model"
+    assert state.agent is fake
+    assert fake.runs == []
+    assert conn.updates[-1][1].content.text == (
+        "Current model: fake-model\nProvider: fake-provider"
+    )
 
 
 @pytest.mark.asyncio
