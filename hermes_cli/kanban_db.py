@@ -90,6 +90,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli._subprocess_compat import (
+    windows_detach_flags,
+    windows_detach_flags_without_breakaway,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -10896,16 +10900,23 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    popen_kwargs = {
+        "cwd": workspace if os.path.isdir(workspace) else None,
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_f,
+        "stderr": subprocess.STDOUT,
+        "env": env,
+    }
+    if _IS_WINDOWS:
+        # ``start_new_session=True`` is accepted but ineffective on Windows.
+        # Use Hermes' hidden-console/process-group ownership bundle instead.
+        popen_kwargs["creationflags"] = windows_detach_flags()
+    else:
+        popen_kwargs["start_new_session"] = True
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            **popen_kwargs,
         )
     except FileNotFoundError:
         log_f.close()
@@ -10913,6 +10924,21 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    except OSError:
+        if not _IS_WINDOWS:
+            log_f.close()
+            raise
+        # Restrictive Windows job objects can reject BREAKAWAY. Retry once
+        # without it while preserving the hidden/process-group behavior.
+        popen_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
+        try:
+            proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+                cmd,
+                **popen_kwargs,
+            )
+        except OSError:
+            log_f.close()
+            raise
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's

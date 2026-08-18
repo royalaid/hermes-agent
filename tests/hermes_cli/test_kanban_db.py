@@ -821,6 +821,7 @@ class TestSharedBoardPaths:
             def __init__(self, cmd, **kwargs):
                 captured["cmd"] = cmd
                 captured["env"] = kwargs.get("env", {})
+                captured["kwargs"] = kwargs
                 self.pid = 4242
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
@@ -859,6 +860,59 @@ class TestSharedBoardPaths:
                 assert env[key] == "kanban"
                 continue
             assert key not in env
+
+        if kb._IS_WINDOWS:
+            assert captured["kwargs"]["creationflags"] == kb.windows_detach_flags()
+            assert "start_new_session" not in captured["kwargs"]
+        else:
+            assert captured["kwargs"]["start_new_session"] is True
+
+    @pytest.mark.windows_only
+    def test_dispatcher_spawn_retries_once_without_windows_breakaway(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        attempts = []
+
+        class _FakeProcess:
+            pid = 4242
+
+        def _fake_popen(cmd, **kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                raise OSError("breakaway rejected")
+            return _FakeProcess()
+
+        monkeypatch.setattr("subprocess.Popen", _fake_popen)
+
+        task = kb.Task(
+            id="t_dispatch_retry",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name="wt/t_dispatch_retry",
+        )
+
+        assert kb._default_spawn(task, str(tmp_path / "ws")) == 4242
+        assert len(attempts) == 2
+        assert attempts[0]["creationflags"] == kb.windows_detach_flags()
+        assert attempts[1]["creationflags"] == kb.windows_detach_flags_without_breakaway()
+        assert "start_new_session" not in attempts[0]
+        assert "start_new_session" not in attempts[1]
 
 
 # ---------------------------------------------------------------------------
