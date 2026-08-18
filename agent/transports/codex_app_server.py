@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -30,6 +31,40 @@ from tools.environments.local import hermes_subprocess_env
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+
+
+def _codex_spawn_env(
+    env: Optional[dict[str, str]] = None,
+    *,
+    codex_home: Optional[str] = None,
+) -> dict[str, str]:
+    """Build the exact environment used for Codex checks and child spawns."""
+    spawn_env = hermes_subprocess_env(inherit_credentials=True)
+    if env:
+        spawn_env.update(env)
+    if codex_home:
+        spawn_env["CODEX_HOME"] = codex_home
+    spawn_env.setdefault("RUST_LOG", "warn")
+    return spawn_env
+
+
+def resolve_codex_binary(codex_bin: str, env: dict[str, str]) -> str:
+    """Resolve Codex against the environment passed to its subprocess."""
+    if os.path.dirname(codex_bin):
+        return codex_bin
+
+    resolved = shutil.which(codex_bin, path=env.get("PATH"))
+    if resolved:
+        return resolved
+
+    if os.name == "nt" and codex_bin.lower() in {"codex", "codex.cmd"}:
+        appdata = env.get("APPDATA")
+        if appdata:
+            npm_shim = os.path.join(appdata, "npm", "codex.cmd")
+            if os.path.isfile(npm_shim):
+                return npm_shim
+
+    return codex_bin
 
 
 @dataclass
@@ -87,11 +122,7 @@ class CodexAppServerClient:
         # centralized helper so Tier-1 + dynamic-internal secrets are always
         # stripped while provider creds still flow, matching copilot_acp_client
         # (#29157 sibling spawn-site gap).
-        spawn_env = hermes_subprocess_env(inherit_credentials=True)
-        if env:
-            spawn_env.update(env)
-        if codex_home:
-            spawn_env["CODEX_HOME"] = codex_home
+        spawn_env = _codex_spawn_env(env, codex_home=codex_home)
 
         app_server_args = list(extra_args or [])
         # Kanban workers must be able to write their handoff/status back to
@@ -123,9 +154,7 @@ class CodexAppServerClient:
                 ]
             )
 
-        cmd = [codex_bin, "app-server"] + app_server_args
-        # Codex emits tracing to stderr; default WARN keeps it quiet for users.
-        spawn_env.setdefault("RUST_LOG", "warn")
+        cmd = [resolve_codex_binary(codex_bin, spawn_env), "app-server"] + app_server_args
 
         # Hide the console the codex child would otherwise flash on Windows
         # (#56747). Hide-only — stdio pipes stay intact for the app-server wire.
@@ -385,18 +414,23 @@ def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:
 
 
 def check_codex_binary(
-    codex_bin: str = "codex", min_version: tuple[int, int, int] = MIN_CODEX_VERSION
+    codex_bin: str = "codex",
+    min_version: tuple[int, int, int] = MIN_CODEX_VERSION,
+    env: Optional[dict[str, str]] = None,
 ) -> tuple[bool, str]:
     """Verify codex CLI is installed and meets minimum version.
 
     Returns (ok, message). Used by setup wizard and runtime startup."""
+    spawn_env = _codex_spawn_env(env)
+    resolved_bin = resolve_codex_binary(codex_bin, spawn_env)
     try:
         proc = subprocess.run(
-            [codex_bin, "--version"],
+            [resolved_bin, "--version"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
+            env=spawn_env,
         )
     except FileNotFoundError:
         return False, (
