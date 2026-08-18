@@ -7,6 +7,9 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import os
+import time
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -123,54 +126,68 @@ class TestCodexAppServerModule:
         assert cas.resolve_codex_binary(explicit, {"PATH": r"C:\stale"}) == explicit
 
     @pytest.mark.windows_only
-    def test_check_and_spawn_use_same_appdata_npm_shim(self, monkeypatch, tmp_path) -> None:
+    def test_check_and_spawn_execute_same_path_resolved_cmd(
+        self, monkeypatch, tmp_path
+    ) -> None:
         from agent.transports import codex_app_server as cas
 
-        appdata = tmp_path / "Roaming"
-        shim = appdata / "npm" / "codex.cmd"
-        shim.parent.mkdir(parents=True)
-        shim.write_text("@echo off\r\n", encoding="utf-8")
-        child_env = {"APPDATA": str(appdata), "PATH": r"C:\stale"}
-        monkeypatch.setattr(
-            cas,
-            "hermes_subprocess_env",
-            lambda **_kwargs: child_env.copy(),
+        shim_dir = tmp_path / "synthetic-codex"
+        shim_dir.mkdir()
+        shim = shim_dir / "codex.cmd"
+        marker = tmp_path / "codex-invocations.txt"
+        shim.write_text(
+            "@echo off\r\n"
+            '>>"%CODEX_TEST_MARKER%" echo %~f0^|%~1\r\n'
+            'if /I "%~1"=="--version" (\r\n'
+            "  echo codex-cli 0.130.0\r\n"
+            "  exit /b 0\r\n"
+            ")\r\n"
+            'if /I "%~1"=="app-server" set /p CODEX_TEST_INPUT=\r\n',
+            encoding="utf-8",
         )
-        monkeypatch.setattr(cas.shutil, "which", lambda *_args, **_kwargs: None)
+        empty_appdata = tmp_path / "empty-appdata"
+        empty_appdata.mkdir()
+        child_env = {
+            "APPDATA": str(empty_appdata),
+            "PATH": str(shim_dir),
+            "PATHEXT": ".CMD",
+            "CODEX_TEST_MARKER": str(marker),
+        }
+        # Keep the parent process's PATHEXT deliberately incompatible: the
+        # production resolver must honor the environment intended for the
+        # child rather than accidentally borrowing the test runner's PATHEXT.
+        monkeypatch.setenv("PATHEXT", ".EXE")
 
-        captured = {}
-
-        class VersionResult:
-            returncode = 0
-            stdout = "codex-cli 0.130.0"
-            stderr = ""
-
-        def fake_run(cmd, **kwargs):
-            captured["check_cmd"] = list(cmd)
-            captured["check_env"] = kwargs.get("env", {}).copy()
-            return VersionResult()
-
-        class FakePopen:
-            def __init__(self, cmd, *args, **kwargs):
-                captured["spawn_cmd"] = list(cmd)
-                captured["spawn_env"] = kwargs.get("env", {}).copy()
-                self.stdin = None
-                self.stdout = None
-                self.stderr = None
-
-            def poll(self):
-                return None
-
-        monkeypatch.setattr(cas.subprocess, "run", fake_run)
-        monkeypatch.setattr(cas.subprocess, "Popen", FakePopen)
-
-        ok, version = cas.check_codex_binary()
-        client = cas.CodexAppServerClient()
-        client._closed = True
-
+        ok, version = cas.check_codex_binary(env=child_env)
         assert (ok, version) == (True, "0.130.0")
-        assert captured["check_cmd"][0] == captured["spawn_cmd"][0] == str(shim)
-        assert captured["check_env"] == captured["spawn_env"]
+
+        client = cas.CodexAppServerClient(env=child_env)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                lines = (
+                    marker.read_text(encoding="utf-8").splitlines()
+                    if marker.exists()
+                    else []
+                )
+                if len(lines) >= 2:
+                    break
+                time.sleep(0.01)
+        finally:
+            client.close()
+        assert not client.is_alive()
+
+        invocations = [
+            line.rsplit("|", 1)
+            for line in marker.read_text(encoding="utf-8").splitlines()
+        ]
+        assert [argument.lower() for _, argument in invocations] == [
+            "--version",
+            "app-server",
+        ]
+        selected_paths = [path for path, _ in invocations]
+        assert os.path.normcase(selected_paths[0]) == os.path.normcase(selected_paths[1])
+        assert os.path.samefile(selected_paths[0], shim)
 
 
 class TestSpawnEnvIsolation:
