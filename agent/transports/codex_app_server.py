@@ -117,7 +117,10 @@ class CodexAppServerClient:
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    f"sandbox_workspace_write.writable_roots={json.dumps([kanban_root])}",
+                    (
+                        "sandbox_workspace_write.writable_roots="
+                        f"{json.dumps([kanban_root], ensure_ascii=False)}"
+                    ),
                     "-c",
                     "sandbox_workspace_write.network_access=false",
                 ]

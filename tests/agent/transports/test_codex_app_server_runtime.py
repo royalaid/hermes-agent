@@ -7,6 +7,8 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import tomllib
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -297,6 +299,44 @@ class TestSpawnEnvIsolation:
             'sandbox_workspace_write.writable_roots=["C:\\\\boards\\\\team \\"alpha\\"\\\\nested"]'
             in captured["cmd"]
         )
+
+    def test_kanban_writable_root_round_trips_non_bmp_unicode(self, monkeypatch):
+        """The generated TOML must preserve non-BMP writable-root characters."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_unicode_root")
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        writable_root = "C:\\boards\\😀\\nested"
+        monkeypatch.setenv("HERMES_KANBAN_ROOT", writable_root)
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        prefix = "sandbox_workspace_write.writable_roots="
+        value = next(
+            part.removeprefix(prefix)
+            for part in captured["cmd"]
+            if part.startswith(prefix)
+        )
+        assert tomllib.loads(f"writable_roots = {value}")["writable_roots"] == [
+            writable_root
+        ]
 
 
 class TestSpawnEnvSecretStripping:
