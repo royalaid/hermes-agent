@@ -6727,17 +6727,15 @@ class DiscordAdapter(BasePlatformAdapter):
         an inbox-style channel should accept unmentioned messages *and*
         still spawn a thread per drop. ``no_thread_channels`` still wins.
         """
-        configured = self.config.extra.get("free_response_auto_thread")
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
-            return bool(configured)
-        return self._gate_env("DISCORD_FREE_RESPONSE_AUTO_THREAD", "false").lower() in {
-            "true",
-            "1",
-            "yes",
-            "on",
-        }
+        configured = self._gate_raw(
+            "free_response_auto_thread",
+            "DISCORD_FREE_RESPONSE_AUTO_THREAD",
+        )
+        if configured is None:
+            return False
+        if isinstance(configured, str):
+            return configured.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(configured)
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.

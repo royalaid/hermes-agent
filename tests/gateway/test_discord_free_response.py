@@ -308,6 +308,49 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     assert event.source.chat_type == "group"
 
 
+def test_discord_free_response_auto_thread_env_overrides_yaml(adapter, monkeypatch):
+    """Explicit env values win over conflicting YAML-derived adapter extras."""
+    adapter.config.extra["free_response_auto_thread"] = False
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_AUTO_THREAD", "true")
+
+    assert adapter._discord_free_response_auto_thread() is True
+
+    adapter.config.extra["free_response_auto_thread"] = True
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_AUTO_THREAD", "false")
+
+    assert adapter._discord_free_response_auto_thread() is False
+
+
+def test_discord_free_response_auto_thread_yaml_only_opt_in(adapter, monkeypatch):
+    """YAML remains the fallback when the environment is unset."""
+    adapter.config.extra["free_response_auto_thread"] = True
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_AUTO_THREAD", raising=False)
+
+    assert adapter._discord_free_response_auto_thread() is True
+
+
+@pytest.mark.asyncio
+async def test_discord_no_thread_channel_overrides_free_response_auto_thread(adapter, monkeypatch):
+    """An explicit no-thread channel remains inline despite the new opt-in."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    adapter._auto_create_thread = AsyncMock()
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="leave this inbox drop inline",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].source.chat_type == "group"
+
+
 @pytest.mark.asyncio
 async def test_discord_free_response_auto_thread_opt_in(adapter, monkeypatch):
     """Inbox-style free-response channels can keep auto-threading."""
