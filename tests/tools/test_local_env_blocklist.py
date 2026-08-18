@@ -231,6 +231,65 @@ class TestProviderEnvBlocklist:
         for var in leaked_vars:
             assert var not in result_env, f"{var} leaked into subprocess env"
 
+    def test_buzz_credentials_are_stripped_without_managed_agent_marker(self):
+        """Buzz CLI identity remains protected in ordinary Hermes terminals."""
+        buzz_identity = {
+            "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result_env = _run_with_env(extra_os_env=buzz_identity)
+
+        for key in buzz_identity:
+            assert key not in result_env
+
+    def test_exact_managed_buzz_agent_receives_only_buzz_cli_identity(self):
+        """The exact managed host gets its scoped identity, not other secrets."""
+        buzz_identity = {
+            "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+        unrelated_secrets = {
+            "TELEGRAM_BOT_TOKEN": "synthetic-telegram-token",
+            "OPENAI_API_KEY": "synthetic-provider-key",
+            "GATEWAY_RELAY_SECRET": "synthetic-gateway-secret",
+        }
+
+        result_env = _run_with_env(extra_os_env={
+            "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app",
+            **buzz_identity,
+            **unrelated_secrets,
+        })
+
+        for key, value in buzz_identity.items():
+            assert result_env.get(key) == value
+        for key in unrelated_secrets:
+            assert key not in result_env
+
+    @pytest.mark.parametrize("lookalike", [
+        "XYZ.BLOCK.BUZZ.APP",
+        "xyz.block.buzz.app ",
+        "prefix.xyz.block.buzz.app",
+        "xyz.block.buzz.app.evil",
+    ])
+    def test_buzz_lookalike_marker_does_not_unlock_credentials(self, lookalike):
+        """The managed-host exception is case-sensitive and exact."""
+        buzz_identity = {
+            "BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            "BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            "BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result_env = _run_with_env(extra_os_env={
+            "BUZZ_MANAGED_AGENT": lookalike,
+            **buzz_identity,
+        })
+
+        for key in buzz_identity:
+            assert key not in result_env
+
     def test_safe_vars_are_preserved(self):
         """Standard env vars (PATH, HOME, USER) must still be passed through."""
         result_env = _run_with_env()

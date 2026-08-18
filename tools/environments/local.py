@@ -337,6 +337,24 @@ def _build_provider_env_blocklist() -> frozenset:
 
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
+# Buzz Desktop launches Hermes as a managed ACP worker and injects an
+# agent-scoped identity specifically for the ``buzz`` CLI. Keep the exception
+# exact and narrow: ordinary Hermes terminals continue to scrub these values.
+_BUZZ_MANAGED_AGENT_MARKER = "xyz.block.buzz.app"
+_BUZZ_MANAGED_TERMINAL_ENV_VARS = frozenset({
+    "BUZZ_PRIVATE_KEY",
+    "BUZZ_RELAY_URL",
+    "BUZZ_AUTH_TAG",
+})
+
+
+def _is_managed_buzz_terminal_env_var(key: str, source_env: Mapping[str, str]) -> bool:
+    """Allow only Buzz's scoped CLI identity in its exact managed ACP host."""
+    return (
+        source_env.get("BUZZ_MANAGED_AGENT") == _BUZZ_MANAGED_AGENT_MARKER
+        and key in _BUZZ_MANAGED_TERMINAL_ENV_VARS
+    )
+
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
 # The gateway runs inside its own venv, so its process environment carries
 # VIRTUAL_ENV (and possibly CONDA_PREFIX). If those leak into commands the
@@ -479,6 +497,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
+    source_env = dict(base_env or {})
+    source_env.update(extra_env or {})
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -486,7 +506,11 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         if _is_hermes_internal_secret(key):
             continue
         passthrough = _is_passthrough(key)
-        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+        if (
+            key in _HERMES_PROVIDER_ENV_BLOCKLIST
+            and not passthrough
+            and not _is_managed_buzz_terminal_env_var(key, source_env)
+        ):
             continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
         if resolved is not None:
@@ -502,7 +526,11 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         else:
             passthrough = _is_passthrough(key)
-            if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            if (
+                key in _HERMES_PROVIDER_ENV_BLOCKLIST
+                and not passthrough
+                and not _is_managed_buzz_terminal_env_var(key, source_env)
+            ):
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
@@ -1360,7 +1388,11 @@ def _make_run_env(env: dict) -> dict:
             continue
         else:
             passthrough = _is_passthrough(k)
-            if k in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            if (
+                k in _HERMES_PROVIDER_ENV_BLOCKLIST
+                and not passthrough
+                and not _is_managed_buzz_terminal_env_var(k, merged)
+            ):
                 continue
             value = _resolve_passthrough_value(k, v) if passthrough else v
             if value is not None:
