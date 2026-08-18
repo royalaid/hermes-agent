@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
-from tools.environments.local import hermes_subprocess_env
+from tools.environments.local import build_subprocess_env
 
 logger = logging.getLogger(__name__)
 _Thread = threading.Thread
@@ -315,10 +315,10 @@ class HostSupervisor:
             raise RuntimeError("compute host respawn disabled after crash loop")
         self._hello_event.clear()
         self._hello = {}
-        env = hermes_subprocess_env(inherit_credentials=True)
-        env.update(os.environ)
-        if self.env:
-            env.update(self.env)
+        # ``os.environ`` is the only authority source for managed Buzz
+        # identity.  Apply the caller overlay through the sanitizer so it can
+        # neither grant authority nor reintroduce any blocked secret.
+        env = build_subprocess_env(os.environ, extra=self.env)
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         env.setdefault("PYTHONPATH", str(_repo_root()))
         if str(_repo_root()) not in env["PYTHONPATH"].split(os.pathsep):

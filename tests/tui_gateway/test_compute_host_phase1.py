@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tui_gateway import compute_host, server
+from tui_gateway import compute_host, host_supervisor, server
 from tui_gateway.compute_host import ComputeHost, _default_workers
 from tui_gateway.host_supervisor import (
     MUTATOR_ROUTE_TABLE,
@@ -98,6 +98,100 @@ def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
     assert result == "pid-reuse-ignored"
     assert killed == []
     assert not registry.exists()
+
+
+@pytest.mark.parametrize(
+    ("host_marker", "overlay_marker", "inherits_buzz_identity"),
+    [
+        ("xyz.block.buzz.app", None, True),
+        (None, None, False),
+        ("xyz.block.buzz.app.evil", None, False),
+        (None, "xyz.block.buzz.app", False),
+    ],
+    ids=["exact-host", "absent-host", "lookalike-host", "overlay-cannot-authorize"],
+)
+def test_supervisor_spawn_sanitizes_host_and_overlay_at_final_boundary(
+    tmp_path,
+    monkeypatch,
+    host_marker,
+    overlay_marker,
+    inherits_buzz_identity,
+):
+    buzz_identity = {
+        "BUZZ_PRIVATE_KEY": "host-private-key",
+        "BUZZ_RELAY_URL": "wss://relay.example",
+        "BUZZ_AUTH_TAG": "host-auth-tag",
+    }
+    user_pythonpath = str(tmp_path / "user-lib")
+    monkeypatch.setenv("NORMAL_REQUIRED", "from-host")
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "blocked-host-secret")
+    monkeypatch.setenv("PYTHONPATH", user_pythonpath)
+    for key, value in buzz_identity.items():
+        monkeypatch.setenv(key, value)
+    if host_marker is None:
+        monkeypatch.delenv("BUZZ_MANAGED_AGENT", raising=False)
+    else:
+        monkeypatch.setenv("BUZZ_MANAGED_AGENT", host_marker)
+
+    overlay = {
+        "OVERLAY_REQUIRED": "from-overlay",
+        "TELEGRAM_BOT_TOKEN": "blocked-overlay-secret",
+    }
+    if overlay_marker is not None:
+        overlay["BUZZ_MANAGED_AGENT"] = overlay_marker
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _FakeProcess:
+        pid = 4321
+        stdin = io.StringIO()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+    class _FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "dashboard-compute-host.json",
+        argv=[sys.executable, "-m", "tui_gateway.compute_host"],
+        env=overlay,
+        heartbeat_secs=23,
+        expected_build_sha="unknown",
+        autostart=False,
+    )
+
+    def _capture_popen(*_args, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        supervisor._hello = {"type": "hello"}
+        supervisor._hello_event.set()
+        return _FakeProcess()
+
+    monkeypatch.setattr(host_supervisor.subprocess, "Popen", _capture_popen)
+    monkeypatch.setattr(host_supervisor, "_Thread", _FakeThread)
+
+    supervisor._spawn_locked(reason="test")
+
+    child_env = captured["env"]
+    assert {
+        "BUZZ_MANAGED_AGENT",
+        "HERMES_DASHBOARD_SESSION_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+    }.isdisjoint(child_env)
+    for key, value in buzz_identity.items():
+        if inherits_buzz_identity:
+            assert child_env[key] == value
+        else:
+            assert key not in child_env
+    assert child_env["NORMAL_REQUIRED"] == "from-host"
+    assert child_env["OVERLAY_REQUIRED"] == "from-overlay"
+    assert child_env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] == "23"
+    pythonpath = child_env["PYTHONPATH"].split(os.pathsep)
+    assert user_pythonpath in pythonpath
+    assert str(Path(host_supervisor.__file__).resolve().parents[1]) in pythonpath
 
 
 def _make_compress_host_session(events: list) -> dict:
