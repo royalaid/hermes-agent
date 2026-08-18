@@ -16,7 +16,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -168,6 +168,112 @@ class TestUpdateCommandGatewayFlag:
 
 class TestWatchUpdateProgress:
     """Tests for _watch_update_progress() streaming output."""
+
+    @pytest.mark.asyncio
+    async def test_completion_retries_after_final_send_exception(self, tmp_path):
+        """A transient final-send exception must not discard the update result."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "agent:main:telegram:dm:111",
+        }))
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        adapter = AsyncMock()
+        adapter.send.side_effect = [
+            RuntimeError("temporary network failure"),
+            SendResult(success=True, message_id="delivered"),
+        ]
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.001,
+                stream_interval=0.001,
+                timeout=0.1,
+            )
+
+        assert adapter.send.await_count == 2
+        assert not pending_path.exists()
+        assert not (hermes_home / ".update_exit_code").exists()
+
+    @pytest.mark.asyncio
+    async def test_completion_retries_after_final_send_result_failure(
+        self, tmp_path, caplog
+    ):
+        """SendResult(success=False) retries without warning on every poll."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "agent:main:telegram:dm:111",
+        }))
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        adapter = AsyncMock()
+        adapter.send.side_effect = [
+            SendResult(success=False, error="temporarily unavailable"),
+            SendResult(success=False, error="temporarily unavailable"),
+            SendResult(success=True, message_id="delivered"),
+        ]
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home), caplog.at_level("WARNING"):
+            await runner._watch_update_progress(
+                poll_interval=0.001,
+                stream_interval=0.001,
+                timeout=0.1,
+            )
+
+        assert adapter.send.await_count == 3
+        assert sum(
+            "was not delivered" in record.getMessage()
+            for record in caplog.records
+        ) == 1
+        assert not pending_path.exists()
+        assert not (hermes_home / ".update_exit_code").exists()
+
+    @pytest.mark.asyncio
+    async def test_timeout_retries_after_send_exception(self, tmp_path):
+        """A timeout result survives a transient send exception and is retried."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        output_path = hermes_home / ".update_output.txt"
+        exit_code_path = hermes_home / ".update_exit_code"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram",
+            "chat_id": "111",
+            "session_key": "agent:main:telegram:dm:111",
+        }))
+        output_path.write_text("update stalled")
+
+        adapter = AsyncMock()
+        adapter.send.side_effect = [
+            RuntimeError("temporary network failure"),
+            SendResult(success=True, message_id="delivered"),
+        ]
+        runner.adapters = {Platform.TELEGRAM: adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._watch_update_progress(
+                poll_interval=0.001,
+                stream_interval=1.0,
+                timeout=0.01,
+            )
+
+        assert adapter.send.await_count == 2
+        assert not pending_path.exists()
+        assert not output_path.exists()
+        assert not exit_code_path.exists()
 
     @pytest.mark.asyncio
     async def test_streams_output_to_adapter(self, tmp_path):

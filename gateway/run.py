@@ -23367,22 +23367,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
+        def _retire_update_interaction_state() -> None:
+            """Clean prompt artifacts only after final notification resolution."""
+            prompt_path.unlink(missing_ok=True)
+            (_hermes_home / ".update_response").unlink(missing_ok=True)
+            if session_key:
+                state = self._peek_session_state(session_key)
+                if state is not None:
+                    state.persistent.update_prompt_pending = False
+
+        async def _retry_completed_notification(
+            *, message_override: Optional[str] = None,
+        ) -> bool:
+            """Drive completed delivery through the persisted bounded lifecycle."""
+            retry_deadline: Optional[float] = None
+            while pending_path.exists() or claimed_path.exists():
+                now = loop.time()
+                terminal_reason = (
+                    "adapter_reconnect_timeout"
+                    if retry_deadline is not None and now >= retry_deadline
+                    else None
+                )
+                resolved = await self._send_update_notification(
+                    message_override=message_override,
+                    terminal_reason=terminal_reason,
+                )
+                if resolved:
+                    _retire_update_interaction_state()
+                    return True
+                if terminal_reason is not None:
+                    logger.warning(
+                        "Update notification terminal disposition could not be persisted; "
+                        "leaving markers for startup recovery"
+                    )
+                    return False
+                if retry_deadline is None:
+                    retry_deadline = (
+                        loop.time()
+                        + self._UPDATE_NOTIFICATION_RECONNECT_TIMEOUT_SECONDS
+                    )
+                remaining = max(0.0, retry_deadline - loop.time())
+                await asyncio.sleep(min(poll_interval, remaining))
+
+            # Another notifier may have resolved the claimed marker while this
+            # watcher was asleep. The interaction artifacts are then stale too.
+            _retire_update_interaction_state()
+            return True
+
         if not adapter or not chat_id:
             logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
-            # Fall back to completion-only: wait for the exit code and send the
-            # final notification. _send_update_notification re-resolves the
-            # adapter on every call, so when the target platform is still
-            # reconnecting it returns False and keeps the markers. Keep polling
-            # until it actually delivers (returns True) instead of giving up
-            # after the first completion check — otherwise a platform that
-            # reconnects a few seconds after completion never gets notified.
-            while (pending_path.exists() or claimed_path.exists()) and loop.time() < deadline:
-                if exit_code_path.exists() and await self._send_update_notification():
-                    return
+            while (
+                (pending_path.exists() or claimed_path.exists())
+                and not exit_code_path.exists()
+                and loop.time() < deadline
+            ):
                 await asyncio.sleep(poll_interval)
             if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
                 exit_code_path.write_text("124", encoding="utf-8")
-                await self._send_update_notification()
+            if exit_code_path.exists():
+                await _retry_completed_notification()
             return
 
         def _strip_ansi(text: str) -> str:
@@ -23441,34 +23484,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
                 await _flush_buffer()
 
-                # Send final status
+                # Route the final send through the same persisted lifecycle as
+                # startup recovery. A raised exception or success=False remains
+                # retryable instead of deleting the only completion record.
                 try:
                     exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
-                        await adapter.send(
-                            chat_id,
-                            "✅ Hermes update finished.",
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
-                        )
+                        final_message = "✅ Hermes update finished."
                     else:
-                        await adapter.send(
-                            chat_id,
-                            "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
+                        final_message = (
+                            "❌ Hermes update failed (exit code {}).".format(exit_code)
                         )
-                    logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
-                    logger.warning("Update final notification failed: %s", e)
+                    logger.warning("Update final status could not be read: %s", e)
+                    final_message = None
 
-                # Cleanup
-                for p in (pending_path, claimed_path, output_path,
-                          exit_code_path, prompt_path):
-                    p.unlink(missing_ok=True)
-                (_hermes_home / ".update_response").unlink(missing_ok=True)
-                _up_done = self._peek_session_state(session_key)
-                if _up_done is not None:
-                    _up_done.persistent.update_prompt_pending = False
+                await _retry_completed_notification(message_override=final_message)
                 return
 
             # Check for new output
@@ -23549,23 +23581,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Update watcher timed out after %.0fs", timeout)
             exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
-            try:
-                await adapter.send(
-                    chat_id,
-                    "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
-            except Exception:
-                pass
-            for p in (pending_path, claimed_path, output_path,
-                      exit_code_path, prompt_path):
-                p.unlink(missing_ok=True)
-            (_hermes_home / ".update_response").unlink(missing_ok=True)
-            _up_timeout_state = self._peek_session_state(session_key)
-            if _up_timeout_state is not None:
-                _up_timeout_state.persistent.update_prompt_pending = False
+            await _retry_completed_notification(
+                message_override="❌ Hermes update timed out after 30 minutes."
+            )
 
-    async def _send_update_notification(self) -> bool:
+    async def _send_update_notification(
+        self,
+        *,
+        message_override: Optional[str] = None,
+        terminal_reason: Optional[str] = None,
+    ) -> bool:
         """Deliver a completed update result or persist a bounded disposition.
 
         ``False`` means a transient condition remains retryable. ``True`` means
@@ -23625,6 +23650,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def _defer(reason: str) -> bool:
             """Persist a deduplicated transient deferral across restarts."""
+            if terminal_reason is not None:
+                return _terminal_disposition(terminal_reason)
             deferred_at = pending.get("notification_deferred_at")
             now = datetime.now(timezone.utc)
             if deferred_at:
@@ -23718,7 +23745,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             from tools.ansi_strip import strip_ansi
             output = strip_ansi(output).strip()
-            if output:
+            if message_override is not None:
+                msg = message_override
+            elif output:
                 if len(output) > 3500:
                     output = "…" + output[-3500:]
                 if exit_code == 0:
@@ -23735,12 +23764,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             if result is not None and getattr(result, "success", True) is False:
-                logger.warning(
-                    "Post-update notification was not delivered to %s:%s: %s",
-                    platform_str,
-                    chat_id,
-                    getattr(result, "error", "send returned success=False"),
-                )
+                if not pending.get("notification_deferred_at"):
+                    logger.warning(
+                        "Post-update notification was not delivered to %s:%s: %s",
+                        platform_str,
+                        chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
                 return _defer("adapter_send_failed")
             logger.info(
                 "Sent post-update notification to %s:%s (exit=%s)",
@@ -23750,7 +23780,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             cleanup = True
         except Exception as exc:
-            logger.warning("Post-update notification failed: %s", exc)
+            if not pending.get("notification_deferred_at"):
+                logger.warning("Post-update notification failed: %s", exc)
             try:
                 return _defer("adapter_send_failed")
             except Exception as defer_error:
