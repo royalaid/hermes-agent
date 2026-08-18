@@ -6,8 +6,9 @@ Covers ``scripts/fork_integration/sync.py`` directly (staged atomic
 ``restamp_manifest()``, and the CLI), plus the two wiring points in
 ``hermes-integration-release-windows.py``: the run-start integrity gate
 (``integration_scripts_integrity_check``) and the post-publish hook
-(``sync_operational_copies``, called only from the true publish success
-branch -- never on failure or under ``--dry-run``).
+(``sync_operational_copies``, called by the verified-publication helper that
+``main()`` reaches only from true publish success -- never on failure or under
+``--dry-run``).
 
 Fixtures build small real git repos (mirrors this suite's existing
 ``test_stable_patch_id_matches_real_git_patch_id`` idiom) rather than
@@ -399,32 +400,105 @@ def test_provisional_deploy_stamps_provisional_and_next_publish_restamps(tmp_pat
 
 def test_sync_hook_call_site_is_inside_the_publish_success_branch() -> None:
     """Code-inspection proof (explicitly permitted by the U2 test-scenario
-    wording): the post-publish sync call appears only in main()'s true
-    success path -- never in the exception handler, never in the
-    --dry-run branch."""
+    wording): main() reaches the helper that directly performs post-publish
+    sync only after public verification -- never in the exception handler or
+    --dry-run branch -- and preserves the release/product SHA boundary."""
+    import ast
     import inspect
+    import textwrap
 
     from scripts.fork_integration.release import mod as release
 
-    source = inspect.getsource(release.main)
+    def function_node(function: Any) -> ast.FunctionDef:
+        module = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        return next(node for node in module.body if isinstance(node, ast.FunctionDef))
 
-    # main() has TWO "except Exception as exc:" blocks: an inner one inside
-    # the --dry-run branch's own try/except, and the outer one wrapping the
-    # whole real-run pipeline (textually last). rpartition targets that
-    # outer/last one so try_body covers the full real-run success path and
-    # except_body is exactly the real-run failure handler.
-    try_body, separator, except_body = source.rpartition("except Exception as exc:")
-    assert separator, "main() must retain its try/except structure"
-    assert "sync_operational_copies(" in try_body
-    assert "sync_operational_copies(" not in except_body
+    def named_calls(node: ast.AST, name: str) -> list[ast.Call]:
+        return [
+            candidate
+            for candidate in ast.walk(node)
+            if isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Name)
+            and candidate.func.id == name
+        ]
 
-    dry_run_branch, separator, real_run_branch = source.partition(
-        "started_at = datetime.now().astimezone()"
+    main = function_node(release.main)
+    helper_calls = named_calls(main, "_finish_verified_publication")
+    assert len(helper_calls) == 1, "main() must have one verified-publication finish path"
+    helper_call = helper_calls[0]
+
+    parents = {
+        child: parent
+        for parent in ast.walk(main)
+        for child in ast.iter_child_nodes(parent)
+    }
+    return_node = parents[helper_call]
+    assert isinstance(return_node, ast.Return)
+    outer_try = parents[return_node]
+    assert isinstance(outer_try, ast.Try), "helper return must remain in the real-run try body"
+    assert any(
+        isinstance(handler.type, ast.Name)
+        and handler.type.id == "Exception"
+        and handler.name == "exc"
+        for handler in outer_try.handlers
     )
-    assert separator, "main() must retain the real-run/dry-run split at started_at"
-    assert "sync_operational_copies(" not in dry_run_branch
-    assert "sync_operational_copies(" in real_run_branch
-    assert 'sync_integrity.get("source_sha"), rebased_output_head' in real_run_branch
+    assert all(
+        not named_calls(handler, "_finish_verified_publication")
+        for handler in outer_try.handlers
+    ), "outer real-run failure handling must not finish publication"
+
+    dry_run_if = next(
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and isinstance(node.test.value, ast.Name)
+        and node.test.value.id == "args"
+        and node.test.attr == "dry_run"
+    )
+    assert not any(
+        named_calls(statement, "_finish_verified_publication")
+        for statement in dry_run_if.body
+    ), "dry-run handling must not finish publication"
+
+    verified_assignments = [
+        statement
+        for statement in outer_try.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "public_integrity_verified"
+            for target in statement.targets
+        )
+        and isinstance(statement.value, ast.Constant)
+        and statement.value.value is True
+    ]
+    assert len(verified_assignments) == 1
+    assert verified_assignments[0].lineno < helper_call.lineno
+
+    keywords = {keyword.arg: keyword.value for keyword in helper_call.keywords}
+    release_source = keywords["release_system_source_sha"]
+    assert (
+        isinstance(release_source, ast.Call)
+        and isinstance(release_source.func, ast.Attribute)
+        and isinstance(release_source.func.value, ast.Name)
+        and release_source.func.value.id == "sync_integrity"
+        and release_source.func.attr == "get"
+        and len(release_source.args) == 1
+        and isinstance(release_source.args[0], ast.Constant)
+        and release_source.args[0].value == "source_sha"
+    )
+    published_product = keywords["published_product_sha"]
+    assert isinstance(published_product, ast.Name)
+    assert published_product.id == "rebased_output_head"
+    assert ast.dump(release_source) != ast.dump(published_product)
+
+    helper = function_node(release._finish_verified_publication)
+    sync_calls = named_calls(helper, "sync_operational_copies")
+    assert len(sync_calls) == 1, "verified-publication helper must directly invoke sync"
+    assert [
+        argument.id if isinstance(argument, ast.Name) else None
+        for argument in sync_calls[0].args
+    ] == ["release_system_source_sha", "published_product_sha"]
 
 
 def test_sync_operational_copies_deploys_verified_release_source_and_records_product(
