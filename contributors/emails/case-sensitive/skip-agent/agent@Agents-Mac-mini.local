@@ -1,0 +1,3 @@
+skip-agent
+# Exact author email: agent@Agents-Mac-mini.local
+# Nested because it case-folds with agent@agents-Mac-mini.local.

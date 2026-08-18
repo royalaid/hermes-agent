@@ -21,6 +21,29 @@ import release  # noqa: E402
 from add_contributor import add_contributor, read_mapping_file  # noqa: E402
 
 
+# ── repository path invariants ────────────────────────────────────────
+
+
+def test_tracked_paths_are_casefold_unique():
+    """Every tracked path must be representable on case-insensitive filesystems."""
+    proc = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    paths_by_casefold = {}
+    collisions = []
+    for path in filter(None, proc.stdout.split("\0")):
+        key = path.casefold()
+        previous = paths_by_casefold.setdefault(key, path)
+        if previous != path:
+            collisions.append((previous, path))
+
+    assert collisions == []
+
+
 # ── directory loader behavior ─────────────────────────────────────────
 
 
@@ -30,6 +53,17 @@ def test_loader_reads_login_from_first_noncomment_line(tmp_path):
     (d / "jane@example.com").write_text("# salvage PR #1\njanedoe\n# trailing note\n")
     mapping = release._load_contributor_dir(d)
     assert mapping == {"jane@example.com": "janedoe"}
+
+
+def test_loader_reads_nested_case_sensitive_mapping(tmp_path):
+    d = tmp_path / "emails"
+    nested = d / "case-sensitive" / "janedoe"
+    nested.mkdir(parents=True)
+    (nested / "Jane@example.com").write_text("janedoe\n", encoding="utf-8")
+
+    mapping = release._load_contributor_dir(d)
+
+    assert mapping == {"Jane@example.com": "janedoe"}
 
 
 
@@ -69,7 +103,25 @@ def test_add_creates_mapping_file(emails_dir):
     assert "# PR #999 salvage" in path.read_text()
 
 
+def test_add_detects_existing_nested_mapping(emails_dir):
+    nested = emails_dir / "case-sensitive" / "janedoe"
+    nested.mkdir(parents=True)
+    (nested / "Jane@example.com").write_text("janedoe\n", encoding="utf-8")
 
+    rc = add_contributor("Jane@example.com", "janedoe")
+
+    assert rc == 0
+    assert not (emails_dir / "Jane@example.com").exists()
+
+
+def test_add_refuses_casefold_colliding_email(emails_dir, capsys):
+    emails_dir.mkdir(parents=True)
+    (emails_dir / "Jane@example.com").write_text("janedoe\n", encoding="utf-8")
+
+    rc = add_contributor("jane@example.com", "janedoe")
+
+    assert rc == 1
+    assert "case-insensitive filesystems" in capsys.readouterr().err
 
 
 

@@ -14,7 +14,9 @@ Usage (from the repo root):
 Idempotent: if the mapping already exists with the same login, prints
 "present" and exits 0. If the email maps to a DIFFERENT login (here or in the
 legacy AUTHOR_MAP), refuses with exit 1 so a typo can't silently reassign
-someone's commits.
+someone's commits. A new email that differs from an existing mapping only by
+case is also refused because both paths alias on Windows and default macOS
+filesystems; resolve that exceptional mapping in a nested case-sensitive path.
 """
 
 import re
@@ -55,6 +57,31 @@ def _legacy_login(email: str) -> str | None:
         return None
 
 
+def _find_mapping_path(email: str) -> Path | None:
+    """Find an exact-email mapping, including nested case-sensitive entries."""
+    if not EMAILS_DIR.is_dir():
+        return None
+    for candidate in EMAILS_DIR.rglob("*"):
+        if candidate.is_file() and candidate.name == email:
+            return candidate
+    return None
+
+
+def _find_casefold_collision(email: str) -> Path | None:
+    """Find a different mapping filename that aliases email on Windows/macOS."""
+    if not EMAILS_DIR.is_dir():
+        return None
+    folded = email.casefold()
+    for candidate in EMAILS_DIR.rglob("*"):
+        if (
+            candidate.is_file()
+            and candidate.name != email
+            and candidate.name.casefold() == folded
+        ):
+            return candidate
+    return None
+
+
 def add_contributor(email: str, login: str, comment: str = "") -> int:
     email = email.strip()
     login = login.strip().lstrip("@")
@@ -66,7 +93,18 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
         print(f"error: {login!r} is not a valid GitHub login", file=sys.stderr)
         return 2
 
-    path = EMAILS_DIR / email
+    path = _find_mapping_path(email)
+    if path is None:
+        collision = _find_casefold_collision(email)
+        if collision is not None:
+            print(
+                f"error: {email} collides with existing mapping {collision.name!r} "
+                "on case-insensitive filesystems — resolve manually under "
+                "contributors/emails/case-sensitive/<github-login>/",
+                file=sys.stderr,
+            )
+            return 1
+        path = EMAILS_DIR / email
     existing = read_mapping_file(path) if path.is_file() else None
     if existing is None:
         existing = _legacy_login(email)

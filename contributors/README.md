@@ -19,6 +19,10 @@ echo "<github-login>" > contributors/emails/<email>
 - File **name** = the exact commit-author email (as shown by `git log --format='%ae'`).
 - File **content** = the GitHub login on the first non-comment line.
   Lines starting with `#` are comments (use them for the PR reference).
+- If two exact emails differ only by case, their flat paths collide on Windows
+  and default macOS filesystems. Keep one at the root and nest the other at
+  `emails/case-sensitive/<github-login>/<exact-email>`; the loader recurses and
+  still uses the exact filename as the email key.
 
 Example — `contributors/emails/jane.doe@example.com`:
 

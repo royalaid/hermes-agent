@@ -2083,14 +2083,14 @@ def _load_contributor_dir(directory: "Path | None" = None) -> dict:
     """Load one-file-per-email mappings from contributors/emails/.
 
     Filename = commit-author email, first non-comment line = GitHub login.
-    Additions never merge-conflict (each mapping is a distinct file), which
-    is why new entries go here instead of the frozen LEGACY_AUTHOR_MAP.
+    Exceptional case-sensitive mappings may be nested to keep tracked paths
+    representable on case-insensitive filesystems.
     """
     directory = directory or CONTRIBUTORS_EMAILS_DIR
     mapping = {}
     if not directory.is_dir():
         return mapping
-    for path in sorted(directory.iterdir()):
+    for path in sorted(directory.rglob("*")):
         if not path.is_file() or path.name.startswith("."):
             continue
         try:
