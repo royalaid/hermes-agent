@@ -398,6 +398,26 @@ class TestBashDiscoveryFailureHandling:
             with pytest.raises(RuntimeError, match="Git Bash not found"):
                 local_mod._find_bash()
 
+    def test_explicit_system32_bash_is_rejected_before_probe(
+        self, monkeypatch, tmp_path
+    ):
+        """An explicit custom path must not bypass the System32/WSL boundary."""
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        monkeypatch.setenv("ProgramFiles", str(tmp_path / "program-files"))
+        monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "program-files-x86"))
+        system32_bash = tmp_path / "Windows" / "System32" / "bash.exe"
+        system32_bash.parent.mkdir(parents=True)
+        system32_bash.touch()
+        monkeypatch.setenv("HERMES_GIT_BASH_PATH", str(system32_bash))
+
+        with patch.object(local_mod.shutil, "which", return_value=None), \
+             patch.object(local_mod, "_bash_starts", return_value=True) as probe:
+            with pytest.raises(RuntimeError, match="Git Bash not found"):
+                local_mod._find_bash()
+
+        probe.assert_not_called()
+
     def test_probe_timeout_terminates_only_spawned_probe_pid_tree(self, monkeypatch):
         """A wedged probe cleans up the exact child it created and then returns."""
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)

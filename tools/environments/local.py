@@ -740,6 +740,13 @@ def _is_system32_bash(path: str) -> bool:
     return parent.casefold() == "system32"
 
 
+def _windows_bash_candidate(path: "str | None") -> "str | None":
+    """Return an existing non-System32 Bash candidate, regardless of source."""
+    if not path or not os.path.isfile(path) or _is_system32_bash(path):
+        return None
+    return path
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:
@@ -753,16 +760,18 @@ def _find_bash() -> str:
 
     candidates: list[str] = []
 
-    custom = os.environ.get("HERMES_GIT_BASH_PATH")
-    if custom and os.path.isfile(custom):
+    custom = _windows_bash_candidate(os.environ.get("HERMES_GIT_BASH_PATH"))
+    if custom:
         # Prefer the Git-for-Windows executable that lives beside the
         # configured bin/bash.exe.  Both understand MSYS /c/... paths, unlike
         # Windows' System32/bash.exe (WSL).
         custom_norm = os.path.normcase(os.path.normpath(custom))
         custom_bin = os.path.dirname(custom_norm)
         custom_root = os.path.dirname(custom_bin)
-        sibling_usr = os.path.join(custom_root, "usr", "bin", "bash.exe")
-        if os.path.isfile(sibling_usr) and os.path.normcase(sibling_usr) != custom_norm:
+        sibling_usr = _windows_bash_candidate(
+            os.path.join(custom_root, "usr", "bin", "bash.exe")
+        )
+        if sibling_usr and os.path.normcase(sibling_usr) != custom_norm:
             # The configured installation is an explicit user choice.  Do not
             # let a health-probe false negative silently redirect it to WSL.
             return sibling_usr
@@ -779,29 +788,29 @@ def _find_bash() -> str:
     _local_appdata = os.environ.get("LOCALAPPDATA", "")
     _hermes_portable_git = os.path.join(_local_appdata, "hermes", "git") if _local_appdata else ""
     if _hermes_portable_git:
-        for candidate in (
+        for path in (
             os.path.join(_hermes_portable_git, "bin", "bash.exe"),        # PortableGit (primary)
             os.path.join(_hermes_portable_git, "usr", "bin", "bash.exe"), # MinGit fallback
         ):
-            if os.path.isfile(candidate) and candidate not in candidates:
+            candidate = _windows_bash_candidate(path)
+            if candidate and candidate not in candidates:
                 candidates.append(candidate)
 
     # Check known Git for Windows install locations before PATH lookup.
     # On machines with both WSL and Git for Windows, shutil.which("bash")
     # may return WSL's bash (which doesn't understand Windows paths and
     # will fail silently).  Explicit Git-for-Windows paths avoid that.
-    for candidate in (
+    for path in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
         os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe") if _local_appdata else "",
     ):
-        if candidate and os.path.isfile(candidate) and candidate not in candidates:
+        candidate = _windows_bash_candidate(path)
+        if candidate and candidate not in candidates:
             candidates.append(candidate)
 
-    found = shutil.which("bash")
-    # PATH commonly resolves bash.exe to WSL's System32 shim.  It is not Git
-    # Bash and cannot consume the MSYS working directories used below.
-    if found and not (_IS_WINDOWS and _is_system32_bash(found)) and found not in candidates:
+    found = _windows_bash_candidate(shutil.which("bash"))
+    if found and found not in candidates:
         candidates.append(found)
 
     # Prefer the first candidate that can actually start.  A stale
