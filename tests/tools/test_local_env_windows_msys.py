@@ -30,7 +30,8 @@ host ``_IS_WINDOWS`` is already False, so no patching is needed at all.
 """
 
 import os
-from unittest.mock import patch
+import subprocess
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -349,3 +350,65 @@ class TestWrapCommandWindowsNativeCwd:
         script = captured["script"]
         assert "/c/Users/Alexander/AppData/Local/Temp/hermes-snap-deadbeef.sh" in script
         assert r"C:\Users\Alexander\AppData" not in script
+
+
+# ---------------------------------------------------------------------------
+# Bash discovery/probe failure handling — avoid ACP stalls and WSL fallback
+# ---------------------------------------------------------------------------
+
+class TestBashDiscoveryFailureHandling:
+    def test_explicit_git_path_uses_usr_bin_without_running_probe(
+        self, monkeypatch, tmp_path
+    ):
+        """An explicit Git-for-Windows path must not fall through to WSL bash."""
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        git_root = tmp_path / "Git"
+        configured = git_root / "bin" / "bash.exe"
+        sibling = git_root / "usr" / "bin" / "bash.exe"
+        configured.parent.mkdir(parents=True)
+        sibling.parent.mkdir(parents=True)
+        configured.touch()
+        sibling.touch()
+        monkeypatch.setenv("HERMES_GIT_BASH_PATH", str(configured))
+
+        with patch.object(local_mod, "_bash_starts") as probe:
+            assert local_mod._find_bash() == os.path.normcase(str(sibling))
+
+        probe.assert_not_called()
+
+    def test_system32_bash_is_not_accepted_as_windows_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        """Native Windows must not select WSL's System32\\bash.exe."""
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.delenv("HERMES_GIT_BASH_PATH", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        monkeypatch.setenv("ProgramFiles", str(tmp_path / "program-files"))
+        monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "program-files-x86"))
+        system32_bash = tmp_path / "Windows" / "System32" / "bash.exe"
+        system32_bash.parent.mkdir(parents=True)
+        system32_bash.touch()
+
+        with patch.object(local_mod.shutil, "which", return_value=str(system32_bash)):
+            with pytest.raises(RuntimeError, match="Git Bash not found"):
+                local_mod._find_bash()
+
+    def test_probe_timeout_terminates_only_spawned_probe_pid_tree(self, monkeypatch):
+        """A wedged probe cleans up the exact child it created and then returns."""
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        local_mod._bash_starts_cache.clear()
+        local_mod._bash_probe_details_cache.clear()
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired("bash", 15),
+            ("", ""),
+        ]
+
+        with patch.object(local_mod.subprocess, "Popen", return_value=proc), \
+             patch("gateway.status.terminate_pid") as terminate_pid:
+            assert local_mod._bash_starts(r"C:\Git\bin\bash.exe") is False
+
+        terminate_pid.assert_called_once_with(proc.pid, force=True)
+        proc.kill.assert_not_called()
+        assert local_mod._bash_probe_details_cache[r"C:\Git\bin\bash.exe"] == "probe timed out"

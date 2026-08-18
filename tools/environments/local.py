@@ -749,7 +749,18 @@ def _find_bash() -> str:
 
     custom = os.environ.get("HERMES_GIT_BASH_PATH")
     if custom and os.path.isfile(custom):
-        candidates.append(custom)
+        # Prefer the Git-for-Windows executable that lives beside the
+        # configured bin/bash.exe.  Both understand MSYS /c/... paths, unlike
+        # Windows' System32/bash.exe (WSL).
+        custom_norm = os.path.normcase(os.path.normpath(custom))
+        custom_bin = os.path.dirname(custom_norm)
+        custom_root = os.path.dirname(custom_bin)
+        sibling_usr = os.path.join(custom_root, "usr", "bin", "bash.exe")
+        if os.path.isfile(sibling_usr) and os.path.normcase(sibling_usr) != custom_norm:
+            # The configured installation is an explicit user choice.  Do not
+            # let a health-probe false negative silently redirect it to WSL.
+            return sibling_usr
+        return custom
 
     # Prefer our own portable Git install — a broken or partially-uninstalled
     # system Git (or a stale HERMES_GIT_BASH_PATH pointing at one) must not
@@ -782,7 +793,12 @@ def _find_bash() -> str:
             candidates.append(candidate)
 
     found = shutil.which("bash")
-    if found and found not in candidates:
+    # PATH commonly resolves bash.exe to WSL's System32 shim.  It is not Git
+    # Bash and cannot consume the MSYS working directories used below.
+    if found and not (
+        _IS_WINDOWS
+        and os.path.normcase(os.path.basename(os.path.dirname(found))) == "system32"
+    ) and found not in candidates:
         candidates.append(found)
 
     # Prefer the first candidate that can actually start.  A stale
@@ -923,18 +939,57 @@ def _bash_starts(bash: str) -> bool:
         return cached
 
     try:
-        result = subprocess.run(
+        # subprocess.run(timeout=...) kills only the wrapper before performing
+        # an unbounded communicate().  An MSYS descendant can retain the pipe
+        # handles and wedge discovery, so own the bounded cleanup explicitly.
+        proc = subprocess.Popen(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=15,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
         )
-        ok = result.returncode == 0
-        if not ok:
-            combined = f"{result.stdout or ''}{result.stderr or ''}"
-            _bash_probe_details_cache[bash] = combined.strip()[:2000]
-            logger.debug("bash probe failed for %s: %s", bash, combined.strip()[:200])
+        try:
+            stdout, stderr = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired as exc:
+            # proc is the exact child created above; terminate only its PID
+            # tree, never a name- or command-line-selected process set.
+            try:
+                if _IS_WINDOWS:
+                    from gateway.status import terminate_pid
+                    terminate_pid(proc.pid, force=True)
+                else:
+                    proc.kill()
+            except Exception as kill_exc:
+                logger.debug("bash probe kill failed for %s: %s", bash, kill_exc)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                # Do not wait again. Close only this probe's pipe handles.
+                for stream in (proc.stdout, proc.stderr):
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except Exception:
+                        pass
+                stdout = getattr(exc, "output", "") or ""
+                stderr = getattr(exc, "stderr", "") or ""
+            combined = f"{stdout or ''}{stderr or ''}"
+            _bash_probe_details_cache[bash] = combined.strip()[:2000] or "probe timed out"
+            logger.debug("bash probe timed out for %s", bash)
+            ok = False
+        else:
+            ok = proc.returncode == 0
+            if not ok:
+                combined = f"{stdout or ''}{stderr or ''}"
+                _bash_probe_details_cache[bash] = combined.strip()[:2000]
+                logger.debug("bash probe failed for %s: %s", bash, combined.strip()[:200])
     except Exception as exc:
         _bash_probe_details_cache[bash] = str(exc)[:2000]
         logger.debug("bash probe error for %s: %s", bash, exc)
