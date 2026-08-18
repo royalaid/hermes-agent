@@ -2444,6 +2444,24 @@ class HermesACPAgent(acp.Agent):
                 model_id,
                 current_provider or "openrouter",
             )
+            current_model = state.model or getattr(state.agent, "model", "")
+            if (
+                requested_provider == current_provider
+                and resolved_model == current_model
+            ):
+                # Buzz applies its configured model immediately after creating a
+                # session, even when new_session already returned that exact
+                # provider/model pair. Rebuilding AIAgent here is expensive and
+                # can exceed the client's short control-RPC deadline, causing a
+                # transport respawn before the first prompt. Treat identical
+                # selections as the idempotent protocol operation they are.
+                logger.debug(
+                    "Session %s: model already %s via provider %s",
+                    session_id,
+                    resolved_model,
+                    requested_provider,
+                )
+                return SetSessionModelResponse()
             state.model = resolved_model
             provider_changed = bool(current_provider and requested_provider != current_provider)
             current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)

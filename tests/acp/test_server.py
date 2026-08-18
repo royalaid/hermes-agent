@@ -178,6 +178,34 @@ class TestAuthenticate:
 class TestSessionOps:
 
     @pytest.mark.asyncio
+    async def test_set_session_model_does_not_rebuild_identical_agent(self):
+        created_agents = []
+
+        def factory():
+            fake = SimpleNamespace(
+                model="gpt-5.6-luna",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_mode="codex_responses",
+            )
+            created_agents.append(fake)
+            return fake
+
+        manager = SessionManager(agent_factory=factory)
+        acp_agent = HermesACPAgent(session_manager=manager)
+        session = await acp_agent.new_session(cwd="/tmp")
+        original_agent = manager.get_session(session.session_id).agent
+
+        response = await acp_agent.set_session_model(
+            "openai-codex:gpt-5.6-luna",
+            session.session_id,
+        )
+
+        assert isinstance(response, SetSessionModelResponse)
+        assert len(created_agents) == 1
+        assert manager.get_session(session.session_id).agent is original_agent
+
+    @pytest.mark.asyncio
     async def test_new_session_returns_authenticated_cross_provider_model_state(self):
         manager = SessionManager(
             agent_factory=lambda: SimpleNamespace(
