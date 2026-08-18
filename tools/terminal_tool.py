@@ -2661,11 +2661,19 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
-        # Use task_id for environment isolation. By default all subagent
-        # task_ids collapse back to "default" so the top-level agent and
-        # every delegate_task child share one container; only task_ids with
-        # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
+        # Use task_id for environment isolation. Container backends deliberately
+        # collapse ordinary child task IDs to "default" so they can share one
+        # long-lived sandbox. The local backend is different: LocalEnvironment
+        # carries mutable cwd/session snapshots and is used by concurrent ACP
+        # sessions. Sharing it under "default" lets one ACP session overwrite
+        # another session's cwd or hold the creation lock while its terminal
+        # call is stuck. Keep local environments session-scoped; preserve the
+        # existing collapsed-key behavior for container backends.
+        effective_task_id = (
+            task_id
+            if env_type == "local" and task_id
+            else _resolve_container_task_id(task_id)
+        )
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
