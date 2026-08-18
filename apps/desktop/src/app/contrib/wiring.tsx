@@ -74,6 +74,7 @@ import { useSkinCommand } from '@/themes/use-skin-command'
 import { closeWorkspaceTab } from '../chat/close-tab'
 import { requestComposerInsert } from '../chat/composer/focus'
 import { useComposerActions } from '../chat/hooks/use-composer-actions'
+import { registerPerfProbeGatewayHandler } from '../chat/perf-probe-bridge'
 import { CommandPalette } from '../command-palette'
 import { triggerAndRefreshCronJobs } from '../cron/cron-actions'
 import { useGatewayBoot } from '../gateway/hooks/use-gateway-boot'
@@ -738,6 +739,36 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     [handleDesktopGatewayEvent, startFreshSessionDraft]
   )
 
+  // The probe can dynamically load before or after this component during
+  // dev/HMR. Register the exact production callback beside its definition so
+  // a synthetic frame follows plugins and the normal reducer in order.
+  useEffect(() => {
+    if (!import.meta.env.DEV && import.meta.env.VITE_PERF_PROBE !== '1') {
+      return
+    }
+
+    return registerPerfProbeGatewayHandler(
+      handleGatewayEventWithPlugins,
+      (sessionId, messages) => {
+        updateSessionState(sessionId, state => ({
+          ...state,
+          busy: true,
+          messages,
+          sawAssistantPayload: true,
+          turnLive: true,
+          turnStartedAt: state.turnStartedAt ?? Date.now()
+        }))
+      },
+      sessionId => {
+        // Reset must invalidate delayed work before deleting the authoritative
+        // cache entry; otherwise a queued coalescer flush can recreate the
+        // probe transcript after its tiles and snapshots have been restored.
+        discardQueuedStreamState(sessionId)
+        sessionStateByRuntimeIdRef.current.delete(sessionId)
+      }
+    )
+  }, [discardQueuedStreamState, handleGatewayEventWithPlugins, sessionStateByRuntimeIdRef, updateSessionState])
+
   useGatewayBoot({
     beforeConnectionSwitch: () => {
       startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null })
@@ -1053,7 +1084,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       {/* The full real overlay set (mirrors DesktopController's `overlays`). */}
       <RemoteDisplayBanner />
       {!isAuxiliaryWindow() && <DesktopInstallOverlay />}
-      {!isAuxiliaryWindow() && (
+      {!isAuxiliaryWindow() && import.meta.env.VITE_PERF_PROBE !== '1' && (
         <DesktopOnboardingOverlay
           enabled={gatewayState === 'open'}
           onCompleted={() => {
