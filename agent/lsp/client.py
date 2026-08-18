@@ -289,9 +289,17 @@ class LSPClient:
         return cmd
 
     async def _spawn(self) -> None:
-        env = dict(os.environ)
-        if self._env:
-            env.update(self._env)
+        from tools.environments.local import build_subprocess_env
+
+        # Merge caller-provided language-server settings before the final
+        # subprocess boundary. This keeps ordinary LSP variables while
+        # consuming host-only authority markers and blocking overlay-created
+        # credential trust.
+        env = build_subprocess_env(
+            base=os.environ,
+            extra=self._env,
+            scrub_secrets=True,
+        )
 
         cmd = self._command
         if sys.platform == "win32":
