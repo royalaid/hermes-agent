@@ -5,17 +5,17 @@ release system's operational copies at ``%HERMES_HOME%\\scripts`` may change.
 Two attributable entry points, both implemented here:
 
   1. Post-publish sync -- ``hermes-integration-release-windows.py`` calls
-     ``sync()`` immediately after a successful publish of the exact
-     ``fork-integration`` SHA containing these files (see that script's
-     ``sync_operational_copies()``).
+     ``sync()`` immediately after a successful product publish, using the
+     release-system source SHA already verified at run start (see that
+     script's ``sync_operational_copies()``).
   2. Provisional/break-glass deploy -- ``python sync.py deploy --from-sha
      <committed SHA> --reason <text>`` for an in-window investigator or an
      authorized operator when the publish path itself is broken. The stamp
      records ``provisional: true``; the next successful publish re-stamps.
 
 Never mid-run, never on a tick, never a direct edit. ``verify()`` compares
-the operational copies against the published (or provisionally deployed)
-git tree's blob hashes via a repo clone -- the embedded stamp only names
+the operational copies against the recorded release-system (or provisionally
+deployed) git tree's blob hashes via a repo clone -- the embedded stamp names
 *which* SHA to check; it is never itself the authority for whether a file
 is correct. A mismatch at run start (see release.py's
 ``integration_scripts_integrity_check``) permits exactly one action --
@@ -38,7 +38,7 @@ it, per the U2 runbook):
     appends blocklist entries), which makes them exactly the kind of file
     that must arrive through an attributable sync boundary rather than by
     hand. NOTE the deploy ordering this implies: the first operational sync
-    carrying them must come from a published SHA that contains them --
+    carrying them must come from a release-system SHA that contains them --
     until then the operational generation keeps running its own older
     ``sync.py`` with the older tracked set, which is unaffected.
   - ``ledger.py`` (U7 provenance) is tracked because the release script

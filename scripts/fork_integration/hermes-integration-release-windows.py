@@ -598,8 +598,8 @@ def _sync_module() -> Any:
 def integration_scripts_integrity_check(*, dry_run: bool) -> dict[str, Any]:
     """Run-start integrity gate (U2/KTD2, R14).
 
-    Verifies the operational copies at ``HERMES_HOME/scripts`` against the
-    published git tree (via the ``WORKTREE`` clone) BEFORE any mutation --
+    Verifies the operational copies at ``HERMES_HOME/scripts`` against their
+    release-system source tree (via the ``WORKTREE`` clone) BEFORE mutation --
     called immediately after argument parsing, before the exclusive lock,
     before any fetch.
 
@@ -633,9 +633,13 @@ def integration_scripts_integrity_check(*, dry_run: bool) -> dict[str, Any]:
     return result
 
 
-def sync_operational_copies(published_sha: str) -> dict[str, Any]:
-    """Post-publish sync hook (U2/KTD2): deploy the exact published tree's
-    tracked release-system files to ``HERMES_HOME/scripts``.
+def sync_operational_copies(
+    release_system_source_sha: str | None, published_product_sha: str,
+) -> dict[str, Any]:
+    """Deploy the verified release-system source after a product publish.
+
+    ``release_system_source_sha`` identifies the tree containing the tracked
+    operational files; ``published_product_sha`` is distinct release context.
 
     Best-effort by design: the release itself has already succeeded, been
     pushed, and had its checksum verified by the time this runs, so a sync
@@ -646,13 +650,47 @@ def sync_operational_copies(published_sha: str) -> dict[str, Any]:
     operational copies until a human runs ``sync.py deploy`` (or the next
     successful publish supersedes it).
     """
+    if not release_system_source_sha:
+        error = "verified release-system source SHA unavailable"
+        log(
+            "WARNING post-publish sync refused: "
+            f"source_sha={release_system_source_sha} "
+            f"published_product_sha={published_product_sha} error={error}"
+        )
+        return {
+            "ok": False,
+            "error": error,
+            "source_sha": release_system_source_sha,
+            "published_product_sha": published_product_sha,
+        }
     try:
-        outcome = _sync_module().sync(published_sha, WORKTREE, HERMES_HOME / "scripts")
-        log(f"POST_PUBLISH_SYNC ok=true source_sha={published_sha}")
-        return {"ok": True, **outcome}
+        outcome = _sync_module().sync(
+            release_system_source_sha, WORKTREE, HERMES_HOME / "scripts"
+        )
+        log(
+            "POST_PUBLISH_SYNC ok=true "
+            f"source_sha={release_system_source_sha} "
+            f"published_product_sha={published_product_sha}"
+        )
+        return {
+            "ok": True,
+            **outcome,
+            "source_sha": release_system_source_sha,
+            "published_product_sha": published_product_sha,
+        }
     except Exception as exc:
-        log(f"WARNING post-publish sync failed: source_sha={published_sha} {type(exc).__name__}: {exc}")
-        return {"ok": False, "error": str(exc), "source_sha": published_sha}
+        log(
+            "WARNING post-publish sync failed: "
+            f"source_sha={release_system_source_sha} "
+            f"published_product_sha={published_product_sha} "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return {
+            "ok": False,
+            "error": str(exc),
+            "source_sha": release_system_source_sha,
+            "published_product_sha": published_product_sha,
+        }
 
 
 # ── U6: reconciliation proposals, blocklist, park-and-continue ──────────────
@@ -3529,7 +3567,9 @@ def main() -> int:
             _consume_upstream_pin_on_publish()
             stage = "sync_operational_copies"
             emit_stage("sync")
-            sync_outcome = sync_operational_copies(rebased_output_head)
+            sync_outcome = sync_operational_copies(
+                sync_integrity.get("source_sha"), rebased_output_head
+            )
             result = {
                 "ok": True,
                 "changed": True,

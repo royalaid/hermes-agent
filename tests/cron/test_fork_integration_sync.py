@@ -424,6 +424,56 @@ def test_sync_hook_call_site_is_inside_the_publish_success_branch() -> None:
     assert separator, "main() must retain the real-run/dry-run split at started_at"
     assert "sync_operational_copies(" not in dry_run_branch
     assert "sync_operational_copies(" in real_run_branch
+    assert 'sync_integrity.get("source_sha"), rebased_output_head' in real_run_branch
+
+
+def test_sync_operational_copies_deploys_verified_release_source_and_records_product(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The product release SHA is context, never the operational sync source."""
+    from scripts.fork_integration.release import mod as release
+
+    release_system_source_sha = "a" * 40
+    published_product_sha = "b" * 40
+    sync_calls: list[tuple[str, Path, Path]] = []
+
+    def sync_from_verified_source(from_sha: str, repo: Path, dest: Path) -> dict[str, Any]:
+        sync_calls.append((from_sha, repo, dest))
+        return {"source_sha": from_sha, "files": {}}
+
+    monkeypatch.setattr(release, "_sync_module", lambda: SimpleNamespace(sync=sync_from_verified_source))
+    monkeypatch.setattr(release, "log", lambda message: None)
+
+    outcome = release.sync_operational_copies(release_system_source_sha, published_product_sha)
+
+    assert sync_calls == [
+        (release_system_source_sha, release.WORKTREE, release.HERMES_HOME / "scripts")
+    ]
+    assert sync_calls[0][0] != published_product_sha
+    assert outcome["ok"] is True
+    assert outcome["source_sha"] == release_system_source_sha
+    assert outcome["published_product_sha"] == published_product_sha
+
+
+def test_sync_operational_copies_fails_closed_without_verified_release_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing run-start lineage must not fall through to sync.sync()."""
+    from scripts.fork_integration.release import mod as release
+
+    sync_calls: list[tuple[Any, ...]] = []
+    fake_sync = SimpleNamespace(sync=lambda *args: sync_calls.append(args))
+    monkeypatch.setattr(release, "_sync_module", lambda: fake_sync)
+    monkeypatch.setattr(release, "log", lambda message: None)
+
+    published_product_sha = "b" * 40
+    outcome = release.sync_operational_copies(None, published_product_sha)
+
+    assert outcome["ok"] is False
+    assert outcome["source_sha"] is None
+    assert outcome["published_product_sha"] == published_product_sha
+    assert "verified release-system source SHA" in outcome["error"]
+    assert sync_calls == []
 
 
 def test_sync_operational_copies_never_raises_and_reports_failure_honestly(
@@ -442,10 +492,16 @@ def test_sync_operational_copies_never_raises_and_reports_failure_honestly(
 
     monkeypatch.setattr(release, "_sync_module", broken_sync_module)
 
-    outcome = release.sync_operational_copies("f" * 40)
+    release_system_source_sha = "f" * 40
+    published_product_sha = "e" * 40
+    outcome = release.sync_operational_copies(
+        release_system_source_sha, published_product_sha
+    )
 
     assert outcome["ok"] is False
     assert "sync.py unavailable" in outcome["error"]
+    assert outcome["source_sha"] == release_system_source_sha
+    assert outcome["published_product_sha"] == published_product_sha
     assert any("post-publish sync failed" in line for line in logs)
 
 
