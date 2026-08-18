@@ -13,8 +13,10 @@ class _FakeEnvironment:
     def __init__(self, cwd):
         self.cwd = cwd
         self.cleanup_count = 0
+        self.execute_count = 0
 
     def execute(self, _command, **_kwargs):
+        self.execute_count += 1
         return {"output": "ok", "returncode": 0}
 
     def cleanup(self):
@@ -276,6 +278,64 @@ def test_get_active_env_container_backend_keeps_collapsed_default_fallback(monke
     assert terminal_tool.get_active_env("session-a") is default_env
 
 
+def test_get_active_env_container_backend_prefers_raw_over_collapsed_default(
+    monkeypatch,
+):
+    raw_env = _FakeEnvironment("raw-cwd")
+    default_env = _FakeEnvironment("default-cwd")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"session-a": raw_env, "default": default_env},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+
+    assert terminal_tool.get_active_env("session-a") is raw_env
+
+
+@pytest.mark.parametrize("raw_present", [True, False])
+def test_terminal_execute_container_selects_raw_then_collapsed_environment(
+    monkeypatch, raw_present
+):
+    raw_env = _FakeEnvironment("raw-cwd")
+    default_env = _FakeEnvironment("default-cwd")
+    active = {"default": default_env}
+    if raw_present:
+        active["session-a"] = raw_env
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "timeout": 30,
+        "docker_image": "docker-image",
+        "singularity_image": "singularity-image",
+        "modal_image": "modal-image",
+        "daytona_image": "daytona-image",
+    }
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", active)
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+
+    result = json.loads(
+        terminal_tool.terminal_tool("pwd", task_id="session-a", force=True)
+    )
+
+    expected_key = "session-a" if raw_present else "default"
+    assert result["exit_code"] == 0
+    assert raw_env.execute_count == int(raw_present)
+    assert default_env.execute_count == int(not raw_present)
+    assert set(terminal_tool._last_activity) == {expected_key}
+
+
 def test_degraded_local_eviction_only_removes_exact_session(monkeypatch):
     default_env = _FakeEnvironment("default-cwd")
     session_env = _FakeEnvironment("session-a-cwd")
@@ -443,6 +503,41 @@ def test_code_execution_local_absent_exact_override_does_not_inherit_default(
     assert created[0]["cwd"] == "config-cwd"
 
 
+@pytest.mark.parametrize("raw_present", [True, False])
+def test_code_execution_container_selects_raw_then_collapsed_environment(
+    monkeypatch, raw_present
+):
+    raw_env = _FakeEnvironment("raw-cwd")
+    default_env = _FakeEnvironment("default-cwd")
+    active = {"default": default_env}
+    if raw_present:
+        active["session-a"] = raw_env
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "timeout": 30,
+        "container_persistent": True,
+        "docker_image": "docker-image",
+        "singularity_image": "singularity-image",
+        "modal_image": "modal-image",
+        "daytona_image": "daytona-image",
+    }
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(terminal_tool, "_active_environments", active)
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+
+    selected, env_type = code_execution_tool._get_or_create_env("session-a")
+
+    expected_key = "session-a" if raw_present else "default"
+    assert selected is (raw_env if raw_present else default_env)
+    assert env_type == "docker"
+    assert set(terminal_tool._last_activity) == {expected_key}
+
+
 def test_clear_file_ops_cache_local_removes_only_exact_session(monkeypatch):
     raw_ops = object()
     default_ops = object()
@@ -480,6 +575,35 @@ def test_clear_file_ops_cache_container_removes_collapsed_default(monkeypatch):
     assert file_tools._file_ops_cache == {"session-a": raw_ops}
 
 
+def test_clear_file_ops_cache_container_removes_raw_cache_for_selected_raw_env(
+    monkeypatch,
+):
+    raw_env = _FakeEnvironment("raw-cwd")
+    default_env = _FakeEnvironment("default-cwd")
+    raw_ops = object()
+    default_ops = object()
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"session-a": raw_env, "default": default_env},
+    )
+    monkeypatch.setattr(
+        file_tools,
+        "_file_ops_cache",
+        {"session-a": raw_ops, "default": default_ops},
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+
+    file_tools.clear_file_ops_cache("session-a")
+
+    assert file_tools._file_ops_cache == {"default": default_ops}
+
+
 def test_file_tools_local_backend_keeps_session_cache_and_creation_keys(monkeypatch):
     created_task_ids = _configure_direct_creation_paths(monkeypatch, "local")
 
@@ -491,6 +615,37 @@ def test_file_tools_local_backend_keeps_session_cache_and_creation_keys(monkeypa
     assert set(terminal_tool._active_environments) == {"session-a", "session-b"}
     assert set(terminal_tool._creation_locks) == {"session-a", "session-b"}
     assert set(file_tools._file_ops_cache) == {"session-a", "session-b"}
+
+
+@pytest.mark.parametrize("raw_present", [True, False])
+def test_file_tools_container_selects_raw_then_collapsed_environment_and_cache(
+    monkeypatch, raw_present
+):
+    raw_env = _FakeEnvironment("raw-cwd")
+    default_env = _FakeEnvironment("default-cwd")
+    active = {"default": default_env}
+    if raw_present:
+        active["session-a"] = raw_env
+    raw_ops = file_tools.ShellFileOperations(raw_env)
+    default_ops = file_tools.ShellFileOperations(default_env)
+    cache = {"default": default_ops}
+    if raw_present:
+        cache["session-a"] = raw_ops
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(terminal_tool, "_active_environments", active)
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(file_tools, "_file_ops_cache", cache)
+
+    selected = file_tools._get_file_ops("session-a")
+
+    expected_key = "session-a" if raw_present else "default"
+    assert selected is (raw_ops if raw_present else default_ops)
+    assert set(terminal_tool._last_activity) == {expected_key}
 
 
 @pytest.mark.parametrize("caller", ["code_execution", "file_tools"])

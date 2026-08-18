@@ -47,7 +47,7 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from utils import env_var_enabled
 
@@ -1261,9 +1261,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         record_session_cwd(task_id, new_cwd)
         # Local environments are keyed by the exact session id; container
         # environments retain their resolved alias/shared-container key.
-        environment_task_id = _resolve_environment_task_id(task_id, _get_env_config())
         with _env_lock:
-            env = _active_environments.get(environment_task_id)
+            _, env = _lookup_active_environment_locked(task_id, _get_env_config())
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -1398,6 +1397,26 @@ def _resolve_environment_task_id(
     if config.get("env_type") == "local":
         return task_id or "default"
     return _resolve_container_task_id(task_id)
+
+
+def _lookup_active_environment_locked(
+    task_id: Optional[str], config: Dict[str, Any]
+) -> Tuple[str, Any]:
+    """Return ``(selected_key, env)`` using the backend's cache policy.
+
+    The caller must hold :data:`_env_lock`. Local environments use only the
+    exact raw session key. Non-local environments first honor an environment
+    already cached under that raw key, then fall back to the resolved
+    alias/shared-container key. When neither exists, the returned key is the
+    backend-appropriate creation key and ``env`` is ``None``.
+    """
+    raw_task_id = task_id or "default"
+    resolved_task_id = _resolve_environment_task_id(raw_task_id, config)
+    if config.get("env_type") != "local" and raw_task_id in _active_environments:
+        selected_key = raw_task_id
+    else:
+        selected_key = resolved_task_id
+    return selected_key, _active_environments.get(selected_key)
 
 
 def resolve_task_overrides(
@@ -1999,7 +2018,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
         # ShellFileOperations from referencing a dead sandbox)
         try:
             from tools.file_tools import clear_file_ops_cache
-            clear_file_ops_cache(task_id)
+            clear_file_ops_cache(task_id, exact=True)
         except ImportError:
             pass
 
@@ -2060,9 +2079,10 @@ def _stop_cleanup_thread():
 
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
-    lookup = _resolve_environment_task_id(task_id, _get_env_config())
+    config = _get_env_config()
     with _env_lock:
-        return _active_environments.get(lookup)
+        _, env = _lookup_active_environment_locked(task_id, config)
+        return env
 
 
 def ensure_task_env(task_id: Optional[str] = None):
@@ -2088,11 +2108,11 @@ def ensure_task_env(task_id: Optional[str] = None):
     effective_task_id = _resolve_container_task_id(task_id)
 
     # Fast path: already active — mirror terminal_tool and refresh activity.
-    existing = get_active_env(effective_task_id)
-    if existing is not None:
-        with _env_lock:
-            _last_activity[effective_task_id] = time.time()
-        return existing
+    with _env_lock:
+        selected_key, existing = _lookup_active_environment_locked(task_id, config)
+        if existing is not None:
+            _last_activity[selected_key] = time.time()
+            return existing
 
     overrides = resolve_task_overrides(task_id, config)
     if env_type == "docker":
@@ -2114,9 +2134,11 @@ def ensure_task_env(task_id: Optional[str] = None):
         task_lock = _creation_locks.setdefault(effective_task_id, threading.Lock())
 
     with task_lock:
-        existing = get_active_env(effective_task_id)
-        if existing is not None:
-            return existing
+        with _env_lock:
+            selected_key, existing = _lookup_active_environment_locked(task_id, config)
+            if existing is not None:
+                _last_activity[selected_key] = time.time()
+                return existing
         try:
             new_env = _create_environment(
                 env_type=env_type,
@@ -2238,7 +2260,7 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        clear_file_ops_cache(task_id, exact=True)
     except ImportError:
         pass
 
@@ -2767,18 +2789,9 @@ def terminal_tool(
         # instead of each creating their own (wasting Modal resources).
         env: Any = None
         with _env_lock:
-            # Prefer the collapsed container id, but fall back to an env cached
-            # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
-            # with a CWD-only override collapse to "default" for container
-            # sharing, yet an env may already be cached under the originating
-            # task_id; honor it instead of spawning a duplicate.
-            _existing_key = (
-                effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
-            )
-            if _existing_key is not None:
-                _last_activity[_existing_key] = time.time()
-                env = _active_environments[_existing_key]
+            selected_key, env = _lookup_active_environment_locked(task_id, config)
+            if env is not None:
+                _last_activity[selected_key] = time.time()
                 needs_creation = False
             else:
                 needs_creation = True
@@ -2793,13 +2806,9 @@ def terminal_tool(
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
-                    _existing_key = (
-                        effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
-                    )
-                    if _existing_key is not None:
-                        _last_activity[_existing_key] = time.time()
-                        env = _active_environments[_existing_key]
+                    selected_key, env = _lookup_active_environment_locked(task_id, config)
+                    if env is not None:
+                        _last_activity[selected_key] = time.time()
                         needs_creation = False
 
                 if needs_creation:

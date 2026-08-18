@@ -792,7 +792,8 @@ def _get_or_create_env(task_id: str):
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, resolve_task_overrides,
-        _resolve_environment_task_id, _resolve_task_host_cwd,
+        _lookup_active_environment_locked, _resolve_environment_task_id,
+        _resolve_task_host_cwd,
     )
 
     config = _get_env_config()
@@ -800,9 +801,10 @@ def _get_or_create_env(task_id: str):
 
     # Fast path: environment already exists
     with _env_lock:
-        if effective_task_id in _active_environments:
-            _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], config["env_type"]
+        selected_key, existing = _lookup_active_environment_locked(task_id, config)
+        if existing is not None:
+            _last_activity[selected_key] = time.time()
+            return existing, config["env_type"]
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
@@ -812,9 +814,10 @@ def _get_or_create_env(task_id: str):
 
     with task_lock:
         with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], config["env_type"]
+            selected_key, existing = _lookup_active_environment_locked(task_id, config)
+            if existing is not None:
+                _last_activity[selected_key] = time.time()
+                return existing, config["env_type"]
 
         env_type = config["env_type"]
         overrides = resolve_task_overrides(task_id, config)
