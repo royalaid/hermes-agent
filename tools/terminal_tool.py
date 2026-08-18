@@ -1259,14 +1259,11 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # A registered workspace cwd IS the session's working directory until
         # a `cd` changes it.
         record_session_cwd(task_id, new_cwd)
-        # The live env is cached under the raw task_id for per-session surfaces
-        # (ACP/gateway/dashboard) and under the collapsed container id for
-        # isolation-keyed rollouts. Try the raw id first, then the container id,
-        # so a CWD-only override (which collapses to "default") still finds and
-        # updates the originating session's env.
-        container_id = _resolve_container_task_id(task_id)
+        # Local environments are keyed by the exact session id; container
+        # environments retain their resolved alias/shared-container key.
+        environment_task_id = _resolve_environment_task_id(task_id, _get_env_config())
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(environment_task_id)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -2060,10 +2057,9 @@ def _stop_cleanup_thread():
 
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
-    lookup = _resolve_container_task_id(task_id)
+    lookup = _resolve_environment_task_id(task_id, _get_env_config())
     with _env_lock:
-        exact = _active_environments.get(task_id)
-        return exact if exact is not None else _active_environments.get(lookup)
+        return _active_environments.get(lookup)
 
 
 def ensure_task_env(task_id: Optional[str] = None):

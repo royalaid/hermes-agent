@@ -102,11 +102,16 @@ def test_get_active_env_prefers_exact_session_over_collapsed_default(monkeypatch
     monkeypatch.setattr(
         terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
     )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "local"}
+    )
 
     assert terminal_tool.get_active_env("session-a") is session_env
 
 
-def test_get_active_env_falls_back_to_collapsed_default(monkeypatch):
+def test_get_active_env_local_backend_does_not_fall_back_to_collapsed_default(
+    monkeypatch,
+):
     default_env = _FakeEnvironment("default-cwd")
     monkeypatch.setattr(
         terminal_tool, "_active_environments", {"default": default_env}
@@ -114,8 +119,66 @@ def test_get_active_env_falls_back_to_collapsed_default(monkeypatch):
     monkeypatch.setattr(
         terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
     )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "local"}
+    )
+
+    assert terminal_tool.get_active_env("session-a") is None
+
+
+def test_get_active_env_container_backend_keeps_collapsed_default_fallback(monkeypatch):
+    default_env = _FakeEnvironment("default-cwd")
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"default": default_env}
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
 
     assert terminal_tool.get_active_env("session-a") is default_env
+
+
+def test_cwd_override_local_backend_does_not_mutate_default_environment(monkeypatch):
+    default_env = _FakeEnvironment("default-cwd")
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"default": default_env}
+    )
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "local"}
+    )
+
+    terminal_tool.register_task_env_overrides("session-a", {"cwd": "session-a-cwd"})
+
+    assert default_env.cwd == "default-cwd"
+
+
+def test_cwd_override_container_backend_updates_collapsed_default_environment(
+    monkeypatch,
+):
+    default_env = _FakeEnvironment("default-cwd")
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"default": default_env}
+    )
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda _task_id: "default"
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: {"env_type": "docker"}
+    )
+
+    terminal_tool.register_task_env_overrides("session-a", {"cwd": "session-a-cwd"})
+
+    assert default_env.cwd == "session-a-cwd"
 
 
 def test_code_execution_local_backend_keeps_session_environment_keys(monkeypatch):
