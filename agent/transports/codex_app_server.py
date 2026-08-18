@@ -34,6 +34,8 @@ MIN_CODEX_VERSION = (0, 125, 0)
 
 def _toml_single_string_array(value: str) -> str:
     """Encode one string as a TOML-compatible array for a Codex ``-c`` value."""
+    if any("\ud800" <= char <= "\udfff" for char in value):
+        raise ValueError("TOML strings cannot contain Unicode surrogate code points")
     # JSON string syntax is compatible with TOML basic strings for the escapes
     # json.dumps emits for C0 controls, quotes, and backslashes. Keep non-BMP
     # characters literal (TOML rejects JSON's UTF-16 surrogate-pair escapes),

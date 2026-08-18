@@ -376,6 +376,14 @@ class TestSpawnEnvIsolation:
             writable_root
         ]
 
+    @pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"])
+    def test_kanban_writable_root_rejects_lone_surrogates(self, surrogate):
+        """TOML cannot represent lone UTF-16 surrogate code points."""
+        from agent.transports import codex_app_server as cas
+
+        with pytest.raises(ValueError, match="surrogate"):
+            cas._toml_single_string_array(f"C:\\boards\\{surrogate}\\nested")
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
