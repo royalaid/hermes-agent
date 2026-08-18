@@ -1,6 +1,7 @@
 // Scenario registry. Add a scenario module here and it's automatically
 // available to the runner, the default suite (tier 'ci'), and the baseline gate.
 
+import codeScrollControl from './code-scroll-control.mjs'
 import coldStart from './cold-start.mjs'
 import firstToken from './first-token.mjs'
 import hitchClassify from './hitch-classify.mjs'
@@ -16,8 +17,10 @@ import stream from './stream.mjs'
 import streamHistory from './stream-history.mjs'
 import submit from './submit.mjs'
 import transcript from './transcript.mjs'
+import subagentFanout from './subagent-fanout.mjs'
 
 export const SCENARIOS = {
+  [codeScrollControl.name]: codeScrollControl,
   [stream.name]: stream,
   [streamHistory.name]: streamHistory,
   [keystroke.name]: keystroke,
@@ -32,7 +35,8 @@ export const SCENARIOS = {
   [submit.name]: submit,
   [sessionLoad.name]: sessionLoad,
   [sessionSwitch.name]: sessionSwitch,
-  [profileSwitch.name]: profileSwitch
+  [profileSwitch.name]: profileSwitch,
+  [subagentFanout.name]: subagentFanout
 }
 
 /** Scenarios safe to run with no LLM credits / no live backend — the default suite. */
