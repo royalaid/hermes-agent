@@ -23,6 +23,7 @@ import { useMessageStream } from './index'
 
 const SID = 'coalesce-session'
 
+let discardQueuedStreamState: ((sessionId: string) => void) | null = null
 let handleEvent: ((event: RpcEvent) => void) | null = null
 let states: Map<string, ClientSessionState>
 let storeWrites: number
@@ -50,9 +51,10 @@ function Harness() {
   })
 
   useEffect(() => {
+    discardQueuedStreamState = stream.discardQueuedStreamState
     handleEvent = stream.handleGatewayEvent
     states = sessionStateByRuntimeIdRef.current
-  }, [stream.handleGatewayEvent])
+  }, [stream.discardQueuedStreamState, stream.handleGatewayEvent])
 
   return null
 }
@@ -95,6 +97,7 @@ describe('subagent and non-terminal tool publish coalescing', () => {
 
   beforeEach(() => {
     vi.useFakeTimers()
+    discardQueuedStreamState = null
     handleEvent = null
     states = new Map()
     storeWrites = 0
@@ -244,6 +247,24 @@ describe('subagent and non-terminal tool publish coalescing', () => {
     expect(row()).toBe(beforeStop)
     expect(row()?.status).toBe('running')
     expect(toolParts()).toHaveLength(0)
+  })
+
+  it('does not let a delayed coalescer flush overwrite restored state after discard', async () => {
+    mount()
+
+    emit('subagent.start', subagent())
+    const restored = row()
+    emit('subagent.progress', subagent({ text: 'synthetic late progress', tool_name: 'terminal' }))
+    expect(row()?.stream.some(entry => entry.text === 'synthetic late progress')).toBe(false)
+
+    expect(discardQueuedStreamState).not.toBeNull()
+    act(() => discardQueuedStreamState!(SID))
+    $subagentsBySession.set({ [SID]: restored ? [restored] : [] })
+
+    await advance(STREAM_DELTA_FLUSH_MS * 4)
+
+    expect(row()).toEqual(restored)
+    expect(row()?.stream.some(entry => entry.text === 'synthetic late progress')).toBe(false)
   })
 
   it('keeps delivering batched publishes while animation frames are parked', async () => {

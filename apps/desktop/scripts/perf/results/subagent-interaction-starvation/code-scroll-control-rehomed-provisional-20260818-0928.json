@@ -1,0 +1,56 @@
+{
+  "timestamp": "2026-08-18T16:28:33.082Z",
+  "results": [
+    {
+      "name": "code-scroll-control",
+      "tier": "report",
+      "metrics": {
+        "code_card_scroll_to_paint_ms": 51.6
+      },
+      "detail": {
+        "dom": {
+          "codeCards": 5
+        },
+        "interaction": {
+          "paintMs": 0,
+          "rendererTotalMs": 45.80000001192093,
+          "rendererWaitMs": 45.80000001192093,
+          "diagnostic": {
+            "bounds": {
+              "bottom": 367.81250762939453,
+              "height": 87.81250762939453,
+              "left": 295.9895935058594,
+              "right": 1328.2292175292969,
+              "top": 280,
+              "width": 1032.2396240234375
+            },
+            "hitInsideScroller": true,
+            "hitTag": "CODE",
+            "intersectionRect": {
+              "bottom": 367.81250762939453,
+              "left": 295.9895935058594,
+              "right": 1328.2292175292969,
+              "top": 280
+            },
+            "maxScrollLeft": 3064,
+            "overflowX": "auto",
+            "scrollEvents": 1,
+            "scrollLeftAfter": 244.4444580078125,
+            "scrollLeftBefore": 0,
+            "viewportIntersection": true,
+            "wheelEvents": 1
+          },
+          "hostMs": 51.56289999999899,
+          "prepared": {
+            "cardCount": 5,
+            "clientWidth": 1032,
+            "scrollWidth": 4096,
+            "x": 812,
+            "y": 324
+          }
+        },
+        "turns": 20
+      }
+    }
+  ]
+}
