@@ -79,6 +79,37 @@ class TestStripByDefault:
         for key in buzz_identity:
             assert key not in result
 
+    def test_forced_extra_buzz_identity_requires_base_managed_agent_marker(self):
+        """Force-prefixed overlays cannot create managed Buzz host trust."""
+        forced_buzz_identity = {
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result = _sanitize_subprocess_env(_SAFE_SAMPLE, forced_buzz_identity)
+
+        for forced_key in forced_buzz_identity:
+            assert forced_key not in result
+            assert forced_key.removeprefix(_HERMES_PROVIDER_ENV_FORCE_PREFIX) not in result
+
+    def test_forced_extra_buzz_identity_allowed_by_exact_base_managed_agent_marker(self):
+        """The authoritative base marker still permits forced Buzz CLI identity."""
+        forced_buzz_identity = {
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result = _sanitize_subprocess_env(
+            {**_SAFE_SAMPLE, "BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"},
+            forced_buzz_identity,
+        )
+
+        for forced_key, value in forced_buzz_identity.items():
+            assert result[forced_key.removeprefix(_HERMES_PROVIDER_ENV_FORCE_PREFIX)] == value
+            assert forced_key not in result
+
 
     def test_pythonutf8_set(self):
         result = _build()

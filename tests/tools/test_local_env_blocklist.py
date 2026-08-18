@@ -350,6 +350,37 @@ class TestForceEnvOptIn:
 
         assert result_env["OPENAI_BASE_URL"] == "http://intended/v1"
 
+    def test_force_prefix_cannot_inject_buzz_identity_without_host_marker(self):
+        """Terminal overlays cannot force scoped Buzz identity into an ordinary host."""
+        forced_buzz_identity = {
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result_env = _run_with_env(self_env=forced_buzz_identity)
+
+        for forced_key in forced_buzz_identity:
+            assert forced_key not in result_env
+            assert forced_key.removeprefix(_HERMES_PROVIDER_ENV_FORCE_PREFIX) not in result_env
+
+    def test_force_prefix_can_inject_buzz_identity_with_exact_host_marker(self):
+        """The authoritative process marker permits the scoped forced identity."""
+        forced_buzz_identity = {
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_PRIVATE_KEY": "synthetic-private-key",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_RELAY_URL": "wss://synthetic.invalid",
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}BUZZ_AUTH_TAG": "synthetic-auth-tag",
+        }
+
+        result_env = _run_with_env(
+            extra_os_env={"BUZZ_MANAGED_AGENT": "xyz.block.buzz.app"},
+            self_env=forced_buzz_identity,
+        )
+
+        for forced_key, value in forced_buzz_identity.items():
+            assert result_env[forced_key.removeprefix(_HERMES_PROVIDER_ENV_FORCE_PREFIX)] == value
+            assert forced_key not in result_env
+
 
 class TestActiveVenvMarkerStripping:
     """Active-virtualenv markers must not leak into terminal subprocesses (#23473).

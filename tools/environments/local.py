@@ -355,6 +355,16 @@ def _is_managed_buzz_terminal_env_var(key: str, source_env: Mapping[str, str]) -
         and key in _BUZZ_MANAGED_TERMINAL_ENV_VARS
     )
 
+
+def _enforce_managed_buzz_terminal_identity_boundary(
+    env: dict[str, str], source_env: Mapping[str, str]
+) -> None:
+    """Remove Buzz CLI identity unless the authoritative host marked itself managed."""
+    if source_env.get("BUZZ_MANAGED_AGENT") != _BUZZ_MANAGED_AGENT_MARKER:
+        for key in _BUZZ_MANAGED_TERMINAL_ENV_VARS:
+            env.pop(key, None)
+
+
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
 # The gateway runs inside its own venv, so its process environment carries
 # VIRTUAL_ENV (and possibly CONDA_PREFIX). If those leak into commands the
@@ -534,6 +544,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
                 sanitized[key] = resolved
+
+    _enforce_managed_buzz_terminal_identity_boundary(sanitized, source_env)
 
     _inject_context_hermes_home(sanitized)
 
@@ -1396,6 +1408,9 @@ def _make_run_env(env: dict) -> dict:
             value = _resolve_passthrough_value(k, v) if passthrough else v
             if value is not None:
                 run_env[k] = value
+
+    _enforce_managed_buzz_terminal_identity_boundary(run_env, os.environ)
+
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
