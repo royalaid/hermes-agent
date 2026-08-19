@@ -40,6 +40,14 @@ import { $voicePlayback } from '@/store/voice-playback'
 // would re-derive the changed-files card on every message re-render.
 const EMPTY_PARTS: readonly unknown[] = []
 
+// PERF: hoisted to module scope so the element OBJECT is identical on every
+// render of every assistant message. React bails out of re-rendering a child
+// whose element identity is unchanged, so a status flip on the message root
+// (pending -> complete and back, N rows per stream flush) can no longer
+// descend into the parts subtree at all. Its props were already the module
+// constant MESSAGE_PARTS_COMPONENTS, so nothing per-message is captured here.
+const MESSAGE_PARTS = <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
+
 interface MessageActionProps {
   messageId: string
   /** Lazy accessor — reads the live message text at action time. Passing the
@@ -97,9 +105,14 @@ export const AssistantMessage: FC<{
   // token flushes (booleans, status strings, '' while running), so the
   // 30 Hz delta stream only re-renders the markdown part and the tiny
   // StreamStallIndicator leaf — not the footer/preview/root subtree.
-  const messageStatus = useAuiState(s => s.message.status?.type)
-  const isRunning = messageStatus === 'running'
-  const isPlaceholder = useAuiState(s => s.message.status?.type === 'running' && s.message.content.length === 0)
+  //
+  // `isRunning` is the one status read left at this level, and only because
+  // two things genuinely need it HERE: the inter-agent collapse gate below (a
+  // running reply must stay expanded) and the mount-time `enabled` of
+  // useEnterAnimation. Every other status-derived read moved down into
+  // AssistantStatusSlot / SettledChangedFiles, so a pending flip no longer
+  // descends into the parts subtree or the changed-files card from here.
+  const isRunning = useAuiState(s => s.message.status?.type === 'running')
   const hasVisibleText = useAuiState(s => contentHasVisibleText(s.message.content))
   // Sealed mid-turn commentary keeps its text but not the footer, so a
   // tool-heavy turn doesn't grow a copy/refresh bar per paragraph (see
@@ -109,13 +122,6 @@ export const AssistantMessage: FC<{
   // Whole-turn wall-clock seconds (set once at completion — referentially
   // stable across the 30 Hz delta stream, so this adds no per-token renders).
   const turnDurationS = useAuiState(s => s.message.metadata?.custom?.durationS as number | undefined)
-
-  // The thinking/stall indicator belongs to the TAIL of the thread, period. A
-  // stale pending bubble mid-transcript (a turn that ended without its settle
-  // event, a steer race) must never show one — a spinner above a later user
-  // message reads as the agent answering out of order. Booleans are stable
-  // across token flushes, so this selector adds no streaming re-renders.
-  const isLastMessage = useAuiState(s => s.thread.messages[s.thread.messages.length - 1]?.id === s.message.id)
 
   // Preview targets only materialize once the turn completes — while running
   // the selector returns '' (stable), so per-token flushes skip the regex
@@ -133,21 +139,6 @@ export const AssistantMessage: FC<{
   }, [completedText])
 
   const getMessageText = useCallback(() => messageContentText(messageRuntime.getState().content), [messageRuntime])
-
-  // Cursor's changed-files card only appears once the turn settles: while the
-  // agent is still editing, the tool rows narrate each patch and a card that
-  // grew a row per write would thrash the transcript. `[]` while running keeps
-  // this selector referentially stable across the 30 Hz delta stream.
-  //
-  // It also only rides the LAST turn. The card is a "here's what just landed"
-  // summary, not a per-turn artifact: leaving one behind on every reply would
-  // stack a wall of stale cards down the transcript. Sending the next message
-  // retires it — the working tree it describes is already history by then.
-  const settledParts = useAuiState(s => {
-    const isLastMessage = s.thread.messages[s.thread.messages.length - 1]?.id === s.message.id
-
-    return s.message.status?.type === 'running' || !isLastMessage ? EMPTY_PARTS : s.message.parts
-  })
 
   const enterRef = useEnterAnimation(isRunning, `assistant-message:${messageId}`)
 
@@ -176,7 +167,7 @@ export const AssistantMessage: FC<{
               show reply
             </summary>
             <div className="mt-1 max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
-              <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
+              {MESSAGE_PARTS}
             </div>
           </details>
         </div>
@@ -198,8 +189,8 @@ export const AssistantMessage: FC<{
         data-slot="aui_assistant-message-content"
       >
         {/* Todos render in the composer status stack now, not inline. */}
-        <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
-        {isLastMessage && (isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />)}
+        {MESSAGE_PARTS}
+        <AssistantStatusSlot />
         {previewTargets.length > 0 && (
           <div className="mt-3 flex flex-wrap gap-2">
             {previewTargets.map(target => (
@@ -237,9 +228,68 @@ export const AssistantMessage: FC<{
       )}
       {/* Last thing in the turn — under the action bar, the way Cursor ends a
           turn on its summary rather than burying it above the controls. */}
-      <ChangedFilesCard parts={settledParts} />
+      <SettledChangedFiles />
     </MessagePrimitive.Root>
   )
+}
+
+/**
+ * PERF leaf: the only subscriber to this message's streaming status inside the
+ * message content. Previously `messageStatus` / `isPlaceholder` /
+ * `isLastMessage` were read by AssistantMessage itself, so every pending flip
+ * re-rendered the whole message subtree — at stream breadth N, N subtrees in a
+ * single commit, which is what widened the recalc scope. Reading them here
+ * confines the flip to this leaf; the sibling parts subtree is a hoisted
+ * constant element and bails out.
+ *
+ * Behaviour is byte-identical to the old inline expression, including the
+ * TAIL-ONLY rule: the thinking/stall indicator belongs to the tail of the
+ * thread, period. A stale pending bubble mid-transcript (a turn that ended
+ * without its settle event, a steer race) must never show one — a spinner
+ * above a later user message reads as the agent answering out of order.
+ */
+const AssistantStatusSlot: FC = () => {
+  const isLastMessage = useAuiState(s => s.thread.messages[s.thread.messages.length - 1]?.id === s.message.id)
+  const isRunning = useAuiState(s => s.message.status?.type === 'running')
+  const isPlaceholder = useAuiState(s => s.message.status?.type === 'running' && s.message.content.length === 0)
+
+  if (!isLastMessage) {
+    return null
+  }
+
+  if (isPlaceholder) {
+    return <ResponseLoadingIndicator />
+  }
+
+  return isRunning ? <StreamStallIndicator /> : null
+}
+
+/**
+ * PERF leaf: owns the `settledParts` selector so the tail's settle stops
+ * re-rendering the message root. This is the one status-derived selector that
+ * returns an OBJECT (`s.message.parts`) rather than a primitive, so it cannot
+ * bail out on identity churn — keeping it at the root meant every settle
+ * re-rendered the root and everything under it.
+ *
+ * Cursor's changed-files card only appears once the turn settles: while the
+ * agent is still editing, the tool rows narrate each patch and a card that
+ * grew a row per write would thrash the transcript. `EMPTY_PARTS` while
+ * running keeps this selector referentially stable across the 30 Hz delta
+ * stream.
+ *
+ * It also only rides the LAST turn. The card is a "here's what just landed"
+ * summary, not a per-turn artifact: leaving one behind on every reply would
+ * stack a wall of stale cards down the transcript. Sending the next message
+ * retires it — the working tree it describes is already history by then.
+ */
+const SettledChangedFiles: FC = () => {
+  const settledParts = useAuiState(s => {
+    const isLastMessage = s.thread.messages[s.thread.messages.length - 1]?.id === s.message.id
+
+    return s.message.status?.type === 'running' || !isLastMessage ? EMPTY_PARTS : s.message.parts
+  })
+
+  return <ChangedFilesCard parts={settledParts} />
 }
 
 const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText, onBranchInNewChat }) => {
