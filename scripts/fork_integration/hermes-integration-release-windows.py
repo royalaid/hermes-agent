@@ -3072,6 +3072,31 @@ def ensure_clean_identity() -> tuple[str, str]:
     return old_head, old_remote
 
 
+def fetch_release_refs() -> None:
+    """Refresh only the two branch refs that define a release transaction.
+
+    The upstream remote tracks every branch and currently carries more than a
+    thousand remote-tracking refs. Fetching that wildcard refspec made the
+    release's required ``main`` refresh contend with unrelated branch churn
+    and exceed its bounded five-minute fetch window. The release consumes
+    other upstream refs only through later explicit fetches, so keep this
+    transaction-opening fetch equally explicit. The fork checkout also has a
+    deliberately narrow default refspec; name the published branch rather than
+    relying on that checkout-local configuration.
+    """
+    upstream_branch = UPSTREAM_REF.removeprefix("refs/heads/")
+    git(
+        "fetch", UPSTREAM_REMOTE,
+        f"+{UPSTREAM_REF}:refs/remotes/{UPSTREAM_REMOTE}/{upstream_branch}",
+        "--prune", timeout=300,
+    )
+    git(
+        "fetch", FORK_REMOTE,
+        f"+refs/heads/{BRANCH}:refs/remotes/{FORK_REMOTE}/{BRANCH}",
+        "--prune", timeout=300,
+    )
+
+
 def synchronize_to_published_head(local_head: str, published_head: str) -> str:
     """Adopt the fetched fork tip, retaining any displaced local tip safely.
 
@@ -3485,8 +3510,7 @@ def main() -> int:
             pre_run_local_head, _pre_fetch_remote_head = ensure_clean_identity()
             stage = "fetch"
             emit_stage("fetch")
-            git("fetch", UPSTREAM_REMOTE, "--prune", timeout=300)
-            git("fetch", FORK_REMOTE, "--prune", timeout=300)
+            fetch_release_refs()
             stage = "resolve_refs"
             upstream_tip = git("rev-parse", f"{UPSTREAM_REMOTE}/{UPSTREAM_REF.removeprefix('refs/heads/')}")
             # Retry-loop determinism (2026-08-17): chasing upstream's tip

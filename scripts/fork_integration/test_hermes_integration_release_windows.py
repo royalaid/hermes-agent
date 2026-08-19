@@ -140,6 +140,41 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         self.repo = scheduler
         return {"base": base, "local": automated, "published": published}
 
+    def test_fetch_release_refs_avoids_unbounded_upstream_branch_fetch(self) -> None:
+        calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+        def record_git(*args: str, **kwargs: object) -> str:
+            calls.append((args, kwargs))
+            if args == ("fetch", release.UPSTREAM_REMOTE, "--prune"):
+                raise subprocess.TimeoutExpired(args, 300)
+            return ""
+
+        release.git = record_git
+        release.fetch_release_refs()
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    (
+                        "fetch", release.UPSTREAM_REMOTE,
+                        f"+{release.UPSTREAM_REF}:refs/remotes/{release.UPSTREAM_REMOTE}/"
+                        f"{release.UPSTREAM_REF.removeprefix('refs/heads/')}",
+                        "--prune",
+                    ),
+                    {"timeout": 300},
+                ),
+                (
+                    (
+                        "fetch", release.FORK_REMOTE,
+                        f"+refs/heads/{release.BRANCH}:refs/remotes/{release.FORK_REMOTE}/{release.BRANCH}",
+                        "--prune",
+                    ),
+                    {"timeout": 300},
+                ),
+            ],
+        )
+
     def test_clean_stale_scheduler_fast_forwards_to_fetched_published_head(self) -> None:
         fixture = self.published_branch_fixture()
         self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), fixture["local"])
