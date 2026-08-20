@@ -119,11 +119,62 @@ def test_export_snippet_unsets_delegation_and_cron_session_markers():
     every later ``source`` re-asserts them (e.g. locking kanban mutations
     out of the parent session)."""
     snippet = _export_dump_excluding_session_vars('"$__hermes_snap_tmp"')
-    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
-    assert "HERMES_CRON_SESSION" in snippet
+    unset_clause, export_clause = snippet.split("export -p", 1)
+    assert "unset" in unset_clause
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in unset_clause
+    assert "HERMES_CRON_SESSION" in unset_clause
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" not in export_clause
+    assert "HERMES_CRON_SESSION" not in export_clause
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+@pytest.mark.windows_only
+def test_windows_snapshot_does_not_persist_lifecycle_markers(tmp_path, monkeypatch):
+    """Exercise the live native-Windows Git Bash snapshot path (#90782)."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.environments.local import LocalEnvironment
+
+    hermes_home = tmp_path / "hermes-home"
+    home_token = set_hermes_home_override(str(hermes_home))
+    env = None
+    try:
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+        assert env._snapshot_ready, "native Git Bash snapshot bootstrap must succeed"
+
+        monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+        monkeypatch.setenv("HERMES_CRON_SESSION", "cron-scope")
+        first = env.execute(
+            'printf "live=%s/%s\\n" "$HERMES_DELEGATED_CHILD_CONTEXT" '
+            '"$HERMES_CRON_SESSION"; '
+            'export HERMES_SNAPSHOT_STABLE="stable-value"'
+        )
+        assert first.get("returncode") == 0, first
+        assert "live=1/cron-scope" in first.get("output", "")
+
+        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
+        monkeypatch.delenv("HERMES_CRON_SESSION")
+
+        with open(env._snapshot_path, encoding="utf-8") as snapshot_file:
+            snapshot = snapshot_file.read()
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snapshot
+        assert "HERMES_CRON_SESSION" not in snapshot
+        assert "HERMES_SNAPSHOT_STABLE" in snapshot
+
+        later = env.execute(
+            'printf "delegated=%s cron=%s stable=%s shell=%s\\n" '
+            '"${HERMES_DELEGATED_CHILD_CONTEXT-unset}" '
+            '"${HERMES_CRON_SESSION-unset}" '
+            '"${HERMES_SNAPSHOT_STABLE-unset}" "${BASH_VERSION-unset}"'
+        )
+        assert later.get("returncode") == 0, later
+        output = later.get("output", "")
+        assert "delegated=unset cron=unset stable=stable-value" in output
+        assert "shell=unset" not in output
+    finally:
+        if env is not None:
+            env.cleanup()
+        reset_hermes_home_override(home_token)
+
+
 def test_snapshot_does_not_persist_delegated_child_marker(tmp_path):
     """End-to-end: a command run with the delegated-child marker in its env
     must not leave that marker in the snapshot file."""
