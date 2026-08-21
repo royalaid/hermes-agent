@@ -13,19 +13,26 @@ import type { ForceReleaseHolder } from './windows-update-force-release'
 
 const execFileAsync = promisify(execFile)
 
-export type RunPowerShell = (script: string, timeoutMs?: number) => Promise<{ stdout: string; stderr: string; code: number }>
+export type RunPowerShell = (
+  script: string,
+  timeoutMs?: number
+) => Promise<{ stdout: string; stderr: string; code: number }>
 
 function powershellExecutable(): string {
   const windowsRoot = process.env.SystemRoot || 'C:\\Windows'
   return path.join(windowsRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 }
 
-async function defaultRunPowerShell(script: string, timeoutMs = 4_000): Promise<{ stdout: string; stderr: string; code: number }> {
+async function defaultRunPowerShell(
+  script: string,
+  timeoutMs = 4_000
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  const budget = Math.max(1, Math.trunc(timeoutMs))
   try {
     const { stdout, stderr } = await execFileAsync(
       powershellExecutable(),
       ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 2 * 1024 * 1024 }
+      { encoding: 'utf8', timeout: budget, windowsHide: true, maxBuffer: 2 * 1024 * 1024 }
     )
     return { stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code: 0 }
   } catch (error: any) {
@@ -41,6 +48,13 @@ function escapePsSingleQuoted(value: string): string {
   return `'${String(value).replace(/'/g, "''")}'`
 }
 
+/**
+ * Emitted PowerShell must split RM rows on a literal pipe.
+ * Prefer String.Split over -split regex so TS template escaping cannot
+ * accidentally emit a character-class / alternation pattern.
+ */
+export const RESTART_MANAGER_ROW_SPLIT_EXPRESSION = "$part.Split([char]'|', 3)"
+
 export function buildRestartManagerScript(resources: readonly string[]): string {
   const list = resources.map(escapePsSingleQuoted).join(',')
   return `
@@ -50,6 +64,7 @@ if (-not $resources -or $resources.Count -eq 0) { Write-Output '[]'; exit 0 }
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class HermesRm {
   public const int CCH_RM_SESSION_KEY = 32;
   public const int CCH_RM_MAX_APP_NAME = 255;
@@ -69,13 +84,14 @@ public static class HermesRm {
     public uint TSSessionId;
     [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
   }
-  [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)] public static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+  // strSessionKey is an OUT buffer of CCH_RM_SESSION_KEY+1 WCHARs per RM docs.
+  [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)] public static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, StringBuilder strSessionKey);
   [DllImport("rstrtmgr.dll")] public static extern int RmEndSession(uint pSessionHandle);
   [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)] public static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, IntPtr rgApplications, uint nServices, string[] rgsServiceNames);
   [DllImport("rstrtmgr.dll")] public static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In,Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
   public static string Query(string[] files) {
     uint handle;
-    string key = Guid.NewGuid().ToString();
+    StringBuilder key = new StringBuilder(CCH_RM_SESSION_KEY + 1);
     int rc = RmStartSession(out handle, 0, key);
     if (rc != 0) return "ERR:"+rc;
     try {
@@ -91,7 +107,7 @@ public static class HermesRm {
         var parts = new System.Collections.Generic.List<string>();
         for (int i=0;i<count;i++) {
           var p = arr[i];
-          long fileTime = ((long)p.Process.ProcessStartTime.dwHighDateTime << 32) | p.Process.ProcessStartTime.dwLowDateTime;
+          long fileTime = ((long)p.Process.ProcessStartTime.dwHighDateTime << 32) | (uint)p.Process.ProcessStartTime.dwLowDateTime;
           // FILETIME is 100ns since 1601; convert to unix seconds
           long unix = (fileTime - 116444736000000000L) / 10000000L;
           string name = (p.strAppName ?? "").Replace("|","/");
@@ -116,7 +132,7 @@ $items = @()
 if ($raw) {
   foreach ($part in ($raw -split ';')) {
     if (-not $part) { continue }
-    $bits = $part -split '\\|', 3
+    $bits = ${RESTART_MANAGER_ROW_SPLIT_EXPRESSION}
     if ($bits.Count -lt 2) { continue }
     $pidVal = 0; $created = 0.0
     if (-not [int]::TryParse($bits[0], [ref]$pidVal)) { continue }
@@ -172,10 +188,12 @@ export async function listRestartManagerHoldersForResources(
   resources: readonly string[],
   {
     platform = process.platform,
-    run = defaultRunPowerShell
+    run = defaultRunPowerShell,
+    timeoutMs = 4_000
   }: {
     platform?: NodeJS.Platform
     run?: RunPowerShell
+    timeoutMs?: number
   } = {}
 ): Promise<ForceReleaseHolder[]> {
   if (platform !== 'win32' || resources.length === 0) {
@@ -185,7 +203,8 @@ export async function listRestartManagerHoldersForResources(
   const existing = resources.filter(Boolean)
   if (existing.length === 0) return []
 
+  const budget = Math.max(1, Math.trunc(timeoutMs))
   const script = buildRestartManagerScript(existing)
-  const result = await run(script, 4_000)
+  const result = await run(script, budget)
   return parseRestartManagerOutput(result.stdout, existing)
 }

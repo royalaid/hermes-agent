@@ -20,19 +20,26 @@ import type { ForceReleaseHolder, ForceReleaseTerminateResult } from './windows-
 
 const execFileAsync = promisify(execFile)
 
-export type RunPowerShell = (script: string, timeoutMs?: number) => Promise<{ stdout: string; stderr: string; code: number }>
+export type RunPowerShell = (
+  script: string,
+  timeoutMs?: number
+) => Promise<{ stdout: string; stderr: string; code: number }>
 
 function powershellExecutable(): string {
   const windowsRoot = process.env.SystemRoot || 'C:\\Windows'
   return path.join(windowsRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 }
 
-async function defaultRunPowerShell(script: string, timeoutMs = 4_000): Promise<{ stdout: string; stderr: string; code: number }> {
+async function defaultRunPowerShell(
+  script: string,
+  timeoutMs = 4_000
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  const budget = Math.max(1, Math.trunc(timeoutMs))
   try {
     const { stdout, stderr } = await execFileAsync(
       powershellExecutable(),
       ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { encoding: 'utf8', timeout: timeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 }
+      { encoding: 'utf8', timeout: budget, windowsHide: true, maxBuffer: 1024 * 1024 }
     )
     return { stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code: 0 }
   } catch (error: any) {
@@ -107,7 +114,6 @@ public static class HermesForceReleaseNative {
     IntPtr handle = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, false, pid);
     if (handle == IntPtr.Zero) {
       int err = Marshal.GetLastWin32Error();
-      if (err == 87 || err == 87) return -87;
       return err == 0 ? -1 : -err;
     }
     try {
@@ -140,7 +146,15 @@ if ($code -eq 0) {
 }
 $err = -[int]$code
 if ($err -eq 5) { Write-Output 'ACCESS_DENIED'; exit 5 }
-if ($err -eq 87) { Write-Output 'ALREADY_GONE'; exit 0 }
+# ERROR_INVALID_HANDLE / ERROR_INVALID_PARAMETER after Get-Process saw the target
+# are terminal failures, not proof the holder is gone.
+if ($err -eq 6 -or $err -eq 87) {
+  Write-Output ("FAILED win32=" + $err)
+  exit 1
+}
+# Protected-process / critical system process class surfaces as access denied
+# variants; callers that already elevated should treat these as blocked.
+if ($err -eq 5) { Write-Output 'PROTECTED win32=5'; exit 5 }
 Write-Output ("FAILED win32=" + $err)
 exit 1
 `.trim()
@@ -148,7 +162,11 @@ exit 1
 
 export function parseTerminateScriptOutput(stdout: string, code: number): ForceReleaseTerminateResult {
   const text = String(stdout || '').trim()
-  if (/ALREADY_GONE/i.test(text) || code === 0 && /TERMINATED/i.test(text)) {
+  if (/PROTECTED/i.test(text)) {
+    const win32 = text.match(/win32=(\d+)/i)
+    return { kind: 'protected', win32Error: win32 ? Number(win32[1]) : 5 }
+  }
+  if (/ALREADY_GONE/i.test(text) || (code === 0 && /TERMINATED/i.test(text))) {
     if (/TERMINATED/i.test(text)) return { kind: 'terminated' }
     if (/ALREADY_GONE/i.test(text)) return { kind: 'already-gone' }
   }
@@ -158,16 +176,12 @@ export function parseTerminateScriptOutput(stdout: string, code: number): ForceR
   if (/ACCESS_DENIED/i.test(text) || code === 5) {
     return { kind: 'access-denied', win32Error: 5 }
   }
-  if (/PROTECTED|ERROR_ACCESS_DENIED|win32=5/i.test(text)) {
-    return { kind: 'access-denied', win32Error: 5 }
-  }
   const win32 = text.match(/win32=(\d+)/i)
   if (win32) {
     const err = Number(win32[1])
     if (err === 5) return { kind: 'access-denied', win32Error: 5 }
-    // Protected process / critical system process class
-    if (err === 87 || err === 6) return { kind: 'already-gone' }
-    return { kind: 'failed', detail: text || `win32=${err}` }
+    // Do not treat 6/87 as already-gone: the process was observed live above.
+    return { kind: 'failed', detail: text || `win32=${err}`, win32Error: err }
   }
   if (code === 0 && /TERMINATED/i.test(text)) return { kind: 'terminated' }
   return { kind: 'failed', detail: text || `exit ${code}` }
@@ -178,11 +192,14 @@ export async function terminateWindowsHolderExact(
   {
     platform = process.platform,
     run = defaultRunPowerShell,
-    waitMs = 1_500
+    waitMs = 1_500,
+    timeoutMs
   }: {
     platform?: NodeJS.Platform
     run?: RunPowerShell
     waitMs?: number
+    /** Hard wall-clock budget for the PowerShell child (includes process start). */
+    timeoutMs?: number
   } = {}
 ): Promise<ForceReleaseTerminateResult> {
   if (platform !== 'win32') {
@@ -195,7 +212,13 @@ export async function terminateWindowsHolderExact(
     return { kind: 'failed', detail: 'invalid createdAt' }
   }
 
-  const script = buildExactTerminateScript(target.pid, target.createdAt, waitMs)
-  const result = await run(script, Math.max(2_000, waitMs + 1_000))
+  const budget = Math.max(1, Math.trunc(timeoutMs ?? Math.max(2_000, waitMs + 1_000)))
+  const effectiveWait = Math.max(0, Math.min(Math.trunc(waitMs), Math.max(0, budget - 250)))
+  if (budget <= 50) {
+    return { kind: 'failed', detail: 'deadline-exhausted' }
+  }
+
+  const script = buildExactTerminateScript(target.pid, target.createdAt, effectiveWait)
+  const result = await run(script, budget)
   return parseTerminateScriptOutput(result.stdout + '\n' + result.stderr, result.code)
 }

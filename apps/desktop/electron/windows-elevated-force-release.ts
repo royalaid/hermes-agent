@@ -36,6 +36,13 @@ export type ForceReleaseRequest = {
   requestMac: string
 }
 
+export type ForceReleaseSurvivor = {
+  pid: number
+  detail: string
+  resource?: string
+  win32Error?: number
+}
+
 export type ForceReleaseResponse = {
   schemaVersion: typeof FORCE_RELEASE_REQUEST_SCHEMA
   nonce: string
@@ -44,11 +51,23 @@ export type ForceReleaseResponse = {
   cancelled?: boolean
   error?: string
   terminated?: number[]
-  survivors?: Array<{ pid: number; detail: string }>
+  survivors?: ForceReleaseSurvivor[]
 }
 
 export function hashInstallRoot(installRoot: string): string {
   return createHash('sha256').update(path.resolve(installRoot)).digest('hex')
+}
+
+/**
+ * Canonical numeric token shared by Electron and the elevated PowerShell helper.
+ * Integers stay decimal integers; non-integers use JS/ECMA round-trip text, which
+ * matches .NET `double.ToString("R", InvariantCulture)`.
+ */
+export function canonicalNumericToken(value: number): string {
+  if (!Number.isFinite(value)) return '0'
+  if (Object.is(value, -0)) return '0'
+  if (Number.isInteger(value)) return String(value)
+  return String(value)
 }
 
 export function canonicalForceReleasePayload(input: {
@@ -61,13 +80,16 @@ export function canonicalForceReleasePayload(input: {
   holders: ReadonlyArray<{ pid: number; createdAt: number; name: string; resource?: string }>
 }): string {
   const holderLines = input.holders
-    .map(holder => `${holder.pid}\t${holder.createdAt}\t${holder.name}\t${holder.resource ?? ''}`)
+    .map(
+      holder =>
+        `${holder.pid}\t${canonicalNumericToken(holder.createdAt)}\t${holder.name}\t${holder.resource ?? ''}`
+    )
     .join('\n')
   return [
     String(input.schemaVersion),
     input.nonce,
-    String(input.issuedAt),
-    String(input.expiresAt),
+    canonicalNumericToken(input.issuedAt),
+    canonicalNumericToken(input.expiresAt),
     input.installRoot,
     input.installRootHash,
     holderLines
@@ -201,6 +223,46 @@ export function parseForceReleaseResponse(raw: string, expectedNonce: string): F
     return parsed as ForceReleaseResponse
   } catch {
     return null
+  }
+}
+
+export function formatElevatedForceReleaseFailure(response: ForceReleaseResponse | null): {
+  message: string
+  protectedHolders: boolean
+} {
+  const survivors = Array.isArray(response?.survivors) ? response!.survivors! : []
+  const survivorText = survivors
+    .slice(0, 8)
+    .map(entry => {
+      const resource = entry.resource ? ` resource=${entry.resource}` : ''
+      const win32 =
+        typeof entry.win32Error === 'number'
+          ? ` win32=${entry.win32Error}`
+          : /win32=(\d+)/i.test(entry.detail || '')
+            ? ''
+            : ''
+      return `PID ${entry.pid}${resource} ${entry.detail || 'survived'}${win32}`.trim()
+    })
+    .join('; ')
+
+  const protectedHolders = survivors.some(entry =>
+    /protected|unkillable|win32=5/i.test(`${entry.detail || ''} ${entry.win32Error ?? ''}`)
+  )
+
+  if (survivorText) {
+    return {
+      message:
+        `Update aborted: elevated force-release could not clear install file locks (${survivorText}). ` +
+        'The virtual environment was not modified.',
+      protectedHolders
+    }
+  }
+
+  return {
+    message:
+      response?.error ||
+      'Update aborted: elevated force-release could not clear install file locks. The virtual environment was not modified.',
+    protectedHolders
   }
 }
 

@@ -363,6 +363,7 @@ import {
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
 import {
+  formatElevatedForceReleaseFailure,
   launchElevatedForceReleaseHelper,
   parseForceReleaseResponse,
   writeForceReleaseRequestFiles
@@ -3835,12 +3836,13 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
     settleMs: 150,
     excludePids: exclude,
     isResourceLocked: async () => isShimLocked(shim),
-    listScannerHolders: async () => {
+    listScannerHolders: async (_budgetMs) => {
+      // Orchestrator races this call against the remaining <=5s budget.
       const outcome = await scanVenvBlockers(updateRoot)
       if (outcome.kind !== 'blocked') return []
       return forceReleaseHoldersFromScan(updateRoot, outcome.result)
     },
-    listRestartManagerHolders: async () => {
+    listRestartManagerHolders: async (budgetMs) => {
       const resources = [shim]
       try {
         const python = path.join(updateRoot, 'venv', 'Scripts', 'python.exe')
@@ -3848,9 +3850,15 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
       } catch {
         void 0
       }
-      return listRestartManagerHoldersForResources(resources)
+      return listRestartManagerHoldersForResources(resources, {
+        timeoutMs: Math.max(250, Math.min(3_500, budgetMs))
+      })
     },
-    terminateHolder: holder => terminateWindowsHolderExact(holder)
+    terminateHolder: (holder, budgetMs) =>
+      terminateWindowsHolderExact(holder, {
+        timeoutMs: Math.max(250, Math.min(2_500, budgetMs)),
+        waitMs: Math.max(100, Math.min(1_500, budgetMs - 200))
+      })
   })
 }
 
@@ -3952,22 +3960,26 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
 
   const response = parseForceReleaseResponse(responseRaw, written.request.nonce)
   if (!response || !response.ok || !response.cleared) {
+    const failure = formatElevatedForceReleaseFailure(response)
     return {
       ok: false,
       error: 'venv-unlock-failed',
-      message:
-        response?.error ||
-        'Update aborted: elevated force-release could not clear install file locks. The virtual environment was not modified.',
+      message: failure.message,
       elevationHolders: holders
     }
   }
 
   if (isShimLocked(shim)) {
+    const survivorDetail = (response.survivors ?? [])
+      .map(entry => `PID ${entry.pid}${entry.resource ? ` resource=${entry.resource}` : ''} ${entry.detail || 'locked'}`.trim())
+      .join('; ')
     return {
       ok: false,
       error: 'venv-unlock-failed',
       message:
-        'Update aborted: install files remain locked after elevated force-release. The virtual environment was not modified.',
+        survivorDetail
+          ? `Update aborted: install files remain locked after elevated force-release (${survivorDetail}). The virtual environment was not modified.`
+          : 'Update aborted: install files remain locked after elevated force-release. The virtual environment was not modified.',
       elevationHolders: holders
     }
   }
