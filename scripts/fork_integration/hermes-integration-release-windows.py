@@ -45,7 +45,7 @@ MANIFEST_PATH = SCRIPT_DIR / "hermes-integration-manifest.json"
 # manifest and is tracked by sync.py; an absent file is an empty blocklist.
 BLOCKLIST_PATH = SCRIPT_DIR / "fork-integration-blocklist.json"
 PROPOSALS_SCRIPT = SCRIPT_DIR / "proposals.py"
-WORKTREE = HERMES_HOME / "worktrees" / "openai-native-windows"
+WORKTREE = HERMES_HOME / "worktrees" / "fork-integration"
 FORK_REMOTE = "fork"
 RELEASE_PREFIX = "integration-"
 RETAIN_RELEASES = 5
