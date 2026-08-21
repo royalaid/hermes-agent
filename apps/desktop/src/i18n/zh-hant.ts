@@ -2108,6 +2108,7 @@ export const zhHant = defineLocale({
     applyingClose: '此視窗會在更新期間關閉，隨後 Hermes 會自動重新開啟。',
     errorTitle: '更新未完成',
     errorBody: '沒有資料遺失。您可以現在重試。',
+    forceUpdateAdministrator: 'Force update (Administrator)',
     blockerTitle: '關閉本機預覽以更新 Hermes？',
     blockerBody: 'Hermes 需要在更新前停止這些本機預覽。這不會修改或刪除您的檔案。',
     foreignBlockerTitle: '關閉其他處理程序以更新 Hermes',

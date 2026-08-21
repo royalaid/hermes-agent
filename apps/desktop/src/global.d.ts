@@ -622,6 +622,16 @@ export interface DesktopUpdateApplyOptions {
   dirtyStrategy?: DesktopUpdateDirtyStrategy
   /** User confirmed that Desktop may stop freshly re-scanned safe local preview servers. */
   stopSafeBlockers?: boolean
+  /** User confirmed the UAC Force update (Administrator) path for exact lock holders. */
+  forceUpdateElevated?: boolean
+}
+
+export interface DesktopUpdateElevationHolder {
+  pid: number
+  name: string
+  cmdline?: string
+  createdAt?: number
+  resource?: string
 }
 
 export interface DesktopUpdateApplyResult {
@@ -630,6 +640,8 @@ export interface DesktopUpdateApplyResult {
   error?: string
   message?: string
   blockers?: DesktopUpdateBlocker[]
+  /** Exact holders that require an elevated terminate pass. */
+  elevationHolders?: DesktopUpdateElevationHolder[]
   /** True when no staged updater exists (CLI install) and the user should run
    *  `hermes update` themselves. `command` is the exact line to run. */
   manual?: boolean

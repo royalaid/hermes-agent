@@ -210,4 +210,85 @@ describe('BlockerView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close previews and update' }))
     expect(onStopAndUpdate).toHaveBeenCalledTimes(1)
   })
+
+  it('offers Force update (Administrator) only for elevation errors and sends forceUpdateElevated', async () => {
+    const applyMock = vi.fn().mockResolvedValue({ ok: false, error: 'still-blocked' })
+    const originalDesktop = window.hermesDesktop
+
+    window.hermesDesktop = {
+      ...(originalDesktop || {}),
+      updates: {
+        ...(originalDesktop?.updates || {}),
+        apply: applyMock,
+        check: vi.fn(),
+        onProgress: vi.fn(() => () => {})
+      }
+    } as any
+
+    try {
+      $updateOverlayTarget.set('client')
+      $updateOverlayOpen.set(true)
+      $updateStatus.set({
+        supported: true,
+        updateAvailable: true,
+        behind: 1,
+        commits: []
+      } as DesktopUpdateStatus)
+      $updateApply.set({
+        applying: false,
+        stage: 'error',
+        message: 'Update needs Administrator permission to stop locked processes.',
+        percent: null,
+        error: 'venv-needs-elevation',
+        command: null,
+        elevationHolders: [
+          {
+            pid: 901,
+            name: 'python.exe',
+            cmdline: 'python.exe tools',
+            createdAt: 123,
+            resource: 'venv\\Scripts\\hermes.exe'
+          }
+        ],
+        log: []
+      })
+
+      await renderUpdatesOverlay()
+
+      const adminButton = screen.getByRole('button', { name: 'Force update (Administrator)' })
+      expect(adminButton).toBeTruthy()
+      expect(screen.queryByRole('button', { name: /try again/i })).toBeNull()
+
+      fireEvent.click(adminButton)
+      expect(applyMock).toHaveBeenCalledWith({ forceUpdateElevated: true })
+    } finally {
+      window.hermesDesktop = originalDesktop
+    }
+  })
+
+  it('keeps the generic retry path when elevation holders are absent', async () => {
+    $updateOverlayTarget.set('client')
+    $updateOverlayOpen.set(true)
+    $updateStatus.set({
+      supported: true,
+      updateAvailable: true,
+      behind: 1,
+      commits: []
+    } as DesktopUpdateStatus)
+    $updateApply.set({
+      applying: false,
+      stage: 'error',
+      message: 'Update didn’t finish',
+      percent: null,
+      error: 'venv-unlock-failed',
+      command: null,
+      elevationHolders: null,
+      log: []
+    })
+
+    await renderUpdatesOverlay()
+
+    expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Force update (Administrator)' })).toBeNull()
+  })
 })

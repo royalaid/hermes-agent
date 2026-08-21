@@ -1963,6 +1963,7 @@ export const ar = defineLocale({
     applyingClose: 'ستُغلق هذه النافذة أثناء تشغيل التحديث، ثم يعيد Hermes فتح نفسه تلقائيا.',
     errorTitle: 'لم يكتمل التحديث',
     errorBody: 'لا داعي للقلق — لم يُفقد شيء. يمكنك إعادة المحاولة الآن.',
+    forceUpdateAdministrator: 'Force update (Administrator)',
     blockerTitle: 'إغلاق المعاينات المحلية لتحديث Hermes؟',
     blockerBody: 'يحتاج Hermes إلى إيقاف هذه المعاينات المحلية قبل التحديث. لن يؤدي ذلك إلى تعديل ملفاتك أو حذفها.',
     foreignBlockerTitle: 'أغلق العمليات الأخرى لتحديث Hermes',

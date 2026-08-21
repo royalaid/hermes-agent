@@ -2693,6 +2693,7 @@ export const zh: Translations = {
     applyingClose: '此窗口会在更新期间关闭，随后 Hermes 会自动重新打开。',
     errorTitle: '更新未完成',
     errorBody: '没有数据丢失。你可以现在重试。',
+    forceUpdateAdministrator: 'Force update (Administrator)',
     blockerTitle: '关闭本地预览以更新 Hermes？',
     blockerBody: 'Hermes 需要在更新前停止这些本地预览。这不会修改或删除你的文件。',
     foreignBlockerTitle: '关闭其他进程以更新 Hermes',
