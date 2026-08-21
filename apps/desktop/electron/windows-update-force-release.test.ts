@@ -1,15 +1,36 @@
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import { promisify } from 'node:util'
 
 import { describe, it, vi } from 'vitest'
 
 import {
   mergeInstallHolders,
   orderHoldersLeafFirst,
+  raceWithBudget,
   runWindowsUpdateForceRelease,
   type ForceReleaseHolder,
   type ForceReleaseTerminateResult,
   type WindowsUpdateForceReleaseDeps
 } from './windows-update-force-release'
+import {
+  buildRestartManagerScript,
+  parseRestartManagerOutput,
+  RESTART_MANAGER_ROW_SPLIT_EXPRESSION
+} from './windows-restart-manager'
+import {
+  buildForceReleaseRequest,
+  canonicalForceReleasePayload,
+  canonicalNumericToken,
+  formatElevatedForceReleaseFailure,
+  parseForceReleaseResponse,
+  verifyForceReleaseRequest
+} from './windows-elevated-force-release'
+import { parseTerminateScriptOutput } from './windows-process-terminate'
+
+const execFileAsync = promisify(execFile)
 
 const holder = (overrides: Partial<ForceReleaseHolder> = {}): ForceReleaseHolder => ({
   pid: 57012,
@@ -290,5 +311,261 @@ describe('runWindowsUpdateForceRelease', () => {
     const outcome = await runWindowsUpdateForceRelease(deps)
 
     assert.notEqual(outcome.kind, 'clear')
+  })
+
+  it('enforces a hard wall-clock budget when dependencies hang past five seconds', async () => {
+    const started = Date.now()
+    const hung = () =>
+      new Promise<ForceReleaseHolder[]>(resolve => {
+        setTimeout(() => resolve([holder({ pid: 1, createdAt: 2 })]), 8_000)
+      })
+
+    const outcome = await runWindowsUpdateForceRelease({
+      deadlineMs: 400,
+      settleMs: 0,
+      isResourceLocked: async () => true,
+      listScannerHolders: async () => hung(),
+      listRestartManagerHolders: async () => [],
+      terminateHolder: async () => ({ kind: 'terminated' })
+    })
+
+    const elapsed = Date.now() - started
+    assert.notEqual(outcome.kind, 'clear')
+    assert.ok(elapsed < 2_000, `elapsed ${elapsed}ms must stay near the 400ms budget`)
+    assert.ok(elapsed >= 300, `elapsed ${elapsed}ms should wait roughly the budget`)
+  })
+
+  it('passes remaining budget into terminateHolder', async () => {
+    const budgets: number[] = []
+    const target = holder({ pid: 3, createdAt: 4 })
+    let locked = true
+    const { deps } = makeDeps({
+      deadlineMs: 1_000,
+      settleMs: 0,
+      isResourceLocked: async () => locked,
+      listScannerHolders: async () => [target],
+      terminateHolder: async (_holder, budgetMs) => {
+        budgets.push(budgetMs)
+        locked = false
+        return { kind: 'terminated' }
+      }
+    })
+
+    const outcome = await runWindowsUpdateForceRelease(deps)
+    assert.equal(outcome.kind, 'clear')
+    assert.ok(budgets.length >= 1)
+    assert.ok(budgets[0]! <= 1_000)
+    assert.ok(budgets[0]! > 0)
+  })
+})
+
+describe('raceWithBudget', () => {
+  it('returns the timeout fallback when work exceeds the budget', async () => {
+    const started = Date.now()
+    const value = await raceWithBudget(
+      new Promise<string>(resolve => setTimeout(() => resolve('late'), 1_000)),
+      100,
+      () => 'fallback'
+    )
+    const elapsed = Date.now() - started
+    assert.equal(value, 'fallback')
+    assert.ok(elapsed < 500)
+  })
+})
+
+describe('restart manager script contract', () => {
+  it('emits a literal pipe split that does not over-escape regex', () => {
+    const script = buildRestartManagerScript(['C:\\h\\venv\\Scripts\\hermes.exe'])
+    assert.match(script, /\$part\.Split\(\[char\]'\|', 3\)/)
+    assert.doesNotMatch(script, /\$part -split '\\\\\|'/)
+    assert.doesNotMatch(script, /\$part -split '\\\|'/)
+    assert.match(script, /StringBuilder\(CCH_RM_SESSION_KEY \+ 1\)/)
+    assert.equal(RESTART_MANAGER_ROW_SPLIT_EXPRESSION, "$part.Split([char]'|', 3)")
+  })
+
+  it('parses RM JSON rows into force-release holders', () => {
+    const holders = parseRestartManagerOutput(
+      JSON.stringify([{ pid: 12, createdAt: 34, name: 'python.exe' }]),
+      ['C:\\h\\venv\\Scripts\\hermes.exe']
+    )
+    assert.equal(holders.length, 1)
+    assert.equal(holders[0]?.source, 'restart-manager')
+    assert.equal(holders[0]?.pid, 12)
+    assert.match(String(holders[0]?.resource), /hermes\.exe/)
+  })
+
+  it('splits generated RM delimiter rows correctly on real Windows PowerShell', async () => {
+    if (process.platform !== 'win32') return
+
+    const probe = `
+$ErrorActionPreference = 'Stop'
+$part = '12|34|name'
+$bits = $part.Split([char]'|', 3)
+if ($bits.Count -ne 3) { Write-Output ("bad-count=" + $bits.Count); exit 2 }
+if ($bits[0] -ne '12' -or $bits[1] -ne '34' -or $bits[2] -ne 'name') {
+  Write-Output ("bad-values=" + ($bits -join ','))
+  exit 3
+}
+Write-Output 'ok'
+exit 0
+`.trim()
+
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    const { stdout } = await execFileAsync(
+      ps,
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', probe],
+      { encoding: 'utf8', windowsHide: true, timeout: 10_000 }
+    )
+    assert.match(String(stdout), /ok/)
+  })
+})
+
+describe('elevated force-release request contract', () => {
+  it('binds request MAC to install root + exact holder claims', () => {
+    const secret = 's'.repeat(32)
+    const request = buildForceReleaseRequest({
+      installRoot: 'C:\\Users\\gwmai\\AppData\\Local\\hermes',
+      holders: [{ pid: 9, createdAt: 100, name: 'hermes.exe', cmdline: 'hermes.exe tools', source: 'scanner' }],
+      secret,
+      now: 1_000,
+      ttlMs: 60_000,
+      nonce: 'abc123'
+    })
+
+    assert.equal(request.nonce, 'abc123')
+    assert.equal(
+      verifyForceReleaseRequest(request, secret, 'C:\\Users\\gwmai\\AppData\\Local\\hermes', 1_500).ok,
+      true
+    )
+    assert.equal(
+      verifyForceReleaseRequest(request, secret, 'C:\\Users\\gwmai\\AppData\\Local\\other', 1_500).ok,
+      false
+    )
+    assert.equal(verifyForceReleaseRequest(request, 'wrong', request.installRoot, 1_500).ok, false)
+    assert.equal(verifyForceReleaseRequest(request, secret, request.installRoot, 100_000).ok, false)
+  })
+
+  it('canonical payload is stable for helper MAC verification', () => {
+    const payload = canonicalForceReleasePayload({
+      schemaVersion: 1,
+      nonce: 'n',
+      issuedAt: 1,
+      expiresAt: 2,
+      installRoot: 'C:\\h',
+      installRootHash: 'abc',
+      holders: [{ pid: 1, createdAt: 2, name: 'x', resource: 'y' }]
+    })
+    assert.equal(payload, ['1', 'n', '1', '2', 'C:\\h', 'abc', '1\t2\tx\ty'].join('\n'))
+  })
+
+  it('uses round-trip numeric tokens that match PowerShell R-format floats', async () => {
+    const sample = 1755738237.4531252
+    assert.equal(canonicalNumericToken(sample), '1755738237.4531252')
+    assert.equal(canonicalNumericToken(1000), '1000')
+
+    if (process.platform !== 'win32') return
+
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    const script = `
+$n = [double]1755738237.4531252
+$js = '1755738237.4531252'
+$r = $n.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+if ($r -ne $js) { Write-Output ("mismatch r=$r"); exit 2 }
+$intTok = if (1000 -eq [math]::Truncate(1000)) { [string][int64]1000 } else { 'nope' }
+if ($intTok -ne '1000') { Write-Output ("int=$intTok"); exit 3 }
+Write-Output 'parity-ok'
+exit 0
+`.trim()
+    const { stdout } = await execFileAsync(
+      ps,
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { encoding: 'utf8', windowsHide: true, timeout: 10_000 }
+    )
+    assert.match(String(stdout), /parity-ok/)
+  })
+
+  it('rejects response nonce mismatch', () => {
+    const raw = JSON.stringify({ schemaVersion: 1, nonce: 'other', ok: true, cleared: true })
+    assert.equal(parseForceReleaseResponse(raw, 'expected'), null)
+  })
+
+  it('surfaces survivor pid/resource/win32 details in elevated failure text', () => {
+    const failure = formatElevatedForceReleaseFailure({
+      schemaVersion: 1,
+      nonce: 'n',
+      ok: true,
+      cleared: false,
+      survivors: [{ pid: 55, detail: 'protected win32=5', resource: 'C:\\h\\venv\\Scripts\\hermes.exe', win32Error: 5 }]
+    })
+    assert.match(failure.message, /PID 55/)
+    assert.match(failure.message, /hermes\.exe/)
+    assert.match(failure.message, /protected|win32=5/i)
+    assert.equal(failure.protectedHolders, true)
+  })
+})
+
+describe('terminate script output parser', () => {
+  it('classifies create-time mismatch, access denied, and protected', () => {
+    assert.deepEqual(parseTerminateScriptOutput('CREATE_TIME_MISMATCH actual=1 expected=2', 3), {
+      kind: 'create-time-mismatch'
+    })
+    assert.deepEqual(parseTerminateScriptOutput('ACCESS_DENIED', 5), {
+      kind: 'access-denied',
+      win32Error: 5
+    })
+    assert.deepEqual(parseTerminateScriptOutput('PROTECTED win32=5', 5), {
+      kind: 'protected',
+      win32Error: 5
+    })
+    assert.deepEqual(parseTerminateScriptOutput('TERMINATED', 0), { kind: 'terminated' })
+    assert.deepEqual(parseTerminateScriptOutput('ALREADY_GONE', 0), { kind: 'already-gone' })
+    assert.equal(parseTerminateScriptOutput('FAILED win32=87', 1).kind, 'failed')
+    assert.equal(parseTerminateScriptOutput('FAILED win32=6', 1).kind, 'failed')
+  })
+})
+
+describe('elevated helper script shape', () => {
+  it('does not assign the read-only $pid automatic variable', () => {
+    const helperPath = path.resolve(__dirname, '../../../scripts/desktop-update/windows-force-release.ps1')
+    const text = fs.readFileSync(helperPath, 'utf8')
+    assert.match(text, /\$holderPid\s*=/)
+    assert.doesNotMatch(text, /\$pid\s*=\s*\[int\]\$holder\.pid/)
+    assert.match(text, /Format-CanonicalNumber/)
+    assert.match(text, /QueryRestartManager/)
+    assert.match(text, /resource-still-locked|Test-FileUnlocked/)
+  })
+
+  it('parses under Windows PowerShell without script errors', async () => {
+    if (process.platform !== 'win32') return
+    const helperPath = path.resolve(__dirname, '../../../scripts/desktop-update/windows-force-release.ps1')
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    const script = `
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(${JSON.stringify(helperPath)}, [ref]$tokens, [ref]$errors) | Out-Null
+if ($errors -and $errors.Count -gt 0) {
+  $errors | ForEach-Object { Write-Output $_.ToString() }
+  exit 2
+}
+# $pid assignment must remain impossible under StrictMode
+try {
+  Set-StrictMode -Version Latest
+  $pid = 1
+  Write-Output 'pid-assignable'
+  exit 3
+} catch {
+  Write-Output 'pid-readonly-ok'
+}
+Write-Output 'parse-ok'
+exit 0
+`.trim()
+    const { stdout } = await execFileAsync(
+      ps,
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { encoding: 'utf8', windowsHide: true, timeout: 15_000 }
+    )
+    assert.match(String(stdout), /pid-readonly-ok/)
+    assert.match(String(stdout), /parse-ok/)
   })
 })
