@@ -259,6 +259,7 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
       terminationSettleMs: 0
     })
     assert.equal(outcome.kind, 'clear')
+    assert.equal(outcome.lease, lease, 'clear preflight preserves the exact capability-bearing lease identity')
     const permit = authorizeUpdateMutation(outcome)
     assert.ok(permit)
     assert.equal(authorizeUpdateMutation(outcome), null, 'a successful preflight permit is consumed exactly once')
