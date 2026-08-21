@@ -34,6 +34,7 @@ import {
   parseTerminateScriptOutput,
   runPowerShellWithHardBoundary
 } from './windows-process-terminate'
+import { queryWindowsProcessCreatedAt } from './windows-process-identity'
 
 const execFileAsync = promisify(execFile)
 
@@ -853,6 +854,101 @@ Start-Sleep -Seconds 20
       } finally {
         controller.abort()
         await runPromise.catch(() => undefined)
+        fs.rmSync(tmp, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it(
+    'contains an external authenticated holder tree when the primary snapshot fails',
+    { timeout: 15_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+
+      const os = await import('node:os')
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-external-holder-'))
+      const sentinel = path.join(tmp, 'sentinel.txt')
+      const rootPidPath = path.join(tmp, 'root.pid')
+      const writerPidPath = path.join(tmp, 'writer.pid')
+      const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+      const quotePowerShellLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
+      const rootScript = `
+$ErrorActionPreference = 'Stop'
+$sentinel = ${quotePowerShellLiteral(sentinel)}
+$rootPidPath = ${quotePowerShellLiteral(rootPidPath)}
+$writerPidPath = ${quotePowerShellLiteral(writerPidPath)}
+Set-Content -LiteralPath $rootPidPath -Value ([string]$PID)
+$writer = Start-Process -FilePath ${quotePowerShellLiteral(ps)} -ArgumentList @(
+  '-NoLogo','-NoProfile','-NonInteractive','-Command',
+  ('Start-Sleep -Milliseconds 5000; Set-Content -LiteralPath ''' + $sentinel + ''' -Value LATE_MUTATION')
+) -PassThru -WindowStyle Hidden
+Set-Content -LiteralPath $writerPidPath -Value ([string]$writer.Id)
+Start-Sleep -Seconds 20
+`.trim()
+      const rootChild = execFile(
+        ps,
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', rootScript],
+        { encoding: 'utf8', windowsHide: true },
+        () => undefined
+      )
+      const waitForFile = async (filePath: string, timeoutMs: number) => {
+        const deadline = Date.now() + timeoutMs
+        while (Date.now() < deadline) {
+          if (fs.existsSync(filePath)) return true
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        return fs.existsSync(filePath)
+      }
+
+      try {
+        assert.equal(await waitForFile(rootPidPath, 1_500), true, 'external holder root did not start')
+        assert.equal(await waitForFile(writerPidPath, 1_500), true, 'detached delayed writer did not start')
+        const rootPid = Number(fs.readFileSync(rootPidPath, 'utf8').trim())
+        const writerPid = Number(fs.readFileSync(writerPidPath, 'utf8').trim())
+        const rootCreatedAt = await queryWindowsProcessCreatedAt(rootPid, { platform: 'win32', timeoutMs: 2_000 })
+        const writerCreatedAt = await queryWindowsProcessCreatedAt(writerPid, { platform: 'win32', timeoutMs: 2_000 })
+        assert.ok(rootCreatedAt && rootCreatedAt > 0, 'could not authenticate external root generation')
+        assert.ok(writerCreatedAt && writerCreatedAt > 0, 'could not authenticate detached writer generation')
+
+        const priorSnapshotFailure = process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
+        process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = '1'
+        const started = Date.now()
+        let result
+        try {
+          // This invokes the same production callback/native runner used by
+          // main.ts, while the holder was created outside its helper job.
+          const { terminateWindowsHolderExact } = await import('./windows-process-terminate')
+          result = await terminateWindowsHolderExact(
+            holder({ pid: rootPid, createdAt: rootCreatedAt, name: 'powershell.exe', cmdline: 'external holder' }),
+            { platform: 'win32', timeoutMs: 5_000, waitMs: 1_500 }
+          )
+        } finally {
+          if (priorSnapshotFailure == null) delete process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
+          else process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = priorSnapshotFailure
+        }
+        const elapsed = Date.now() - started
+        assert.deepEqual(
+          result,
+          { kind: 'terminated' },
+          'boundary result=' + JSON.stringify(result) + ' root=' + rootPid + ' writer=' + writerPid
+        )
+        assert.ok(elapsed <= 5_000, `external holder termination elapsed ${elapsed}`)
+
+        const identities = [
+          { pid: rootPid, createdAt: rootCreatedAt },
+          { pid: writerPid, createdAt: writerCreatedAt }
+        ]
+        const { identitiesStillPresent } = await import('./windows-process-terminate')
+        assert.deepEqual(await identitiesStillPresent(identities), [])
+        await new Promise(resolve => setTimeout(resolve, 1_800))
+        assert.equal(fs.existsSync(sentinel), false)
+        assert.deepEqual(await identitiesStillPresent(identities), [])
+      } finally {
+        try {
+          rootChild.kill('SIGKILL')
+        } catch {
+          void 0
+        }
         fs.rmSync(tmp, { recursive: true, force: true })
       }
     }
