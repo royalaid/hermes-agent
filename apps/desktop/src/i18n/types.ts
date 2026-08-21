@@ -2110,6 +2110,7 @@ export interface Translations {
     applyingClose: string
     errorTitle: string
     errorBody: string
+    forceUpdateAdministrator: string
     blockerTitle: string
     blockerBody: string
     foreignBlockerTitle: string

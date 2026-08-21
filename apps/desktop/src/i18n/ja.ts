@@ -2163,6 +2163,7 @@ export const ja = defineLocale({
     applyingClose: 'このウィンドウは更新中に閉じ、その後 Hermes が自動的に再度開きます。',
     errorTitle: '更新が完了しませんでした',
     errorBody: 'ご安心ください。何も失われていません。今すぐ再試行できます。',
+    forceUpdateAdministrator: 'Force update (Administrator)',
     blockerTitle: 'Hermes を更新するためにローカルプレビューを閉じますか？',
     blockerBody:
       '更新する前に、これらのローカルプレビューを停止する必要があります。ファイルが変更または削除されることはありません。',
