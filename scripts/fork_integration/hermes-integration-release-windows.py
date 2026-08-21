@@ -477,8 +477,12 @@ def launch_failure_investigator(*, stage: str, error: str) -> None:
             manifest_path=MANIFEST_PATH,
             investigator=_failure_investigator_settings(),
         )
-        investigator.maybe_launch_investigator(result)
-        log(f"FAILURE_INVESTIGATOR signature={result['signature']} spawned={str(bool(result['spawn'])).lower()} occurrences={result['occurrences']}")
+        decision = investigator.maybe_launch_investigator(result)
+        log(
+            "FAILURE_INVESTIGATOR "
+            f"signature={result['signature']} action={decision.get('action', 'unknown')} "
+            f"reason={decision.get('reason', 'unknown')} occurrences={result['occurrences']}"
+        )
     except Exception as investigator_exc:
         log(f"WARNING failure investigator unavailable: {type(investigator_exc).__name__}")
 

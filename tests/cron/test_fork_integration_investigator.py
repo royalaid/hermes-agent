@@ -733,6 +733,172 @@ def test_heartbeat_cli_reports_json_and_an_exit_code(
     ]) == 1
 
 
+# ── manual investigation lease ──────────────────────────────────────────────
+
+
+def _acquire_lease(home: Path, *, now: datetime, ttl_seconds: float = 3600) -> dict[str, Any]:
+    return investigator.acquire_investigation_lease(
+        home=home, job_id=JOB_ID, owner="agent:parent", session_id="session-123",
+        incident_key="updater-force-release", ttl_seconds=ttl_seconds, now=now,
+    )
+
+
+def _write_release_lock(home: Path, *, started_at: datetime, pid: int = 4242) -> None:
+    path = home / "cron" / "locks" / "hermes-integration-release.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "holder": "scheduler", "pid": pid, "started_at": started_at.isoformat(),
+    }), encoding="utf-8")
+
+
+def test_live_manual_lease_suppresses_all_signatures_from_the_claimed_run_only(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=2)).isoformat())
+    lease = _acquire_lease(tmp_path, now=now)
+    _write_release_lock(tmp_path, started_at=now + timedelta(seconds=30))
+    first = _record(tmp_path, stage="verify_build", error="known updater incident")
+
+    suppressed = _launch(tmp_path, signature=first["signature"], now=now + timedelta(minutes=1))
+
+    assert suppressed["action"] == "suppress"
+    assert suppressed["reason"] == "active_investigation_lease"
+    assert suppressed["lease"]["lease_id"] == lease["lease"]["lease_id"]
+    artifact = json.loads(Path(first["artifact_path"]).read_text(encoding="utf-8"))
+    assert artifact["investigator_status"] == "suppressed_by_investigation_lease"
+    assert artifact["suppression"]["session_id"] == "session-123"
+    state = json.loads(Path(first["state_path"]).read_text(encoding="utf-8"))
+    assert state["open"][first["signature"]]["token_sha256"] is None
+
+    second = _record(tmp_path, stage="publish", error="different genuine failure")
+    decision = _launch(tmp_path, signature=second["signature"], now=now + timedelta(minutes=2))
+    assert decision["action"] == "suppress"
+
+    # A later release lock is a different run: the lease cannot hide it.
+    _write_release_lock(tmp_path, started_at=now + timedelta(minutes=3), pid=4343)
+    third = _record(tmp_path, stage="publish", error="different run failure")
+    next_run = _launch(tmp_path, signature=third["signature"], now=now + timedelta(minutes=4))
+    assert next_run["action"] == "spawn"
+    assert next_run["reason"] == "no_live_finisher"
+
+
+def test_repeat_of_the_claimed_signature_remains_suppressed_while_lease_is_live(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=2)).isoformat())
+    _acquire_lease(tmp_path, now=now)
+    _write_release_lock(tmp_path, started_at=now + timedelta(seconds=30))
+    first = _record(tmp_path)
+    assert _launch(tmp_path, signature=first["signature"], now=now + timedelta(minutes=1))["action"] == "suppress"
+
+    repeat = _record(tmp_path)
+    decision = _launch(tmp_path, signature=repeat["signature"], now=now + timedelta(minutes=2))
+
+    assert decision["action"] == "suppress"
+    assert repeat["occurrences"] == 2
+
+
+def test_live_lease_without_a_new_parseable_release_lock_fails_safe_to_spawn(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=2)).isoformat())
+    _acquire_lease(tmp_path, now=now)
+    result = _record(tmp_path)
+
+    decision = _launch(tmp_path, signature=result["signature"], now=now + timedelta(minutes=1))
+
+    assert decision["action"] == "spawn"
+    assert decision["reason"] == "no_live_finisher"
+
+
+def test_maybe_launch_does_not_spawn_a_helper_when_the_manual_lease_owns_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=2)).isoformat())
+    _acquire_lease(tmp_path, now=now)
+    _write_release_lock(tmp_path, started_at=now)
+    result = _record(tmp_path)
+    launches: list[list[str]] = []
+    monkeypatch.setattr(investigator, "spawn_detached", launches.append)
+
+    decision = investigator.maybe_launch_investigator(result)
+
+    assert decision["action"] == "suppress"
+    assert launches == []
+
+
+def test_manual_lease_closes_a_stale_automatic_finisher_before_suppressing(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=3)).isoformat())
+    automatic = _record(tmp_path, stage="verify_manifest", error="automatic")
+    token = _launch(tmp_path, signature=automatic["signature"], now=now)
+    _acquire_lease(tmp_path, now=now + timedelta(minutes=21))
+    _write_release_lock(tmp_path, started_at=now + timedelta(minutes=21, seconds=30), pid=4343)
+    manual_failure = _record(tmp_path, stage="verify_build", error="manual known incident")
+
+    decision = _launch(tmp_path, signature=manual_failure["signature"], now=now + timedelta(minutes=22))
+
+    assert decision["action"] == "suppress"
+    assert decision["closed"] == [{"signature": automatic["signature"], "state": "abandoned"}]
+    assert investigator.verify_authority(
+        token_path=token["token_path"], job_id=JOB_ID, action="push", home=tmp_path,
+        now=now + timedelta(minutes=22),
+    )["reason"] == "authority_incident_closed"
+
+
+@pytest.mark.parametrize("stale_kind", ["heartbeat", "expiry"])
+def test_stale_or_expired_manual_lease_fails_safe_to_normal_spawn(tmp_path: Path, stale_kind: str) -> None:
+    now = datetime.now(timezone.utc)
+    _write_jobs_store(tmp_path, next_run_at=(now + timedelta(hours=3)).isoformat())
+    ttl = 60 if stale_kind == "expiry" else 3600
+    _acquire_lease(tmp_path, now=now, ttl_seconds=ttl)
+    result = _record(tmp_path)
+    later = now + (timedelta(minutes=11) if stale_kind == "heartbeat" else timedelta(minutes=2))
+
+    decision = _launch(tmp_path, signature=result["signature"], now=later)
+
+    assert decision["action"] == "spawn"
+    assert decision["reason"] == "no_live_finisher"
+
+
+def test_lease_heartbeat_is_identity_bound_and_does_not_extend_frozen_expiry(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    acquired = _acquire_lease(tmp_path, now=now)
+    lease = acquired["lease"]
+    wrong = investigator.heartbeat_investigation_lease(
+        home=tmp_path, job_id=JOB_ID, lease_id=lease["lease_id"], session_id="other",
+        now=now + timedelta(minutes=1),
+    )
+    assert wrong["reason"] == "lease_identity_mismatch"
+
+    beat = investigator.heartbeat_investigation_lease(
+        home=tmp_path, job_id=JOB_ID, lease_id=lease["lease_id"], session_id="session-123",
+        now=now + timedelta(minutes=5),
+    )
+    assert beat["ok"] is True
+    written = json.loads(Path(acquired["path"]).read_text(encoding="utf-8"))
+    assert written["expires_at"] == lease["expires_at"]
+
+
+def test_lease_cli_acquire_status_and_release_use_attributed_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert investigator.main([
+        "lease", "acquire", "--job", JOB_ID, "--owner", "human:royal",
+        "--session", "desktop-session", "--incident", "manual updater verification",
+        "--home", str(tmp_path),
+    ]) == 0
+    acquired = json.loads(capsys.readouterr().out)
+    lease_id = acquired["lease"]["lease_id"]
+    assert investigator.main([
+        "lease", "status", "--job", JOB_ID, "--home", str(tmp_path),
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["reason"] == "lease_active"
+    assert investigator.main([
+        "lease", "release", "--job", JOB_ID, "--lease-id", lease_id,
+        "--session", "desktop-session", "--home", str(tmp_path),
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["reason"] == "lease_released"
+
+
 # ── one finisher per window ─────────────────────────────────────────────────
 
 

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -316,6 +317,16 @@ INCIDENT_SCHEMA = 2
 HEARTBEAT_STALE_SECONDS = 20 * 60
 CLOSURE_STATES = ("resolved", "expired", "abandoned", "superseded")
 
+# A human/agent that is about to manually fire the cron job may acquire this
+# separate, non-authorizing lease.  It suppresses only the first normalized
+# failure signature observed while the lease is live (and repeats of that same
+# signature).  It never changes the release lock or grants push/publish.
+INVESTIGATION_LEASE_SUBDIR = Path("cron") / "investigation-leases"
+INVESTIGATION_LEASE_SCHEMA = 1
+INVESTIGATION_LEASE_DEFAULT_SECONDS = 60 * 60
+INVESTIGATION_LEASE_MAX_SECONDS = 2 * 60 * 60
+INVESTIGATION_LEASE_HEARTBEAT_STALE_SECONDS = 10 * 60
+
 
 def _v2_entry(entry: dict[str, Any] | None = None) -> dict[str, Any]:
     """One incident entry with every v2 field present."""
@@ -548,7 +559,8 @@ def record_failure(*, job_id: str, stage: str, error: str, home: Path, worktree:
         previous = previous if isinstance(previous, dict) and not previous.get("closure") else None
         occurrence = int(previous.get("occurrences", 0)) + 1 if previous else 1
         spawn = previous is None
-        status = "admitted" if (previous or {}).get("status") == "admitted" else "pending"
+        previous_status = str((previous or {}).get("status", ""))
+        status = previous_status if previous_status in {"admitted", "suppressed_by_lease"} else "pending"
         entry = _v2_entry(previous)
         entry.update({"occurrences": occurrence, "stage": stage, "status": status, "last_seen_at": now.isoformat()})
         entry.setdefault("first_seen_at", now.isoformat())
@@ -658,6 +670,131 @@ def spawn_detached(argv: list[str]) -> None:
     subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_windows_hidden_kwargs(detached=True))
 
 
+def investigation_lease_path(home: Path, job_id: str) -> Path:
+    return Path(home) / INVESTIGATION_LEASE_SUBDIR / f"{job_id}.json"
+
+
+def _release_run_identity(home: Path) -> dict[str, Any] | None:
+    """Return the current release-lock identity without changing the lock."""
+    path = Path(home) / "cron" / "locks" / "hermes-integration-release.lock"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    holder = value.get("holder")
+    pid = value.get("pid")
+    started = parse_timestamp(value.get("started_at"))
+    if not isinstance(holder, str) or not holder or not isinstance(pid, int) or pid <= 0 or started is None:
+        return None
+    return {"holder": holder, "pid": pid, "started_at": started.isoformat()}
+
+
+def _lease_identity(value: Any, field: str) -> str:
+    text = redact(str(value or "")).replace("\r", " ").replace("\n", " ").strip()
+    if not text or len(text) > 200:
+        raise ValueError(f"{field} must be 1..200 characters")
+    return text
+
+
+def _lease_liveness(lease: Any, *, job_id: str, now: datetime) -> dict[str, Any]:
+    if not isinstance(lease, dict) or lease.get("schema") != INVESTIGATION_LEASE_SCHEMA:
+        return {"active": False, "reason": "lease_malformed"}
+    if str(lease.get("job_id", "")) != job_id:
+        return {"active": False, "reason": "lease_job_mismatch"}
+    if lease.get("status") != "active":
+        return {"active": False, "reason": "lease_not_active"}
+    if not all(isinstance(lease.get(key), str) and lease.get(key) for key in ("lease_id", "owner", "session_id")):
+        return {"active": False, "reason": "lease_malformed"}
+    expires = parse_timestamp(lease.get("expires_at"))
+    beat = parse_timestamp(lease.get("heartbeat_at"))
+    if expires is None or beat is None:
+        return {"active": False, "reason": "lease_malformed"}
+    if now >= expires:
+        return {"active": False, "reason": "lease_expired", "expires_at": expires.isoformat()}
+    age = (now - beat).total_seconds()
+    if age < -60 or age >= INVESTIGATION_LEASE_HEARTBEAT_STALE_SECONDS:
+        return {"active": False, "reason": "lease_heartbeat_stale", "heartbeat_at": beat.isoformat()}
+    return {"active": True, "reason": "lease_active", "expires_at": expires.isoformat()}
+
+
+def acquire_investigation_lease(*, home: Path, job_id: str, owner: str, session_id: str,
+                                incident_key: str, ttl_seconds: float = INVESTIGATION_LEASE_DEFAULT_SECONDS,
+                                now: datetime | None = None) -> dict[str, Any]:
+    """Acquire a bounded, attributed lease before manually firing this job.
+
+    The lease is deliberately not an authority token.  It only says that an
+    existing session owns the next failure investigation; the first observed
+    failure atomically binds the lease to that normalized signature.
+    """
+    moment = (now or _utc_now()).astimezone(timezone.utc)
+    ttl = float(ttl_seconds)
+    if ttl <= 0 or ttl > INVESTIGATION_LEASE_MAX_SECONDS:
+        raise ValueError(f"ttl_seconds must be > 0 and <= {INVESTIGATION_LEASE_MAX_SECONDS}")
+    owner_text = _lease_identity(owner, "owner")
+    session_text = _lease_identity(session_id, "session_id")
+    incident_text = _lease_identity(incident_key, "incident_key")
+    path = investigation_lease_path(home, job_id)
+    state_lock = incident_state_path(home, job_id).with_suffix(".lock")
+    with _state_lock(state_lock):
+        existing = read_incident_state(path)
+        existing_liveness = _lease_liveness(existing, job_id=job_id, now=moment)
+        if existing_liveness["active"]:
+            return {"ok": False, "reason": "lease_already_active", "lease": existing, "path": str(path)}
+        lease = {
+            "schema": INVESTIGATION_LEASE_SCHEMA,
+            "status": "active",
+            "lease_id": uuid.uuid4().hex,
+            "job_id": job_id,
+            "owner": owner_text,
+            "session_id": session_text,
+            "incident_key": incident_text,
+            "issued_at": moment.isoformat(),
+            "heartbeat_at": moment.isoformat(),
+            "expires_at": (moment + timedelta(seconds=ttl)).isoformat(),
+            "claimed_signature": None,
+            "claimed_signatures": [],
+            "claimed_stage": None,
+            "claimed_at": None,
+            "claimed_run": None,
+        }
+        _atomic_json(path, lease)
+    return {"ok": True, "reason": "lease_acquired", "lease": lease, "path": str(path)}
+
+
+def heartbeat_investigation_lease(*, home: Path, job_id: str, lease_id: str, session_id: str,
+                                  now: datetime | None = None) -> dict[str, Any]:
+    moment = (now or _utc_now()).astimezone(timezone.utc)
+    path = investigation_lease_path(home, job_id)
+    state_lock = incident_state_path(home, job_id).with_suffix(".lock")
+    with _state_lock(state_lock):
+        lease = read_incident_state(path)
+        live = _lease_liveness(lease, job_id=job_id, now=moment)
+        if not live["active"]:
+            return {"ok": False, "reason": live["reason"], "path": str(path)}
+        if lease.get("lease_id") != lease_id or lease.get("session_id") != session_id:
+            return {"ok": False, "reason": "lease_identity_mismatch", "path": str(path)}
+        lease["heartbeat_at"] = moment.isoformat()
+        _atomic_json(path, lease)
+    return {"ok": True, "reason": "lease_heartbeat", "heartbeat_at": moment.isoformat(), "path": str(path)}
+
+
+def release_investigation_lease(*, home: Path, job_id: str, lease_id: str, session_id: str,
+                                now: datetime | None = None) -> dict[str, Any]:
+    moment = (now or _utc_now()).astimezone(timezone.utc)
+    path = investigation_lease_path(home, job_id)
+    state_lock = incident_state_path(home, job_id).with_suffix(".lock")
+    with _state_lock(state_lock):
+        lease = read_incident_state(path)
+        if lease.get("lease_id") != lease_id or lease.get("session_id") != session_id:
+            return {"ok": False, "reason": "lease_identity_mismatch", "path": str(path)}
+        lease["status"] = "released"
+        lease["released_at"] = moment.isoformat()
+        _atomic_json(path, lease)
+    return {"ok": True, "reason": "lease_released", "path": str(path)}
+
+
 def plan_investigator_launch(*, home: Path, job_id: str, signature: str,
                              artifact_path: Path | None = None,
                              now: datetime | None = None) -> dict[str, Any]:
@@ -740,9 +877,53 @@ def plan_investigator_launch(*, home: Path, job_id: str, signature: str,
         entry = state["open"].get(signature)
         if not isinstance(entry, dict):
             # The failing signature was itself just closed (it WAS the dead
-            # finisher). Re-open it so the replacement has an incident.
+            # finisher). Re-open it so the replacement or active manual lease
+            # has a current incident record.
             entry = _v2_entry({"occurrences": 1, "stage": "", "status": "pending"})
             state["open"][signature] = entry
+
+        # Bind a live lease to the current release-lock identity on its first
+        # failure. It may absorb multiple signatures from that exact run (the
+        # release reports parked items as separate incidents), but never a
+        # later run. Stale automatic finishers were closed above first, so this
+        # cannot preserve stale push/publish authority.
+        lease_path = investigation_lease_path(home, job_id)
+        lease = read_incident_state(lease_path)
+        lease_liveness = _lease_liveness(lease, job_id=job_id, now=moment)
+        if lease_liveness["active"]:
+            current_run = _release_run_identity(home)
+            claimed_run = lease.get("claimed_run")
+            issued = parse_timestamp(lease.get("issued_at"))
+            run_started = parse_timestamp((current_run or {}).get("started_at"))
+            if claimed_run is None and current_run is not None and issued is not None and run_started is not None and run_started >= issued:
+                lease["claimed_run"] = current_run
+                lease["claimed_signature"] = signature
+                lease["claimed_stage"] = str(entry.get("stage", ""))
+                lease["claimed_at"] = moment.isoformat()
+                claimed_run = current_run
+            if claimed_run == current_run and current_run is not None:
+                signatures = lease.setdefault("claimed_signatures", [])
+                if isinstance(signatures, list) and signature not in signatures:
+                    signatures.append(signature)
+                _atomic_json(lease_path, lease)
+                entry["status"] = "suppressed_by_lease"
+                entry["suppression_lease_id"] = lease["lease_id"]
+                _atomic_json(state_path, state)
+                suppression = {
+                    "lease_id": lease["lease_id"], "owner": lease["owner"],
+                    "session_id": lease["session_id"], "incident_key": lease["incident_key"],
+                    "expires_at": lease["expires_at"], "run": current_run,
+                }
+                _record_in_artifact(artifact, {
+                    "investigator_status": "suppressed_by_investigation_lease",
+                    "suppression": suppression,
+                })
+                decision.update({
+                    "action": "suppress", "reason": "active_investigation_lease",
+                    "lease": suppression,
+                })
+                return decision
+
         if expired and authority_window_end(moment, next_scheduled_fire(home, job_id), cap=cap) <= moment:
             # The previous finisher's window ran out and the schedule offers no
             # new one. Replacing a dead window with another dead window would
@@ -1129,10 +1310,54 @@ def _heartbeat_main(argv: list[str]) -> int:
     return 0 if outcome.get("ok") else 1
 
 
+def _lease_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="hermes-release-failure-investigator.py lease")
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+    acquire = subparsers.add_parser("acquire")
+    acquire.add_argument("--job", required=True)
+    acquire.add_argument("--owner", required=True)
+    acquire.add_argument("--session", required=True)
+    acquire.add_argument("--incident", required=True)
+    acquire.add_argument("--ttl-seconds", type=float, default=INVESTIGATION_LEASE_DEFAULT_SECONDS)
+    acquire.add_argument("--home", default=None)
+    for name in ("heartbeat", "release"):
+        child = subparsers.add_parser(name)
+        child.add_argument("--job", required=True)
+        child.add_argument("--lease-id", required=True)
+        child.add_argument("--session", required=True)
+        child.add_argument("--home", default=None)
+    status = subparsers.add_parser("status")
+    status.add_argument("--job", required=True)
+    status.add_argument("--home", default=None)
+    args = parser.parse_args(argv)
+    home = Path(args.home) if args.home else default_home()
+    if args.operation == "acquire":
+        outcome = acquire_investigation_lease(
+            home=home, job_id=args.job, owner=args.owner, session_id=args.session,
+            incident_key=args.incident, ttl_seconds=args.ttl_seconds,
+        )
+    elif args.operation == "heartbeat":
+        outcome = heartbeat_investigation_lease(
+            home=home, job_id=args.job, lease_id=args.lease_id, session_id=args.session,
+        )
+    elif args.operation == "release":
+        outcome = release_investigation_lease(
+            home=home, job_id=args.job, lease_id=args.lease_id, session_id=args.session,
+        )
+    else:
+        lease = read_incident_state(investigation_lease_path(home, args.job))
+        live = _lease_liveness(lease, job_id=args.job, now=_utc_now())
+        outcome = {"ok": live["active"], "reason": live["reason"], "lease": lease}
+    print(json.dumps(outcome, ensure_ascii=False, sort_keys=True))
+    return 0 if outcome.get("ok") else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "heartbeat":
         return _heartbeat_main(arguments[1:])
+    if arguments and arguments[0] == "lease":
+        return _lease_main(arguments[1:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact", required=True)
     parser.add_argument("--authority-token", default=None, dest="authority_token",
