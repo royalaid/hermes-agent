@@ -1046,24 +1046,35 @@ export async function snapshotProcessTreeIdentities(
         `
 $ErrorActionPreference = 'Stop'
 $root = ${Math.trunc(rootPid)}
-$ids = New-Object 'System.Collections.Generic.List[int]'
-function Add-Tree([int]$pidVal) {
-  if ($pidVal -le 0 -or $ids.Contains($pidVal)) { return }
-  $ids.Add($pidVal) | Out-Null
-  Get-CimInstance Win32_Process -Filter ("ParentProcessId = $pidVal") -ErrorAction SilentlyContinue | ForEach-Object {
-    Add-Tree ([int]$_.ProcessId)
+$seen = @{}
+$outputRows = New-Object 'System.Collections.Generic.List[string]'
+function Get-RowCreationUnix($row) {
+  $raw = $row.CreationDate
+  if ($null -eq $raw -or [string]::IsNullOrWhiteSpace([string]$raw)) { throw 'TREE_SNAPSHOT_MISSING_CREATE_TIME' }
+  if ($raw -is [DateTime]) {
+    return [DateTimeOffset]::new(([DateTime]$raw).ToUniversalTime()).ToUnixTimeSeconds()
+  }
+  return [DateTimeOffset]::new(
+    [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$raw).ToUniversalTime()
+  ).ToUnixTimeSeconds()
+}
+function Add-Tree($row, [double]$parentCreated, [bool]$hasParent) {
+  if ($null -eq $row) { return }
+  $pidVal = [int]$row.ProcessId
+  if ($pidVal -le 0 -or $seen.ContainsKey([string]$pidVal)) { return }
+  $created = Get-RowCreationUnix $row
+  # ParentProcessId alone is not generation-safe after PID reuse. Ignore an
+  # older process that merely retains the reused parent PID.
+  if ($hasParent -and (($created + 1.5) -lt $parentCreated)) { return }
+  $seen[[string]$pidVal] = $true
+  [void]$outputRows.Add(("{0}|{1}" -f $pidVal, $created))
+  foreach ($child in @(Get-CimInstance Win32_Process -Filter ("ParentProcessId = $pidVal") -ErrorAction Stop)) {
+    Add-Tree $child $created $true
   }
 }
-Add-Tree $root
-$rows = @()
-foreach ($id in $ids) {
-  try {
-    $p = Get-Process -Id $id -ErrorAction Stop
-    $created = [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
-    $rows += ("{0}|{1}" -f $id, $created)
-  } catch {}
-}
-$rows -join ';'
+$rootRow = Get-CimInstance Win32_Process -Filter ("ProcessId = $root") -ErrorAction Stop | Select-Object -First 1
+Add-Tree $rootRow 0.0 $false
+$outputRows -join ';'
 `.trim()
       ],
       { encoding: 'utf8', windowsHide: true, timeout: budget }
@@ -2137,6 +2148,9 @@ public static class HermesForceReleaseNative {
   public const int JobObjectExtendedLimitInformation = 9;
   public const uint WAIT_OBJECT_0 = 0;
   public const uint WAIT_TIMEOUT = 258;
+  public const uint FILE_SHARE_ALL = 0x00000007;
+  public const uint OPEN_EXISTING = 3;
+  public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
   public const int CCH_RM_SESSION_KEY = 32;
   public const int CCH_RM_MAX_APP_NAME = 255;
   public const int CCH_RM_MAX_SVC_NAME = 63;
@@ -2194,6 +2208,10 @@ public static class HermesForceReleaseNative {
   public static extern bool GetProcessTimes(IntPtr process, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
   public static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern IntPtr CreateFile(string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern uint GetFinalPathNameByHandle(IntPtr file, StringBuilder path, uint pathLength, uint flags);
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern bool CloseHandle(IntPtr handle);
   [DllImport("ntdll.dll")]
@@ -2238,6 +2256,28 @@ public static class HermesForceReleaseNative {
     uint size = 32768;
     var buffer = new StringBuilder((int)size);
     return QueryFullProcessImageName(process, 0, buffer, ref size) ? buffer.ToString() : "";
+  }
+  public static string ReadFinalPath(string path) {
+    if (String.IsNullOrWhiteSpace(path)) return "";
+    IntPtr handle = CreateFile(path, 0, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+    if (handle == new IntPtr(-1)) return "";
+    try {
+      var buffer = new StringBuilder(32768);
+      uint length = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, 0);
+      if (length == 0 || length >= buffer.Capacity) return "";
+      string value = buffer.ToString();
+      if (value.StartsWith(@"\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase)) value = @"\\\\" + value.Substring(8);
+      else if (value.StartsWith(@"\\\\?\\", StringComparison.OrdinalIgnoreCase)) value = value.Substring(4);
+      return value.TrimEnd('\\\\');
+    } finally {
+      CloseHandle(handle);
+    }
+  }
+  public static bool IsSameOrUnderRoot(string path, string root) {
+    if (String.IsNullOrWhiteSpace(path) || String.IsNullOrWhiteSpace(root)) return false;
+    string cleanRoot = root.TrimEnd('\\\\');
+    return path.Equals(cleanRoot, StringComparison.OrdinalIgnoreCase) ||
+      path.StartsWith(cleanRoot + "\\\\", StringComparison.OrdinalIgnoreCase);
   }
   public static bool IsCurrentResourceOwner(string resource, int pid, double expectedUnix) {
     if (String.IsNullOrWhiteSpace(resource)) return false;
@@ -2448,22 +2488,29 @@ try {
   $rootHandle = [HermesForceReleaseNative]::OpenAuthenticatedProcess($pidTarget, $expectedUnix, [ref]$rootActual, [ref]$rootOpenError)
   if ($rootHandle -eq [IntPtr]::Zero) {
     if ($rootOpenError -eq 0x10001) { throw ("CREATE_TIME_MISMATCH root=" + $pidTarget) }
-    throw ('TREE_OPEN_FAILED win32=' + $rootOpenError)
+    throw ('HOLDER_OPEN_FAILED win32=' + $rootOpenError)
   }
   if (-not [string]::IsNullOrWhiteSpace($installRootClaim) -or -not [string]::IsNullOrWhiteSpace($resourceClaim)) {
     if ([string]::IsNullOrWhiteSpace($installRootClaim) -or [string]::IsNullOrWhiteSpace($resourceClaim)) {
       throw 'TERMINATION_AUTHORIZATION_CLAIM_INCOMPLETE'
     }
-    $installRootFull = [IO.Path]::GetFullPath($installRootClaim).TrimEnd('\\') + '\\'
-    $resourceFull = [IO.Path]::GetFullPath($resourceClaim)
-    if (-not $resourceFull.StartsWith($installRootFull, [StringComparison]::OrdinalIgnoreCase)) {
+    $installRootFinal = [HermesForceReleaseNative]::ReadFinalPath($installRootClaim)
+    $resourceFinal = [HermesForceReleaseNative]::ReadFinalPath($resourceClaim)
+    if ([string]::IsNullOrWhiteSpace($installRootFinal) -or [string]::IsNullOrWhiteSpace($resourceFinal)) {
+      throw 'TERMINATION_FINAL_PATH_UNAVAILABLE'
+    }
+    if (-not [HermesForceReleaseNative]::IsSameOrUnderRoot($resourceFinal, $installRootFinal)) {
       throw 'TERMINATION_RESOURCE_OUTSIDE_INSTALL_ROOT'
     }
     $imagePath = [HermesForceReleaseNative]::ReadImagePath($rootHandle)
-    if ([string]::IsNullOrWhiteSpace($imagePath) -or -not [IO.Path]::IsPathRooted($imagePath)) {
+    $imageFinal = [HermesForceReleaseNative]::ReadFinalPath($imagePath)
+    if ([string]::IsNullOrWhiteSpace($imageFinal)) {
       throw 'TERMINATION_EXECUTABLE_IDENTITY_UNAVAILABLE'
     }
-    if (-not [HermesForceReleaseNative]::IsCurrentResourceOwner($resourceFull, $pidTarget, $expectedUnix)) {
+    if (-not [HermesForceReleaseNative]::IsSameOrUnderRoot($imageFinal, $installRootFinal)) {
+      throw 'TERMINATION_EXECUTABLE_OUTSIDE_INSTALL_ROOT'
+    }
+    if (-not [HermesForceReleaseNative]::IsCurrentResourceOwner($resourceFinal, $pidTarget, $expectedUnix)) {
       throw 'TERMINATION_CURRENT_LOCK_OWNERSHIP_MISMATCH'
     }
   }
@@ -2483,19 +2530,25 @@ try {
 
   $rows = New-Object 'System.Collections.Generic.List[object]'
   $seen = @{}
-  $queue = New-Object 'System.Collections.Generic.Queue[int]'
+  $queue = New-Object 'System.Collections.Generic.Queue[object]'
   $seen[[string]$pidTarget] = $true
-  [void]$queue.Enqueue($pidTarget)
+  [void]$queue.Enqueue([pscustomobject]@{ pid = $pidTarget; created = $rootRevalidated })
   while ($queue.Count -gt 0) {
-    $parentPid = $queue.Dequeue()
+    $parent = $queue.Dequeue()
+    $parentPid = [int]$parent.pid
+    $parentCreated = [double]$parent.created
     foreach ($child in @(Get-TreeChildren $parentPid)) {
       $childPid = [int]$child.ProcessId
       if ($childPid -le 0 -or $seen.ContainsKey([string]$childPid)) { continue }
-      $seen[[string]$childPid] = $true
       # Use the creation timestamp from the same process-tree row that yielded
       # this PID. Never turn a stale/reused PID into a fresh authenticated
       # generation by probing it again before opening its boundary handle.
       $childExpected = Get-TreeRowCreationUnix $child
+      # Windows can retain a stale ParentProcessId after the original parent PID
+      # exits and is reused. An older process is not a descendant of this exact
+      # authenticated parent generation and must never be opened or assigned.
+      if (($childExpected + 1.5) -lt $parentCreated) { continue }
+      $seen[[string]$childPid] = $true
       $childActual = 0.0
       $childOpenError = 0
       $childHandle = [HermesForceReleaseNative]::OpenAuthenticatedProcess($childPid, $childExpected, [ref]$childActual, [ref]$childOpenError)
@@ -2517,7 +2570,7 @@ try {
         throw ("CREATE_TIME_MISMATCH child=" + $childPid)
       }
       [void]$rows.Add([pscustomobject]@{ pid = $childPid; created = $childRevalidated })
-      [void]$queue.Enqueue($childPid)
+      [void]$queue.Enqueue([pscustomobject]@{ pid = $childPid; created = $childRevalidated })
     }
   }
 
@@ -2540,8 +2593,10 @@ try {
   Write-Output 'TERMINATED'
 } catch {
   $message = [string]$_.Exception.Message
-  $win32 = [regex]::Match($message, 'win32=(\d+)').Groups[1].Value
-  if ($message -match 'Access is denied|AccessDenied|denied' -or $win32 -eq '5') {
+  # Elevation is authorized only when opening the exact authenticated holder
+  # failed with access denied. Generic Job create/assign/terminate failures do
+  # not prove protected holder ownership and must remain ordinary failures.
+  if ($message -match '^HOLDER_OPEN_FAILED win32=5$') {
     Write-Output ('ACCESS_DENIED ' + $message)
     $exitCode = 5
   } elseif ($message -match 'CREATE_TIME_MISMATCH') {
@@ -2584,7 +2639,7 @@ export function parseTerminateScriptOutput(stdout: string, code: number): ForceR
   if (/CREATE_TIME_MISMATCH/i.test(text) || code === 3) {
     return { kind: 'create-time-mismatch' }
   }
-  if (/ACCESS_DENIED/i.test(text) || code === 5) {
+  if (/ACCESS_DENIED/i.test(text)) {
     const marker = text.match(/ACCESS_DENIED(?:\s+([\s\S]*))?/i)
     const detail = marker?.[1]?.trim()
     return detail ? { kind: 'access-denied', win32Error: 5, detail } : { kind: 'access-denied', win32Error: 5 }
@@ -2592,7 +2647,6 @@ export function parseTerminateScriptOutput(stdout: string, code: number): ForceR
   const win32 = text.match(/win32=(\d+)/i)
   if (win32) {
     const err = Number(win32[1])
-    if (err === 5) return { kind: 'access-denied', win32Error: 5, detail: text }
     // Do not treat 6/87 as already-gone: the process was observed live above.
     return { kind: 'failed', detail: text || `win32=${err}`, win32Error: err }
   }

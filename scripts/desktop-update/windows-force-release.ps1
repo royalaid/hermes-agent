@@ -126,7 +126,11 @@ using System.Runtime.InteropServices;
 using System.Text;
 public static class HermesElevatedTerminate {
   public const uint PROCESS_TERMINATE = 0x0001;
+  public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
   public const uint SYNCHRONIZE = 0x00100000;
+  public const uint FILE_SHARE_ALL = 0x00000007;
+  public const uint OPEN_EXISTING = 3;
+  public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
   public const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
   public const uint TOKEN_QUERY = 0x0008;
   public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
@@ -152,6 +156,10 @@ public static class HermesElevatedTerminate {
   [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
   [DllImport("advapi32.dll", SetLastError=true)] public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
   [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetProcessTimes(IntPtr process, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr CreateFile(string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern uint GetFinalPathNameByHandle(IntPtr file, StringBuilder path, uint pathLength, uint flags);
   [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
   [DllImport("kernel32.dll", SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
   [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr hObject);
@@ -173,15 +181,51 @@ public static class HermesElevatedTerminate {
       AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
     } finally { CloseHandle(token); }
   }
-  public static int Terminate(int pid) {
+  public static double ToUnixSeconds(FILETIME time) {
+    long ticks = ((long)time.dwHighDateTime << 32) | time.dwLowDateTime;
+    return (ticks - 116444736000000000L) / 10000000.0;
+  }
+  public static IntPtr OpenAuthenticated(int pid, double expectedUnix, out int error) {
     TryEnableDebugPrivilege();
-    IntPtr h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, false, pid);
-    if (h == IntPtr.Zero) return Marshal.GetLastWin32Error() == 0 ? -1 : Marshal.GetLastWin32Error();
+    error = 0;
+    IntPtr h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, false, pid);
+    if (h == IntPtr.Zero) { error = Marshal.GetLastWin32Error(); return IntPtr.Zero; }
+    FILETIME creation, exit, kernel, user;
+    if (!GetProcessTimes(h, out creation, out exit, out kernel, out user)) {
+      error = Marshal.GetLastWin32Error(); CloseHandle(h); return IntPtr.Zero;
+    }
+    if (Math.Abs(ToUnixSeconds(creation) - expectedUnix) > 1.5) {
+      error = 0x10001; CloseHandle(h); return IntPtr.Zero;
+    }
+    return h;
+  }
+  public static string ReadImagePath(IntPtr process) {
+    uint size = 32768;
+    var buffer = new StringBuilder((int)size);
+    return QueryFullProcessImageName(process, 0, buffer, ref size) ? buffer.ToString() : "";
+  }
+  public static string ReadFinalPath(string path) {
+    if (String.IsNullOrWhiteSpace(path)) return "";
+    IntPtr h = CreateFile(path, 0, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+    if (h == new IntPtr(-1)) return "";
     try {
-      if (!TerminateProcess(h, 1)) return Marshal.GetLastWin32Error() == 0 ? -1 : Marshal.GetLastWin32Error();
-      WaitForSingleObject(h, 2000);
-      return 0;
+      var buffer = new StringBuilder(32768);
+      uint length = GetFinalPathNameByHandle(h, buffer, (uint)buffer.Capacity, 0);
+      if (length == 0 || length >= buffer.Capacity) return "";
+      string value = buffer.ToString();
+      if (value.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) value = @"\\" + value.Substring(8);
+      else if (value.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) value = value.Substring(4);
+      return value.TrimEnd('\\');
     } finally { CloseHandle(h); }
+  }
+  public static bool IsSameOrUnderRoot(string path, string root) {
+    if (String.IsNullOrWhiteSpace(path) || String.IsNullOrWhiteSpace(root)) return false;
+    string cleanRoot = root.TrimEnd('\\');
+    return path.Equals(cleanRoot, StringComparison.OrdinalIgnoreCase) || path.StartsWith(cleanRoot + "\\", StringComparison.OrdinalIgnoreCase);
+  }
+  public static int TerminateHandle(IntPtr h) {
+    if (!TerminateProcess(h, 1)) return Marshal.GetLastWin32Error() == 0 ? -1 : Marshal.GetLastWin32Error();
+    return WaitForSingleObject(h, 2000) == 0 ? 0 : -258;
   }
   public static List<string> QueryRestartManager(string[] files) {
     var rows = new List<string>();
@@ -230,30 +274,41 @@ public static class HermesElevatedTerminate {
     }
   }
 
+  $installRootFinal = [HermesElevatedTerminate]::ReadFinalPath($installRootFull)
+  if ([string]::IsNullOrWhiteSpace($installRootFinal)) { throw 'install root final path unavailable' }
+
   $resourceList = New-Object System.Collections.Generic.List[string]
   foreach ($rel in @('venv\Scripts\hermes.exe', 'venv\Scripts\python.exe', 'venv\python.exe')) {
     $candidate = Join-Path $installRootFull $rel
-    if (Test-Path -LiteralPath $candidate) { $resourceList.Add($candidate) | Out-Null }
-  }
-  foreach ($h in @($request.holders)) {
-    if ($h.PSObject.Properties['resource'] -and $h.resource) {
-      $resPath = [string]$h.resource
-      if ($resPath -and (Test-Path -LiteralPath $resPath)) {
-        if (-not ($resourceList -contains $resPath)) { $resourceList.Add($resPath) | Out-Null }
-      }
-    }
+    if (-not (Test-Path -LiteralPath $candidate)) { continue }
+    $candidateFinal = [HermesElevatedTerminate]::ReadFinalPath($candidate)
+    if (
+      [string]::IsNullOrWhiteSpace($candidateFinal) -or
+      -not [HermesElevatedTerminate]::IsSameOrUnderRoot($candidateFinal, $installRootFinal)
+    ) { throw 'default resource outside install root' }
+    if (-not ($resourceList -contains $candidateFinal)) { $resourceList.Add($candidateFinal) | Out-Null }
   }
 
-  # Authorized claim map from the signed request (pid -> expected create time + metadata).
+  # Authorized claim map from the signed request. Every target must name one
+  # exact resource whose handle-resolved final path remains under installRoot.
   $claims = @{}
   foreach ($h in @($request.holders)) {
     $claimPid = [int]$h.pid
     if ($claimPid -le 0 -or $exclude.Contains($claimPid)) { continue }
+    if (-not $h.PSObject.Properties['resource'] -or [string]::IsNullOrWhiteSpace([string]$h.resource)) {
+      throw 'holder resource claim missing'
+    }
+    $claimResourceFinal = [HermesElevatedTerminate]::ReadFinalPath([string]$h.resource)
+    if (
+      [string]::IsNullOrWhiteSpace($claimResourceFinal) -or
+      -not [HermesElevatedTerminate]::IsSameOrUnderRoot($claimResourceFinal, $installRootFinal)
+    ) { throw 'holder resource outside install root' }
+    if (-not ($resourceList -contains $claimResourceFinal)) { $resourceList.Add($claimResourceFinal) | Out-Null }
     $claims[$claimPid] = [pscustomobject]@{
       pid = $claimPid
       createdAt = [double]$h.createdAt
       name = [string]$h.name
-      resource = if ($h.PSObject.Properties['resource'] -and $h.resource) { [string]$h.resource } else { '' }
+      resource = $claimResourceFinal
     }
   }
 
@@ -314,27 +369,60 @@ public static class HermesElevatedTerminate {
     $holderPid = [int]$target.pid
     $expected = [double]$target.createdAt
     $resource = [string]$target.resource
+    $processHandle = [IntPtr]::Zero
     try {
-      $proc = Get-Process -Id $holderPid -ErrorAction Stop
-      $actual = [DateTimeOffset]::new($proc.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
-      if ([math]::Abs($actual - $expected) -gt 1.5) {
+      $openError = 0
+      $processHandle = [HermesElevatedTerminate]::OpenAuthenticated($holderPid, $expected, [ref]$openError)
+      if ($processHandle -eq [IntPtr]::Zero) {
+        $detail = if ($openError -eq 0x10001) { 'create-time-mismatch' } else { "open-failed win32=$openError" }
+        $survivor = [ordered]@{ pid = $holderPid; detail = $detail; resource = $resource }
+        if ($openError -gt 0 -and $openError -ne 0x10001) { $survivor.win32Error = [int]$openError }
+        $survivors.Add([pscustomobject]$survivor) | Out-Null
+        continue
+      }
+
+      $imagePath = [HermesElevatedTerminate]::ReadImagePath($processHandle)
+      $imageFinal = [HermesElevatedTerminate]::ReadFinalPath($imagePath)
+      if (
+        [string]::IsNullOrWhiteSpace($imageFinal) -or
+        -not [HermesElevatedTerminate]::IsSameOrUnderRoot($imageFinal, $installRootFinal)
+      ) {
         $survivors.Add([pscustomobject]@{
           pid = $holderPid
-          detail = 'create-time-mismatch'
+          detail = 'executable-outside-install-root'
           resource = $resource
         }) | Out-Null
         continue
       }
-      $rc = [HermesElevatedTerminate]::Terminate($holderPid)
-      if ($rc -eq 0) {
-        $terminated.Add($holderPid) | Out-Null
-      } elseif ($rc -eq 5) {
+
+      # Re-enumerate the exact resource after opening/authenticating the process
+      # handle. Termination below uses this same handle, never a PID reopen.
+      $ownsResourceNow = $false
+      foreach ($row in [HermesElevatedTerminate]::QueryRestartManager([string[]]@($resource))) {
+        if (-not $row) { continue }
+        $bits = $row.Split([char]'|', 3)
+        if ($bits.Count -lt 2) { continue }
+        $rmPid = 0
+        $rmCreated = 0.0
+        if (-not [int]::TryParse($bits[0], [ref]$rmPid)) { continue }
+        if (-not [double]::TryParse($bits[1], [ref]$rmCreated)) { continue }
+        if ($rmPid -eq $holderPid -and [math]::Abs($rmCreated - $expected) -le 1.5) {
+          $ownsResourceNow = $true
+          break
+        }
+      }
+      if (-not $ownsResourceNow) {
         $survivors.Add([pscustomobject]@{
           pid = $holderPid
-          detail = 'protected win32=5'
+          detail = 'current-lock-ownership-mismatch'
           resource = $resource
-          win32Error = 5
         }) | Out-Null
+        continue
+      }
+
+      $rc = [HermesElevatedTerminate]::TerminateHandle($processHandle)
+      if ($rc -eq 0) {
+        $terminated.Add($holderPid) | Out-Null
       } else {
         $survivors.Add([pscustomobject]@{
           pid = $holderPid
@@ -344,8 +432,15 @@ public static class HermesElevatedTerminate {
         }) | Out-Null
       }
     } catch {
-      # Already gone counts as success for this PID.
-      $terminated.Add($holderPid) | Out-Null
+      $survivors.Add([pscustomobject]@{
+        pid = $holderPid
+        detail = 'elevated-authorization-failed'
+        resource = $resource
+      }) | Out-Null
+    } finally {
+      if ($processHandle -ne [IntPtr]::Zero) {
+        [HermesElevatedTerminate]::CloseHandle($processHandle) | Out-Null
+      }
     }
   }
 
