@@ -26,6 +26,8 @@ export interface VenvBlockerIdentity {
   name: string
   cmdline: string
   createdAt?: number
+  /** Parent PID when the scanner could prove it for leaf-first drain. */
+  parentPid?: number
 }
 
 // The preview classification is optional so every identity record — including
@@ -256,10 +258,21 @@ function parseIdentityRecord(
   // A generic record may additionally carry the scanner's local-preview UI
   // metadata.  Those hints never relax the hard block the tuple below enforces;
   // they only tell Desktop which single PID it may ask the scanner to stop.
-  const optional = kind === 'process' ? ['created_at', ...LOCAL_PREVIEW_HINT_KEYS] : []
+  const optional = kind === 'process' ? ['created_at', 'parent_pid', ...LOCAL_PREVIEW_HINT_KEYS] : []
 
   if (!hasExactKeys(entry, required, optional)) {return null}
-  const { pid, name, cmdline, owner, role, actionable, actionability, action, created_at: createdAt } = entry
+  const {
+    pid,
+    name,
+    cmdline,
+    owner,
+    role,
+    actionable,
+    actionability,
+    action,
+    created_at: createdAt,
+    parent_pid: parentPid
+  } = entry
 
   if (
     !Number.isInteger(pid) ||
@@ -270,7 +283,8 @@ function parseIdentityRecord(
     typeof cmdline !== 'string' ||
     cmdline.length > 120 ||
     (createdAt !== undefined &&
-      (typeof createdAt !== 'number' || !Number.isFinite(createdAt) || createdAt <= 0))
+      (typeof createdAt !== 'number' || !Number.isFinite(createdAt) || createdAt <= 0)) ||
+    (parentPid !== undefined && (!Number.isInteger(parentPid) || parentPid <= 0))
   ) {
     return null
   }
@@ -297,7 +311,8 @@ function parseIdentityRecord(
   // force-drain can re-prove this exact PID before it stops anything.
   return {
     ...classifyVenvBlocker({ pid, name, cmdline }, entry),
-    ...(createdAt === undefined ? {} : { createdAt })
+    ...(createdAt === undefined ? {} : { createdAt }),
+    ...(parentPid === undefined ? {} : { parentPid })
   }
 }
 

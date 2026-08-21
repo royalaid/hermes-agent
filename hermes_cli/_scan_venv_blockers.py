@@ -712,6 +712,8 @@ def _generic_record(
     }
     if snapshot is not None:
         record["created_at"] = snapshot.created_at
+        if int(snapshot.ppid) > 0:
+            record["parent_pid"] = int(snapshot.ppid)
     # Safe-to-stop local previews (``python -m http.server``) still carry their
     # UI metadata. This is display/affordance data only — the record stays a
     # hard block for the updater; stopping one goes through the separate

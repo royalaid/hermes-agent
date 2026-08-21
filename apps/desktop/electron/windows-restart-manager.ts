@@ -53,7 +53,7 @@ function escapePsSingleQuoted(value: string): string {
  * Prefer String.Split over -split regex so TS template escaping cannot
  * accidentally emit a character-class / alternation pattern.
  */
-export const RESTART_MANAGER_ROW_SPLIT_EXPRESSION = "$part.Split([char]'|', 3)"
+export const RESTART_MANAGER_ROW_SPLIT_EXPRESSION = "$part.Split([char]'|', 4)"
 
 export function buildRestartManagerScript(resources: readonly string[]): string {
   const list = resources.map(escapePsSingleQuoted).join(',')
@@ -89,47 +89,46 @@ public static class HermesRm {
   [DllImport("rstrtmgr.dll")] public static extern int RmEndSession(uint pSessionHandle);
   [DllImport("rstrtmgr.dll", CharSet=CharSet.Unicode)] public static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, IntPtr rgApplications, uint nServices, string[] rgsServiceNames);
   [DllImport("rstrtmgr.dll")] public static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In,Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
-  public static string Query(string[] files) {
+  public static string QueryOne(string file) {
     uint handle;
     StringBuilder key = new StringBuilder(CCH_RM_SESSION_KEY + 1);
     int rc = RmStartSession(out handle, 0, key);
-    if (rc != 0) return "ERR:"+rc;
+    if (rc != 0) return "";
     try {
-      rc = RmRegisterResources(handle, (uint)files.Length, files, 0, IntPtr.Zero, 0, null);
-      if (rc != 0) return "ERR:"+rc;
+      rc = RmRegisterResources(handle, 1, new string[]{ file }, 0, IntPtr.Zero, 0, null);
+      if (rc != 0) return "";
       uint needed = 0, count = 0, reboot = 0;
       rc = RmGetList(handle, out needed, ref count, null, ref reboot);
       if (rc == 234) { // ERROR_MORE_DATA
         count = needed;
         RM_PROCESS_INFO[] arr = new RM_PROCESS_INFO[count];
         rc = RmGetList(handle, out needed, ref count, arr, ref reboot);
-        if (rc != 0) return "ERR:"+rc;
+        if (rc != 0) return "";
         var parts = new System.Collections.Generic.List<string>();
+        string safeFile = (file ?? "").Replace("|","/");
         for (int i=0;i<count;i++) {
           var p = arr[i];
           long fileTime = ((long)p.Process.ProcessStartTime.dwHighDateTime << 32) | (uint)p.Process.ProcessStartTime.dwLowDateTime;
           // FILETIME is 100ns since 1601; convert to unix seconds
           long unix = (fileTime - 116444736000000000L) / 10000000L;
           string name = (p.strAppName ?? "").Replace("|","/");
-          parts.Add(p.Process.dwProcessId.ToString() + "|" + unix.ToString() + "|" + name);
+          parts.Add(p.Process.dwProcessId.ToString() + "|" + unix.ToString() + "|" + name + "|" + safeFile);
         }
         return string.Join(";", parts);
       }
-      if (rc != 0) return "ERR:"+rc;
       return "";
     } finally { RmEndSession(handle); }
   }
 }
 "@
-try {
-  $raw = [HermesRm]::Query([string[]]$resources)
-} catch {
-  Write-Output '[]'
-  exit 0
-}
-if ($raw -like 'ERR:*') { Write-Output '[]'; exit 0 }
 $items = @()
-if ($raw) {
+foreach ($resource in $resources) {
+  try {
+    $raw = [HermesRm]::QueryOne([string]$resource)
+  } catch {
+    continue
+  }
+  if (-not $raw) { continue }
   foreach ($part in ($raw -split ';')) {
     if (-not $part) { continue }
     $bits = ${RESTART_MANAGER_ROW_SPLIT_EXPRESSION}
@@ -139,7 +138,8 @@ if ($raw) {
     if (-not [double]::TryParse($bits[1], [ref]$created)) { continue }
     if ($pidVal -le 0 -or $created -le 0) { continue }
     $name = if ($bits.Count -ge 3) { $bits[2] } else { 'unknown' }
-    $items += [pscustomobject]@{ pid = $pidVal; createdAt = $created; name = $name }
+    $res = if ($bits.Count -ge 4 -and $bits[3]) { $bits[3] } else { [string]$resource }
+    $items += [pscustomobject]@{ pid = $pidVal; createdAt = $created; name = $name; resource = $res }
   }
 }
 $items | ConvertTo-Json -Compress -Depth 3
@@ -161,13 +161,17 @@ export function parseRestartManagerOutput(
   }
 
   const rows = Array.isArray(parsed) ? parsed : [parsed]
-  const resourceLabel = resources[0]
+  const fallbackResource = resources[0]
   const holders: ForceReleaseHolder[] = []
 
   for (const row of rows) {
     const pid = Number(row?.pid)
     const createdAt = Number(row?.createdAt)
     const name = typeof row?.name === 'string' && row.name ? row.name : 'unknown'
+    const resource =
+      typeof row?.resource === 'string' && row.resource
+        ? row.resource
+        : fallbackResource
     if (!Number.isInteger(pid) || pid <= 0) continue
     if (!Number.isFinite(createdAt) || createdAt <= 0) continue
     holders.push({
@@ -176,7 +180,7 @@ export function parseRestartManagerOutput(
       name,
       cmdline: name,
       source: 'restart-manager',
-      resource: resourceLabel,
+      resource,
       role: 'other'
     })
   }
