@@ -21,6 +21,12 @@ assert SPEC and SPEC.loader
 release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 
+SYNC_SCRIPT = Path(__file__).with_name("sync.py")
+SYNC_SPEC = importlib.util.spec_from_file_location("integration_sync", SYNC_SCRIPT)
+assert SYNC_SPEC and SYNC_SPEC.loader
+sync_boundary = importlib.util.module_from_spec(SYNC_SPEC)
+SYNC_SPEC.loader.exec_module(sync_boundary)
+
 
 @contextmanager
 def chdir(path: Path):
@@ -219,6 +225,135 @@ class IntegrationReleaseRegressionTests(unittest.TestCase):
         with chdir(self.repo), self.assertRaisesRegex(RuntimeError, rf"missing.*{re.escape(published_ref)}"):
             release.synchronize_to_published_head(fixture["local"], fixture["published"])
         self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), fixture["local"])
+
+    def test_sync_exclusion_reclaims_dead_holder_lock(self) -> None:
+        lock_path = self.repo / sync_boundary._DEST_LOCK_FILENAME
+        lock_path.write_text("99999999", encoding="utf-8")
+        original_pid_exists = sync_boundary._pid_exists
+        sync_boundary._pid_exists = lambda _pid: False
+        try:
+            with sync_boundary._dest_directory_exclusion(self.repo):
+                self.assertEqual(lock_path.read_text(encoding="utf-8"), str(os.getpid()))
+        finally:
+            sync_boundary._pid_exists = original_pid_exists
+        self.assertFalse(lock_path.exists())
+
+    def test_sync_exclusion_preserves_live_holder_lock(self) -> None:
+        lock_path = self.repo / sync_boundary._DEST_LOCK_FILENAME
+        lock_path.write_text("1234", encoding="utf-8")
+        original_pid_exists = sync_boundary._pid_exists
+        sync_boundary._pid_exists = lambda _pid: True
+        try:
+            with self.assertRaisesRegex(sync_boundary.SyncError, "already in progress"):
+                with sync_boundary._dest_directory_exclusion(self.repo):
+                    self.fail("a live holder lock must not be entered")
+        finally:
+            sync_boundary._pid_exists = original_pid_exists
+        self.assertEqual(lock_path.read_text(encoding="utf-8"), "1234")
+
+    def test_authorized_investigator_repair_applies_direct_child_after_reconstruction(self) -> None:
+        published = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.command("git", "checkout", "-qb", "incident-repair")
+        repair = self.write_and_commit("repair.txt", "repair\n", "incident repair")
+        self.command("git", "checkout", "-q", self.initial_branch)
+        reconstructed = self.write_and_commit("upstream.txt", "upstream\n", "reconstructed output")
+        grants: list[tuple[str, str, str | None]] = []
+        original_require_authority = release.require_authority
+        release.require_authority = lambda action, *, holder, token_path: grants.append(
+            (action, holder, token_path)
+        ) or {}
+        try:
+            with chdir(self.repo):
+                record = release.apply_investigator_repair(
+                    repair,
+                    published_input_head=published,
+                    holder="investigator-e02251ae",
+                    authority_token="incident-token.json",
+                )
+        finally:
+            release.require_authority = original_require_authority
+
+        self.assertEqual(grants, [("push", "investigator-e02251ae", "incident-token.json")])
+        self.assertEqual(record["source_commit"], repair)
+        self.assertEqual(record["status"], "investigator_repair")
+        self.assertEqual(self.command("git", "show", "HEAD:repair.txt").stdout, "repair\n")
+        self.assertEqual(self.command("git", "show", "HEAD:upstream.txt").stdout, "upstream\n")
+        self.assertEqual(
+            self.command("git", "rev-parse", "HEAD^").stdout.strip(),
+            reconstructed,
+            "the repair must be appended to the reconstructed output",
+        )
+
+    def test_authorized_investigator_repair_uses_proven_conflict_resolver(self) -> None:
+        published = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.command("git", "checkout", "-qb", "incident-repair")
+        repair = self.write_and_commit("repair.txt", "repair\n", "incident repair")
+        self.command("git", "checkout", "-q", self.initial_branch)
+        self.write_and_commit("upstream.txt", "upstream\n", "reconstructed output")
+        resolver_calls: list[tuple[str, str, str]] = []
+        original_require_authority = release.require_authority
+        original_cherry_pick = release._git_write_with_lock_retry
+        original_resolver = release.attempt_in_job_conflict_resolution
+        release.require_authority = lambda *_args, **_kwargs: {}
+        release._git_write_with_lock_retry = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("content conflict")
+        )
+
+        def resolve(commit: str, subject: str, kind: str) -> dict[str, object]:
+            resolver_calls.append((commit, subject, kind))
+            output = self.write_and_commit("repair.txt", "resolved repair\n", "resolved repair")
+            return {
+                "output_commit": output,
+                "output_patch_id": "resolved-patch",
+                "conflicted_files": ["repair.txt"],
+                "resolution_artifact": "resolution.json",
+            }
+
+        release.attempt_in_job_conflict_resolution = resolve
+        try:
+            with chdir(self.repo):
+                record = release.apply_investigator_repair(
+                    repair,
+                    published_input_head=published,
+                    holder="investigator-e02251ae",
+                    authority_token="incident-token.json",
+                )
+        finally:
+            release.require_authority = original_require_authority
+            release._git_write_with_lock_retry = original_cherry_pick
+            release.attempt_in_job_conflict_resolution = original_resolver
+
+        self.assertEqual(resolver_calls, [(repair, "incident repair", "investigator_repair")])
+        self.assertEqual(record["status"], "investigator_repair_resolved")
+        self.assertEqual(record["conflicted_files"], ["repair.txt"])
+        self.assertEqual(self.command("git", "show", "HEAD:repair.txt").stdout, "resolved repair\n")
+
+    def test_investigator_repair_refuses_scheduler_holder_before_mutation(self) -> None:
+        published = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        before = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        with chdir(self.repo), self.assertRaisesRegex(RuntimeError, "authorized investigator"):
+            release.apply_investigator_repair(
+                published,
+                published_input_head=published,
+                holder="scheduler",
+                authority_token=None,
+            )
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), before)
+
+    def test_investigator_repair_refuses_commit_not_based_on_published_input(self) -> None:
+        published = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        unrelated_parent = self.write_and_commit("other.txt", "other\n", "other parent")
+        unrelated_repair = self.write_and_commit("repair.txt", "repair\n", "unrelated repair")
+        before = self.command("git", "rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(unrelated_parent, published)
+        with chdir(self.repo), self.assertRaisesRegex(RuntimeError, "direct child of the published input"):
+            release.apply_investigator_repair(
+                unrelated_repair,
+                published_input_head=published,
+                holder="investigator-e02251ae",
+                authority_token="incident-token.json",
+            )
+        self.assertEqual(self.command("git", "rev-parse", "HEAD").stdout.strip(), before)
 
     def test_abort_after_prior_success_is_clean_but_does_not_reset_entire_series(self) -> None:
         self.command("git", "checkout", "-qb", "series")

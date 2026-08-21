@@ -3185,6 +3185,66 @@ def push_rebased_output(published_input_head: str, rebased_output_head: str) -> 
     )
 
 
+def apply_investigator_repair(
+    repair_commit: str,
+    *,
+    published_input_head: str,
+    holder: str,
+    authority_token: str | None,
+) -> dict[str, str]:
+    """Apply one authorized incident repair after reconstruction.
+
+    The repair must be a single direct child of the immutable published input.
+    This permits a semantic integration correction without allowing an
+    unrelated branch to replace the reconstructed release candidate. The
+    normal build, guarded push, publication, and checksum proof still run.
+    """
+    if holder == "scheduler":
+        raise RuntimeError("--repair-commit is reserved for an authorized investigator holder")
+    resolved = git("rev-parse", "--verify", f"{repair_commit}^{{commit}}", check=False)
+    if not resolved:
+        raise RuntimeError(f"investigator repair does not resolve to a commit: {repair_commit}")
+    parents = _commit_parents(resolved)
+    if parents != [published_input_head]:
+        raise RuntimeError(
+            "investigator repair must be a direct child of the published input: "
+            f"repair={resolved} parents={parents} published_input={published_input_head}"
+        )
+    require_authority("push", holder=holder, token_path=authority_token)
+    resolution: dict[str, Any] | None = None
+    try:
+        _git_write_with_lock_retry("cherry-pick", resolved, timeout=600)
+    except Exception:
+        subject = git("show", "-s", "--format=%s", resolved)
+        resolution = attempt_in_job_conflict_resolution(
+            resolved, subject, kind="investigator_repair"
+        )
+        if resolution is None:
+            raise
+    _ensure_pristine_tree("investigator_repair")
+    output_commit = git("rev-parse", "HEAD")
+    output_patch_id = stable_patch_id(output_commit)
+    status = "investigator_repair_resolved" if resolution is not None else "investigator_repair"
+    log(
+        f"INVESTIGATOR_REPAIR_APPLIED source={resolved} output={output_commit} "
+        f"status={status}"
+    )
+    return {
+        "source_commit": resolved,
+        "output_commit": output_commit,
+        "output_patch_id": output_patch_id,
+        "status": status,
+        **(
+            {
+                "conflicted_files": resolution.get("conflicted_files", []),
+                "resolution_artifact": resolution.get("resolution_artifact"),
+            }
+            if resolution is not None
+            else {}
+        ),
+    }
+
+
 def release_recovery_decision(
     *,
     published_input_head: str,
@@ -3458,6 +3518,13 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--repair-commit", default=None, dest="repair_commit",
+        help=(
+            "authorized incident repair to cherry-pick after reconstruction; must be a direct child of "
+            "the fetched published input and requires a non-scheduler --holder plus --authority-token"
+        ),
+    )
+    parser.add_argument(
         "--canary-manifest", default=None, dest="canary_manifest",
         help=(
             "U11 witnessed-canary entry point: resolve MANIFEST_PATH from this file instead of the "
@@ -3550,6 +3617,16 @@ def main() -> int:
                 git("branch", f"safety/{BRANCH.replace('/', '-')}-{datetime.now():%Y%m%d-%H%M%S}", published_input_head)
                 published_records = replay_published_integration_range(
                     published_input_head, upstream, return_records=True
+                )
+
+            if args.repair_commit:
+                published_records.append(
+                    apply_investigator_repair(
+                        args.repair_commit,
+                        published_input_head=published_input_head,
+                        holder=args.holder,
+                        authority_token=args.authority_token,
+                    )
                 )
 
             rebased_output_head = git("rev-parse", "HEAD")

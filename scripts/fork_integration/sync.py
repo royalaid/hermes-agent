@@ -205,18 +205,26 @@ def _dest_directory_exclusion(dest_dir: Path) -> Iterator[None]:
     phase (U2 Approach: "Exclusion held over the scripts directory during
     the swap").
 
-    Deliberately simple relative to ``release.py``'s ``exclusive_lock()``:
-    no holder-identity/stale-reclaim protocol. A sync or a manifest
-    restamp is short-lived and rare (once per publish, or an occasional
-    manual break-glass/approval action); a contended lock just refuses
-    immediately rather than reclaiming.
+    A live holder always wins. A dead holder is reclaimed once before the
+    atomic ``O_EXCL`` acquisition is retried; otherwise one interrupted
+    short-lived deploy can permanently block every sanctioned sync.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     lock_path = dest_dir / _DEST_LOCK_FILENAME
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        raise SyncError(f"another sync/deploy is already in progress: {lock_path}")
+        try:
+            holder_pid = int(lock_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            holder_pid = None
+        if holder_pid is None or _pid_exists(holder_pid):
+            raise SyncError(f"another sync/deploy is already in progress: {lock_path}")
+        try:
+            lock_path.unlink()
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except (FileNotFoundError, FileExistsError):
+            raise SyncError(f"another sync/deploy is already in progress: {lock_path}")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(str(os.getpid()))
@@ -226,6 +234,28 @@ def _dest_directory_exclusion(dest_dir: Path) -> Iterator[None]:
             lock_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _pid_exists(pid: int) -> bool:
+    """Read-only PID liveness check; never use ``os.kill(pid, 0)`` on Windows."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return kernel32.GetLastError() != 87
+            kernel32.CloseHandle(handle)
+            return True
+        except (OSError, AttributeError):
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def _write_stamp(dest_dir: Path, stamp: dict[str, Any]) -> None:
