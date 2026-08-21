@@ -286,26 +286,9 @@ public static class HermesElevatedTerminate {
     }
   }
 
-  # Also revalidate each signed claim by direct process identity (no broad path scan).
-  foreach ($claimPid in @($claims.Keys)) {
-    if ($exclude.Contains([int]$claimPid)) { continue }
-    if ($live.ContainsKey([int]$claimPid)) { continue }
-    try {
-      $proc = Get-Process -Id ([int]$claimPid) -ErrorAction Stop
-      $created = [DateTimeOffset]::new($proc.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
-      $live[[int]$claimPid] = [pscustomobject]@{
-        pid = [int]$claimPid
-        createdAt = [double]$created
-        name = [string]$proc.ProcessName
-        resource = $claims[[int]$claimPid].resource
-        source = 'claim-revalidate'
-      }
-    } catch {
-      # Gone or inaccessible — skip; clearance proof decides final outcome.
-    }
-  }
-
-  # Eligible targets: currently live holders that still match a signed claim.
+  # Eligible targets: current Restart Manager holders that still match a signed
+  # claim. A live PID/create-time claim alone is not termination authority after
+  # the process releases the install resource.
   # Fail-closed: never terminate unauthenticated/unclaimed installRoot processes.
   $targets = @()
   foreach ($entry in $live.Values) {
