@@ -7,16 +7,16 @@ import path from 'node:path'
 import { test, vi } from 'vitest'
 
 import {
-  observeUpdaterHandoff,
   captureSpawnedUpdaterCreatedAt,
   collectRelaunchArgs,
   formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
   launchWindowsUpdateTransport,
-  resolveWindowsDevRelaunchAppPath,
+  observeUpdaterHandoff,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
+  resolveWindowsDevRelaunchAppPath,
   resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,

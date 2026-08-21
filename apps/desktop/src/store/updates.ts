@@ -9,6 +9,7 @@ import type {
   DesktopUpdateApplyOptions,
   DesktopUpdateApplyResult,
   DesktopUpdateBlocker,
+  DesktopUpdateElevationHolder,
   DesktopUpdateProgress,
   DesktopUpdateStage,
   DesktopUpdateStatus,
@@ -34,7 +35,7 @@ export interface UpdateApplyState {
   /** Structured update blockers used by the safe close-and-update confirmation. */
   blockers?: readonly DesktopUpdateBlocker[] | null
   /** Exact holders requiring the Force update (Administrator) action. */
-  elevationHolders?: readonly import('@/global').DesktopUpdateElevationHolder[] | null
+  elevationHolders?: readonly DesktopUpdateElevationHolder[] | null
   log: readonly { stage: DesktopUpdateStage; message: string; at: number }[]
 }
 

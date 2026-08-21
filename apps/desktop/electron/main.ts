@@ -201,7 +201,6 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
-import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   acquireMcpBridgeQuiesceLease,
   clearMcpBridgeQuiesceLease,
@@ -212,6 +211,7 @@ import {
   revokeMcpBridgeQuiesceLease,
   waitForMcpBridgeQuiesceLeaseAdoption
 } from './mcp-bridge-quiesce'
+import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
   oauthSessionIsLive,
@@ -230,11 +230,6 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
-import {
-  buildWindowsRelaunchCommand,
-  configureWindowsTaskbarDetails,
-  resolveWindowsAppUserModelId
-} from './windows-taskbar-details'
 import {
   createParentStartMarkerResolver,
   electronProcessStartMarker,
@@ -322,6 +317,7 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
+import { resolveDefaultUpdateBranch } from './update-branch'
 import {
   compareApiUrl,
   parseCompareBehindCount,
@@ -329,7 +325,6 @@ import {
   resolveCommitLogSelection,
   shouldCountCommits
 } from './update-count'
-import { resolveDefaultUpdateBranch } from './update-branch'
 import { UpdateInFlightTransaction, waitForLocalBackendClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import {
@@ -341,15 +336,15 @@ import {
 } from './update-preflight'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
-  observeUpdaterHandoff,
   captureSpawnedUpdaterCreatedAt,
   collectRelaunchArgs,
   formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
   launchWindowsUpdateTransport,
-  resolveWindowsDevRelaunchAppPath,
+  observeUpdaterHandoff,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
+  resolveWindowsDevRelaunchAppPath,
   resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
@@ -357,28 +352,13 @@ import {
   terminateSpawnedUpdaterIfExact
 } from './updater-process'
 import {
+  isExactVenvHolder,
   scanVenvBlockers,
   stopSafeVenvBlockers,
   terminateDesktopPluginService,
   terminateVenvHolder,
-  isExactVenvHolder,
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
-import {
-  cleanupForceReleaseArtifacts,
-  formatElevatedForceReleaseFailure,
-  launchElevatedForceReleaseHelper,
-  parseForceReleaseResponse,
-  writeForceReleaseRequestFiles
-} from './windows-elevated-force-release'
-import { listRestartManagerHoldersForResources } from './windows-restart-manager'
-import { terminateWindowsHolderWithinDeadline } from './windows-process-terminate'
-import {
-  attachHolderTreeRelationships,
-  mergeInstallHolders,
-  runWindowsUpdateForceRelease,
-  type ForceReleaseHolder
-} from './windows-update-force-release'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { readWindowBelow } from './window-below'
@@ -394,13 +374,22 @@ import {
 } from './window-state'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 import {
+  cleanupForceReleaseArtifacts,
+  formatElevatedForceReleaseFailure,
+  launchElevatedForceReleaseHelper,
+  parseForceReleaseResponse,
+  writeForceReleaseRequestFiles
+} from './windows-elevated-force-release'
+import {
   buildPathExtCandidates,
   chooseUpdaterArgs,
   getVenvSitePackagesEntries,
   resolveVenvHermesCommand
 } from './windows-hermes-path'
 import { queryWindowsProcessCreatedAt } from './windows-process-identity'
+import { terminateWindowsHolderWithinDeadline } from './windows-process-terminate'
 import { connectWindowsRemote, detectRemotePlatform, helper } from './windows-remote-lifecycle'
+import { listRestartManagerHoldersForResources } from './windows-restart-manager'
 import {
   alreadyHasNoSandbox,
   buildNoSandboxRelaunchArgs,
@@ -416,6 +405,17 @@ import {
   writeSandboxMarker
 } from './windows-sandbox-fallback'
 import { installWindowsSystemCaTrust } from './windows-system-ca'
+import {
+  buildWindowsRelaunchCommand,
+  configureWindowsTaskbarDetails,
+  resolveWindowsAppUserModelId
+} from './windows-taskbar-details'
+import {
+  attachHolderTreeRelationships,
+  type ForceReleaseHolder,
+  mergeInstallHolders,
+  runWindowsUpdateForceRelease
+} from './windows-update-force-release'
 import { readWindowsHostPath, readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
@@ -2231,6 +2231,7 @@ function logHandoffRelaunchExitWatchStatus(status: string) {
   if (status === handoffRelaunchExitWatchStatus) {
     return
   }
+
   handoffRelaunchExitWatchStatus = status
   rememberLog(`[updates] ${status}`)
 }
@@ -2341,6 +2342,7 @@ function startHandoffResultPoll() {
   if (handoffResultPollRunning) {
     return
   }
+
   handoffResultPollRunning = true
 
   // Do not delay ordinary Desktop startup. Poll in the background so a
@@ -3098,6 +3100,7 @@ async function resolveDesktopUpdateBranch(updateRoot) {
   const currentBranch = firstLine(current.stdout)
   const originUrl = await getOriginUrl(updateRoot)
   const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
+
   const published = currentBranch && currentBranch !== 'HEAD'
     ? await runGit(['ls-remote', '--exit-code', '--heads', remote, currentBranch], { cwd: updateRoot })
     : null
@@ -3401,6 +3404,7 @@ function venvHermesShimPath(updateRoot) {
 
 function windowsPowerShellPath() {
   const windowsRoot = process.env.SystemRoot || 'C:\\Windows'
+
   return path.join(windowsRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 }
 
@@ -3445,22 +3449,27 @@ function installLockResources(updateRoot) {
     path.join(updateRoot, 'venv', 'Scripts', 'python.exe'),
     path.join(updateRoot, 'venv', 'python.exe')
   ]
+
   const existing = []
+
   for (const candidate of candidates) {
     try {
-      if (fs.existsSync(candidate)) existing.push(candidate)
+      if (fs.existsSync(candidate)) {existing.push(candidate)}
     } catch {
       void 0
     }
   }
+
   return existing
 }
 
 function isAnyInstallResourceLocked(updateRoot) {
   const resources = installLockResources(updateRoot)
+
   if (resources.length === 0) {
     return isShimLocked(venvHermesShimPath(updateRoot))
   }
+
   return resources.some(resource => isFileLocked(resource))
 }
 
@@ -3816,7 +3825,7 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
   const holders: ForceReleaseHolder[] = []
 
   for (const process of result.processes) {
-      if (!isExactVenvHolder(process)) continue
+      if (!isExactVenvHolder(process)) {continue}
       holders.push({
         pid: process.pid,
         createdAt: process.createdAt,
@@ -3831,7 +3840,7 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
     }
 
   for (const bridge of result.mcpBridges) {
-    if (!isExactVenvHolder(bridge)) continue
+    if (!isExactVenvHolder(bridge)) {continue}
     holders.push({
       pid: bridge.pid,
       createdAt: bridge.createdAt,
@@ -3844,7 +3853,7 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
   }
 
   for (const service of result.desktopPluginServices) {
-    if (!isExactVenvHolder(service)) continue
+    if (!isExactVenvHolder(service)) {continue}
     holders.push({
       pid: service.pid,
       createdAt: service.createdAt,
@@ -3862,6 +3871,7 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
 function forceReleaseHoldersFromScan(updateRoot: string, result: VenvBlockerScanResult): ForceReleaseHolder[] {
   const resources = installLockResources(updateRoot)
   const defaultResource = resources[0] ?? venvHermesShimPath(updateRoot)
+
   return scanResultToForceReleaseHolders(result).map(holder => ({
     ...holder,
     resource: holder.resource ?? defaultResource
@@ -3880,13 +3890,17 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
     listScannerHolders: async (_budgetMs) => {
       // Orchestrator races this call against the remaining <=5s budget.
       const outcome = await scanVenvBlockers(updateRoot)
-      if (outcome.kind !== 'blocked') return []
+
+      if (outcome.kind !== 'blocked') {return []}
+
       return forceReleaseHoldersFromScan(updateRoot, outcome.result)
     },
     listRestartManagerHolders: async (budgetMs) => {
       const rmResources = resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
       const timeoutMs = Math.max(0, Math.min(3_500, Math.trunc(budgetMs)))
-      if (timeoutMs <= 0) return []
+
+      if (timeoutMs <= 0) {return []}
+
       return listRestartManagerHoldersForResources(rmResources, { timeoutMs })
     },
     terminateHolder: (holder, budgetMs, signal, deadlineAt) =>
@@ -3912,11 +3926,14 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
   const resources = installLockResources(updateRoot)
   const excludePids = [process.pid].filter(pid => Number.isInteger(pid) && pid > 0)
   const scanOutcome = await scanVenvBlockers(updateRoot)
+
   const scannerHolders =
     scanOutcome.kind === 'blocked' ? forceReleaseHoldersFromScan(updateRoot, scanOutcome.result) : []
+
   const rmHolders = await listRestartManagerHoldersForResources(
     resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
   )
+
   const holders = mergeInstallHolders([...scannerHolders, ...rmHolders], new Set(excludePids)).filter(
     holder => Number.isInteger(holder.pid) && holder.pid > 0
   )
@@ -3936,6 +3953,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     'desktop-update',
     'windows-force-release.ps1'
   )
+
   if (!fs.existsSync(helperScriptPath)) {
     return {
       ok: false,
@@ -3945,6 +3963,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
   }
 
   let written: Awaited<ReturnType<typeof writeForceReleaseRequestFiles>> | null = null
+
   try {
     written = await writeForceReleaseRequestFiles({
       installRoot: updateRoot,
@@ -3957,6 +3976,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
       requestPath: written.requestPath,
       responsePath: written.responsePath
     })
+
     if (launch.responseTempPath) {
       written.responseTempPath = launch.responseTempPath
     }
@@ -3979,6 +3999,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     }
 
     let responseRaw = ''
+
     try {
       responseRaw = fs.readFileSync(written.responsePath, 'utf8')
     } catch {
@@ -3990,8 +4011,10 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     }
 
     const response = parseForceReleaseResponse(responseRaw, written.request.nonce)
+
     if (!response || !response.ok || !response.cleared) {
       const failure = formatElevatedForceReleaseFailure(response)
+
       return {
         ok: false,
         error: 'venv-unlock-failed',
@@ -4004,6 +4027,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
       const survivorDetail = (response.survivors ?? [])
         .map(entry => `PID ${entry.pid}${entry.resource ? ` resource=${entry.resource}` : ''} ${entry.detail || 'locked'}`.trim())
         .join('; ')
+
       return {
         ok: false,
         error: 'venv-unlock-failed',
@@ -4018,6 +4042,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     return { ok: true, message: 'cleared' }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
+
     return {
       ok: false,
       error: 'venv-unlock-failed',
@@ -4222,10 +4247,12 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     // same helper; neither path may spawn an updater on an unknown state.
     if (IS_WINDOWS && opts.forceUpdateElevated) {
       const elevated = await runElevatedForceReleaseForUpdate(updateRoot)
+
       if (!elevated.ok) {
         rememberLog(`[updates] elevated force-release failed: ${elevated.error}`)
         emitUpdateProgress({ stage: 'error', message: elevated.message, percent: null })
         startHermes().catch(() => {})
+
         return {
           ok: false,
           error: elevated.error,
@@ -4233,6 +4260,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
           ...(elevated.elevationHolders ? { elevationHolders: elevated.elevationHolders } : {})
         }
       }
+
       rememberLog('[updates] elevated force-release cleared install holders')
     }
 
@@ -4288,7 +4316,8 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     }
 
     const mutationPermit = authorizeUpdateMutation(preflight)
-    if (!mutationPermit) throw new Error('clear update preflight did not mint a mutation permit')
+
+    if (!mutationPermit) {throw new Error('clear update preflight did not mint a mutation permit')}
     bridgeLease = mutationPermit.preflight.lease
 
     // Detached so the updater outlives this process — it needs us GONE before
@@ -4487,6 +4516,7 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
   }
 
   const updateRoot = resolveUpdateRoot()
+
   const branch = directoryExists(path.join(updateRoot, '.git'))
     ? await resolveDesktopUpdateBranch(updateRoot)
     : readDesktopUpdateConfig().branch || DEFAULT_UPDATE_BRANCH
@@ -4509,6 +4539,7 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
     },
     branch
   )
+
   const preflight = await runWindowsHandoffPreflight(updateRoot, 'bootstrap-recovery')
 
   if (preflight.kind !== 'clear') {
@@ -4520,7 +4551,8 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
   }
 
   const mutationPermit = authorizeUpdateMutation(preflight)
-  if (!mutationPermit) throw new Error('clear recovery preflight did not mint a mutation permit')
+
+  if (!mutationPermit) {throw new Error('clear recovery preflight did not mint a mutation permit')}
   let bridgeLease = mutationPermit.preflight.lease
   let bridgeLeaseHandedOff = false
 
@@ -15509,6 +15541,7 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
 
 ipcMain.handle('hermes:updates:branch:get', async () => {
   const updateRoot = resolveUpdateRoot()
+
   const branch = directoryExists(path.join(updateRoot, '.git'))
     ? await resolveDesktopUpdateBranch(updateRoot)
     : readDesktopUpdateConfig().branch || DEFAULT_UPDATE_BRANCH
