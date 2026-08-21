@@ -394,6 +394,57 @@ public static class HermesElevatedBoundaryJob {
   }
 }`.trim()
 
+/** SHA-256 of UTF-8 helper text after CRLF/CR normalization to LF. */
+export const ELEVATED_FORCE_RELEASE_HELPER_SHA256 =
+  '182d4d0ebdd5ec6dac0f74f7719cff3ecd1001db32530a74f3a14f6a28cee26c'
+
+/**
+ * Trusted elevated source carried inside the compiled Desktop bundle. Dynamic
+ * values replace base64-only placeholders in the non-elevated launcher, then
+ * the whole command is passed via -EncodedCommand. Before joining the Job this
+ * performs memory-only Reflection.Emit P/Invoke construction: no files,
+ * processes, or external state are created. Helper bytes are hash-checked and
+ * converted to a ScriptBlock only after Job assignment.
+ */
+export const ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE = String.raw`
+$ErrorActionPreference = 'Stop'
+function Decode-HermesData([string]$Value) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value)) }
+$jobName = Decode-HermesData '__JOB__'
+$assemblyName = New-Object Reflection.AssemblyName('HermesElevatedBoundary')
+$assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+$module = $assembly.DefineDynamicModule('HermesElevatedBoundary')
+$builder = $module.DefineType('HermesElevatedBoundaryNative', [Reflection.TypeAttributes]'Public,Sealed,Abstract')
+$attributes = [Reflection.MethodAttributes]'Public,Static,PinvokeImpl'
+$calling = [Reflection.CallingConventions]::Standard
+$nativeCalling = [Runtime.InteropServices.CallingConvention]::Winapi
+$open = $builder.DefinePInvokeMethod('OpenJobObjectW','kernel32.dll','OpenJobObjectW',$attributes,$calling,[IntPtr],[Type[]]@([uint32],[bool],[string]),$nativeCalling,[Runtime.InteropServices.CharSet]::Unicode)
+$assign = $builder.DefinePInvokeMethod('AssignProcessToJobObject','kernel32.dll','AssignProcessToJobObject',$attributes,$calling,[bool],[Type[]]@([IntPtr],[IntPtr]),$nativeCalling,[Runtime.InteropServices.CharSet]::Auto)
+$current = $builder.DefinePInvokeMethod('GetCurrentProcess','kernel32.dll','GetCurrentProcess',$attributes,$calling,[IntPtr],[Type[]]@(),$nativeCalling,[Runtime.InteropServices.CharSet]::Auto)
+$close = $builder.DefinePInvokeMethod('CloseHandle','kernel32.dll','CloseHandle',$attributes,$calling,[bool],[Type[]]@([IntPtr]),$nativeCalling,[Runtime.InteropServices.CharSet]::Auto)
+foreach ($method in @($open,$assign,$current,$close)) { $method.SetImplementationFlags($method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig) }
+$native = $builder.CreateType()
+$job = $native::OpenJobObjectW(0x001F001F, $false, $jobName)
+if ($job -eq [IntPtr]::Zero) { exit 5 }
+try {
+  if (-not $native::AssignProcessToJobObject($job, $native::GetCurrentProcess())) { exit 5 }
+} finally {
+  $native::CloseHandle($job) | Out-Null
+}
+`.trim()
+
+export const ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE = String.raw`${ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE}
+$helper = Decode-HermesData '__HELPER__'
+$request = Decode-HermesData '__REQUEST__'
+$response = Decode-HermesData '__RESPONSE__'
+$helperText = [IO.File]::ReadAllText($helper, [Text.Encoding]::UTF8).Replace(([string][char]13 + [char]10), [string][char]10).Replace([string][char]13, [string][char]10)
+$helperBytes = [Text.UTF8Encoding]::new($false).GetBytes($helperText)
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $actualHash = ([BitConverter]::ToString($sha.ComputeHash($helperBytes))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+if ($actualHash -ne '${ELEVATED_FORCE_RELEASE_HELPER_SHA256}') { exit 13 }
+$verifiedHelper = [ScriptBlock]::Create($helperText)
+& $verifiedHelper -RequestPath $request -ResponsePath $response
+exit $LASTEXITCODE
+`.trim()
 
 /**
  * Windows PowerShell's Start-Process joins -ArgumentList elements into one
@@ -421,8 +472,8 @@ export const WINDOWS_ARGUMENT_QUOTER_FUNCTION = [
 export const ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER = WINDOWS_ARGUMENT_QUOTER_FUNCTION
 
 /**
- * Constant outer launcher. Paths are read from env and passed as ArgumentList
- * array elements (data), never interpolated into PowerShell source.
+ * Constant outer launcher. Dynamic values become base64-only tokens in the
+ * trusted bootstrap template, then cross ShellExecute via -EncodedCommand.
  */
 export const ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND = [
   "$ErrorActionPreference = 'Stop'",
@@ -432,13 +483,16 @@ export const ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND = [
   `$request = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request}')`,
   `$response = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response}')`,
   "if ([string]::IsNullOrWhiteSpace($bootstrap) -or [string]::IsNullOrWhiteSpace($helper) -or [string]::IsNullOrWhiteSpace($request) -or [string]::IsNullOrWhiteSpace($response)) { throw 'missing force-release launch env' }",
-  "$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+  `$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'`,
   WINDOWS_ARGUMENT_QUOTER_FUNCTION,
+  'function ConvertTo-HermesData([string]$Value) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Value)) }',
   `$jobName = 'Local\\HermesForceRelease-' + [guid]::NewGuid().ToString('N')`,
+  "$bootstrapSource = $bootstrap.Replace('__JOB__',(ConvertTo-HermesData $jobName)).Replace('__HELPER__',(ConvertTo-HermesData $helper)).Replace('__REQUEST__',(ConvertTo-HermesData $request)).Replace('__RESPONSE__',(ConvertTo-HermesData $response))",
+  '$encodedBootstrap = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrapSource))',
   '$job = [HermesElevatedBoundaryJob]::CreateKillOnClose($jobName)',
   "if ($job -eq [IntPtr]::Zero) { throw 'elevated boundary job create failed' }",
   'try {',
-  "  $argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(ConvertTo-WindowsArgument $bootstrap),'-JobName',(ConvertTo-WindowsArgument $jobName),'-HelperPath',(ConvertTo-WindowsArgument $helper),'-RequestPath',(ConvertTo-WindowsArgument $request),'-ResponsePath',(ConvertTo-WindowsArgument $response))",
+  "  $argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',(ConvertTo-WindowsArgument $encodedBootstrap))",
   '  $p = Start-Process -FilePath $ps -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList $argList',
   '  if ($null -eq $p) { exit 1223 }',
   '  Write-Output ("HERMES_ELEVATED_PID=" + $p.Id)',
@@ -456,13 +510,11 @@ export type ElevatedForceReleaseRun = (
 ) => Promise<{ code: number; stdout?: string }>
 
 /**
- * Launch the elevated helper via ShellExecuteEx runas. The helper path must be
- * a repo-owned script. Dynamic paths travel only via environment variables into
- * a constant launcher; they never become PowerShell source.
+ * Launch via ShellExecuteEx runas. The helper text is bound to the trusted
+ * digest and executed from the verified bytes only after Job assignment.
  */
 export async function launchElevatedForceReleaseHelper(input: {
   helperScriptPath: string
-  bootstrapScriptPath?: string
   requestPath: string
   responsePath: string
   platform?: NodeJS.Platform
@@ -504,14 +556,12 @@ export async function launchElevatedForceReleaseHelper(input: {
       }))
 
   const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  const bootstrapScriptPath =
-    input.bootstrapScriptPath ?? path.join(path.dirname(input.helperScriptPath), 'windows-force-release-bootstrap.ps1')
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
     [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request]: input.requestPath,
     [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath,
-    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap]: bootstrapScriptPath
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap]: ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE
   }
 
   const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND]
@@ -526,9 +576,14 @@ export async function launchElevatedForceReleaseHelper(input: {
     if (!Number.isInteger(helperPid) || helperPid <= 0 || !Number.isFinite(helperCreatedAt) || helperCreatedAt <= 0) {
       return { kind: 'failed', detail: 'elevated helper identity missing', responseTempPath }
     }
-    const confirmIdentityAbsent =
-      input.confirmIdentityAbsent ??
-      (async identity => (await identitiesStillPresent([identity])).length === 0)
+    const confirmIdentityAbsent = input.confirmIdentityAbsent ?? (async identity => {
+      const expiresAt = Date.now() + 5_000
+      do {
+        if ((await identitiesStillPresent([identity])).length === 0) return true
+        await new Promise(resolve => setTimeout(resolve, 25))
+      } while (Date.now() < expiresAt)
+      return false
+    })
     if (!(await confirmIdentityAbsent({ pid: helperPid, createdAt: helperCreatedAt }))) {
       return { kind: 'failed', detail: 'elevated helper survived terminal boundary', responseTempPath }
     }
@@ -542,12 +597,9 @@ export async function launchElevatedForceReleaseHelper(input: {
 /** Pure helper for tests: capture argv + env without launching. */
 export function buildElevatedForceReleaseLaunchInvocation(input: {
   helperScriptPath: string
-  bootstrapScriptPath?: string
   requestPath: string
   responsePath: string
 }): { args: string[]; env: Record<string, string>; command: string } {
-  const bootstrapScriptPath =
-    input.bootstrapScriptPath ?? path.join(path.dirname(input.helperScriptPath), 'windows-force-release-bootstrap.ps1')
   return {
     command: ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND,
     args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND],
@@ -555,7 +607,7 @@ export function buildElevatedForceReleaseLaunchInvocation(input: {
       [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
       [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request]: input.requestPath,
       [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath,
-      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap]: bootstrapScriptPath
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap]: ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE
     }
   }
 }
