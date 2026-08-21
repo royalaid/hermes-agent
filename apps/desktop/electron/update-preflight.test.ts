@@ -125,6 +125,7 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
       const isMcpBridge =
         'role' in current &&
         (current.role === 'mcp_bridge_worker' || current.role === 'mcp_bridge_wrapper')
+
       calls.push(`${isMcpBridge ? 'terminate' : 'terminate-holder'}:${current.pid}:${current.createdAt}`)
 
       return true
@@ -160,10 +161,12 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     const { calls, deps } = makeDeps([clear(), clear(), clear()], {
       releaseTrackedBackendTrees: async () => {
         calls.push('release')
+
         return { unlocked: false }
       },
       forceReleaseInstallHolders: async () => {
         calls.push('force-release')
+
         return { kind: 'clear' }
       }
     })
@@ -199,6 +202,7 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
 
     const outcome = await runWindowsUpdatePreflight(purpose, deps)
     assert.equal(outcome.kind, 'blocked')
+
     if (outcome.kind === 'blocked') {
       assert.equal(outcome.reason, 'needs-elevation')
       assert.equal(outcome.elevationHolders?.[0]?.pid, 901)
@@ -214,13 +218,16 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
       source: 'scanner' as const,
       resource: 'C:\\Hermes\\venv\\Scripts\\hermes.exe'
     }
+
     const { calls, deps } = makeDeps([], {
       releaseTrackedBackendTrees: async () => {
         calls.push('release')
+
         return { unlocked: false }
       },
       forceReleaseInstallHolders: async () => {
         calls.push('force-release')
+
         return {
           kind: 'timeout',
           holders: [survivor],
@@ -253,11 +260,13 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
 
   it('mints a permit only after the clear production preflight and runs both handoff mutations', async () => {
     const { deps } = makeDeps([clear(), clear(), clear()])
+
     const outcome = await runWindowsUpdatePreflight(purpose, deps, {
       cooperativeExitMs: 0,
       respawnIntervalMs: 0,
       terminationSettleMs: 0
     })
+
     assert.equal(outcome.kind, 'clear')
     assert.equal(outcome.lease, lease, 'clear preflight preserves the exact capability-bearing lease identity')
     const permit = authorizeUpdateMutation(outcome)
@@ -331,10 +340,12 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
       cmdline: 'python.exe user-script.py',
       createdAt: 456.5
     }
+
     const blocked: ScanOutcome = {
       kind: 'blocked',
       result: result({ blocked: true, processes: [holder] })
     }
+
     const { calls, deps } = makeDeps([blocked, blocked, clear(), clear()])
 
     const outcome = await runWindowsUpdatePreflight(purpose, deps, {
@@ -452,16 +463,19 @@ describe('MCP bridge drain', () => {
 
   it('drains an exact Desktop plugin worker before its wrapper after explicit consent', async () => {
     const wrapper = desktopPluginService()
+
     const worker = desktopPluginService({
       pid: 302,
       createdAt: 334.5,
       role: 'desktop_plugin_worker',
       wrapperPid: wrapper.pid
     })
+
     const stillRunning: ScanOutcome = {
       kind: 'blocked',
       result: result({ blocked: true, desktopPluginServices: [wrapper, worker] })
     }
+
     const { calls, deps } = makeDeps([stillRunning, stillRunning, clear(), clear()])
 
     const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
@@ -681,6 +695,7 @@ describe('MCP bridge drain', () => {
       kind: 'blocked',
       result: result({ blocked: true, processes: [transient] })
     }
+
     const { calls, deps } = makeDeps([blockedByBridges(), mixed, genericOnly, clear(), clear()])
 
     const outcome = await runWindowsUpdatePreflight('normal-update', deps, {

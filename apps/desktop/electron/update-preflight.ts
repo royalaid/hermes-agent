@@ -57,8 +57,10 @@ const updateMutationPermits = new WeakSet<object>()
 
 export function authorizeUpdateMutation(preflight: UpdatePreflightOutcome): UpdateMutationPermit | null {
   const permit = successfulPreflightPermits.get(preflight) ?? null
-  if (!permit) return null
+
+  if (!permit) {return null}
   successfulPreflightPermits.delete(preflight)
+
   return permit
 }
 
@@ -66,6 +68,7 @@ export function runAuthorizedUpdateMutation<T>(permit: UpdateMutationPermit, ope
   if (!updateMutationPermits.has(permit)) {
     throw new Error('update mutation requires a clear-preflight permit')
   }
+
   return operation()
 }
 
@@ -136,6 +139,7 @@ export async function runWindowsUpdatePreflight(
   if (lock?.unlocked !== true) {
     if (typeof deps.forceReleaseInstallHolders === 'function') {
       let forceOutcome: WindowsUpdateForceReleaseOutcome
+
       try {
         forceOutcome = await deps.forceReleaseInstallHolders()
       } catch (error) {
@@ -267,15 +271,19 @@ export async function runWindowsUpdatePreflight(
       const forceableMcpAndDesktopServices =
         firstClear.result.mcpBridges.every(bridge => isExactVenvHolder(bridge)) &&
         firstClear.result.desktopPluginServices.every(service => isExactVenvHolder(service))
+
       const naturallyExitingGenericHolders =
         firstClear.result.processes.length > 0 &&
         firstClear.result.processes.every(holder => !isExactVenvHolder(holder))
+
       const exactCurrentHolders =
         exactDrainableOnly(firstClear.result) ||
         (forceableMcpAndDesktopServices && naturallyExitingGenericHolders)
+
       const logicalDrainGroups =
         logicalDrainGroupCount(firstClear.result.mcpBridges) +
         logicalDrainGroupCount(firstClear.result.desktopPluginServices)
+
       const drainRecordCount =
         firstClear.result.processes.length +
         firstClear.result.mcpBridges.length +
@@ -336,6 +344,7 @@ export async function runWindowsUpdatePreflight(
         if (!isExactVenvHolder(holder)) {
           continue
         }
+
         try {
           await deps.terminateVenvHolder(holder)
         } catch {
@@ -422,9 +431,11 @@ export async function runWindowsUpdatePreflight(
       // the public fields while silently destroying handoff authority.
       lease
     })
+
     const permit: UpdateMutationPermit = Object.freeze({ preflight: outcome })
     successfulPreflightPermits.set(outcome, permit)
     updateMutationPermits.add(permit)
+
     return outcome
   } catch (error) {
     const detail = `preflight transaction failed: ${errorText(error)}`

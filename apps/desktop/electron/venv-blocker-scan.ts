@@ -261,6 +261,7 @@ function parseIdentityRecord(
   const optional = kind === 'process' ? ['created_at', 'parent_pid', ...LOCAL_PREVIEW_HINT_KEYS] : []
 
   if (!hasExactKeys(entry, required, optional)) {return null}
+
   const {
     pid,
     name,
@@ -793,23 +794,29 @@ async function terminateScannedHolder(
 ): Promise<boolean> {
   const execFn = execOverride || execFileAsync
   const resolveFn = resolveOverride || resolveVenvPython
+
   const canonicalizeFn =
     canonicalizeOverride ?? ((target: string) => fs.realpathSync.native(target))
 
   let scanRoot: string
+
   try {
     scanRoot = canonicalizeFn(updateRoot)
   } catch {
     return false
   }
+
   const venvPython = resolveFn(scanRoot)
+
   if (!venvPython) {return false}
   let scanVenv: string
+
   try {
     scanVenv = canonicalizeFn(path.dirname(path.dirname(venvPython)))
   } catch {
     return false
   }
+
   const env = { ...process.env }
   delete env.PYTHONPATH
 
@@ -828,6 +835,7 @@ async function terminateScannedHolder(
       ],
       { cwd: scanRoot, encoding: 'utf-8', timeout: SCAN_TIMEOUT_MS, windowsHide: true, env } as any
     )
+
     return parseTerminateOutput(
       String((proc as any).stdout ?? ''),
       { expectedRoot: scanRoot, expectedVenv: scanVenv },

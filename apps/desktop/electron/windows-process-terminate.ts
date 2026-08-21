@@ -17,7 +17,7 @@
  * KILL_ON_JOB_CLOSE terminal is applied). No late mutation after return.
  */
 
-import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -42,6 +42,7 @@ export type HardBoundaryDependencies = {
 }
 
 const WRAPPER_MARKER_POLL_MS = 10
+
 const WRAPPER_PHASE_NAMES = [
   'marker-published',
   'target-job-created',
@@ -79,7 +80,9 @@ export const TERMINATE_KILL_CONFIRM_RATIO = 0.3
 
 export function terminateKillReserveMs(budgetMs: number): number {
   const budget = Math.max(0, Math.trunc(budgetMs))
-  if (budget <= 0) return 0
+
+  if (budget <= 0) {return 0}
+
   return Math.min(
     budget,
     TERMINATE_KILL_CONFIRM_MS,
@@ -89,6 +92,7 @@ export function terminateKillReserveMs(budgetMs: number): number {
 
 function powershellExecutable(): string {
   const windowsRoot = process.env.SystemRoot || 'C:\\Windows'
+
   return path.join(windowsRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 }
 
@@ -686,10 +690,13 @@ export type ProcessIdentity = { pid: number; createdAt?: number }
 
 export function parseWrapperProcessMarker(value: string, expectedNonce: string): ProcessIdentity | null {
   const match = /^PID:(\d+);CREATED_AT_MS:(\d+);NONCE:([A-Za-z0-9_-]+)$/.exec(String(value ?? '').trim())
-  if (!match || match[3] !== expectedNonce) return null
+
+  if (!match || match[3] !== expectedNonce) {return null}
   const pid = Number(match[1])
   const createdAtMs = Number(match[2])
-  if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(createdAtMs) || createdAtMs <= 0) return null
+
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(createdAtMs) || createdAtMs <= 0) {return null}
+
   return { pid, createdAt: createdAtMs / 1_000 }
 }
 
@@ -702,15 +709,19 @@ async function waitForWrapperProcessMarker(
     try {
       if (fs.existsSync(markerPath)) {
         const identity = parseWrapperProcessMarker(fs.readFileSync(markerPath, 'utf8'), markerNonce)
-        if (identity && identity.createdAt != null) return identity
+
+        if (identity && identity.createdAt != null) {return identity}
       }
     } catch {
       // A partial or stale marker is not an authenticated wrapper identity.
     }
+
     const remaining = Math.max(0, deadlineAt - Date.now())
-    if (remaining <= 0) break
+
+    if (remaining <= 0) {break}
     await new Promise(resolve => setTimeout(resolve, Math.min(WRAPPER_MARKER_POLL_MS, remaining)))
   }
+
   return null
 }
 
@@ -718,14 +729,17 @@ function readWrapperPhaseDiagnostics(phasePath: string, phaseNonce: string): str
   const summary = WRAPPER_PHASE_NAMES.map(phase => {
     const markerPath = `${phasePath}.${phase}.marker`
     const expectedPrefix = `PHASE:${phaseNonce};NAME:${phase};TICKS:`
+
     try {
-      if (!fs.existsSync(markerPath)) return `${phase}=missing`
+      if (!fs.existsSync(markerPath)) {return `${phase}=missing`}
       const value = fs.readFileSync(markerPath, 'utf8').trim().replace(/[\r\n]+/g, ' ')
+
       return value.startsWith(expectedPrefix) ? `${phase}=${value.slice(0, 512)}` : `${phase}=invalid`
     } catch {
       return `${phase}=unreadable`
     }
   })
+
   return `wrapper-phases ${summary.join(' ')}`.slice(0, 4_096)
 }
 
@@ -734,12 +748,15 @@ function hasSuccessfulWrapperReceipt(phasePath: string, phaseNonce: string): boo
     try {
       const value = fs.readFileSync(`${phasePath}.${phase}.marker`, 'utf8').trim()
       const expectedPrefix = `PHASE:${phaseNonce};NAME:${phase};TICKS:`
+
       return value.startsWith(expectedPrefix) ? value : undefined
     } catch {
       return undefined
     }
   }
+
   const innerExited = readPhase('inner-exited')
+
   return Boolean(
     innerExited?.endsWith(';DETAIL:code=0') &&
       readPhase('target-terminated') &&
@@ -751,17 +768,20 @@ function hasTargetBoundaryReceipt(phasePath: string, phaseNonce: string): boolea
   const hasPhase = (phase: 'target-terminated' | 'handles-closed'): boolean => {
     try {
       const value = fs.readFileSync(`${phasePath}.${phase}.marker`, 'utf8').trim()
+
       return value.startsWith(`PHASE:${phaseNonce};NAME:${phase};TICKS:`)
     } catch {
       return false
     }
   }
+
   return hasPhase('target-terminated') && hasPhase('handles-closed')
 }
 
 function readExactWatcherReadyValue(watcherReadyPath: string): string | undefined {
   try {
-    if (!fs.existsSync(watcherReadyPath)) return undefined
+    if (!fs.existsSync(watcherReadyPath)) {return undefined}
+
     return fs.readFileSync(watcherReadyPath, 'utf8').trim().replace(/[\r\n]+/g, ' ').slice(0, 512)
   } catch {
     return undefined
@@ -772,10 +792,13 @@ async function readProcessCreatedAt(
   pid: number,
   timeoutMs = 2_000
 ): Promise<number | null> {
-  if (!Number.isInteger(pid) || pid <= 0) return null
+  if (!Number.isInteger(pid) || pid <= 0) {return null}
   const budget = Math.trunc(timeoutMs)
-  if (budget <= 0) return null
-  if (process.platform !== 'win32') return null
+
+  if (budget <= 0) {return null}
+
+  if (process.platform !== 'win32') {return null}
+
   try {
     const { stdout } = await execFileAsync(
       powershellExecutable(),
@@ -788,7 +811,9 @@ async function readProcessCreatedAt(
       ],
       { encoding: 'utf8', windowsHide: true, timeout: budget }
     )
+
     const value = Number(String(stdout).trim())
+
     return Number.isFinite(value) && value > 0 ? value : null
   } catch {
     return null
@@ -827,10 +852,12 @@ async function resolveBeforeDeadline<T>(
   deadlineAt: number
 ): Promise<DeadlineProbeResult<T>> {
   const remaining = Math.max(0, deadlineAt - Date.now())
-  if (remaining <= 0) return { completed: false }
+
+  if (remaining <= 0) {return { completed: false }}
 
   const pending = Promise.resolve().then(operation)
   let timer: NodeJS.Timeout | undefined
+
   const timeout = new Promise<DeadlineProbeResult<T>>(resolve => {
     timer = setTimeout(() => resolve({ completed: false }), Math.max(1, remaining - 1))
   })
@@ -840,12 +867,14 @@ async function resolveBeforeDeadline<T>(
       pending.then(value => ({ completed: true as const, value })),
       timeout
     ])
-    if (!outcome.completed || Date.now() > deadlineAt) return { completed: false }
+
+    if (!outcome.completed || Date.now() > deadlineAt) {return { completed: false }}
+
     return outcome
   } catch {
     return { completed: false }
   } finally {
-    if (timer) clearTimeout(timer)
+    if (timer) {clearTimeout(timer)}
     void pending.catch(() => undefined)
   }
 }
@@ -857,10 +886,13 @@ async function resolveBeforeDeadline<T>(
  */
 export function classifyLivenessProbeResult(result: LivenessProbeResult): ProcessLiveness {
   if (result.kind === 'exit') {
-    if (result.code === 0) return 'live'
-    if (result.code === 3) return 'absent'
+    if (result.code === 0) {return 'live'}
+
+    if (result.code === 3) {return 'absent'}
+
     return 'unknown'
   }
+
   // kind=error: timeout/access/spawn/malformed — never prove absence from error metadata.
   return 'unknown'
 }
@@ -874,14 +906,17 @@ function execFileFailureToLivenessResult(error: any): LivenessProbeResult {
       message: String(error?.message ?? error)
     }
   }
+
   // Node execFile puts authenticated child exit status on error.code as a number.
   if (typeof error?.code === 'number') {
     return { kind: 'exit', code: error.code }
   }
+
   // Some paths expose exit status on .status while .code is a string errno.
   if (typeof error?.status === 'number') {
     return { kind: 'exit', code: error.status }
   }
+
   return {
     kind: 'error',
     code: typeof error?.code === 'string' || typeof error?.code === 'number' ? error.code : undefined,
@@ -896,10 +931,12 @@ async function defaultLivenessProbeRunner(
   if (process.platform !== 'win32') {
     try {
       process.kill(pid, 0)
+
       return { kind: 'exit', code: 0 }
     } catch (error: any) {
       // ESRCH is an authenticated "no such process" from the kill(2) probe.
-      if (error?.code === 'ESRCH') return { kind: 'exit', code: 3 }
+      if (error?.code === 'ESRCH') {return { kind: 'exit', code: 3 }}
+
       return {
         kind: 'error',
         code: error?.code,
@@ -907,6 +944,7 @@ async function defaultLivenessProbeRunner(
       }
     }
   }
+
   try {
     await execFileAsync(
       powershellExecutable(),
@@ -920,6 +958,7 @@ async function defaultLivenessProbeRunner(
       ],
       { windowsHide: true, timeout: timeoutMs }
     )
+
     return { kind: 'exit', code: 0 }
   } catch (error: any) {
     return execFileFailureToLivenessResult(error)
@@ -931,10 +970,12 @@ export async function probeProcessLiveness(
   timeoutMs = 2_000,
   runner: LivenessProbeRunner = defaultLivenessProbeRunner
 ): Promise<ProcessLiveness> {
-  if (!Number.isInteger(pid) || pid <= 0) return 'absent'
+  if (!Number.isInteger(pid) || pid <= 0) {return 'absent'}
   const budget = Math.trunc(timeoutMs)
-  if (budget <= 0) return 'unknown'
+
+  if (budget <= 0) {return 'unknown'}
   const result = await runner(pid, budget)
+
   return classifyLivenessProbeResult(result)
 }
 
@@ -951,57 +992,76 @@ export async function identitiesStillPresent(
   } = {}
 ): Promise<ProcessIdentity[]> {
   const survivors: ProcessIdentity[] = []
+
   const absoluteDeadline =
     typeof deadlineAt === 'number' && Number.isFinite(deadlineAt) ? deadlineAt : Date.now() + 2_000
+
   const remaining = () => Math.max(0, absoluteDeadline - Date.now())
   const runner = livenessRunner ?? defaultLivenessProbeRunner
   const createdAtReader = readCreatedAt ?? readProcessCreatedAt
 
   for (const identity of identities) {
     const left = remaining()
+
     if (left <= 0) {
       // No time for an absence probe: keep known/unknown identities as survivors.
       survivors.push(identity)
+
       continue
     }
+
     const slice = Math.max(1, Math.floor(left / Math.max(1, identities.length - survivors.length)))
+
     const createdAtResult = await resolveBeforeDeadline(
       () => createdAtReader(identity.pid, slice),
       absoluteDeadline
     )
+
     if (!createdAtResult.completed) {
       survivors.push(identity)
+
       continue
     }
+
     const createdAt = createdAtResult.value
+
     if (createdAt == null) {
       // Do not infer absence from a null create-time read. Probe liveness with
       // remaining budget; only explicit not-found proves absence.
       const liveLeft = remaining()
+
       if (liveLeft <= 0) {
         survivors.push(identity)
+
         continue
       }
+
       const livenessResult = await resolveBeforeDeadline(
         () => probeProcessLiveness(identity.pid, liveLeft, runner),
         absoluteDeadline
       )
+
       if (!livenessResult.completed || livenessResult.value !== 'absent') {
         // live, unknown, or an expired probe => survivor
         survivors.push(identity)
       }
+
       continue
     }
+
     // Unknown generation: any completed create-time read is still only
     // identity evidence; a matching live generation remains a survivor.
     if (identity.createdAt == null || !Number.isFinite(identity.createdAt)) {
       survivors.push({ pid: identity.pid, createdAt })
+
       continue
     }
+
     if (Math.abs(createdAt - identity.createdAt) <= 1.5) {
       survivors.push(identity)
     }
   }
+
   return survivors
 }
 
@@ -1016,25 +1076,31 @@ export async function snapshotProcessTreeIdentities(
     deadlineAt
   }: { timeoutMs?: number; deadlineAt?: number } = {}
 ): Promise<ProcessIdentity[]> {
-  if (!Number.isInteger(rootPid) || rootPid <= 0) return []
+  if (!Number.isInteger(rootPid) || rootPid <= 0) {return []}
   const requestedBudget = Math.max(0, Math.trunc(timeoutMs))
+
   const remainingBudget =
     typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
       ? Math.max(0, Math.trunc(deadlineAt - Date.now()))
       : requestedBudget
+
   const budget = Math.min(requestedBudget, remainingBudget)
+
   // A zero/negative caller budget is a hard no-probe condition on every
   // platform. In particular, do not fall through to a fresh default-timeout
   // probe after the shared deadline is exhausted.
   if (budget <= 0) {
     return [{ pid: rootPid }]
   }
+
   if (process.platform !== 'win32') {
     const createdAt = await readProcessCreatedAt(rootPid, budget)
+
     return createdAt == null ? [] : [{ pid: rootPid, createdAt }]
   }
 
   const startedAt = Date.now()
+
   try {
     const { stdout } = await execFileAsync(
       powershellExecutable(),
@@ -1079,7 +1145,9 @@ $outputRows -join ';'
       ],
       { encoding: 'utf8', windowsHide: true, timeout: budget }
     )
+
     const identities: ProcessIdentity[] = []
+
     for (const part of String(stdout || '')
       .trim()
       .split(';')
@@ -1087,10 +1155,12 @@ $outputRows -join ';'
       const [pidText, createdText] = part.split('|')
       const pid = Number(pidText)
       const createdAt = Number(createdText)
+
       if (Number.isInteger(pid) && pid > 0 && Number.isFinite(createdAt) && createdAt > 0) {
         identities.push({ pid, createdAt })
       }
     }
+
     return identities
   } catch {
     // If the tree query failed, spend only the caller's remaining slice on an
@@ -1098,8 +1168,10 @@ $outputRows -join ';'
     // independent two-second default and overrun the absolute deadline.
     const elapsed = Date.now() - startedAt
     const fallbackBudget = Math.max(0, Math.min(budget, elapsed >= budget ? 0 : budget - elapsed))
-    if (fallbackBudget <= 0) return [{ pid: rootPid }]
+
+    if (fallbackBudget <= 0) {return [{ pid: rootPid }]}
     const createdAt = await readProcessCreatedAt(rootPid, fallbackBudget)
+
     return createdAt == null ? [{ pid: rootPid }] : [{ pid: rootPid, createdAt }]
   }
 }
@@ -1109,17 +1181,21 @@ async function runTaskkillWithinDeadline(
   deadlineAt: number
 ): Promise<{ completed: boolean; succeeded: boolean }> {
   const remaining = Math.max(0, deadlineAt - Date.now())
-  if (remaining <= 0) return { completed: false, succeeded: false }
+
+  if (remaining <= 0) {return { completed: false, succeeded: false }}
 
   return await new Promise(resolve => {
     let settled = false
     let timer: NodeJS.Timeout | undefined
+
     const finish = (result: { completed: boolean; succeeded: boolean }) => {
-      if (settled) return
+      if (settled) {return}
       settled = true
-      if (timer) clearTimeout(timer)
+
+      if (timer) {clearTimeout(timer)}
       resolve(result)
     }
+
     const child = execFile(
       'taskkill',
       ['/PID', String(pid), '/T', '/F'],
@@ -1130,6 +1206,7 @@ async function runTaskkillWithinDeadline(
       },
       (error: any) => finish({ completed: true, succeeded: !error })
     )
+
     child.once('error', () => finish({ completed: true, succeeded: false }))
     timer = setTimeout(() => {
       // This command only supervises the already-contained mutation child.
@@ -1140,6 +1217,7 @@ async function runTaskkillWithinDeadline(
       } catch {
         void 0
       }
+
       finish({ completed: false, succeeded: false })
     }, Math.max(1, remaining - 1))
   })
@@ -1182,30 +1260,37 @@ export async function killProcessTreeAndAwaitGone(
       : Date.now() + Math.max(0, Math.trunc(confirmMs))
 
   const remaining = () => Math.max(0, absoluteDeadline - Date.now())
+
   if (remaining() <= 0) {
     // No time for probes: fail closed with known/unknown identities as survivors.
     const identities =
       preSnapshot && preSnapshot.length > 0 ? [...preSnapshot] : [{ pid }]
+
     return { confirmed: false, identities, survivors: identities }
   }
 
   const snapshot = snapshotProcessTree ?? snapshotProcessTreeIdentities
   let captured: ProcessIdentity[] = []
   let snapshotTimedOut = false
+
   if (preSnapshot && preSnapshot.length > 0) {
     captured = [...preSnapshot]
   } else {
     const snapshotBudget = remaining()
+
     if (snapshotBudget <= 0) {
       return { confirmed: false, identities: [{ pid }], survivors: [{ pid }] }
     }
+
     const snapshotPromise = Promise.resolve().then(() =>
       snapshot(pid, {
         timeoutMs: Math.min(500, snapshotBudget),
         deadlineAt: absoluteDeadline
       })
     )
+
     let snapshotTimer: NodeJS.Timeout | undefined
+
     try {
       // Native execFile has its own timeout, but keep the boundary safe even
       // if an injected/native adapter ignores that option. Snapshotting is
@@ -1224,17 +1309,20 @@ export async function killProcessTreeAndAwaitGone(
       // The caller's Job Object boundary, when present, is the hard fallback.
       captured = []
     } finally {
-      if (snapshotTimer) clearTimeout(snapshotTimer)
+      if (snapshotTimer) {clearTimeout(snapshotTimer)}
     }
+
     // A timed-out adapter may settle later; consume its rejection without
     // extending this boundary or creating an unhandled-rejection side effect.
     void snapshotPromise.catch(() => undefined)
+
     if (snapshotTimedOut) {
       // The shared deadline was consumed by snapshotting. Do not launch a
       // second native probe for a fabricated/fresh root generation.
       captured = []
     }
   }
+
   const identities = captured
   const createdAtReader = readCreatedAt ?? readProcessCreatedAt
 
@@ -1244,22 +1332,28 @@ export async function killProcessTreeAndAwaitGone(
   if (!identities.some(entry => entry.pid === pid)) {
     const left = remaining()
     let createdAt: number | null = null
+
     if (!snapshotTimedOut && left > 0) {
       const rootResult = await resolveBeforeDeadline(
         () => createdAtReader(pid, left),
         absoluteDeadline
       )
-      if (rootResult.completed) createdAt = rootResult.value
+
+      if (rootResult.completed) {createdAt = rootResult.value}
     }
+
     identities.push(createdAt != null ? { pid, createdAt } : { pid })
   }
 
   const taskkillBudget = Math.min(remaining(), Math.max(0, Math.trunc(confirmMs)))
+
   if (taskkillBudget > 0) {
     const taskkillResult = await runTaskkillWithinDeadline(pid, absoluteDeadline)
+
     if (!taskkillResult.completed) {
       return { confirmed: false, identities, survivors: identities }
     }
+
     if (!taskkillResult.succeeded) {
       try {
         process.kill(pid, 'SIGKILL')
@@ -1272,12 +1366,16 @@ export async function killProcessTreeAndAwaitGone(
   // Also hard-kill every known identity in case /T missed a detached Start-Process child.
   for (const identity of identities) {
     const left = remaining()
-    if (left <= 0) break
-    if (identity.pid === pid) continue
+
+    if (left <= 0) {break}
+
+    if (identity.pid === pid) {continue}
     const taskkillResult = await runTaskkillWithinDeadline(identity.pid, absoluteDeadline)
+
     if (!taskkillResult.completed) {
       return { confirmed: false, identities, survivors: identities }
     }
+
     if (!taskkillResult.succeeded) {
       try {
         process.kill(identity.pid, 'SIGKILL')
@@ -1292,9 +1390,11 @@ export async function killProcessTreeAndAwaitGone(
   }
 
   let survivors = await identitiesStillPresent(identities, { deadlineAt: absoluteDeadline })
+
   while (survivors.length > 0 && remaining() > 0) {
     await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.min(pollMs, remaining()))))
-    if (remaining() <= 0) break
+
+    if (remaining() <= 0) {break}
     survivors = await identitiesStillPresent(identities, { deadlineAt: absoluteDeadline })
   }
 
@@ -1313,13 +1413,16 @@ function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boole
   if (child.exitCode != null || child.signalCode != null) {
     return Promise.resolve(true)
   }
+
   return new Promise(resolve => {
     let settled = false
+
     const done = (ok: boolean) => {
-      if (settled) return
+      if (settled) {return}
       settled = true
       resolve(ok)
     }
+
     const timer = setTimeout(() => done(false), Math.max(1, timeoutMs))
     child.once('exit', () => {
       clearTimeout(timer)
@@ -1337,10 +1440,12 @@ async function terminateNamedTargetJobWithinDeadline(
   deadlineAt: number,
   maxBudgetMs = 1_000
 ): Promise<boolean> {
-  if (process.platform !== 'win32' || !targetJobName) return false
+  if (process.platform !== 'win32' || !targetJobName) {return false}
   const remaining = Math.max(0, deadlineAt - Date.now())
   const budget = Math.min(Math.max(0, Math.trunc(maxBudgetMs)), remaining)
-  if (budget <= 0) return false
+
+  if (budget <= 0) {return false}
+
   try {
     await execFileAsync(
       powershellExecutable(),
@@ -1363,6 +1468,7 @@ async function terminateNamedTargetJobWithinDeadline(
         }
       }
     )
+
     return true
   } catch {
     return false
@@ -1377,8 +1483,9 @@ function startTargetJobWatcher(
   watcherReadyNonce: string,
   deadlineAt: number
 ): ReturnType<StartTargetJobWatcher> {
-  if (process.platform !== 'win32' || !Number.isInteger(ownerPid) || ownerPid <= 0) return undefined
+  if (process.platform !== 'win32' || !Number.isInteger(ownerPid) || ownerPid <= 0) {return undefined}
   const encodedWatcherCommand = Buffer.from(TERMINATE_JOB_WATCHER_BOOTSTRAP, 'utf16le').toString('base64')
+
   try {
     const watcher = spawn(
       process.execPath,
@@ -1401,11 +1508,12 @@ function startTargetJobWatcher(
           // transport, where escaped C# quotes are consumed before PowerShell
           // parses the here-string. ScriptBlock/environment transport preserves
           // those backslashes, so normalize only escaped double quotes here.
-          HERMES_TERMINATE_WATCHER_SCRIPT: TERMINATE_JOB_WATCHER_COMMAND.replace(/\\\"/g, '"'),
+          HERMES_TERMINATE_WATCHER_SCRIPT: TERMINATE_JOB_WATCHER_COMMAND.replace(/\\"/g, '"'),
           HERMES_TERMINATE_WATCHER_DEADLINE_AT: String(Math.trunc(deadlineAt))
         }
       }
     )
+
     return watcher
   } catch {
     return undefined
@@ -1423,37 +1531,45 @@ function observeTargetJobWatcher(child: ChildProcess, spawnedAt: number): Target
     spawnedAt,
     pid: child.pid
   }
+
   child.on('error', error => {
-    if (diagnostics.errorAt == null) diagnostics.errorAt = Date.now()
+    if (diagnostics.errorAt == null) {diagnostics.errorAt = Date.now()}
+
     if (diagnostics.errorCode == null) {
       const errorCode = (error as NodeJS.ErrnoException).code
-      if (typeof errorCode === 'string' || typeof errorCode === 'number') diagnostics.errorCode = errorCode
+
+      if (typeof errorCode === 'string' || typeof errorCode === 'number') {diagnostics.errorCode = errorCode}
     }
-    if (!diagnostics.errorMessage) diagnostics.errorMessage = boundedWatcherErrorMessage(error?.message)
+
+    if (!diagnostics.errorMessage) {diagnostics.errorMessage = boundedWatcherErrorMessage(error?.message)}
   })
   child.on('exit', (code, signal) => {
-    if (diagnostics.exitAt == null) diagnostics.exitAt = Date.now()
+    if (diagnostics.exitAt == null) {diagnostics.exitAt = Date.now()}
     diagnostics.exitCode = code
     diagnostics.signalCode = signal
   })
+
   if (child.exitCode != null || child.signalCode != null) {
     diagnostics.exitAt = Date.now()
     diagnostics.exitCode = child.exitCode
     diagnostics.signalCode = child.signalCode
   }
+
   return diagnostics
 }
 
 function formatTargetJobWatcherDiagnostics(diagnostics?: TargetJobWatcherDiagnostics): string {
-  if (!diagnostics) return 'watcher-diagnostics=none'
+  if (!diagnostics) {return 'watcher-diagnostics=none'}
   const now = Date.now()
   const errorElapsedMs = diagnostics.errorAt == null ? 'none' : Math.max(0, diagnostics.errorAt - diagnostics.spawnedAt)
   const exitElapsedMs = diagnostics.exitAt == null ? 'none' : Math.max(0, diagnostics.exitAt - diagnostics.spawnedAt)
+
   const elapsedMs = diagnostics.exitAt != null
     ? exitElapsedMs
     : diagnostics.errorAt != null
       ? errorElapsedMs
       : Math.max(0, now - diagnostics.spawnedAt)
+
   return [
     `watcher-spawned-at=${diagnostics.spawnedAt}`,
     `watcher-pid=${diagnostics.pid ?? 'none'}`,
@@ -1469,28 +1585,37 @@ function formatTargetJobWatcherDiagnostics(diagnostics?: TargetJobWatcherDiagnos
 
 function sanitizeBoundaryDiagnostics(value: unknown): string {
   const safeLines: string[] = []
+
   for (const rawLine of String(value ?? '').split(/\r?\n/)) {
     const line = rawLine.trim()
-    if (!line || /Command failed:/i.test(line)) continue
+
+    if (!line || /Command failed:/i.test(line)) {continue}
+
     if (/watcher-(?:spawned|exited|stalled|error|exit|signal|elapsed)/i.test(line)) {
       safeLines.push(line.slice(0, 1_200))
+
       continue
     }
+
     if (/^(?:TARGET_[A-Z0-9_ -]+|unconfirmed-tree-survivors:[0-9,]+|exit -?\d+|timeout|killed|aborted|deadline-exhausted)\b/i.test(line)) {
       safeLines.push(line.slice(0, 512))
     }
   }
+
   return [...new Set(safeLines)].slice(0, 8).join('\n')
 }
 
 function deadlineFailureDetail(stderr: unknown): string {
   const diagnostics = sanitizeBoundaryDiagnostics(stderr)
+
   return diagnostics ? `deadline-exhausted ${diagnostics}` : 'deadline-exhausted'
 }
 
 function sanitizeRunnerStderr(value: unknown): string {
   const stderr = String(value ?? '').replace(/\0/g, '')
-  if (/Command failed:/i.test(stderr)) return sanitizeBoundaryDiagnostics(stderr)
+
+  if (/Command failed:/i.test(stderr)) {return sanitizeBoundaryDiagnostics(stderr)}
+
   return stderr.slice(0, 4_096)
 }
 
@@ -1520,10 +1645,12 @@ async function waitForTargetJobWatcher(
 ): Promise<TargetJobWatcherResult> {
   if (!watcher || !Number.isInteger(watcher.pid) || (watcher.pid as number) <= 0) {
     const remaining = Math.max(0, deadlineAt - Date.now())
+
     const targetJobAttempt =
       remaining > 0
         ? await terminateNamedTargetJobWithinDeadline(targetJobName, deadlineAt, Math.min(1_000, remaining))
         : false
+
     return {
       terminal: true,
       healthy: false,
@@ -1534,6 +1661,7 @@ async function waitForTargetJobWatcher(
 
   const watcherPid = watcher.pid
   const settleBudget = skipGrace ? 0 : Math.min(TARGET_JOB_WATCHER_GRACE_MS, Math.max(0, deadlineAt - Date.now()))
+
   if (settleBudget > 0 && (await waitForChildExit(watcher, settleBudget))) {
     if (watcher.exitCode === 0 && watcher.signalCode == null) {
       return {
@@ -1543,11 +1671,14 @@ async function waitForTargetJobWatcher(
         detail: `watcher-exited-cleanly ${formatTargetJobWatcherDiagnostics(diagnostics)}`
       }
     }
+
     const remaining = Math.max(0, deadlineAt - Date.now())
+
     const targetJobAttempt =
       remaining > 0
         ? await terminateNamedTargetJobWithinDeadline(targetJobName, deadlineAt, Math.min(1_000, remaining))
         : false
+
     return {
       terminal: true,
       healthy: false,
@@ -1559,6 +1690,7 @@ async function waitForTargetJobWatcher(
   // The watcher is stalled. Kill its exact process tree and close the named
   // target job in parallel, then observe the watcher exit before returning.
   const remaining = Math.max(0, deadlineAt - Date.now())
+
   const watcherTreeSnapshot =
     remaining > 0
       ? await snapshotProcessTreeIdentities(watcherPid, {
@@ -1566,22 +1698,27 @@ async function waitForTargetJobWatcher(
           deadlineAt
         })
       : []
+
   const targetJobTermination =
     remaining > 0
       ? terminateNamedTargetJobWithinDeadline(targetJobName, deadlineAt, Math.min(1_000, remaining))
       : Promise.resolve(false)
+
   try {
     watcher.kill('SIGKILL')
   } catch {
     void 0
   }
+
   const watcherTreeTermination = killProcessTreeAndAwaitGone(watcherPid, {
     confirmMs: Math.min(500, remaining),
     preSnapshot: watcherTreeSnapshot.length > 0 ? watcherTreeSnapshot : [{ pid: watcherPid }],
     deadlineAt
   })
+
   const [targetJobAttempt, watcherTreeResult] = await Promise.all([targetJobTermination, watcherTreeTermination])
   const remainingAfterKill = Math.max(0, deadlineAt - Date.now())
+
   const watcherExited =
     remainingAfterKill > 0
       ? await waitForChildExit(watcher, remainingAfterKill)
@@ -1615,15 +1752,19 @@ async function defaultRunPowerShell(
   // Leave a small scheduler/IPC margin so the public return stays inside the
   // caller's hard wall-clock budget even when native callbacks settle late.
   const deadlineSafetyMarginMs = Math.min(100, Math.floor(requestedBudget / 10))
+
   const requestedDeadline =
     typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
       ? Math.min(Math.trunc(deadlineAt), startedAt + requestedBudget)
       : startedAt + requestedBudget
+
   const absoluteDeadline = Math.max(startedAt, requestedDeadline - deadlineSafetyMarginMs)
   const budget = Math.max(0, absoluteDeadline - startedAt)
+
   if (budget <= 0) {
     return { stdout: '', stderr: 'aborted', code: 1 }
   }
+
   if (signal?.aborted) {
     return { stdout: '', stderr: 'aborted', code: 1 }
   }
@@ -1636,9 +1777,11 @@ async function defaultRunPowerShell(
   const watcherSettleReserveMs = Math.min(250, Math.floor(killReserveMs / 4))
   const watcherDeadline = absoluteDeadline - watcherSettleReserveMs
   const runMs = Math.max(0, wrapperDeadline - startedAt)
+
   if (runMs <= 0) {
     return { stdout: '', stderr: 'deadline-exhausted', code: 1 }
   }
+
   const jobName = `HermesTerminateHelper-${randomBytes(16).toString('hex')}`
   const targetJobName = `HermesTerminateTarget-${randomBytes(16).toString('hex')}`
   const targetWaitMs = Math.max(0, Math.min(1_500, runMs - 100))
@@ -1687,6 +1830,7 @@ async function defaultRunPowerShell(
       ].filter(
         (entry): entry is string => typeof entry === 'string'
       )
+
       for (const exactPath of exactPaths) {
         try {
           fs.rmSync(exactPath, { force: true })
@@ -1694,6 +1838,7 @@ async function defaultRunPowerShell(
           void 0
         }
       }
+
       try {
         fs.rmdirSync(watcherReadyDirectory)
       } catch {
@@ -1704,14 +1849,15 @@ async function defaultRunPowerShell(
     }
 
     const finish = async (result: { stdout: string; stderr: string; code: number; pid?: number }) => {
-      if (settled || terminalizing) return
+      if (settled || terminalizing) {return}
       terminalizing = (async () => {
         let finalResult = { ...result, pid: childPid }
         const mustKill = killing || signal?.aborted === true
 
-        if (wrapperMarkerSetup) await wrapperMarkerSetup
+        if (wrapperMarkerSetup) {await wrapperMarkerSetup}
 
         const watcherReadyAtFinish = watcherEnabled ? readExactWatcherReadyValue(watcherReadyPath) : undefined
+
         if (
           watcherEnabled &&
           watcherReadyAtFinish !== `ARMED:${watcherReadyNonce}` &&
@@ -1742,6 +1888,7 @@ async function defaultRunPowerShell(
             }
 
         let targetBoundaryConfirmed = watcherResult.targetBoundaryConfirmed
+
         // On cancellation, drain the named target Job while the wrapper still
         // owns its persistent handle. Only then kill and confirm the wrapper /
         // helper process tree. This removes the close-before-open race.
@@ -1761,7 +1908,9 @@ async function defaultRunPowerShell(
                 deadlineAt: absoluteDeadline
               })
             : undefined
+
         let watcherTerminal = watcherResult.terminal
+
         if (
           watcherEnabled &&
           !watcherTerminal &&
@@ -1772,21 +1921,27 @@ async function defaultRunPowerShell(
           const watcherSurvivors = await identitiesStillPresent([{ pid: watcherProcess?.pid as number }], {
             deadlineAt: absoluteDeadline
           })
+
           watcherTerminal = watcherSurvivors.length === 0
         }
+
         if (watcherEnabled && !watcherTerminal && watcherProcess) {
           watcherTerminal = watcherProcess.exitCode != null || watcherProcess.signalCode != null
         }
+
         let wrapperBoundaryRequired = mustKill
 
         // Only the injected legacy watcher can authenticate wrapper absence.
         // Production requires the normal wrapper-tree liveness proof.
         if (watcherEnabled && watcherResult.healthy && killResult && wrapperProcessIdentity) {
           const survivors = killResult.survivors.filter(identity => {
-            if (identity.pid !== wrapperProcessIdentity?.pid) return true
-            if (identity.createdAt == null || wrapperProcessIdentity.createdAt == null) return false
+            if (identity.pid !== wrapperProcessIdentity?.pid) {return true}
+
+            if (identity.createdAt == null || wrapperProcessIdentity.createdAt == null) {return false}
+
             return Math.abs(identity.createdAt - wrapperProcessIdentity.createdAt) > 1.5
           })
+
           killResult = { ...killResult, survivors, confirmed: survivors.length === 0 }
         }
 
@@ -1807,6 +1962,7 @@ async function defaultRunPowerShell(
           wrapperBoundaryRequired = true
           killing = true
           const remaining = Math.max(0, absoluteDeadline - Date.now())
+
           if (!targetBoundaryConfirmed && remaining > 0) {
             targetBoundaryConfirmed = await terminateNamedTargetJobWithinDeadline(
               targetJobName,
@@ -1814,6 +1970,7 @@ async function defaultRunPowerShell(
               Math.min(1_000, remaining)
             )
           }
+
           if (typeof childPid === 'number' && (!killResult || !killResult.confirmed)) {
             killResult = await killProcessTreeAndAwaitGone(childPid, {
               confirmMs: Math.min(killReserveMs, Math.max(0, absoluteDeadline - Date.now())),
@@ -1833,6 +1990,7 @@ async function defaultRunPowerShell(
             pid: childPid
           }
         }
+
         if (watcherEnabled && watcherDiagnostics && finalResult.code !== 0) {
           finalResult = {
             ...finalResult,
@@ -1842,6 +2000,7 @@ async function defaultRunPowerShell(
             pid: childPid
           }
         }
+
         if (!targetBoundaryConfirmed) {
           finalResult = {
             ...finalResult,
@@ -1850,6 +2009,7 @@ async function defaultRunPowerShell(
             pid: childPid
           }
         }
+
         if (killResult && !killResult.confirmed) {
           finalResult = {
             ...finalResult,
@@ -1863,6 +2023,7 @@ async function defaultRunPowerShell(
             pid: childPid
           }
         }
+
         if (!watcherTerminal) {
           finalResult = {
             ...finalResult,
@@ -1883,6 +2044,7 @@ async function defaultRunPowerShell(
         // bounded diagnostics identify which side of the boundary stalled
         // without making cleanup depend on a wildcard directory scan.
         const wrapperPhaseDiagnostics = readWrapperPhaseDiagnostics(wrapperPhasePath, wrapperPhaseNonce)
+
         if (finalResult.code !== 0) {
           finalResult = {
             ...finalResult,
@@ -1903,7 +2065,7 @@ async function defaultRunPowerShell(
 
         // Do not remove READY or its PID-qualified temp file while the watcher
         // can still publish FAILED or terminate the target job.
-        if (watcherTerminal) cleanupWatcherArtifacts()
+        if (watcherTerminal) {cleanupWatcherArtifacts()}
         settled = true
         signal?.removeEventListener('abort', onAbort)
         resolve(finalResult)
@@ -1960,8 +2122,10 @@ async function defaultRunPowerShell(
           const errorStdout = String(stdout ?? error?.stdout ?? '')
           const capturedStderr = sanitizeRunnerStderr(stderr ?? error?.stderr ?? '')
           const errorMessage = String(error?.message ?? '')
+
           const lifecycleFact =
             error?.killed === true || /ETIMEDOUT|timeout|killed/i.test(errorMessage) ? 'timeout' : ''
+
           const errorStderr = [
             capturedStderr,
             typeof error?.code === 'number' ? `exit ${error.code}` : '',
@@ -1969,10 +2133,13 @@ async function defaultRunPowerShell(
           ]
             .filter(Boolean)
             .join('\n')
+
           if (!error) {
             await finish({ stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code: 0 })
+
             return
           }
+
           if (
             typeof childPid === 'number' &&
             (error?.killed || /ETIMEDOUT|timeout/i.test(String(error?.message ?? '')))
@@ -1983,8 +2150,10 @@ async function defaultRunPowerShell(
               stderr: errorStderr || 'timeout',
               code: typeof error?.code === 'number' ? error.code : 1
             })
+
             return
           }
+
           await finish({
             stdout: errorStdout,
             stderr: errorStderr,
@@ -2006,17 +2175,21 @@ async function defaultRunPowerShell(
           wrapperPidMarkerNonce,
           wrapperDeadline
         )
+
         if (!wrapperProcessIdentity) {
           watcherStartupFailure = `wrapper-marker-unavailable launch-pid=${launchedPid}`
           killing = true
           treeSnapshot = [{ pid: launchedPid }]
+
           try {
             childProcess?.kill('SIGKILL')
           } catch {
             void 0
           }
+
           return
         }
+
         if (watcherStarter) {
           const watcherSpawnedAt = Date.now()
           watcherProcess = watcherStarter(
@@ -2027,13 +2200,17 @@ async function defaultRunPowerShell(
             watcherReadyNonce,
             watcherDeadline
           )
-          if (watcherProcess) watcherDiagnostics = observeTargetJobWatcher(watcherProcess, watcherSpawnedAt)
+
+          if (watcherProcess) {watcherDiagnostics = observeTargetJobWatcher(watcherProcess, watcherSpawnedAt)}
+
           if (!watcherProcess) {
             watcherStartupFailure = `watcher-spawn-failed wrapper-pid=${wrapperProcessIdentity.pid} launch-pid=${launchedPid}`
             killing = true
+
             return
           }
         }
+
         // Capture identities promptly after spawn with a bounded slice; abort must
         // not wait for a fresh snapshot before killing. Keep the authenticated
         // wrapper generation in the same confirmation set even when the launch
@@ -2041,6 +2218,7 @@ async function defaultRunPowerShell(
         const snapshot = await snapshotProcessTreeIdentities(launchedPid, {
           timeoutMs: Math.min(400, killReserveMs)
         })
+
         // Never let the launch hint or an unknown-generation snapshot entry
         // replace the exact nonce-authenticated wrapper generation.
         treeSnapshot = [
@@ -2058,8 +2236,9 @@ async function defaultRunPowerShell(
     }
 
     const onAbort = () => {
-      if (settled || terminalizing) return
+      if (settled || terminalizing) {return}
       killing = true
+
       if (typeof childPid === 'number') {
         // Kill immediately with already-captured identities (+ root). Never
         // delay kill for a fresh unbounded snapshot, and never synthesize
@@ -2068,6 +2247,7 @@ async function defaultRunPowerShell(
           treeSnapshot = [{ pid: childPid }]
         }
       }
+
       // finish() first drains the wrapper-owned named target Job, then kills and
       // confirms the authenticated wrapper/helper tree. Do not pre-kill the
       // wrapper here or its only persistent target-Job handle disappears before
@@ -2124,6 +2304,7 @@ export function buildExactTerminateScript(
   const phaseMarkerPath = psLiteral(options?.phaseMarkerPath ?? '')
   const installRootClaim = psLiteral(options?.installRoot ?? '')
   const resourceClaim = psLiteral(options?.resource ?? '')
+
   return `
 $ErrorActionPreference = 'Stop'
 $pidTarget = ${Math.trunc(pid)}
@@ -2628,29 +2809,41 @@ exit $exitCode
 
 export function parseTerminateScriptOutput(stdout: string, code: number): ForceReleaseTerminateResult {
   const text = String(stdout || '').trim()
+
   if (/PROTECTED/i.test(text)) {
     const win32 = text.match(/win32=(\d+)/i)
+
     return { kind: 'protected', win32Error: win32 ? Number(win32[1]) : 5 }
   }
+
   if (/ALREADY_GONE/i.test(text) || (code === 0 && /TERMINATED/i.test(text))) {
-    if (/TERMINATED/i.test(text)) return { kind: 'terminated' }
-    if (/ALREADY_GONE/i.test(text)) return { kind: 'already-gone' }
+    if (/TERMINATED/i.test(text)) {return { kind: 'terminated' }}
+
+    if (/ALREADY_GONE/i.test(text)) {return { kind: 'already-gone' }}
   }
+
   if (/CREATE_TIME_MISMATCH/i.test(text) || code === 3) {
     return { kind: 'create-time-mismatch' }
   }
+
   if (/ACCESS_DENIED/i.test(text)) {
     const marker = text.match(/ACCESS_DENIED(?:\s+([\s\S]*))?/i)
     const detail = marker?.[1]?.trim()
+
     return detail ? { kind: 'access-denied', win32Error: 5, detail } : { kind: 'access-denied', win32Error: 5 }
   }
+
   const win32 = text.match(/win32=(\d+)/i)
+
   if (win32) {
     const err = Number(win32[1])
+
     // Do not treat 6/87 as already-gone: the process was observed live above.
     return { kind: 'failed', detail: text || `win32=${err}`, win32Error: err }
   }
-  if (code === 0 && /TERMINATED/i.test(text)) return { kind: 'terminated' }
+
+  if (code === 0 && /TERMINATED/i.test(text)) {return { kind: 'terminated' }}
+
   return { kind: 'failed', detail: text || `exit ${code}` }
 }
 
@@ -2689,26 +2882,32 @@ export async function terminateWindowsHolderExact(
   if (platform !== 'win32') {
     return { kind: 'failed', detail: 'windows-only' }
   }
+
   if (signal?.aborted) {
     return { kind: 'failed', detail: 'deadline-exhausted' }
   }
+
   if (!Number.isInteger(target.pid) || target.pid <= 0) {
     return { kind: 'failed', detail: 'invalid pid' }
   }
+
   if (!Number.isFinite(target.createdAt) || target.createdAt <= 0) {
     return { kind: 'failed', detail: 'invalid createdAt' }
   }
 
   const requestedBudget = Math.max(0, Math.trunc(timeoutMs ?? Math.max(2_000, waitMs + 1_000)))
+
   const remainingBudget =
     typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
       ? Math.max(0, Math.trunc(deadlineAt - Date.now()))
       : requestedBudget
+
   const budget = Math.min(requestedBudget, remainingBudget)
   // Keep TerminateProcess wait short enough that kill-reserve still fits.
   const killReserveMs = terminateKillReserveMs(budget)
   const runBudget = Math.max(1, budget - killReserveMs)
   const effectiveWait = Math.max(0, Math.min(Math.trunc(waitMs), Math.max(0, runBudget - 250)))
+
   if (budget <= 50) {
     return { kind: 'failed', detail: 'deadline-exhausted' }
   }
@@ -2717,18 +2916,23 @@ export async function terminateWindowsHolderExact(
     installRoot,
     resource: target.resource
   })
+
   const result = await run(script, budget, signal, deadlineAt)
+
   if (signal?.aborted) {
     // Child tree must already be confirmed gone by run(); never claim mutation.
     return { kind: 'failed', detail: deadlineFailureDetail(result.stderr) }
   }
+
   if (/unconfirmed-tree-survivors/i.test(result.stderr || '')) {
     return { kind: 'failed', detail: sanitizeBoundaryDiagnostics(result.stderr) || 'unconfirmed-tree-survivors' }
   }
+
   // Timed-out/killed child: do not parse a partial TerminateProcess success.
   if (/aborted|ETIMEDOUT|timeout/i.test(result.stderr || '') && !/TERMINATED|ACCESS_DENIED|PROTECTED|CREATE_TIME/i.test(result.stdout || '')) {
     return { kind: 'failed', detail: deadlineFailureDetail(result.stderr) }
   }
+
   return parseTerminateScriptOutput(result.stdout + '\n' + result.stderr, result.code)
 }
 
@@ -2760,6 +2964,7 @@ export async function terminateWindowsHolderWithinDeadline(
   const absoluteDeadline = Number.isFinite(deadlineAt) ? Math.trunc(deadlineAt) : Date.now() + requestedBudget
   const remainingBudget = Math.max(0, absoluteDeadline - Date.now())
   const budget = Math.min(requestedBudget, remainingBudget)
+
   if (budget <= 50 || signal?.aborted) {
     return { kind: 'failed', detail: 'deadline-exhausted' }
   }
