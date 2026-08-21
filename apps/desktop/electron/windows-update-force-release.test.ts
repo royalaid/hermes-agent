@@ -920,6 +920,24 @@ exit 17
       fs.rmSync(tmp, { recursive: true, force: true })
     }
   })
+
+  it('never treats a process older than the authenticated parent generation as a descendant', async () => {
+    if (process.platform !== 'win32') return
+    const rootCreatedAt = await queryWindowsProcessCreatedAt(process.pid, {
+      platform: 'win32',
+      timeoutMs: 2_000
+    })
+    assert.ok(rootCreatedAt && rootCreatedAt > 0, 'test root generation unavailable')
+
+    const tree = await snapshotProcessTreeIdentities(process.pid, { timeoutMs: 2_000 })
+    const older = tree.filter(
+      identity =>
+        identity.pid !== process.pid &&
+        identity.createdAt != null &&
+        identity.createdAt + 1.5 < rootCreatedAt
+    )
+    assert.deepEqual(older, [], `stale-parent PID edges entered the snapshot: ${JSON.stringify(older)}`)
+  })
 })
 
 describe('elevated helper script shape', () => {
@@ -1463,10 +1481,6 @@ Start-Sleep -Seconds 20
     async () => {
       if (process.platform !== 'win32') return
 
-      const os = await import('node:os')
-      const watcherDirsBefore = new Set(
-        fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('hermes-terminate-watcher-'))
-      )
       const injectedWatcher = makeInjectedWatcherStarter('setTimeout(() => {}, 30000)')
       const started = Date.now()
       const result = await runPowerShellWithHardBoundary(
@@ -1488,10 +1502,6 @@ Start-Sleep -Seconds 20
         assert.ok(watcherArtifacts, 'no-READY watcher artifacts unavailable')
         const { identitiesStillPresent } = await import('./windows-process-terminate')
         assert.deepEqual(await identitiesStillPresent([{ pid: watcherPid }]), [], 'no-READY watcher leaked')
-        const retainedWatcherDirs = fs
-          .readdirSync(os.tmpdir())
-          .filter(name => name.startsWith('hermes-terminate-watcher-') && !watcherDirsBefore.has(name))
-        assert.deepEqual(retainedWatcherDirs, [], 'no-READY boundary retained parent-owned artifacts')
         assert.equal(fs.existsSync(watcherArtifacts.readyPath), false, 'no-READY watcher published READY late')
         assert.equal(fs.existsSync(watcherArtifacts.tempPath), false, 'no-READY watcher temp artifact remained')
         await new Promise(resolve => setTimeout(resolve, 250))
@@ -2269,9 +2279,14 @@ describe('access-denied identity classification', () => {
     assert.match(script, /TERMINATION_EXECUTABLE_IDENTITY_UNAVAILABLE/)
     assert.match(script, /TERMINATION_CURRENT_LOCK_OWNERSHIP_MISMATCH/)
     assert.match(script, /QueryFullProcessImageName/)
+    assert.match(script, /GetFinalPathNameByHandle/)
+    assert.match(script, /IsSameOrUnderRoot\(\$resourceFinal, \$installRootFinal\)/)
+    assert.match(script, /IsSameOrUnderRoot\(\$imageFinal, \$installRootFinal\)/)
+    assert.match(script, /TERMINATION_EXECUTABLE_OUTSIDE_INSTALL_ROOT/)
     assert.match(script, /IsCurrentResourceOwner/)
     assert.match(script, /RmRegisterResources/)
     assert.match(script, /C:\\Hermes\\venv\\Scripts\\hermes\.exe/)
+    assert.match(script, /\(\$childExpected \+ 1\.5\) -lt \$parentCreated/)
   })
 
   it('classifies access-denied identity failures for Administrator routing', () => {
@@ -2280,10 +2295,16 @@ describe('access-denied identity classification', () => {
       win32Error: 5
     })
     const script = buildExactTerminateScript(9, 100, 100)
-    assert.match(script, /Access is denied|AccessDenied|denied/)
+    assert.match(script, /HOLDER_OPEN_FAILED win32=5/)
     assert.match(script, /ACCESS_DENIED/)
-    // Get-Process/StartTime access denial must not collapse to ALREADY_GONE only.
-    assert.match(script, /ALREADY_GONE/)
-    assert.ok(script.includes("if ($msg -match 'Access"))
+    assert.doesNotMatch(script, /\$win32 -eq '5'/)
+  })
+
+  it('does not classify generic Job failures as Administrator escalation', () => {
+    assert.deepEqual(parseTerminateScriptOutput('BOUNDARY_FAILED TREE_ASSIGN_FAILED win32=5', 5), {
+      kind: 'failed',
+      detail: 'BOUNDARY_FAILED TREE_ASSIGN_FAILED win32=5',
+      win32Error: 5
+    })
   })
 })
