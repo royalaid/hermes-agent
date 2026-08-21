@@ -4517,7 +4517,9 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
     throw new Error(preflight.message)
   }
 
-  let bridgeLease = preflight.lease
+  const mutationPermit = authorizeUpdateMutation(preflight)
+  if (!mutationPermit) throw new Error('clear recovery preflight did not mint a mutation permit')
+  let bridgeLease = mutationPermit.preflight.lease
   let bridgeLeaseHandedOff = false
 
   try {
@@ -4533,19 +4535,21 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
 
     bridgeLease = handoffLease
 
-    const child = spawnUpdaterProcess(updater, updaterArgs, {
-      cwd: HERMES_HOME,
-      env: stagedUpdaterEnvironment(
-        {
-          ...process.env,
-          HERMES_HOME,
-          PATH: pathWithHermesManagedNode(venvBin)
-        },
-        bridgeLease.leaseId
-      ),
-      detached: true,
-      stdio: 'ignore'
-    })
+    const child = runAuthorizedUpdateMutation(mutationPermit, () =>
+      spawnUpdaterProcess(updater, updaterArgs, {
+        cwd: HERMES_HOME,
+        env: stagedUpdaterEnvironment(
+          {
+            ...process.env,
+            HERMES_HOME,
+            PATH: pathWithHermesManagedNode(venvBin)
+          },
+          bridgeLease.leaseId
+        ),
+        detached: true,
+        stdio: 'ignore'
+      })
+    )
 
     const updaterPid = Number.isInteger(child.pid) ? Number(child.pid) : null
     const updaterStartedAt = updaterPid ? await captureSpawnedUpdaterCreatedAt(updaterPid) : null
@@ -4588,11 +4592,13 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
     }
 
     isQuittingForHandoff = true
-    setTimeout(
-      () => {
-        app.quit()
-      },
-      Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
+    runAuthorizedUpdateMutation(mutationPermit, () =>
+      setTimeout(
+        () => {
+          app.quit()
+        },
+        Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
+      )
     )
 
     return true
