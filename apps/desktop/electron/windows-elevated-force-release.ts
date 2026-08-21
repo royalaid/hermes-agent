@@ -11,11 +11,8 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { promisify } from 'node:util'
 
 import type { ForceReleaseHolder } from './windows-update-force-release'
-
-const execFileAsync = promisify(execFile)
 
 export const FORCE_RELEASE_REQUEST_SCHEMA = 1 as const
 
@@ -206,6 +203,8 @@ export type ForceReleaseRequestFiles = {
   requestPath: string
   secretPath: string
   responsePath: string
+  /** Exact helper response temp path once the elevated helper PID is known. */
+  responseTempPath?: string
   /** True when writeForceReleaseRequestFiles created the directory via mkdtemp. */
   ownedDirectory: boolean
 }
@@ -227,8 +226,21 @@ export async function writeForceReleaseRequestFiles(input: {
     excludePids: input.excludePids
   })
   const paths = forceReleasePaths(directory, request.nonce)
-  fs.writeFileSync(paths.secretPath, secret, { encoding: 'utf8', mode: 0o600 })
-  fs.writeFileSync(paths.requestPath, JSON.stringify(request, null, 2), { encoding: 'utf8', mode: 0o600 })
+  try {
+    fs.writeFileSync(paths.secretPath, secret, { encoding: 'utf8', mode: 0o600 })
+    fs.writeFileSync(paths.requestPath, JSON.stringify(request, null, 2), { encoding: 'utf8', mode: 0o600 })
+  } catch (error) {
+    // A failed second write can otherwise strand the freshly-created secret or
+    // owned mkdtemp directory before the caller receives a return value.
+    cleanupForceReleaseArtifacts({
+      directory,
+      requestPath: paths.requestPath,
+      secretPath: paths.secretPath,
+      responsePath: paths.responsePath,
+      ownedDirectory
+    })
+    throw error
+  }
   return {
     directory,
     request,
@@ -250,9 +262,10 @@ export function cleanupForceReleaseArtifacts(files: {
   requestPath?: string
   secretPath?: string
   responsePath?: string
+  responseTempPath?: string
   ownedDirectory?: boolean
 }): void {
-  for (const filePath of [files.requestPath, files.secretPath, files.responsePath]) {
+  for (const filePath of [files.requestPath, files.secretPath, files.responsePath, files.responseTempPath]) {
     if (!filePath) continue
     try {
       fs.rmSync(filePath, { force: true })
@@ -337,6 +350,31 @@ export const ELEVATED_FORCE_RELEASE_LAUNCH_ENV = {
 } as const
 
 /**
+ * Windows PowerShell's Start-Process joins -ArgumentList elements into one
+ * command line. Quote values at that final Windows command-line boundary, not
+ * in the outer PowerShell source. This is the standard CommandLineToArgvW
+ * quoting rule, including doubled trailing backslashes and embedded quotes.
+ */
+export const WINDOWS_ARGUMENT_QUOTER_FUNCTION = [
+  'function ConvertTo-WindowsArgument([string]$Value) {',
+  "  if ($null -eq $Value -or $Value.IndexOf([char]0) -ge 0) { throw 'invalid force-release process argument' }",
+  '  $builder = New-Object System.Text.StringBuilder',
+  '  [void]$builder.Append([char]34)',
+  '  $slashes = 0',
+  '  foreach ($current in $Value.ToCharArray()) {',
+  "    if ($current -eq [char]92) { $slashes++; continue }",
+  "    if ($current -eq [char]34) { [void]$builder.Append((('\\' * ($slashes * 2 + 1)) -join '')); [void]$builder.Append([char]34); $slashes = 0; continue }",
+  "    if ($slashes -gt 0) { [void]$builder.Append((('\\' * $slashes) -join '')); $slashes = 0 }",
+  '    [void]$builder.Append($current)',
+  '  }',
+  "  if ($slashes -gt 0) { [void]$builder.Append((('\\' * ($slashes * 2)) -join '')) }",
+  '  [void]$builder.Append([char]34)',
+  '  return $builder.ToString()',
+  '}'
+].join('; ')
+export const ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER = WINDOWS_ARGUMENT_QUOTER_FUNCTION
+
+/**
  * Constant outer launcher. Paths are read from env and passed as ArgumentList
  * array elements (data), never interpolated into PowerShell source.
  */
@@ -347,9 +385,11 @@ export const ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND = [
   `$response = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response}')`,
   "if ([string]::IsNullOrWhiteSpace($helper) -or [string]::IsNullOrWhiteSpace($request) -or [string]::IsNullOrWhiteSpace($response)) { throw 'missing force-release launch env' }",
   "$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
-  "$argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$helper,'-RequestPath',$request,'-ResponsePath',$response)",
+  WINDOWS_ARGUMENT_QUOTER_FUNCTION,
+  "$argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(ConvertTo-WindowsArgument $helper),'-RequestPath',(ConvertTo-WindowsArgument $request),'-ResponsePath',(ConvertTo-WindowsArgument $response))",
   '$p = Start-Process -FilePath $ps -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList $argList',
   'if ($null -eq $p) { exit 1223 }',
+  'Write-Output ("HERMES_ELEVATED_PID=" + $p.Id)',
   'exit $p.ExitCode'
 ].join('; ')
 
@@ -357,7 +397,7 @@ export type ElevatedForceReleaseRun = (
   command: string,
   args: string[],
   options?: { env?: NodeJS.ProcessEnv }
-) => Promise<{ code: number }>
+) => Promise<{ code: number; stdout?: string }>
 
 /**
  * Launch the elevated helper via ShellExecuteEx runas. The helper path must be
@@ -370,7 +410,11 @@ export async function launchElevatedForceReleaseHelper(input: {
   responsePath: string
   platform?: NodeJS.Platform
   run?: ElevatedForceReleaseRun
-}): Promise<{ kind: 'launched' } | { kind: 'cancelled' } | { kind: 'failed'; detail: string }> {
+}): Promise<
+  | { kind: 'launched'; responseTempPath?: string }
+  | { kind: 'cancelled'; responseTempPath?: string }
+  | { kind: 'failed'; detail: string; responseTempPath?: string }
+> {
   const platform = input.platform ?? process.platform
   if (platform !== 'win32') {
     return { kind: 'failed', detail: 'windows-only' }
@@ -378,23 +422,28 @@ export async function launchElevatedForceReleaseHelper(input: {
 
   const run: ElevatedForceReleaseRun =
     input.run ??
-    (async (command, args, options) => {
-      try {
-        await execFileAsync(command, args, {
-          windowsHide: true,
-          timeout: 180_000,
-          env: options?.env
-        })
-        return { code: 0 }
-      } catch (error: any) {
-        const code = typeof error?.code === 'number' ? error.code : 1
-        // 1223 = ERROR_CANCELLED (UAC denied)
-        if (code === 1223 || /canceled|cancelled/i.test(String(error?.message ?? ''))) {
-          return { code: 1223 }
-        }
-        return { code }
-      }
-    })
+    (async (command, args, options) =>
+      await new Promise(resolve => {
+        execFile(
+          command,
+          args,
+          {
+            windowsHide: true,
+            timeout: 180_000,
+            env: options?.env,
+            encoding: 'utf8'
+          },
+          (error: any, stdout: string) => {
+            const code = typeof error?.code === 'number' ? error.code : error ? 1 : 0
+            // 1223 = ERROR_CANCELLED (UAC denied)
+            if (code === 1223 || /canceled|cancelled/i.test(String(error?.message ?? ''))) {
+              resolve({ code: 1223, stdout: String(stdout ?? '') })
+              return
+            }
+            resolve({ code, stdout: String(stdout ?? '') })
+          }
+        )
+      }))
 
   const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
   const env: NodeJS.ProcessEnv = {
@@ -406,9 +455,11 @@ export async function launchElevatedForceReleaseHelper(input: {
 
   const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND]
   const result = await run(ps, args, { env })
-  if (result.code === 1223) return { kind: 'cancelled' }
-  if (result.code === 0) return { kind: 'launched' }
-  return { kind: 'failed', detail: `elevated helper exit ${result.code}` }
+  const helperPid = String(result.stdout ?? '').match(/HERMES_ELEVATED_PID=(\d+)/i)?.[1]
+  const responseTempPath = helperPid ? `${input.responsePath}.${helperPid}.tmp` : undefined
+  if (result.code === 1223) return { kind: 'cancelled', responseTempPath }
+  if (result.code === 0) return { kind: 'launched', responseTempPath }
+  return { kind: 'failed', detail: `elevated helper exit ${result.code}`, responseTempPath }
 }
 
 /** Pure helper for tests: capture argv + env without launching. */
