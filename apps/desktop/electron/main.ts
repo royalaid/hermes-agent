@@ -3889,7 +3889,8 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
       terminateWindowsHolderWithinDeadline(holder, {
         budgetMs,
         deadlineAt: deadlineAt ?? Date.now(),
-        signal
+        signal,
+        installRoot: updateRoot
       })
   })
 }
@@ -3935,9 +3936,8 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
   if (!fs.existsSync(helperScriptPath)) {
     return {
       ok: false,
-      error: 'venv-needs-elevation',
-      message: 'Update aborted: elevated force-release helper is missing from this checkout.',
-      elevationHolders: holders
+      error: 'venv-unlock-failed',
+      message: 'Update aborted: elevated force-release helper is missing from this checkout.'
     }
   }
 
@@ -3970,9 +3970,8 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     if (launch.kind === 'failed') {
       return {
         ok: false,
-        error: 'venv-needs-elevation',
-        message: `Update aborted: elevated force-release failed (${launch.detail}).`,
-        elevationHolders: holders
+        error: 'venv-unlock-failed',
+        message: `Update aborted: elevated force-release failed (${launch.detail}).`
       }
     }
 
@@ -3982,9 +3981,8 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     } catch {
       return {
         ok: false,
-        error: 'venv-needs-elevation',
-        message: 'Update aborted: elevated helper produced no response.',
-        elevationHolders: holders
+        error: 'venv-unlock-failed',
+        message: 'Update aborted: elevated helper produced no response.'
       }
     }
 
@@ -4019,9 +4017,8 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     const detail = error instanceof Error ? error.message : String(error)
     return {
       ok: false,
-      error: 'venv-needs-elevation',
-      message: `Update aborted: could not prepare the elevated force-release request (${detail}).`,
-      elevationHolders: holders
+      error: 'venv-unlock-failed',
+      message: `Update aborted: could not prepare the elevated force-release request (${detail}).`
     }
   } finally {
     if (written) {

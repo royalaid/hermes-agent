@@ -291,4 +291,38 @@ describe('BlockerView', () => {
     expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Force update (Administrator)' })).toBeNull()
   })
+
+  it('does not offer Administrator retry for a generic helper failure even when holder details remain', async () => {
+    $updateOverlayTarget.set('client')
+    $updateOverlayOpen.set(true)
+    $updateStatus.set({
+      supported: true,
+      updateAvailable: true,
+      behind: 1,
+      commits: []
+    } as DesktopUpdateStatus)
+    $updateApply.set({
+      applying: false,
+      stage: 'error',
+      message: 'Elevated helper failed to launch.',
+      percent: null,
+      error: 'venv-unlock-failed',
+      command: null,
+      elevationHolders: [
+        {
+          pid: 902,
+          name: 'python.exe',
+          cmdline: 'python.exe tools',
+          createdAt: 124,
+          resource: 'venv\\Scripts\\hermes.exe'
+        }
+      ],
+      log: []
+    })
+
+    await renderUpdatesOverlay()
+
+    expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Force update (Administrator)' })).toBeNull()
+  })
 })

@@ -45,7 +45,7 @@ const WRAPPER_MARKER_POLL_MS = 10
 const WRAPPER_PHASE_NAMES = [
   'marker-published',
   'target-job-created',
-  'watcher-READY-observed',
+  'target-boundary-armed',
   'inner-started',
   'inner-exited',
   'target-terminated',
@@ -106,8 +106,6 @@ $helperJobName = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_JOB_NAM
 $targetJobName = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_TARGET_JOB_NAME')
 $targetWaitText = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_TARGET_WAIT_MS')
 $deadlineAtText = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_DEADLINE_AT')
-$watcherReadyPath = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_WATCHER_READY_PATH')
-$watcherReadyNonce = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_WATCHER_READY_NONCE')
 $wrapperPidMarkerPath = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_WRAPPER_PID_MARKER_PATH')
 $wrapperPidMarkerNonce = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_WRAPPER_PID_MARKER_NONCE')
 $wrapperPhasePath = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_WRAPPER_PHASE_PATH')
@@ -118,8 +116,6 @@ if (
     [string]::IsNullOrWhiteSpace($targetScript) -or
     [string]::IsNullOrWhiteSpace($helperJobName) -or
     [string]::IsNullOrWhiteSpace($targetJobName) -or
-    [string]::IsNullOrWhiteSpace($watcherReadyPath) -or
-    [string]::IsNullOrWhiteSpace($watcherReadyNonce) -or
     [string]::IsNullOrWhiteSpace($helperScriptPath) -or
     [string]::IsNullOrWhiteSpace($helperGatePath)
 ) { exit 87 }
@@ -191,32 +187,6 @@ function Get-TargetWaitMs {
     $remaining = $deadlineAt - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     if ($remaining -le 0) { return -1 }
     return [Math]::Min($targetWaitMs, [int][Math]::Min($remaining, [long][int]::MaxValue))
-}
-function Wait-TargetWatcherArmed {
-    $expectedReadyValue = 'ARMED:' + $watcherReadyNonce
-    $expectedFailurePrefix = 'FAILED:' + $watcherReadyNonce
-    $waitDeadline = $deadlineAt
-    if ($waitDeadline -le 0) {
-        $waitDeadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [Math]::Max(1, $targetWaitMs)
-    }
-    while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $waitDeadline) {
-        if (Test-Path -LiteralPath $watcherReadyPath) {
-            try {
-                $readyValue = [IO.File]::ReadAllText($watcherReadyPath).Trim()
-                if ($readyValue -eq $expectedReadyValue) {
-                    Write-WrapperPhase 'watcher-READY-observed'
-                    return
-                }
-                if ($readyValue.StartsWith($expectedFailurePrefix, [StringComparison]::Ordinal)) {
-                    throw $readyValue
-                }
-            } catch {
-                if ($_.Exception.Message.StartsWith($expectedFailurePrefix, [StringComparison]::Ordinal)) { throw }
-            }
-        }
-        Start-Sleep -Milliseconds 10
-    }
-    throw 'TARGET_WATCHER_NOT_ARMED'
 }
 
 Add-Type -TypeDefinition @'
@@ -349,11 +319,9 @@ while (-not (Test-Path -LiteralPath $helperGatePath)) {
     $targetJob = [HermesTerminateJob]::CreateKillOnClose($targetJobName)
     $helperJob = [HermesTerminateJob]::CreateKillOnClose($helperJobName)
     Write-WrapperPhase 'target-job-created'
-    # The wrapper must not start the mutating helper until a detached watcher
-    # has authenticated this exact wrapper process and opened this exact job.
-    # Without this gate a watcher startup failure could be mistaken for a
-    # completed boundary while the nested helper still owns a job handle.
-    Wait-TargetWatcherArmed
+    # The wrapper owns the only persistent target-Job handle. Wrapper death
+    # closes it and applies KILL_ON_JOB_CLOSE to every assigned target.
+    Write-WrapperPhase 'target-boundary-armed'
     $child = [System.Diagnostics.Process]::Start($psi)
     [HermesTerminateJob]::Assign($helperJob, $child.Handle)
     [IO.File]::WriteAllText($helperGatePath, 'GO', [Text.UTF8Encoding]::new($false))
@@ -528,7 +496,7 @@ function Write-WatcherLog([string]$message) {
 }
 function Write-WatcherReady([string]$value) {
     if ([string]::IsNullOrWhiteSpace($watcherReadyPath) -or [string]::IsNullOrWhiteSpace($watcherReadyNonce)) { return }
-    $tempPath = $watcherReadyPath + '.' + $PID + '.tmp'
+    $tempPath = $watcherReadyPath + '.tmp'
     try {
         [IO.File]::WriteAllText($tempPath, $value)
         [IO.File]::Move($tempPath, $watcherReadyPath)
@@ -777,6 +745,18 @@ function hasSuccessfulWrapperReceipt(phasePath: string, phaseNonce: string): boo
       readPhase('target-terminated') &&
       readPhase('handles-closed')
   )
+}
+
+function hasTargetBoundaryReceipt(phasePath: string, phaseNonce: string): boolean {
+  const hasPhase = (phase: 'target-terminated' | 'handles-closed'): boolean => {
+    try {
+      const value = fs.readFileSync(`${phasePath}.${phase}.marker`, 'utf8').trim()
+      return value.startsWith(`PHASE:${phaseNonce};NAME:${phase};TICKS:`)
+    } catch {
+      return false
+    }
+  }
+  return hasPhase('target-terminated') && hasPhase('handles-closed')
 }
 
 function readExactWatcherReadyValue(watcherReadyPath: string): string | undefined {
@@ -1651,7 +1631,11 @@ async function defaultRunPowerShell(
   const jobName = `HermesTerminateHelper-${randomBytes(16).toString('hex')}`
   const targetJobName = `HermesTerminateTarget-${randomBytes(16).toString('hex')}`
   const targetWaitMs = Math.max(0, Math.min(1_500, runMs - 100))
-  const watcherStarter = dependencies?.startWatcher ?? startTargetJobWatcher
+  // Production relies on the wrapper-owned kill-on-close target/helper Jobs.
+  // A watcher can be injected only by boundary tests; it is never an ambient
+  // or production lifecycle dependency.
+  const watcherStarter = dependencies?.startWatcher
+  const watcherEnabled = typeof watcherStarter === 'function'
   const watcherReadyDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-terminate-watcher-'))
   const watcherReadyPath = path.join(watcherReadyDirectory, 'ready')
   const watcherReadyNonce = randomBytes(16).toString('hex')
@@ -1675,16 +1659,12 @@ async function defaultRunPowerShell(
     let watcherDiagnostics: TargetJobWatcherDiagnostics | undefined
     let watcherStartupFailure: string | undefined
 
-    const watcherTempPath = () =>
-      Number.isInteger(watcherProcess?.pid) && (watcherProcess?.pid as number) > 0
-        ? `${watcherReadyPath}.${watcherProcess?.pid}.tmp`
-        : undefined
     const cleanupWatcherArtifacts = () => {
-      // The watcher writes only these exact paths. Never recursively remove the
-      // temporary directory, because a late or unrelated file must not be swept.
+      // Every writer path is parent-known and nonce-directory-bound. Never
+      // recursively remove the directory, because unrelated files must not be swept.
       const exactPaths = [
         watcherReadyPath,
-        watcherTempPath(),
+        `${watcherReadyPath}.tmp`,
         wrapperPidMarkerPath,
         `${wrapperPidMarkerPath}.tmp`,
         helperScriptPath,
@@ -1716,40 +1696,63 @@ async function defaultRunPowerShell(
       if (settled || terminalizing) return
       terminalizing = (async () => {
         let finalResult = { ...result, pid: childPid }
-        let watcherTerminal = false
         const mustKill = killing || signal?.aborted === true
 
         if (wrapperMarkerSetup) await wrapperMarkerSetup
 
-        const watcherReadyAtFinish = readExactWatcherReadyValue(watcherReadyPath)
-        const watcherUnauthenticated = watcherReadyAtFinish !== `ARMED:${watcherReadyNonce}`
-        if (watcherUnauthenticated && watcherProcess?.exitCode == null && watcherProcess?.signalCode == null) {
+        const watcherReadyAtFinish = watcherEnabled ? readExactWatcherReadyValue(watcherReadyPath) : undefined
+        if (
+          watcherEnabled &&
+          watcherReadyAtFinish !== `ARMED:${watcherReadyNonce}` &&
+          watcherProcess?.exitCode == null &&
+          watcherProcess?.signalCode == null
+        ) {
           try {
             watcherProcess?.kill('SIGKILL')
           } catch {
             void 0
           }
         }
-        const watcherPromise = waitForTargetJobWatcher(
-          watcherProcess,
-          targetJobName,
-          absoluteDeadline,
-          watcherStartupFailure,
-          watcherDiagnostics,
-          watcherReadyAtFinish !== `ARMED:${watcherReadyNonce}`
-        )
-        const killPromise =
+
+        const watcherResult: TargetJobWatcherResult = watcherEnabled
+          ? await waitForTargetJobWatcher(
+              watcherProcess,
+              targetJobName,
+              absoluteDeadline,
+              watcherStartupFailure,
+              watcherDiagnostics,
+              watcherReadyAtFinish !== `ARMED:${watcherReadyNonce}`
+            )
+          : {
+              terminal: true,
+              healthy: true,
+              targetBoundaryConfirmed: hasTargetBoundaryReceipt(wrapperPhasePath, wrapperPhaseNonce),
+              detail: 'wrapper-owned-job-boundary'
+            }
+
+        let targetBoundaryConfirmed = watcherResult.targetBoundaryConfirmed
+        // On cancellation, drain the named target Job while the wrapper still
+        // owns its persistent handle. Only then kill and confirm the wrapper /
+        // helper process tree. This removes the close-before-open race.
+        if (!watcherEnabled && mustKill && !targetBoundaryConfirmed && Date.now() < absoluteDeadline) {
+          targetBoundaryConfirmed = await terminateNamedTargetJobWithinDeadline(
+            targetJobName,
+            absoluteDeadline,
+            Math.min(1_000, Math.max(0, absoluteDeadline - Date.now()))
+          )
+        }
+
+        let killResult =
           mustKill && typeof childPid === 'number'
-            ? killProcessTreeAndAwaitGone(childPid, {
+            ? await killProcessTreeAndAwaitGone(childPid, {
                 confirmMs: killReserveMs,
                 preSnapshot: treeSnapshot,
                 deadlineAt: absoluteDeadline
               })
-            : Promise.resolve(undefined)
-        const watcherResult = await watcherPromise
-        let killResult = await killPromise
-        watcherTerminal = watcherResult.terminal
+            : undefined
+        let watcherTerminal = watcherResult.terminal
         if (
+          watcherEnabled &&
           !watcherTerminal &&
           Number.isInteger(watcherProcess?.pid) &&
           (watcherProcess?.pid as number) > 0 &&
@@ -1760,21 +1763,14 @@ async function defaultRunPowerShell(
           })
           watcherTerminal = watcherSurvivors.length === 0
         }
-        // The bounded native probe can consume the outer tail on Windows. An
-        // exit/signal event delivered while that probe was in flight is also
-        // terminal evidence; do not confuse kill() delivery (`killed`) with this
-        // completed child-process event.
-        if (!watcherTerminal && watcherProcess) {
+        if (watcherEnabled && !watcherTerminal && watcherProcess) {
           watcherTerminal = watcherProcess.exitCode != null || watcherProcess.signalCode != null
         }
         let wrapperBoundaryRequired = mustKill
-        let targetBoundaryConfirmed = watcherResult.targetBoundaryConfirmed
 
-        // A healthy watcher opened and generation-checked the exact wrapper
-        // process handle, then observed it signaled. That is authoritative
-        // absence proof for that one captured generation; every other captured
-        // descendant still requires the normal liveness proof.
-        if (watcherResult.healthy && killResult && wrapperProcessIdentity) {
+        // Only the injected legacy watcher can authenticate wrapper absence.
+        // Production requires the normal wrapper-tree liveness proof.
+        if (watcherEnabled && watcherResult.healthy && killResult && wrapperProcessIdentity) {
           const survivors = killResult.survivors.filter(identity => {
             if (identity.pid !== wrapperProcessIdentity?.pid) return true
             if (identity.createdAt == null || wrapperProcessIdentity.createdAt == null) return false
@@ -1783,47 +1779,40 @@ async function defaultRunPowerShell(
           killResult = { ...killResult, survivors, confirmed: survivors.length === 0 }
         }
 
-        // execFile completion can lag exact process death while inherited stdio
-        // drains. Accept only the nonce-bound success receipt written after
-        // target termination and handle closure, corroborated by the healthy
-        // watcher and its authenticated READY value.
-        const watcherReadyValue = readExactWatcherReadyValue(watcherReadyPath)
+        // execFile completion can lag exact process death. Accept only the
+        // nonce-bound success receipt written after target drain and handle
+        // closure; watcher READY is required only for an explicitly injected
+        // watcher test path.
         if (
           finalResult.code !== 0 &&
-          watcherResult.healthy &&
           targetBoundaryConfirmed &&
-          watcherReadyValue === `ARMED:${watcherReadyNonce}` &&
+          (!watcherEnabled || watcherReadyAtFinish === `ARMED:${watcherReadyNonce}`) &&
           hasSuccessfulWrapperReceipt(wrapperPhasePath, wrapperPhaseNonce)
         ) {
           finalResult = { stdout: 'TERMINATED\n', stderr: '', code: 0, pid: childPid }
         }
 
-        // A watcher failure is not itself a target-tree boundary. Even when the
-        // wrapper callback reports a normal exit, force the authenticated wrapper
-        // identity through the same kill/absence confirmation and require the
-        // named target-job drain to have returned a proven result.
         if (!watcherResult.healthy || !targetBoundaryConfirmed) {
           wrapperBoundaryRequired = true
           killing = true
           const remaining = Math.max(0, absoluteDeadline - Date.now())
-          const forcedKillPromise =
-            typeof childPid === 'number' && (!killResult || !killResult.confirmed)
-              ? killProcessTreeAndAwaitGone(childPid, {
-                  confirmMs: Math.min(killReserveMs, remaining),
-                  preSnapshot: treeSnapshot,
-                  deadlineAt: absoluteDeadline
-                })
-              : Promise.resolve(killResult)
-          const targetJobFallback =
-            !targetBoundaryConfirmed && remaining > 0
-              ? terminateNamedTargetJobWithinDeadline(targetJobName, absoluteDeadline, Math.min(1_000, remaining))
-              : Promise.resolve(targetBoundaryConfirmed)
-          const [forcedKillResult, targetJobResult] = await Promise.all([forcedKillPromise, targetJobFallback])
-          killResult = forcedKillResult
-          targetBoundaryConfirmed = targetBoundaryConfirmed || targetJobResult
+          if (!targetBoundaryConfirmed && remaining > 0) {
+            targetBoundaryConfirmed = await terminateNamedTargetJobWithinDeadline(
+              targetJobName,
+              absoluteDeadline,
+              Math.min(1_000, remaining)
+            )
+          }
+          if (typeof childPid === 'number' && (!killResult || !killResult.confirmed)) {
+            killResult = await killProcessTreeAndAwaitGone(childPid, {
+              confirmMs: Math.min(killReserveMs, Math.max(0, absoluteDeadline - Date.now())),
+              preSnapshot: treeSnapshot,
+              deadlineAt: absoluteDeadline
+            })
+          }
         }
 
-        if (!watcherResult.healthy) {
+        if (watcherEnabled && !watcherResult.healthy) {
           finalResult = {
             ...finalResult,
             stderr: [watcherStartupFailure, watcherResult.detail, finalResult.stderr]
@@ -1833,7 +1822,7 @@ async function defaultRunPowerShell(
             pid: childPid
           }
         }
-        if (watcherDiagnostics && finalResult.code !== 0) {
+        if (watcherEnabled && watcherDiagnostics && finalResult.code !== 0) {
           finalResult = {
             ...finalResult,
             stderr: [formatTargetJobWatcherDiagnostics(watcherDiagnostics), finalResult.stderr]
@@ -1887,7 +1876,11 @@ async function defaultRunPowerShell(
           finalResult = {
             ...finalResult,
             stderr: [
-              watcherReadyValue ? `watcher-ready-value=${JSON.stringify(watcherReadyValue)}` : 'watcher-ready-value=missing',
+              watcherEnabled
+                ? watcherReadyAtFinish
+                  ? 'watcher-ready=armed'
+                  : 'watcher-ready=missing'
+                : 'boundary=wrapper-owned-job',
               wrapperPhaseDiagnostics,
               finalResult.stderr
             ]
@@ -2013,23 +2006,21 @@ async function defaultRunPowerShell(
           }
           return
         }
-        const watcherSpawnedAt = Date.now()
-        watcherProcess = watcherStarter(
-          wrapperProcessIdentity.pid,
-          wrapperProcessIdentity.createdAt ?? 0,
-          targetJobName,
-          watcherReadyPath,
-          watcherReadyNonce,
-          watcherDeadline
-        )
-        if (watcherProcess) watcherDiagnostics = observeTargetJobWatcher(watcherProcess, watcherSpawnedAt)
-        if (!watcherProcess) {
-          watcherStartupFailure = `watcher-spawn-failed wrapper-pid=${wrapperProcessIdentity.pid} launch-pid=${launchedPid}`
-          killing = true
-          try {
-            childProcess?.kill('SIGKILL')
-          } catch {
-            void 0
+        if (watcherStarter) {
+          const watcherSpawnedAt = Date.now()
+          watcherProcess = watcherStarter(
+            wrapperProcessIdentity.pid,
+            wrapperProcessIdentity.createdAt ?? 0,
+            targetJobName,
+            watcherReadyPath,
+            watcherReadyNonce,
+            watcherDeadline
+          )
+          if (watcherProcess) watcherDiagnostics = observeTargetJobWatcher(watcherProcess, watcherSpawnedAt)
+          if (!watcherProcess) {
+            watcherStartupFailure = `watcher-spawn-failed wrapper-pid=${wrapperProcessIdentity.pid} launch-pid=${launchedPid}`
+            killing = true
+            return
           }
         }
         // Capture identities promptly after spawn with a bounded slice; abort must
@@ -2066,13 +2057,10 @@ async function defaultRunPowerShell(
           treeSnapshot = [{ pid: childPid }]
         }
       }
-      try {
-        childProcess?.kill('SIGKILL')
-      } catch {
-        void 0
-      }
-      // finish() concurrently awaits the watcher and the authenticated tree
-      // drain. If the watcher stalls it performs the bounded named-job fallback.
+      // finish() first drains the wrapper-owned named target Job, then kills and
+      // confirms the authenticated wrapper/helper tree. Do not pre-kill the
+      // wrapper here or its only persistent target-Job handle disappears before
+      // the bounded drain can open it.
       void finish({ stdout: '', stderr: 'aborted', code: 1, pid: childPid })
     }
 
@@ -2101,16 +2089,40 @@ export async function runPowerShellWithHardBoundary(
  * Build a self-contained PowerShell script that terminates one PID only when
  * its create-time ticks still match the expected generation.
  */
-export function buildExactTerminateScript(pid: number, createdAtUnixSeconds: number, waitMs = 1_500): string {
+export type ExactTerminateScriptOptions = {
+  installRoot?: string
+  resource?: string
+  forcePrimarySnapshotFailure?: boolean
+  pausePhase?: 'after-root-assignment' | 'after-root-suspension' | 'after-child-assignment' | 'after-child-suspension'
+  pausePid?: number
+  phaseMarkerPath?: string
+}
+
+export function buildExactTerminateScript(
+  pid: number,
+  createdAtUnixSeconds: number,
+  waitMs = 1_500,
+  options?: ExactTerminateScriptOptions
+): string {
   // createdAt from psutil is epoch seconds (float). Compare at second resolution.
   const expected = Number(createdAtUnixSeconds)
+  const psLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
+  const forcePrimarySnapshotFailure = options?.forcePrimarySnapshotFailure === true ? '$true' : '$false'
+  const pausePhase = psLiteral(options?.pausePhase ?? '')
+  const pausePid = Number.isInteger(options?.pausePid) ? Math.max(0, options?.pausePid as number) : 0
+  const phaseMarkerPath = psLiteral(options?.phaseMarkerPath ?? '')
+  const installRootClaim = psLiteral(options?.installRoot ?? '')
+  const resourceClaim = psLiteral(options?.resource ?? '')
   return `
 $ErrorActionPreference = 'Stop'
 $pidTarget = ${Math.trunc(pid)}
 $expectedUnix = [double]${expected}
 $waitMs = ${Math.max(0, Math.trunc(waitMs))}
+$installRootClaim = ${installRootClaim}
+$resourceClaim = ${resourceClaim}
 Add-Type -TypeDefinition @"
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
 public static class HermesForceReleaseNative {
   public const uint PROCESS_TERMINATE = 0x0001;
@@ -2125,6 +2137,9 @@ public static class HermesForceReleaseNative {
   public const int JobObjectExtendedLimitInformation = 9;
   public const uint WAIT_OBJECT_0 = 0;
   public const uint WAIT_TIMEOUT = 258;
+  public const int CCH_RM_SESSION_KEY = 32;
+  public const int CCH_RM_MAX_APP_NAME = 255;
+  public const int CCH_RM_MAX_SVC_NAME = 63;
   [StructLayout(LayoutKind.Sequential)]
   public struct BasicLimits {
     public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
@@ -2147,6 +2162,18 @@ public static class HermesForceReleaseNative {
   }
   [StructLayout(LayoutKind.Sequential)]
   public struct FileTime { public uint Low; public uint High; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct RmUniqueProcess { public int ProcessId; public FileTime ProcessStartTime; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct RmProcessInfo {
+    public RmUniqueProcess Process;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=CCH_RM_MAX_APP_NAME+1)] public string AppName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=CCH_RM_MAX_SVC_NAME+1)] public string ServiceShortName;
+    public int ApplicationType;
+    public uint AppStatus;
+    public uint TerminalSessionId;
+    [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
+  }
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -2165,12 +2192,22 @@ public static class HermesForceReleaseNative {
   public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern bool GetProcessTimes(IntPtr process, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern bool CloseHandle(IntPtr handle);
   [DllImport("ntdll.dll")]
   public static extern int NtSuspendProcess(IntPtr process);
   [DllImport("ntdll.dll")]
   public static extern int NtResumeProcess(IntPtr process);
+  [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+  public static extern int RmStartSession(out uint sessionHandle, int sessionFlags, StringBuilder sessionKey);
+  [DllImport("rstrtmgr.dll")]
+  public static extern int RmEndSession(uint sessionHandle);
+  [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+  public static extern int RmRegisterResources(uint sessionHandle, uint fileCount, string[] files, uint appCount, IntPtr apps, uint serviceCount, string[] services);
+  [DllImport("rstrtmgr.dll")]
+  public static extern int RmGetList(uint sessionHandle, out uint needed, ref uint count, [In,Out] RmProcessInfo[] processes, ref uint rebootReasons);
   public static double ToUnixSeconds(FileTime time) {
     long fileTicks = ((long)time.High << 32) | time.Low;
     return (fileTicks - 116444736000000000L) / 10000000.0;
@@ -2196,6 +2233,35 @@ public static class HermesForceReleaseNative {
       return IntPtr.Zero;
     }
     return process;
+  }
+  public static string ReadImagePath(IntPtr process) {
+    uint size = 32768;
+    var buffer = new StringBuilder((int)size);
+    return QueryFullProcessImageName(process, 0, buffer, ref size) ? buffer.ToString() : "";
+  }
+  public static bool IsCurrentResourceOwner(string resource, int pid, double expectedUnix) {
+    if (String.IsNullOrWhiteSpace(resource)) return false;
+    uint session;
+    var key = new StringBuilder(CCH_RM_SESSION_KEY + 1);
+    if (RmStartSession(out session, 0, key) != 0) return false;
+    try {
+      if (RmRegisterResources(session, 1, new string[]{ resource }, 0, IntPtr.Zero, 0, null) != 0) return false;
+      uint needed = 0, count = 0, reboot = 0;
+      int rc = RmGetList(session, out needed, ref count, null, ref reboot);
+      if (rc != 234 || needed == 0) return false;
+      count = needed;
+      var rows = new RmProcessInfo[count];
+      rc = RmGetList(session, out needed, ref count, rows, ref reboot);
+      if (rc != 0) return false;
+      for (int i = 0; i < count; i++) {
+        if (rows[i].Process.ProcessId != pid) continue;
+        double actualUnix = ToUnixSeconds(rows[i].Process.ProcessStartTime);
+        if (Math.Abs(actualUnix - expectedUnix) <= 1.5) return true;
+      }
+      return false;
+    } finally {
+      RmEndSession(session);
+    }
   }
   public static int SuspendProcess(IntPtr process) {
     int status = NtSuspendProcess(process);
@@ -2292,11 +2358,15 @@ $success = $false
 $exitCode = 1
 $fallbackSnapshotUsed = $false
 $treeRows = $null
+$forcePrimarySnapshotFailure = ${forcePrimarySnapshotFailure}
+$testPausePhase = ${pausePhase}
+$testPausePid = ${pausePid}
+$testPhaseMarker = ${phaseMarkerPath}
 
 function Get-TreeChildren([int]$parentPid) {
   if ($null -eq $script:treeRows) {
     try {
-      if ([Environment]::GetEnvironmentVariable('HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE') -eq '1' -and -not $script:fallbackSnapshotUsed) {
+      if ($forcePrimarySnapshotFailure -and -not $script:fallbackSnapshotUsed) {
         $script:fallbackSnapshotUsed = $true
         throw 'forced primary snapshot failure'
       }
@@ -2345,14 +2415,9 @@ function Assign-ContainedProcess([IntPtr]$processHandle, [int]$currentPid) {
 }
 
 function Pause-BoundaryTest([string]$phase, [int]$currentPid) {
-  $wanted = [Environment]::GetEnvironmentVariable('HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE')
-  if ($wanted -ne $phase) { return }
-  $wantedPidText = [Environment]::GetEnvironmentVariable('HERMES_FORCE_RELEASE_TEST_PAUSE_PID')
-  if (-not [string]::IsNullOrWhiteSpace($wantedPidText)) {
-    $wantedPid = 0
-    if (-not [int]::TryParse($wantedPidText, [ref]$wantedPid) -or $wantedPid -ne $currentPid) { return }
-  }
-  $marker = [Environment]::GetEnvironmentVariable('HERMES_FORCE_RELEASE_TEST_PHASE_MARKER')
+  if ($testPausePhase -ne $phase) { return }
+  if ($testPausePid -gt 0 -and $testPausePid -ne $currentPid) { return }
+  $marker = $testPhaseMarker
   if (-not [string]::IsNullOrWhiteSpace($marker)) {
     $markerTemp = $marker + '.tmp'
     [IO.File]::WriteAllText(
@@ -2384,6 +2449,23 @@ try {
   if ($rootHandle -eq [IntPtr]::Zero) {
     if ($rootOpenError -eq 0x10001) { throw ("CREATE_TIME_MISMATCH root=" + $pidTarget) }
     throw ('TREE_OPEN_FAILED win32=' + $rootOpenError)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($installRootClaim) -or -not [string]::IsNullOrWhiteSpace($resourceClaim)) {
+    if ([string]::IsNullOrWhiteSpace($installRootClaim) -or [string]::IsNullOrWhiteSpace($resourceClaim)) {
+      throw 'TERMINATION_AUTHORIZATION_CLAIM_INCOMPLETE'
+    }
+    $installRootFull = [IO.Path]::GetFullPath($installRootClaim).TrimEnd('\\') + '\\'
+    $resourceFull = [IO.Path]::GetFullPath($resourceClaim)
+    if (-not $resourceFull.StartsWith($installRootFull, [StringComparison]::OrdinalIgnoreCase)) {
+      throw 'TERMINATION_RESOURCE_OUTSIDE_INSTALL_ROOT'
+    }
+    $imagePath = [HermesForceReleaseNative]::ReadImagePath($rootHandle)
+    if ([string]::IsNullOrWhiteSpace($imagePath) -or -not [IO.Path]::IsPathRooted($imagePath)) {
+      throw 'TERMINATION_EXECUTABLE_IDENTITY_UNAVAILABLE'
+    }
+    if (-not [HermesForceReleaseNative]::IsCurrentResourceOwner($resourceFull, $pidTarget, $expectedUnix)) {
+      throw 'TERMINATION_CURRENT_LOCK_OWNERSHIP_MISMATCH'
+    }
   }
   $handles[[string]$pidTarget] = $rootHandle
   Assign-ContainedProcess $rootHandle $pidTarget
@@ -2526,7 +2608,9 @@ export async function terminateWindowsHolderExact(
     waitMs = 1_500,
     timeoutMs,
     signal,
-    deadlineAt
+    deadlineAt,
+    installRoot,
+    buildScript = buildExactTerminateScript
   }: {
     platform?: NodeJS.Platform
     run?: RunPowerShell
@@ -2537,6 +2621,15 @@ export async function terminateWindowsHolderExact(
     signal?: AbortSignal
     /** Absolute deadline shared with the caller's orchestration budget. */
     deadlineAt?: number
+    /** Canonical update root for final resource-authorization validation. */
+    installRoot?: string
+    /** Explicit test seam; production uses buildExactTerminateScript. */
+    buildScript?: (
+      pid: number,
+      createdAt: number,
+      waitMs: number,
+      options?: ExactTerminateScriptOptions
+    ) => string
   } = {}
 ): Promise<ForceReleaseTerminateResult> {
   if (platform !== 'win32') {
@@ -2566,7 +2659,10 @@ export async function terminateWindowsHolderExact(
     return { kind: 'failed', detail: 'deadline-exhausted' }
   }
 
-  const script = buildExactTerminateScript(target.pid, target.createdAt, effectiveWait)
+  const script = buildScript(target.pid, target.createdAt, effectiveWait, {
+    installRoot,
+    resource: target.resource
+  })
   const result = await run(script, budget, signal, deadlineAt)
   if (signal?.aborted) {
     // Child tree must already be confirmed gone by run(); never claim mutation.
@@ -2595,12 +2691,14 @@ export async function terminateWindowsHolderWithinDeadline(
     run = defaultRunPowerShell,
     budgetMs,
     deadlineAt,
+    installRoot,
     signal
   }: {
     platform?: NodeJS.Platform
     run?: RunPowerShell
     budgetMs: number
     deadlineAt: number
+    installRoot?: string
     signal?: AbortSignal
   }
 ): Promise<ForceReleaseTerminateResult> {
@@ -2618,6 +2716,7 @@ export async function terminateWindowsHolderWithinDeadline(
     timeoutMs: budget,
     waitMs: Math.max(0, Math.min(1_500, budget - 250)),
     signal,
-    deadlineAt: absoluteDeadline
+    deadlineAt: absoluteDeadline,
+    installRoot
   })
 }
