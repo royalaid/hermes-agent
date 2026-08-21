@@ -513,20 +513,23 @@ export async function killProcessTreeAndAwaitGone(
         deadlineAt: absoluteDeadline
       })
     )
+    let snapshotTimer: NodeJS.Timeout | undefined
     try {
       // Native execFile has its own timeout, but keep the boundary safe even
       // if an injected/native adapter ignores that option. Snapshotting is
       // read-only, so abandoning its late result cannot leave mutation work.
       captured = await Promise.race([
         snapshotPromise,
-        new Promise<ProcessIdentity[]>(resolve =>
-          setTimeout(() => resolve([]), Math.max(1, snapshotBudget))
-        )
+        new Promise<ProcessIdentity[]>(resolve => {
+          snapshotTimer = setTimeout(() => resolve([]), Math.max(1, snapshotBudget))
+        })
       ])
     } catch {
       // Snapshot failure is intentionally represented by the unknown root.
       // The caller's Job Object boundary, when present, is the hard fallback.
       captured = []
+    } finally {
+      if (snapshotTimer) clearTimeout(snapshotTimer)
     }
     // A timed-out adapter may settle later; consume its rejection without
     // extending this boundary or creating an unhandled-rejection side effect.
@@ -825,83 +828,110 @@ $ErrorActionPreference = 'Stop'
 $pidTarget = ${Math.trunc(pid)}
 $expectedUnix = [double]${expected}
 $waitMs = ${Math.max(0, Math.trunc(waitMs))}
-try {
-  Add-Type -TypeDefinition @"
+Add-Type -TypeDefinition @"
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 public static class HermesForceReleaseNative {
   public const uint PROCESS_TERMINATE = 0x0001;
+  public const uint PROCESS_SET_QUOTA = 0x0100;
+  public const uint PROCESS_SUSPEND_RESUME = 0x0800;
+  public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
   public const uint SYNCHRONIZE = 0x00100000;
-  public const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
-  public const uint TOKEN_QUERY = 0x0008;
-  public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
-  [StructLayout(LayoutKind.Sequential, Pack = 1)]
-  public struct LUID { public uint LowPart; public int HighPart; }
-  [StructLayout(LayoutKind.Sequential, Pack = 1)]
-  public struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
-  [StructLayout(LayoutKind.Sequential, Pack = 1)]
-  public struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID_AND_ATTRIBUTES Privileges; }
-  [DllImport("advapi32.dll", SetLastError = true)]
-  public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
-  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-  public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
-  [DllImport("advapi32.dll", SetLastError = true)]
-  public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+  public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+  public const int JobObjectExtendedLimitInformation = 9;
+  public const uint WAIT_OBJECT_0 = 0;
+  public const uint WAIT_TIMEOUT = 258;
+  [StructLayout(LayoutKind.Sequential)]
+  public struct BasicLimits {
+    public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+    public uint LimitFlags;
+    public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+    public uint ActiveProcessLimit;
+    public UIntPtr Affinity;
+    public uint PriorityClass, SchedulingClass;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct IoCounters {
+    public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+    public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct ExtendedLimits {
+    public BasicLimits BasicLimitInformation;
+    public IoCounters IoInfo;
+    public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+  }
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern IntPtr CreateJobObject(IntPtr attributes, string name);
   [DllImport("kernel32.dll", SetLastError = true)]
-  public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+  public static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimits info, uint length);
   [DllImport("kernel32.dll", SetLastError = true)]
-  public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+  public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern bool CloseHandle(IntPtr hObject);
-  [DllImport("kernel32.dll")]
-  public static extern IntPtr GetCurrentProcess();
-  public static void TryEnableDebugPrivilege() {
-    IntPtr token;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token)) return;
-    try {
-      LUID luid;
-      if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out luid)) return;
-      TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
-      tp.PrivilegeCount = 1;
-      tp.Privileges.Luid = luid;
-      tp.Privileges.Attributes = SE_PRIVILEGE_ENABLED;
-      AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
-    } finally { CloseHandle(token); }
+  [DllImport("ntdll.dll")]
+  public static extern int NtSuspendProcess(IntPtr process);
+  [DllImport("ntdll.dll")]
+  public static extern int NtResumeProcess(IntPtr process);
+  public static int SuspendProcess(int pid) {
+    IntPtr process = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+    if (process == IntPtr.Zero) { int error = Marshal.GetLastWin32Error(); return error == 0 ? -1 : -error; }
+    try { return NtSuspendProcess(process) == 0 ? 0 : -1; }
+    finally { CloseHandle(process); }
   }
-  public static int TerminateExact(int pid, int waitMs) {
-    TryEnableDebugPrivilege();
-    IntPtr handle = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, false, pid);
-    if (handle == IntPtr.Zero) {
-      int err = Marshal.GetLastWin32Error();
-      return err == 0 ? -1 : -err;
+  public static int ResumeProcess(int pid) {
+    IntPtr process = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+    if (process == IntPtr.Zero) return 0;
+    try { return NtResumeProcess(process) == 0 ? 0 : -1; }
+    finally { CloseHandle(process); }
+  }
+  public static IntPtr CreateKillOnCloseJob() {
+    IntPtr job = CreateJobObject(IntPtr.Zero, null);
+    if (job == IntPtr.Zero) return IntPtr.Zero;
+    var limits = new ExtendedLimits();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedLimits)))) {
+      CloseHandle(job);
+      return IntPtr.Zero;
     }
+    return job;
+  }
+  public static int AssignProcess(IntPtr job, int pid) {
+    IntPtr process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, false, pid);
+    if (process == IntPtr.Zero) { int error = Marshal.GetLastWin32Error(); return error == 0 ? -1 : -error; }
     try {
-      if (!TerminateProcess(handle, 1)) {
-        int err = Marshal.GetLastWin32Error();
-        return err == 0 ? -1 : -err;
-      }
-      WaitForSingleObject(handle, (uint)Math.Max(0, waitMs));
-      return 0;
-    } finally { CloseHandle(handle); }
+      if (AssignProcessToJobObject(job, process)) return 0;
+      int error = Marshal.GetLastWin32Error();
+      return error == 0 ? -1 : -error;
+    } finally { CloseHandle(process); }
+  }
+  public static int TerminateJobAndWait(IntPtr job, int waitMs) {
+    if (!TerminateJobObject(job, 1)) {
+      int error = Marshal.GetLastWin32Error();
+      return error == 0 ? -1 : -error;
+    }
+    uint result = WaitForSingleObject(job, (uint)Math.Max(0, waitMs));
+    if (result == WAIT_OBJECT_0) return 0;
+    if (result == WAIT_TIMEOUT) return -258;
+    int waitError = Marshal.GetLastWin32Error();
+    return waitError == 0 ? -1 : -waitError;
   }
 }
 "@
-} catch {}
+
+function Get-IdentityUnix([int]$targetPid) {
+  $p = Get-Process -Id $targetPid -ErrorAction Stop
+  return [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
+}
+
 try {
-  $p = Get-Process -Id $pidTarget -ErrorAction Stop
-  try {
-    $actualUnix = [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
-  } catch {
-    $msg = [string]$_.Exception.Message
-    if ($msg -match 'Access is denied|AccessDenied|denied') {
-      Write-Output 'ACCESS_DENIED'
-      exit 5
-    }
-    throw
-  }
+  $actualUnix = Get-IdentityUnix $pidTarget
 } catch {
   $msg = [string]$_.Exception.Message
   if ($msg -match 'Access is denied|AccessDenied|denied') {
@@ -915,24 +945,113 @@ if ([math]::Abs($actualUnix - $expectedUnix) -gt 1.5) {
   Write-Output ("CREATE_TIME_MISMATCH actual=" + $actualUnix + " expected=" + $expectedUnix)
   exit 3
 }
-$code = [HermesForceReleaseNative]::TerminateExact($pidTarget, $waitMs)
-if ($code -eq 0) {
+
+$job = [IntPtr]::Zero
+$suspended = New-Object 'System.Collections.Generic.List[int]'
+$contained = New-Object 'System.Collections.Generic.HashSet[int]'
+$success = $false
+$exitCode = 1
+$fallbackSnapshotUsed = $false
+
+function Get-TreeChildren([int]$parentPid) {
+  try {
+    if ([Environment]::GetEnvironmentVariable('HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE') -eq '1' -and -not $script:fallbackSnapshotUsed) {
+      $script:fallbackSnapshotUsed = $true
+      throw 'forced primary snapshot failure'
+    }
+    return @(Get-CimInstance Win32_Process -Filter ('ParentProcessId = ' + $parentPid) -ErrorAction Stop)
+  } catch {
+    # Independent WMI enumeration is the bounded fallback for a CIM timeout;
+    # if both views fail, no target mutation is claimed.
+    return @(Get-WmiObject Win32_Process -Filter ('ParentProcessId = ' + $parentPid) -ErrorAction Stop)
+  }
+}
+
+function Assert-NativeSuccess([int]$code, [string]$operation) {
+  if ($code -ne 0) { throw ($operation + ' win32=' + (-$code)) }
+}
+
+try {
+  $suspendCode = [HermesForceReleaseNative]::SuspendProcess($pidTarget)
+  Assert-NativeSuccess $suspendCode 'TREE_SUSPEND_FAILED'
+  [void]$suspended.Add($pidTarget)
+
+  # Assign the authenticated root before discovery. It is suspended, so it
+  # cannot create a new child between containment setup and the fixed-point walk.
+  $job = [HermesForceReleaseNative]::CreateKillOnCloseJob()
+  if ($job -eq [IntPtr]::Zero) { throw 'TREE_JOB_CREATE_FAILED win32=5' }
+  $assignRoot = [HermesForceReleaseNative]::AssignProcess($job, $pidTarget)
+  Assert-NativeSuccess $assignRoot 'TREE_ASSIGN_FAILED'
+  [void]$contained.Add($pidTarget)
+
+  $rows = New-Object 'System.Collections.Generic.List[object]'
+  $seen = @{}
+  $queue = New-Object 'System.Collections.Generic.Queue[int]'
+  $seen[[string]$pidTarget] = $true
+  [void]$queue.Enqueue($pidTarget)
+  while ($queue.Count -gt 0) {
+    $parentPid = $queue.Dequeue()
+    foreach ($child in @(Get-TreeChildren $parentPid)) {
+      $childPid = [int]$child.ProcessId
+      if ($childPid -le 0 -or $seen.ContainsKey([string]$childPid)) { continue }
+      $seen[[string]$childPid] = $true
+      $childCreated = Get-IdentityUnix $childPid
+      $childSuspend = [HermesForceReleaseNative]::SuspendProcess($childPid)
+      Assert-NativeSuccess $childSuspend 'TREE_SUSPEND_FAILED'
+      [void]$suspended.Add($childPid)
+      $childRevalidated = Get-IdentityUnix $childPid
+      if ([math]::Abs($childRevalidated - $childCreated) -gt 1.5) {
+        throw ("CREATE_TIME_MISMATCH child=" + $childPid)
+      }
+      [void]$rows.Add([pscustomobject]@{ pid = $childPid; created = $childRevalidated })
+      [void]$queue.Enqueue($childPid)
+    }
+  }
+
+  foreach ($row in @($rows)) {
+    $assignChild = [HermesForceReleaseNative]::AssignProcess($job, [int]$row.pid)
+    Assert-NativeSuccess $assignChild 'TREE_ASSIGN_FAILED'
+    [void]$contained.Add([int]$row.pid)
+  }
+
+  $terminateCode = [HermesForceReleaseNative]::TerminateJobAndWait($job, $waitMs)
+  Assert-NativeSuccess $terminateCode 'TREE_TERMINATE_FAILED'
+  $allRows = @([pscustomobject]@{ pid = $pidTarget; created = $actualUnix }) + @($rows)
+  foreach ($row in $allRows) {
+    $live = Get-Process -Id ([int]$row.pid) -ErrorAction SilentlyContinue
+    if ($null -ne $live) {
+      $liveCreated = Get-IdentityUnix ([int]$row.pid)
+      if ([math]::Abs($liveCreated - [double]$row.created) -le 1.5) {
+        throw ("TREE_SURVIVOR pid=" + [int]$row.pid)
+      }
+    }
+  }
+  $success = $true
+  $exitCode = 0
   Write-Output 'TERMINATED'
-  exit 0
+} catch {
+  $message = [string]$_.Exception.Message
+  $win32 = [regex]::Match($message, 'win32=(\d+)').Groups[1].Value
+  if ($message -match 'Access is denied|AccessDenied|denied' -or $win32 -eq '5') {
+    Write-Output 'ACCESS_DENIED'
+    $exitCode = 5
+  } else {
+    Write-Output ('BOUNDARY_FAILED ' + $message)
+    $exitCode = 1
+  }
+} finally {
+  if ($job -ne [IntPtr]::Zero) {
+    if (-not $success) { [HermesForceReleaseNative]::TerminateJobAndWait($job, $waitMs) | Out-Null }
+    [HermesForceReleaseNative]::CloseHandle($job)
+  }
+  for ($index = $suspended.Count - 1; $index -ge 0; $index--) {
+    $suspendedPid = [int]$suspended[$index]
+    if (-not $contained.Contains($suspendedPid)) {
+      [HermesForceReleaseNative]::ResumeProcess($suspendedPid) | Out-Null
+    }
+  }
 }
-$err = -[int]$code
-if ($err -eq 5) { Write-Output 'ACCESS_DENIED'; exit 5 }
-# ERROR_INVALID_HANDLE / ERROR_INVALID_PARAMETER after Get-Process saw the target
-# are terminal failures, not proof the holder is gone.
-if ($err -eq 6 -or $err -eq 87) {
-  Write-Output ("FAILED win32=" + $err)
-  exit 1
-}
-# Protected-process / critical system process class surfaces as access denied
-# variants; callers that already elevated should treat these as blocked.
-if ($err -eq 5) { Write-Output 'PROTECTED win32=5'; exit 5 }
-Write-Output ("FAILED win32=" + $err)
-exit 1
+exit $exitCode
 `.trim()
 }
 
