@@ -810,31 +810,112 @@ Write-Output ('ROOT=' + $PID + ';CHILD=' + $writer.Id)
 })
 
 describe('liveness probe classification', () => {
-  it('liveness probe is tri-state: live / absent / unknown', async () => {
-    const { probeProcessLiveness } = await import('./windows-process-terminate')
-    assert.equal(await probeProcessLiveness(-1), 'absent')
-    assert.equal(await probeProcessLiveness(1, 0), 'unknown')
-    // Explicit not-found path for a PID that should not exist.
-    if (process.platform === 'win32') {
-      assert.equal(await probeProcessLiveness(999_999_991, 2_000), 'absent')
-    }
-  })
+  it('classifies discriminated exit vs error outcomes without host PIDs', async () => {
+    const {
+      classifyLivenessProbeResult,
+      probeProcessLiveness,
+      identitiesStillPresent
+    } = await import('./windows-process-terminate')
 
-  it('timeout/unknown liveness keeps identity as survivor; explicit absent drops it', async () => {
-    const module = await import('./windows-process-terminate')
-    // Injectable-style: call identitiesStillPresent with a deadline already passed
-    // and ensure identities remain survivors (no probe => unknown => survivor).
-    const expired = await module.identitiesStillPresent([{ pid: 42 }], { deadlineAt: Date.now() - 1 })
-    assert.equal(expired.length, 1)
-    assert.equal(expired[0]?.pid, 42)
+    // Authenticated exits only.
+    assert.equal(classifyLivenessProbeResult({ kind: 'exit', code: 0 }), 'live')
+    assert.equal(classifyLivenessProbeResult({ kind: 'exit', code: 3 }), 'absent')
+    assert.equal(classifyLivenessProbeResult({ kind: 'exit', code: 1 }), 'unknown')
+    assert.equal(classifyLivenessProbeResult({ kind: 'exit', code: 99 }), 'unknown')
 
-    if (process.platform === 'win32') {
-      // Explicit not-found PID should be dropped when there is budget.
-      const gone = await module.identitiesStillPresent([{ pid: 999_999_992 }], {
-        deadlineAt: Date.now() + 3_000
-      })
-      assert.equal(gone.length, 0)
+    // Error metadata never proves absence — even numeric/string 3.
+    assert.equal(classifyLivenessProbeResult({ kind: 'error', code: 3 }), 'unknown')
+    assert.equal(classifyLivenessProbeResult({ kind: 'error', code: '3' }), 'unknown')
+    assert.equal(classifyLivenessProbeResult({ kind: 'error', code: 'ETIMEDOUT' }), 'unknown')
+    assert.equal(classifyLivenessProbeResult({ kind: 'error', code: 'EACCES' }), 'unknown')
+    assert.equal(classifyLivenessProbeResult({ kind: 'error', code: 'EPERM' }), 'unknown')
+    assert.equal(classifyLivenessProbeResult({ kind: 'error', code: 'ENOENT' }), 'unknown')
+    assert.equal(
+      classifyLivenessProbeResult({ kind: 'error', message: 'spawn powershell ENOENT' }),
+      'unknown'
+    )
+
+    assert.equal(
+      await probeProcessLiveness(7, 1_000, async () => ({ kind: 'exit', code: 0 })),
+      'live'
+    )
+    assert.equal(
+      await probeProcessLiveness(7, 1_000, async () => ({ kind: 'exit', code: 3 })),
+      'absent'
+    )
+    assert.equal(
+      await probeProcessLiveness(7, 1_000, async () => ({ kind: 'error', code: 'ETIMEDOUT' })),
+      'unknown'
+    )
+    assert.equal(
+      await probeProcessLiveness(7, 1_000, async () => ({ kind: 'error', code: 'EACCES' })),
+      'unknown'
+    )
+    assert.equal(
+      await probeProcessLiveness(7, 1_000, async () => ({ kind: 'error', code: 'ENOENT' })),
+      'unknown'
+    )
+    assert.equal(
+      await probeProcessLiveness(7, 1_000, async () => ({ kind: 'error', code: 3 })),
+      'unknown'
+    )
+    assert.equal(
+      await probeProcessLiveness(7, 1_000, async () => ({ kind: 'error', code: '3' })),
+      'unknown'
+    )
+    assert.equal(
+      await probeProcessLiveness(7, 0, async () => ({ kind: 'exit', code: 0 })),
+      'unknown'
+    )
+    assert.equal(
+      await probeProcessLiveness(-1, 1_000, async () => ({ kind: 'exit', code: 0 })),
+      'absent'
+    )
+
+    // identitiesStillPresent retains every unknown; drops only explicit exit-3 absent.
+    // Force null create-time so the injectable liveness runner is exercised, not host PIDs.
+    const noCreateTime = async () => null
+    const unknownRunner = async () => ({ kind: 'error' as const, code: 'ETIMEDOUT' as const })
+    const kept = await identitiesStillPresent([{ pid: 11 }, { pid: 12 }], {
+      deadlineAt: Date.now() + 5_000,
+      livenessRunner: unknownRunner,
+      readCreatedAt: noCreateTime
+    })
+    assert.deepEqual(
+      kept.map(entry => entry.pid),
+      [11, 12]
+    )
+
+    const errorThreeRunner = async () => ({ kind: 'error' as const, code: 3 as const })
+    const errorThreeKept = await identitiesStillPresent([{ pid: 31 }, { pid: 32 }], {
+      deadlineAt: Date.now() + 5_000,
+      livenessRunner: errorThreeRunner,
+      readCreatedAt: noCreateTime
+    })
+    assert.deepEqual(
+      errorThreeKept.map(entry => entry.pid),
+      [31, 32]
+    )
+
+    const mixedRunner = async (pid: number) => {
+      if (pid === 21) return { kind: 'exit' as const, code: 0 }
+      if (pid === 22) return { kind: 'exit' as const, code: 3 }
+      if (pid === 23) return { kind: 'error' as const, code: 'EPERM' }
+      if (pid === 24) return { kind: 'error' as const, code: 3 }
+      return { kind: 'error' as const, code: 'ENOENT' }
     }
+    const mixed = await identitiesStillPresent(
+      [{ pid: 21 }, { pid: 22 }, { pid: 23 }, { pid: 24 }, { pid: 25 }],
+      {
+        deadlineAt: Date.now() + 5_000,
+        livenessRunner: mixedRunner,
+        readCreatedAt: noCreateTime
+      }
+    )
+    assert.deepEqual(
+      mixed.map(entry => entry.pid).sort((a, b) => a - b),
+      [21, 23, 24, 25]
+    )
   })
 })
 

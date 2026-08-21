@@ -80,20 +80,76 @@ async function readProcessCreatedAt(
 
 export type ProcessLiveness = 'live' | 'absent' | 'unknown'
 
-export async function probeProcessLiveness(
+/**
+ * Discriminated liveness probe outcome.
+ * Only authenticated child-process exits may prove live/absent.
+ * Error metadata (timeout/access/spawn) is never treated as an exit code.
+ */
+export type LivenessProbeResult =
+  | { kind: 'exit'; code: number }
+  | { kind: 'error'; code?: string | number; message?: string }
+
+/** Injectable runner for process liveness probes (tests inject fakes). */
+export type LivenessProbeRunner = (
   pid: number,
-  timeoutMs = 2_000
-): Promise<ProcessLiveness> {
-  if (!Number.isInteger(pid) || pid <= 0) return 'absent'
-  const budget = Math.trunc(timeoutMs)
-  if (budget <= 0) return 'unknown'
+  timeoutMs: number
+) => Promise<LivenessProbeResult>
+
+/**
+ * Pure classification of a liveness probe outcome.
+ * live only for kind=exit/code=0; absent only for kind=exit/code=3.
+ * Every kind=error is unknown regardless of embedded code metadata.
+ */
+export function classifyLivenessProbeResult(result: LivenessProbeResult): ProcessLiveness {
+  if (result.kind === 'exit') {
+    if (result.code === 0) return 'live'
+    if (result.code === 3) return 'absent'
+    return 'unknown'
+  }
+  // kind=error: timeout/access/spawn/malformed — never prove absence from error metadata.
+  return 'unknown'
+}
+
+function execFileFailureToLivenessResult(error: any): LivenessProbeResult {
+  // Timeout/killed probes are errors even if a numeric code is present.
+  if (error?.killed === true || error?.signal) {
+    return {
+      kind: 'error',
+      code: typeof error?.code === 'string' || typeof error?.code === 'number' ? error.code : undefined,
+      message: String(error?.message ?? error)
+    }
+  }
+  // Node execFile puts authenticated child exit status on error.code as a number.
+  if (typeof error?.code === 'number') {
+    return { kind: 'exit', code: error.code }
+  }
+  // Some paths expose exit status on .status while .code is a string errno.
+  if (typeof error?.status === 'number') {
+    return { kind: 'exit', code: error.status }
+  }
+  return {
+    kind: 'error',
+    code: typeof error?.code === 'string' || typeof error?.code === 'number' ? error.code : undefined,
+    message: String(error?.message ?? error)
+  }
+}
+
+async function defaultLivenessProbeRunner(
+  pid: number,
+  timeoutMs: number
+): Promise<LivenessProbeResult> {
   if (process.platform !== 'win32') {
     try {
       process.kill(pid, 0)
-      return 'live'
+      return { kind: 'exit', code: 0 }
     } catch (error: any) {
-      if (error?.code === 'ESRCH') return 'absent'
-      return 'unknown'
+      // ESRCH is an authenticated "no such process" from the kill(2) probe.
+      if (error?.code === 'ESRCH') return { kind: 'exit', code: 3 }
+      return {
+        kind: 'error',
+        code: error?.code,
+        message: String(error?.message ?? error)
+      }
     }
   }
   try {
@@ -107,31 +163,45 @@ export async function probeProcessLiveness(
         // Exit 0 = live, 3 = explicitly not found, anything else = unknown.
         `$p = Get-Process -Id ${Math.trunc(pid)} -ErrorAction SilentlyContinue; if ($null -ne $p) { exit 0 } else { exit 3 }`
       ],
-      { windowsHide: true, timeout: budget }
+      { windowsHide: true, timeout: timeoutMs }
     )
-    return 'live'
+    return { kind: 'exit', code: 0 }
   } catch (error: any) {
-    const code = typeof error?.code === 'number' ? error.code : null
-    if (code === 3) return 'absent'
-    // timeout / access / spawn / killed probe => unknown, never absent
-    return 'unknown'
+    return execFileFailureToLivenessResult(error)
   }
 }
 
-/** @deprecated Prefer probeProcessLiveness; true only when explicitly live. */
-export async function processIsLive(pid: number, timeoutMs = 2_000): Promise<boolean> {
-  return (await probeProcessLiveness(pid, timeoutMs)) === 'live'
+export async function probeProcessLiveness(
+  pid: number,
+  timeoutMs = 2_000,
+  runner: LivenessProbeRunner = defaultLivenessProbeRunner
+): Promise<ProcessLiveness> {
+  if (!Number.isInteger(pid) || pid <= 0) return 'absent'
+  const budget = Math.trunc(timeoutMs)
+  if (budget <= 0) return 'unknown'
+  const result = await runner(pid, budget)
+  return classifyLivenessProbeResult(result)
 }
 
 export async function identitiesStillPresent(
   identities: readonly ProcessIdentity[],
-  { deadlineAt }: { deadlineAt?: number } = {}
+  {
+    deadlineAt,
+    livenessRunner,
+    readCreatedAt
+  }: {
+    deadlineAt?: number
+    livenessRunner?: LivenessProbeRunner
+    readCreatedAt?: (pid: number, timeoutMs: number) => Promise<number | null>
+  } = {}
 ): Promise<ProcessIdentity[]> {
   const survivors: ProcessIdentity[] = []
   const remaining = () =>
     typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
       ? Math.max(0, deadlineAt - Date.now())
       : 2_000
+  const runner = livenessRunner ?? defaultLivenessProbeRunner
+  const createdAtReader = readCreatedAt ?? readProcessCreatedAt
 
   for (const identity of identities) {
     const left = remaining()
@@ -141,7 +211,7 @@ export async function identitiesStillPresent(
       continue
     }
     const slice = Math.max(1, Math.floor(left / Math.max(1, identities.length - survivors.length)))
-    const createdAt = await readProcessCreatedAt(identity.pid, slice)
+    const createdAt = await createdAtReader(identity.pid, slice)
     if (createdAt == null) {
       // Do not infer absence from a null create-time read. Probe liveness with
       // remaining budget; only explicit not-found proves absence.
@@ -150,7 +220,7 @@ export async function identitiesStillPresent(
         survivors.push(identity)
         continue
       }
-      const liveness = await probeProcessLiveness(identity.pid, liveLeft)
+      const liveness = await probeProcessLiveness(identity.pid, liveLeft, runner)
       if (liveness === 'absent') {
         continue
       }
