@@ -370,7 +370,7 @@ import {
   writeForceReleaseRequestFiles
 } from './windows-elevated-force-release'
 import { listRestartManagerHoldersForResources } from './windows-restart-manager'
-import { terminateWindowsHolderExact } from './windows-process-terminate'
+import { terminateWindowsHolderWithinDeadline } from './windows-process-terminate'
 import {
   attachHolderTreeRelationships,
   mergeInstallHolders,
@@ -3881,14 +3881,14 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
     },
     listRestartManagerHolders: async (budgetMs) => {
       const rmResources = resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
-      return listRestartManagerHoldersForResources(rmResources, {
-        timeoutMs: Math.max(250, Math.min(3_500, budgetMs))
-      })
+      const timeoutMs = Math.max(0, Math.min(3_500, Math.trunc(budgetMs)))
+      if (timeoutMs <= 0) return []
+      return listRestartManagerHoldersForResources(rmResources, { timeoutMs })
     },
-    terminateHolder: (holder, budgetMs, signal) =>
-      terminateWindowsHolderExact(holder, {
-        timeoutMs: Math.max(250, Math.min(2_500, budgetMs)),
-        waitMs: Math.max(100, Math.min(1_500, budgetMs - 200)),
+    terminateHolder: (holder, budgetMs, signal, deadlineAt) =>
+      terminateWindowsHolderWithinDeadline(holder, {
+        budgetMs,
+        deadlineAt: deadlineAt ?? Date.now(),
         signal
       })
   })
@@ -3954,6 +3954,9 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
       requestPath: written.requestPath,
       responsePath: written.responsePath
     })
+    if (launch.responseTempPath) {
+      written.responseTempPath = launch.responseTempPath
+    }
 
     if (launch.kind === 'cancelled') {
       return {
