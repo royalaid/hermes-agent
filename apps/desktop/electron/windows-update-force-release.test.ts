@@ -182,7 +182,7 @@ const readyPath = process.env.HERMES_TERMINATE_WATCHER_READY_PATH;
 const nonce = process.env.HERMES_TERMINATE_WATCHER_READY_NONCE;
 const deadlineAt = Number(process.env.HERMES_TERMINATE_WATCHER_DEADLINE_AT);
 if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !readyPath || !nonce) process.exit(87);
-const tempPath = readyPath + '.' + process.pid + '.tmp';
+const tempPath = readyPath + '.tmp';
 fs.writeFileSync(tempPath, 'ARMED:' + nonce, 'utf8');
 fs.renameSync(tempPath, readyPath);
 const ownerIsAlive = () => {
@@ -227,7 +227,7 @@ function makeInjectedWatcherStarter(command: string) {
         }
       }
     )
-    artifacts = { readyPath: watcherReadyPath, tempPath: `${watcherReadyPath}.${child.pid}.tmp` }
+    artifacts = { readyPath: watcherReadyPath, tempPath: `${watcherReadyPath}.tmp` }
     return child
   }
   return {
@@ -1595,9 +1595,7 @@ Start-Sleep -Seconds 20
         assert.ok(rootCreatedAt && rootCreatedAt > 0, 'could not authenticate external root generation')
         assert.ok(writerCreatedAt && writerCreatedAt > 0, 'could not authenticate detached writer generation')
 
-        const priorSnapshotFailure = process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
         const priorWatcherLog = process.env.HERMES_TERMINATE_WATCHER_LOG
-        process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = '1'
         process.env.HERMES_TERMINATE_WATCHER_LOG = watcherLog
         const started = Date.now()
         let result
@@ -1607,11 +1605,15 @@ Start-Sleep -Seconds 20
           const { terminateWindowsHolderExact } = await import('./windows-process-terminate')
           result = await terminateWindowsHolderExact(
             holder({ pid: rootPid, createdAt: rootCreatedAt, name: 'powershell.exe', cmdline: 'external holder' }),
-            { platform: 'win32', timeoutMs: 5_000, waitMs: 1_500 }
+            {
+              platform: 'win32',
+              timeoutMs: 5_000,
+              waitMs: 1_500,
+              buildScript: (pid, createdAt, waitMs) =>
+                buildExactTerminateScript(pid, createdAt, waitMs, { forcePrimarySnapshotFailure: true })
+            }
           )
         } finally {
-          if (priorSnapshotFailure == null) delete process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
-          else process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = priorSnapshotFailure
           if (priorWatcherLog == null) delete process.env.HERMES_TERMINATE_WATCHER_LOG
           else process.env.HERMES_TERMINATE_WATCHER_LOG = priorWatcherLog
         }
@@ -1717,13 +1719,6 @@ Start-Sleep -Seconds 30
           }
           return fs.existsSync(filePath)
         }
-        const savedEnvironment = {
-          snapshot: process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE,
-          phase: process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE,
-          marker: process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER,
-          pausePid: process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID
-        }
-
         try {
           assert.equal(await waitForFile(rootPidPath, 4_000), true, `${phase}: root did not start`)
           assert.equal(await waitForFile(writerPidPath, 4_000), true, `${phase}: writer did not start`)
@@ -1737,10 +1732,6 @@ Start-Sleep -Seconds 30
           assert.ok(rootCreatedAt && rootCreatedAt > 0, `${phase}: root generation unavailable`)
           assert.ok(writerCreatedAt && writerCreatedAt > 0, `${phase}: writer generation unavailable`)
 
-          process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = '1'
-          process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE = phase
-          process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER = phaseMarker
-          process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID = String(writerPid)
           boundaryPromise = new Promise(resolve => {
             boundaryChild = execFile(
               ps,
@@ -1758,7 +1749,12 @@ Start-Sleep -Seconds 30
                 windowsHide: true,
                 env: {
                   ...process.env,
-                  HERMES_TERMINATE_SCRIPT: buildExactTerminateScript(rootPid, rootCreatedAt, 1_500),
+                  HERMES_TERMINATE_SCRIPT: buildExactTerminateScript(rootPid, rootCreatedAt, 1_500, {
+                    forcePrimarySnapshotFailure: true,
+                    pausePhase: phase,
+                    pausePid: writerPid,
+                    phaseMarkerPath: phaseMarker
+                  }),
                   HERMES_TERMINATE_JOB_NAME: helperJobName,
                   HERMES_TERMINATE_TARGET_JOB_NAME: targetJobName,
                   HERMES_TERMINATE_TARGET_WAIT_MS: '1500',
@@ -1918,14 +1914,6 @@ Start-Sleep -Seconds 30
               void 0
             }
           }
-          if (savedEnvironment.snapshot == null) delete process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
-          else process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = savedEnvironment.snapshot
-          if (savedEnvironment.phase == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE
-          else process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE = savedEnvironment.phase
-          if (savedEnvironment.marker == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER
-          else process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER = savedEnvironment.marker
-          if (savedEnvironment.pausePid == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID
-          else process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID = savedEnvironment.pausePid
           fs.rmSync(`${phaseMarker}.tmp`, { force: true })
           try {
             rootChild.kill('SIGKILL')
@@ -1994,10 +1982,6 @@ Start-Sleep -Seconds 30
           return fs.existsSync(filePath)
         }
         const savedEnvironment = {
-          snapshot: process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE,
-          phase: process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE,
-          marker: process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER,
-          pausePid: process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID,
           watcherLog: process.env.HERMES_TERMINATE_WATCHER_LOG,
           namedJobLog: process.env.HERMES_TERMINATE_NAMED_JOB_LOG
         }
@@ -2014,14 +1998,15 @@ Start-Sleep -Seconds 30
           assert.ok(rootCreatedAt && rootCreatedAt > 0, `${phase}: root generation unavailable`)
           assert.ok(writerCreatedAt && writerCreatedAt > 0, `${phase}: writer generation unavailable`)
 
-          process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = '1'
-          process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE = phase
-          process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER = phaseMarker
-          process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID = String(writerPid)
           process.env.HERMES_TERMINATE_WATCHER_LOG = watcherLog
           process.env.HERMES_TERMINATE_NAMED_JOB_LOG = namedJobLog
           runPromise = runPowerShellWithHardBoundary(
-            buildExactTerminateScript(rootPid, rootCreatedAt, 1_500),
+            buildExactTerminateScript(rootPid, rootCreatedAt, 1_500, {
+              forcePrimarySnapshotFailure: true,
+              pausePhase: phase,
+              pausePid: writerPid,
+              phaseMarkerPath: phaseMarker
+            }),
             5_000,
             controller.signal
           )
@@ -2077,14 +2062,6 @@ Start-Sleep -Seconds 30
               void 0
             }
           }
-          if (savedEnvironment.snapshot == null) delete process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
-          else process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = savedEnvironment.snapshot
-          if (savedEnvironment.phase == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE
-          else process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE = savedEnvironment.phase
-          if (savedEnvironment.marker == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER
-          else process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER = savedEnvironment.marker
-          if (savedEnvironment.pausePid == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID
-          else process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID = savedEnvironment.pausePid
           if (savedEnvironment.watcherLog == null) delete process.env.HERMES_TERMINATE_WATCHER_LOG
           else process.env.HERMES_TERMINATE_WATCHER_LOG = savedEnvironment.watcherLog
           if (savedEnvironment.namedJobLog == null) delete process.env.HERMES_TERMINATE_NAMED_JOB_LOG
@@ -2274,6 +2251,29 @@ describe('liveness probe classification', () => {
 })
 
 describe('access-denied identity classification', () => {
+  it('does not expose ambient test controls in the production termination script', () => {
+    const script = buildExactTerminateScript(9, 100, 100)
+    assert.doesNotMatch(script, /HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE/)
+    assert.doesNotMatch(script, /HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE/)
+    assert.doesNotMatch(script, /HERMES_FORCE_RELEASE_TEST_PAUSE_PID/)
+    assert.doesNotMatch(script, /HERMES_FORCE_RELEASE_TEST_PHASE_MARKER/)
+  })
+
+  it('embeds final install-root and current Restart Manager ownership authorization', () => {
+    const script = buildExactTerminateScript(4242, 1234, 500, {
+      installRoot: 'C:\\Hermes',
+      resource: 'C:\\Hermes\\venv\\Scripts\\hermes.exe'
+    })
+
+    assert.match(script, /TERMINATION_RESOURCE_OUTSIDE_INSTALL_ROOT/)
+    assert.match(script, /TERMINATION_EXECUTABLE_IDENTITY_UNAVAILABLE/)
+    assert.match(script, /TERMINATION_CURRENT_LOCK_OWNERSHIP_MISMATCH/)
+    assert.match(script, /QueryFullProcessImageName/)
+    assert.match(script, /IsCurrentResourceOwner/)
+    assert.match(script, /RmRegisterResources/)
+    assert.match(script, /C:\\Hermes\\venv\\Scripts\\hermes\.exe/)
+  })
+
   it('classifies access-denied identity failures for Administrator routing', () => {
     assert.deepEqual(parseTerminateScriptOutput('ACCESS_DENIED', 5), {
       kind: 'access-denied',

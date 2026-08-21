@@ -425,6 +425,7 @@ describe('elevated helper script shape', () => {
     assert.match(text, /excludePids/)
     assert.doesNotMatch(text, /Get-CimInstance Win32_Process \| ForEach-Object/)
     assert.match(text, /never terminate unauthenticated|Fail-closed: never terminate unauthenticated/i)
-    assert.match(text, /claim-revalidate|claims\.ContainsKey/)
+    assert.match(text, /current Restart Manager holders/i)
+    assert.doesNotMatch(text, /source = 'claim-revalidate'/)
   })
 })
