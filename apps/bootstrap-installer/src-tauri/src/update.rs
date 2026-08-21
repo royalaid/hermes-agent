@@ -314,10 +314,24 @@ impl UpdateMarkerGuard {
             }
             return Err(UpdateMarkerAcquireError::ForeignOwner(owner));
         }
-        let started_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // Same adoption rule as the live-owner branch above, for the marker that
+        // names us but is no longer *provably* live (its claim predates this
+        // process). Republishing it must keep the original holder age: minting a
+        // fresh one here would let a wedged updater reset its own clock on every
+        // retry and never reach the stale ceiling. Only a marker that is absent
+        // or owned by someone else starts a new age.
+        let started_at = prior
+            .as_deref()
+            .and_then(update_marker_identity_from_raw)
+            .and_then(|(prior_pid, prior_started_at)| {
+                (prior_pid == pid).then_some(prior_started_at)
+            })
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(UpdateMarkerAcquireError::Publish)?;
         }
