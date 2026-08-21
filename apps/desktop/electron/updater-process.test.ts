@@ -7,7 +7,6 @@ import path from 'node:path'
 import { test, vi } from 'vitest'
 
 import {
-  MARKER_SELF_ADOPT_EPOCH_MS,
   observeUpdaterHandoff,
   captureSpawnedUpdaterCreatedAt,
   collectRelaunchArgs,
@@ -661,6 +660,10 @@ class FakeChild {
 
   unref() {}
 
+  kill() {
+    return true
+  }
+
   once(event: string, listener: (...args: unknown[]) => void) {
     const arr = this.listeners.get(event) ?? []
 
@@ -793,7 +796,7 @@ test('observeUpdaterHandoff ignores events after the first settle', async () => 
 
 test('observeUpdaterHandoff settles ok for children without an event interface', async () => {
   const timer = manualTimer()
-  const outcomePromise = observeUpdaterHandoff({ pid: 1, unref: () => {} }, 2500, timer.deps)
+  const outcomePromise = observeUpdaterHandoff({ pid: 1, kill: () => true, unref: () => {} }, 2500, timer.deps)
 
   timer.fire()
 
