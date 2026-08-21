@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -32,11 +33,236 @@ import {
 import {
   buildExactTerminateScript,
   parseTerminateScriptOutput,
-  runPowerShellWithHardBoundary
+  runPowerShellWithHardBoundary,
+  parseWrapperProcessMarker,
+  snapshotProcessTreeIdentities,
+  terminateWindowsHolderExact,
+  terminateWindowsHolderWithinDeadline,
+  TERMINATE_JOB_WATCHER_BRIDGE,
+  TERMINATE_JOB_WATCHER_COMMAND,
+  TERMINATE_JOB_WRAPPER_COMMAND
 } from './windows-process-terminate'
 import { queryWindowsProcessCreatedAt } from './windows-process-identity'
 
 const execFileAsync = promisify(execFile)
+
+async function launchPowerShellThroughWmi(ps: string, script: string): Promise<number> {
+  const encodedScript = Buffer.from(script, 'utf16le').toString('base64')
+  const commandLine = `"${ps}" -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encodedScript}`
+  const brokerScript = `
+$ErrorActionPreference = 'Stop'
+$commandLine = [Environment]::GetEnvironmentVariable('HERMES_TEST_WMI_COMMAND_LINE')
+$startup = ([wmiclass]'Win32_ProcessStartup').CreateInstance()
+$startup.ShowWindow = 0 # SW_HIDE; CREATE_NO_WINDOW is rejected by this WMI provider.
+$result = ([wmiclass]'Win32_Process').Create($commandLine, $null, $startup)
+if ($null -eq $result -or [int]$result.ReturnValue -ne 0) {
+  $returnValue = if ($null -eq $result) { -1 } else { [int]$result.ReturnValue }
+  throw ('WMI_PROCESS_CREATE_FAILED return=' + $returnValue)
+}
+Write-Output ([int]$result.ProcessId)
+`.trim()
+  const { stdout, stderr } = await execFileAsync(
+    ps,
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', brokerScript],
+    {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 2_000,
+      env: {
+        ...process.env,
+        HERMES_TEST_WMI_COMMAND_LINE: commandLine
+      }
+    }
+  )
+  const pid = Number(String(stdout).trim().split(/\r?\n/).pop())
+  if (!Number.isInteger(pid) || pid <= 0) {
+    throw new Error(`WMI process broker returned invalid PID stdout=${stdout} stderr=${stderr}`)
+  }
+  return pid
+}
+
+function buildHoldTargetJobScript(
+  rootPid: number,
+  rootCreatedAt: number,
+  writerPid: number,
+  writerCreatedAt: number
+): string {
+  return String.raw`
+$ErrorActionPreference = 'Stop'
+$targetJobName = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_TARGET_JOB_NAME')
+if ([string]::IsNullOrWhiteSpace($targetJobName)) { throw 'missing target job name' }
+Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class HermesTestTargetJob {
+  private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+  private const uint PROCESS_SET_QUOTA = 0x0100;
+  private const uint PROCESS_TERMINATE = 0x0001;
+  private const uint SYNCHRONIZE = 0x00100000;
+  private const uint JOB_OBJECT_ASSIGN_PROCESS = 0x0001;
+  private const uint JOB_OBJECT_TERMINATE = 0x0008;
+  private const uint JOB_OBJECT_QUERY = 0x0004;
+  [StructLayout(LayoutKind.Sequential)]
+  private struct FileTime { public uint Low; public uint High; }
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern IntPtr OpenProcess(uint access, bool inheritHandle, int pid);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern IntPtr OpenJobObject(uint access, bool inheritHandle, string name);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool GetProcessTimes(IntPtr process, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool CloseHandle(IntPtr handle);
+  private static double ToUnixSeconds(FileTime time) {
+    long ticks = ((long)time.High << 32) | time.Low;
+    return (ticks - 116444736000000000L) / 10000000.0;
+  }
+  public static IntPtr OpenTargetJob(string name) {
+    IntPtr job = OpenJobObject(JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_TERMINATE | JOB_OBJECT_QUERY | SYNCHRONIZE, false, name);
+    if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+    return job;
+  }
+  public static IntPtr OpenAuthenticatedProcess(int pid, double expectedUnix) {
+    IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, false, pid);
+    if (process == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+    FileTime creation, exit, kernel, user;
+    if (!GetProcessTimes(process, out creation, out exit, out kernel, out user)) {
+      int error = Marshal.GetLastWin32Error();
+      CloseHandle(process);
+      throw new Win32Exception(error);
+    }
+    if (Math.Abs(ToUnixSeconds(creation) - expectedUnix) > 1.5) {
+      CloseHandle(process);
+      throw new InvalidOperationException("create-time mismatch");
+    }
+    return process;
+  }
+  public static void Assign(IntPtr job, IntPtr process) {
+    if (!AssignProcessToJobObject(job, process)) throw new Win32Exception(Marshal.GetLastWin32Error());
+  }
+  public static void AssertAssigned(IntPtr job, IntPtr process, int pid) {
+    bool assigned;
+    if (!IsProcessInJob(process, job, out assigned)) throw new Win32Exception(Marshal.GetLastWin32Error());
+    if (!assigned) throw new InvalidOperationException("target job membership false pid=" + pid);
+  }
+  public static void Close(IntPtr handle) { if (handle != IntPtr.Zero) CloseHandle(handle); }
+}
+"@
+$job = [HermesTestTargetJob]::OpenTargetJob($targetJobName)
+try {
+  foreach ($target in @(
+    @(${Math.trunc(rootPid)}, [double]${rootCreatedAt}),
+    @(${Math.trunc(writerPid)}, [double]${writerCreatedAt})
+  )) {
+    $process = [HermesTestTargetJob]::OpenAuthenticatedProcess([int]$target[0], [double]$target[1])
+    try {
+      [HermesTestTargetJob]::Assign($job, $process)
+      [HermesTestTargetJob]::AssertAssigned($job, $process, [int]$target[0])
+    }
+    finally { [HermesTestTargetJob]::Close($process) }
+  }
+  # The wrapper owns the other target-job handle. Returning normally leaves the
+  # authenticated target tree for the injected watcher/fallback boundary.
+  Write-Output 'TERMINATED'
+} finally {
+  [HermesTestTargetJob]::Close($job)
+}
+`.trim()
+}
+
+function buildWatcherFailureCommand(): string {
+  return String.raw`
+const fs = require('node:fs');
+const ownerPid = Number(process.env.HERMES_TERMINATE_OWNER_PID);
+const readyPath = process.env.HERMES_TERMINATE_WATCHER_READY_PATH;
+const nonce = process.env.HERMES_TERMINATE_WATCHER_READY_NONCE;
+const deadlineAt = Number(process.env.HERMES_TERMINATE_WATCHER_DEADLINE_AT);
+if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !readyPath || !nonce) process.exit(87);
+const tempPath = readyPath + '.' + process.pid + '.tmp';
+fs.writeFileSync(tempPath, 'ARMED:' + nonce, 'utf8');
+fs.renameSync(tempPath, readyPath);
+const ownerIsAlive = () => {
+  try { process.kill(ownerPid, 0); return true; }
+  catch { return false; }
+};
+const timer = setInterval(() => {
+  if (!ownerIsAlive() || Date.now() >= deadlineAt) {
+    clearInterval(timer);
+    process.exit(17);
+  }
+}, 10);
+`.trim()
+}
+
+function makeInjectedWatcherStarter(command: string) {
+  let child: ChildProcess | undefined
+  let artifacts: { readyPath: string; tempPath: string } | undefined
+  const startWatcher = (
+    ownerPid: number,
+    ownerCreatedAt: number,
+    targetJobName: string,
+    watcherReadyPath: string,
+    watcherReadyNonce: string,
+    deadlineAt: number
+  ) => {
+    child = spawn(
+      process.execPath,
+      ['-e', command],
+      {
+        windowsHide: true,
+        detached: true,
+        stdio: 'ignore',
+        env: {
+          ...process.env,
+          HERMES_TERMINATE_OWNER_PID: String(ownerPid),
+          HERMES_TERMINATE_OWNER_CREATED_AT: String(ownerCreatedAt),
+          HERMES_TERMINATE_TARGET_JOB_NAME: targetJobName,
+          HERMES_TERMINATE_WATCHER_READY_PATH: watcherReadyPath,
+          HERMES_TERMINATE_WATCHER_READY_NONCE: watcherReadyNonce,
+          HERMES_TERMINATE_WATCHER_DEADLINE_AT: String(Math.trunc(deadlineAt))
+        }
+      }
+    )
+    artifacts = { readyPath: watcherReadyPath, tempPath: `${watcherReadyPath}.${child.pid}.tmp` }
+    return child
+  }
+  return {
+    startWatcher,
+    getChild: () => child,
+    getArtifacts: () => artifacts
+  }
+}
+
+async function queryWindowsProcessDetails(
+  ps: string,
+  pid: number
+): Promise<{ raw: string; parentPid: number | null }> {
+  try {
+    const { stdout } = await execFileAsync(
+      ps,
+      [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${Math.trunc(pid)}' -ErrorAction SilentlyContinue; if ($null -eq $p) { 'absent' } else { $p | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress }`
+      ],
+      { encoding: 'utf8', windowsHide: true, timeout: 3_000 }
+    )
+    const raw = String(stdout).trim() || 'absent'
+    if (raw === 'absent') return { raw, parentPid: null }
+    const parsed = JSON.parse(raw) as { ParentProcessId?: number | string } | Array<{ ParentProcessId?: number | string }>
+    const row = Array.isArray(parsed) ? parsed[0] : parsed
+    const parentPid = Number(row?.ParentProcessId)
+    return { raw, parentPid: Number.isInteger(parentPid) && parentPid > 0 ? parentPid : null }
+  } catch (error) {
+    return { raw: `diagnostic-error:${String((error as any)?.message ?? error)}`, parentPid: null }
+  }
+}
 
 const holder = (overrides: Partial<ForceReleaseHolder> = {}): ForceReleaseHolder => ({
   pid: 57012,
@@ -530,6 +756,172 @@ describe('terminate script output parser', () => {
   })
 })
 
+describe('target watcher transport boundary', () => {
+  it('requires a nonce-bound wrapper marker and fail-closed watcher script handling', () => {
+    assert.match(TERMINATE_JOB_WRAPPER_COMMAND, /HERMES_TERMINATE_WRAPPER_PID_MARKER_PATH/)
+    assert.match(TERMINATE_JOB_WRAPPER_COMMAND, /HERMES_TERMINATE_WRAPPER_PID_MARKER_NONCE/)
+    assert.match(TERMINATE_JOB_WRAPPER_COMMAND, /HERMES_TERMINATE_WRAPPER_PHASE_PATH/)
+    assert.match(TERMINATE_JOB_WRAPPER_COMMAND, /HERMES_TERMINATE_WRAPPER_PHASE_NONCE/)
+    assert.match(TERMINATE_JOB_WRAPPER_COMMAND, /marker-published|target-job-created|watcher-READY-observed/)
+    assert.match(TERMINATE_JOB_WATCHER_BRIDGE, /spawnSync/)
+    assert.match(TERMINATE_JOB_WATCHER_COMMAND, /\$ErrorActionPreference = 'Stop'/)
+    assert.match(TERMINATE_JOB_WATCHER_COMMAND, /Add-Type -TypeDefinition @'[\s\S]*'@ -ErrorAction Stop/)
+    assert.match(TERMINATE_JOB_WATCHER_COMMAND, /exit \$watchResult/)
+    assert.match(TERMINATE_JOB_WATCHER_COMMAND, /FAILED:' \+ \$watcherReadyNonce/)
+  })
+
+  it('publishes an authenticated wrapper self marker before waiting for READY', { timeout: 10_000 }, async () => {
+    if (process.platform !== 'win32') return
+
+    const tmp = fs.mkdtempSync(path.join((await import('node:os')).tmpdir(), 'hermes-wrapper-marker-'))
+    const markerPath = path.join(tmp, 'wrapper.pid')
+    const readyPath = path.join(tmp, 'ready')
+    const helperScriptPath = path.join(tmp, 'helper.ps1')
+    const helperGatePath = path.join(tmp, 'helper.go')
+    const markerNonce = randomBytes(16).toString('hex')
+    const readyNonce = randomBytes(16).toString('hex')
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    const childResult = new Promise<{ error: any; stdout: string; stderr: string }>(resolve => {
+      const child = execFile(
+        ps,
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', TERMINATE_JOB_WRAPPER_COMMAND],
+        {
+          encoding: 'utf8',
+          windowsHide: true,
+          env: {
+            ...process.env,
+            HERMES_TERMINATE_SCRIPT: "Write-Output 'TERMINATED'",
+            HERMES_TERMINATE_JOB_NAME: `HermesTestHelper-${randomBytes(8).toString('hex')}`,
+            HERMES_TERMINATE_TARGET_JOB_NAME: `HermesTestTarget-${randomBytes(8).toString('hex')}`,
+            HERMES_TERMINATE_TARGET_WAIT_MS: '500',
+            HERMES_TERMINATE_DEADLINE_AT: String(Date.now() + 5_000),
+            HERMES_TERMINATE_WATCHER_READY_PATH: readyPath,
+            HERMES_TERMINATE_WATCHER_READY_NONCE: readyNonce,
+            HERMES_TERMINATE_WRAPPER_PID_MARKER_PATH: markerPath,
+            HERMES_TERMINATE_WRAPPER_PID_MARKER_NONCE: markerNonce,
+            HERMES_TERMINATE_HELPER_SCRIPT_PATH: helperScriptPath,
+            HERMES_TERMINATE_HELPER_GATE_PATH: helperGatePath
+          }
+        },
+        (error, stdout, stderr) => resolve({ error, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') })
+      )
+      const deadline = Date.now() + 2_000
+      const poll = async () => {
+        while (Date.now() < deadline && !fs.existsSync(markerPath)) {
+          await new Promise(resolve => setTimeout(resolve, 20))
+        }
+        if (child.exitCode == null && child.signalCode == null) child.kill('SIGKILL')
+      }
+      void poll()
+    })
+
+    try {
+      const markerDeadline = Date.now() + 2_000
+      while (!fs.existsSync(markerPath) && Date.now() < markerDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      assert.equal(fs.existsSync(markerPath), true, 'wrapper did not publish its marker')
+      const marker = parseWrapperProcessMarker(fs.readFileSync(markerPath, 'utf8'), markerNonce)
+      assert.ok(marker && marker.pid > 0 && marker.createdAt && marker.createdAt > 0)
+      const result = await childResult
+      assert.ok(result.error, `wrapper unexpectedly completed: ${result.stdout} ${result.stderr}`)
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('uses a detached Node bridge and terminalizes the bridge plus PowerShell child', { timeout: 15_000 }, async () => {
+    if (process.platform !== 'win32') return
+
+    assert.match(TERMINATE_JOB_WATCHER_BRIDGE, /spawnSync/)
+    assert.match(TERMINATE_JOB_WATCHER_BRIDGE, /detached:\s*false/)
+    assert.match(TERMINATE_JOB_WATCHER_BRIDGE, /HERMES_TERMINATE_WATCHER_ENCODED_COMMAND/)
+
+    const os = await import('node:os')
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-watcher-bridge-'))
+    const proofPath = path.join(tmp, 'powershell.pid')
+    const readyPath = path.join(tmp, 'ready')
+    const nonce = randomBytes(16).toString('hex')
+    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    const powershellScript = String.raw`
+$proofPath = [Environment]::GetEnvironmentVariable('HERMES_TEST_BRIDGE_PROOF_PATH')
+$readyPath = [Environment]::GetEnvironmentVariable('HERMES_TEST_BRIDGE_READY_PATH')
+$nonce = [Environment]::GetEnvironmentVariable('HERMES_TEST_BRIDGE_NONCE')
+[IO.File]::WriteAllText($proofPath, [string]$PID)
+Start-Sleep -Milliseconds 4000
+[IO.File]::WriteAllText($readyPath, 'READY:' + $nonce)
+exit 17
+`.trim()
+    const encodedCommand = Buffer.from(powershellScript, 'utf16le').toString('base64')
+    const bridge = spawn(process.execPath, ['-e', TERMINATE_JOB_WATCHER_BRIDGE], {
+      windowsHide: true,
+      detached: true,
+      stdio: 'ignore',
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: '1',
+        HERMES_TERMINATE_WATCHER_POWERSHELL: ps,
+        HERMES_TERMINATE_WATCHER_ENCODED_COMMAND: encodedCommand,
+        HERMES_TEST_BRIDGE_PROOF_PATH: proofPath,
+        HERMES_TEST_BRIDGE_READY_PATH: readyPath,
+        HERMES_TEST_BRIDGE_NONCE: nonce
+      }
+    })
+    const bridgePid = bridge.pid
+    assert.ok(Number.isInteger(bridgePid) && bridgePid > 0, 'bridge did not return a PID')
+    const bridgeResult = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+      bridge.once('exit', (code, signal) => resolve({ code, signal }))
+      bridge.once('error', () => resolve({ code: null, signal: null }))
+    })
+    const waitDeadline = Date.now() + 2_000
+    try {
+      while (!fs.existsSync(proofPath) && Date.now() < waitDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 20))
+      }
+      assert.equal(fs.existsSync(proofPath), true, 'bridge never executed its PowerShell child')
+      const powershellPid = Number(fs.readFileSync(proofPath, 'utf8').trim())
+      assert.ok(Number.isInteger(powershellPid) && powershellPid > 0, 'PowerShell proof PID invalid')
+      const tree = await snapshotProcessTreeIdentities(bridgePid as number, { timeoutMs: 2_000 })
+      assert.ok(tree.some(identity => identity.pid === bridgePid), 'bridge identity missing from snapshot')
+      const powershellCreatedAt = await queryWindowsProcessCreatedAt(powershellPid, { platform: 'win32', timeoutMs: 2_000 })
+      assert.ok(powershellCreatedAt && powershellCreatedAt > 0, 'PowerShell generation unavailable')
+      const authenticatedTree = [
+        ...new Map(
+          [...tree, { pid: powershellPid, createdAt: powershellCreatedAt }].map(identity => [identity.pid, identity] as const)
+        ).values()
+      ]
+      const result = await bridgeResult
+      assert.equal(result.code, 17, `bridge did not propagate PowerShell exit: ${JSON.stringify(result)}`)
+      assert.equal(fs.readFileSync(readyPath, 'utf8'), `READY:${nonce}`)
+      const absenceDeadline = Date.now() + 3_000
+      let remainingDetails = await Promise.all(
+        authenticatedTree.map(async identity => ({
+          pid: identity.pid,
+          details: await queryWindowsProcessDetails(ps, identity.pid)
+        }))
+      )
+      while (remainingDetails.some(entry => entry.details.raw !== 'absent') && Date.now() < absenceDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 50))
+        remainingDetails = await Promise.all(
+          authenticatedTree.map(async identity => ({
+            pid: identity.pid,
+            details: await queryWindowsProcessDetails(ps, identity.pid)
+          }))
+        )
+      }
+      assert.ok(
+        remainingDetails.every(entry => entry.details.raw === 'absent'),
+        `bridge descendant survived return powershellPid=${powershellPid} tree=${JSON.stringify(authenticatedTree)} details=${JSON.stringify(remainingDetails)} result=${JSON.stringify(result)}`
+      )
+    } finally {
+      if (bridge.exitCode == null && bridge.signalCode == null) {
+        try { bridge.kill('SIGKILL') } catch {}
+      }
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('elevated helper script shape', () => {
   it('does not assign the read-only $pid automatic variable', () => {
     const helperPath = path.resolve(__dirname, '../../../scripts/desktop-update/windows-force-release.ps1')
@@ -641,6 +1033,109 @@ describe('termination cancellation hard boundary', () => {
     assert.equal(mutated, false)
     assert.ok(elapsed < 2_000, `elapsed ${elapsed}`)
   })
+
+  it(
+    'maps multiple near-expiry holders through one production absolute deadline',
+    { timeout: 10_000 },
+    async () => {
+      const holders = [
+        holder({ pid: 701, createdAt: 1_701_000_001 }),
+        holder({ pid: 702, createdAt: 1_701_000_002 })
+      ]
+      const terminated = new Set<number>()
+      const terminationCalls: Array<{ pid: number; budgetMs: number; deadlineAt?: number }> = []
+      let scanPass = 0
+      let runCalls = 0
+      let lateMutations = 0
+      const started = Date.now()
+
+      const fakeRun = async (
+        _script: string,
+        timeoutMs = 0,
+        signal?: AbortSignal,
+        nativeDeadlineAt?: number
+      ): Promise<{ stdout: string; stderr: string; code: number }> => {
+        const call = ++runCalls
+        // Leave a real margin for the outer kill/confirmation reserve while
+        // still making the second holder genuinely near-expiry.
+        const delayMs = call === 1 ? 4_250 : 500
+        let aborted = false
+        const lateMutation = setTimeout(() => {
+          lateMutations += 1
+        }, delayMs + 250)
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(resolve, delayMs)
+          const onAbort = () => {
+            aborted = true
+            clearTimeout(timer)
+            resolve()
+          }
+          if (signal?.aborted) onAbort()
+          else signal?.addEventListener('abort', onAbort, { once: true })
+        })
+        clearTimeout(lateMutation)
+
+        if (
+          aborted ||
+          signal?.aborted ||
+          (typeof nativeDeadlineAt === 'number' && Date.now() >= nativeDeadlineAt)
+        ) {
+          return { stdout: '', stderr: `aborted timeout=${timeoutMs}`, code: 1 }
+        }
+        if (call === 1) return { stdout: 'TERMINATED', stderr: '', code: 0 }
+        return { stdout: '', stderr: 'near-expiry failure', code: 1 }
+      }
+
+      const outcome = await runWindowsUpdateForceRelease({
+        deadlineMs: 5_000,
+        settleMs: 0,
+        isResourceLocked: async () => terminated.size < holders.length,
+        listScannerHolders: async () => {
+          scanPass += 1
+          return scanPass === 1 ? holders : []
+        },
+        listRestartManagerHolders: async () => [],
+        // Keep this callback identical to the production mapping in main.ts:
+        // one remaining budget and one absolute deadline reach the native seam.
+        terminateHolder: async (target, budgetMs, signal, deadlineAt) => {
+          terminationCalls.push({ pid: target.pid, budgetMs, deadlineAt })
+          const result = await terminateWindowsHolderWithinDeadline(target, {
+            platform: 'win32',
+            budgetMs,
+            deadlineAt: deadlineAt ?? Date.now(),
+            signal,
+            run: fakeRun
+          })
+          if (result.kind === 'terminated' || result.kind === 'already-gone') {
+            terminated.add(target.pid)
+          }
+          return result
+        }
+      })
+      const elapsed = Date.now() - started
+
+      assert.equal(outcome.kind, 'timeout')
+      assert.equal(runCalls, 2, 'both near-expiry holders must reach the bounded seam')
+      assert.equal(terminationCalls.length, 2)
+      assert.equal(
+        new Set(terminationCalls.map(call => call.deadlineAt)).size,
+        1,
+        'holders must share one absolute deadline'
+      )
+      const first = terminationCalls[0]
+      const second = terminationCalls[1]
+      assert.ok(first && second)
+      assert.ok(first.budgetMs <= 5_000)
+      assert.ok(second.budgetMs < 900, `second holder was not near expiry: ${second.budgetMs}`)
+      assert.ok(second.budgetMs > 450, `test did not exercise a meaningful second budget: ${second.budgetMs}`)
+      assert.ok(typeof first.deadlineAt === 'number')
+      assert.ok((first.deadlineAt as number) - started <= 5_000)
+      assert.ok(elapsed <= 5_000, `production-mapped force release elapsed ${elapsed}`)
+
+      await new Promise(resolve => setTimeout(resolve, 800))
+      assert.equal(lateMutations, 0, 'near-expiry mutation fired after the updater returned')
+    }
+  )
 
   it(
     'kills a real PowerShell root+descendant tree and leaves the delayed sentinel untouched',
@@ -860,6 +1355,153 @@ Start-Sleep -Seconds 20
   )
 
   it(
+    'waits for a failed watcher and drains its delayed target before returning',
+    { timeout: 20_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+
+      const os = await import('node:os')
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-watcher-failure-'))
+      const sentinel = path.join(tmp, 'sentinel.txt')
+      const rootPidPath = path.join(tmp, 'root.pid')
+      const writerPidPath = path.join(tmp, 'writer.pid')
+      const watcherLog = path.join(tmp, 'watcher.log')
+      const ps = path.join(process.env.SystemRoot || 'C:\\\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+      const quotePowerShellLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
+      const rootScript = `
+$ErrorActionPreference = 'Stop'
+$sentinel = ${quotePowerShellLiteral(sentinel)}
+$rootPidPath = ${quotePowerShellLiteral(rootPidPath)}
+$writerPidPath = ${quotePowerShellLiteral(writerPidPath)}
+Set-Content -LiteralPath $rootPidPath -Value ([string]$PID)
+$writer = Start-Process -FilePath ${quotePowerShellLiteral(ps)} -ArgumentList @(
+  '-NoLogo','-NoProfile','-NonInteractive','-Command',
+  ('Start-Sleep -Milliseconds 6000; Set-Content -LiteralPath ''' + $sentinel + ''' -Value LATE_MUTATION')
+) -PassThru -WindowStyle Hidden
+Set-Content -LiteralPath $writerPidPath -Value ([string]$writer.Id)
+Start-Sleep -Seconds 20
+`.trim()
+      const waitForFile = async (filePath: string, timeoutMs: number) => {
+        const deadline = Date.now() + timeoutMs
+        while (Date.now() < deadline) {
+          if (fs.existsSync(filePath)) return true
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        return fs.existsSync(filePath)
+      }
+      let launchedRootPid: number | undefined
+
+      try {
+        launchedRootPid = await launchPowerShellThroughWmi(ps, rootScript)
+        assert.equal(await waitForFile(rootPidPath, 4_000), true, 'watcher-failure root did not start')
+        assert.equal(await waitForFile(writerPidPath, 4_000), true, 'watcher-failure writer did not start')
+        const rootPid = Number(fs.readFileSync(rootPidPath, 'utf8').trim())
+        const writerPid = Number(fs.readFileSync(writerPidPath, 'utf8').trim())
+        assert.equal(rootPid, launchedRootPid, 'watcher-failure root PID mismatch')
+        const rootCreatedAt = await queryWindowsProcessCreatedAt(rootPid, { platform: 'win32', timeoutMs: 2_000 })
+        const writerCreatedAt = await queryWindowsProcessCreatedAt(writerPid, { platform: 'win32', timeoutMs: 2_000 })
+        assert.ok(rootCreatedAt && rootCreatedAt > 0, 'watcher-failure root generation unavailable')
+        assert.ok(writerCreatedAt && writerCreatedAt > 0, 'watcher-failure writer generation unavailable')
+
+        const injectedWatcher = makeInjectedWatcherStarter(buildWatcherFailureCommand())
+        const started = Date.now()
+        const result = await runPowerShellWithHardBoundary(
+          buildHoldTargetJobScript(rootPid, rootCreatedAt, writerPid, writerCreatedAt),
+          5_000,
+          undefined,
+          undefined,
+          { startWatcher: injectedWatcher.startWatcher }
+        )
+        const elapsed = Date.now() - started
+        assert.equal(result.code, 1, `watcher failure unexpectedly cleared: ${JSON.stringify(result)}`)
+        assert.ok(elapsed <= 5_000, `watcher failure elapsed ${elapsed}ms`)
+        const watcherChild = injectedWatcher.getChild()
+        if (!watcherChild) throw new Error('injected watcher was not started')
+        const watcherPid = watcherChild.pid ?? 0
+        assert.ok(watcherPid > 0, 'injected watcher PID unavailable')
+        assert.ok(
+          watcherChild.exitCode != null || watcherChild.signalCode != null,
+          `injected watcher still running pid=${watcherPid}`
+        )
+        const watcherArtifacts = injectedWatcher.getArtifacts()
+        assert.ok(watcherArtifacts, 'injected watcher artifacts unavailable')
+
+        const identities = [
+          { pid: rootPid, createdAt: rootCreatedAt },
+          { pid: writerPid, createdAt: writerCreatedAt }
+        ]
+        const { identitiesStillPresent } = await import('./windows-process-terminate')
+        assert.deepEqual(await identitiesStillPresent([{ pid: watcherPid }]), [], 'failed watcher leaked')
+        assert.equal(fs.existsSync(watcherArtifacts.readyPath), false, 'failed watcher READY artifact remained')
+        assert.equal(fs.existsSync(watcherArtifacts.tempPath), false, 'failed watcher temp artifact remained')
+        assert.deepEqual(
+          await identitiesStillPresent(identities),
+          [],
+          `target survived failed watcher boundary result=${JSON.stringify(result)}`
+        )
+        await new Promise(resolve => setTimeout(resolve, 6_500))
+        assert.equal(fs.existsSync(sentinel), false, 'delayed writer mutated after failed watcher return')
+        assert.deepEqual(await identitiesStillPresent([{ pid: watcherPid }]), [], 'failed watcher reappeared')
+        assert.equal(fs.existsSync(watcherArtifacts.readyPath), false, 'failed watcher READY appeared late')
+        assert.equal(fs.existsSync(watcherArtifacts.tempPath), false, 'failed watcher temp appeared late')
+        assert.deepEqual(await identitiesStillPresent(identities), [], 'target generation reappeared after failed watcher')
+      } finally {
+        if (Number.isInteger(launchedRootPid) && (launchedRootPid as number) > 0) {
+          await execFileAsync('taskkill', ['/PID', String(launchedRootPid), '/T', '/F'], {
+            windowsHide: true,
+            timeout: 2_000
+          }).catch(() => undefined)
+        }
+        fs.rmSync(tmp, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it(
+    'fails closed when an explicitly injected watcher never publishes READY',
+    { timeout: 10_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+
+      const os = await import('node:os')
+      const watcherDirsBefore = new Set(
+        fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('hermes-terminate-watcher-'))
+      )
+      const injectedWatcher = makeInjectedWatcherStarter('setTimeout(() => {}, 30000)')
+      const started = Date.now()
+      const result = await runPowerShellWithHardBoundary(
+        "Write-Output 'TERMINATED'",
+        2_000,
+        undefined,
+        undefined,
+        { startWatcher: injectedWatcher.startWatcher }
+        )
+        const elapsed = Date.now() - started
+        assert.equal(result.code, 1, `no-READY watcher unexpectedly cleared: ${JSON.stringify(result)}`)
+        assert.match(`${result.stdout}\n${result.stderr}`, /TARGET_WATCHER_NOT_ARMED|watcher|boundary/i)
+        assert.ok(elapsed <= 3_000, `no-READY boundary elapsed ${elapsed}ms`)
+        const watcherChild = injectedWatcher.getChild()
+        if (!watcherChild) throw new Error('no-READY watcher was not started')
+        const watcherPid = watcherChild.pid ?? 0
+        assert.ok(watcherPid > 0, 'no-READY watcher PID unavailable')
+        const watcherArtifacts = injectedWatcher.getArtifacts()
+        assert.ok(watcherArtifacts, 'no-READY watcher artifacts unavailable')
+        const { identitiesStillPresent } = await import('./windows-process-terminate')
+        assert.deepEqual(await identitiesStillPresent([{ pid: watcherPid }]), [], 'no-READY watcher leaked')
+        const retainedWatcherDirs = fs
+          .readdirSync(os.tmpdir())
+          .filter(name => name.startsWith('hermes-terminate-watcher-') && !watcherDirsBefore.has(name))
+        assert.deepEqual(retainedWatcherDirs, [], 'no-READY boundary retained parent-owned artifacts')
+        assert.equal(fs.existsSync(watcherArtifacts.readyPath), false, 'no-READY watcher published READY late')
+        assert.equal(fs.existsSync(watcherArtifacts.tempPath), false, 'no-READY watcher temp artifact remained')
+        await new Promise(resolve => setTimeout(resolve, 250))
+        assert.deepEqual(await identitiesStillPresent([{ pid: watcherPid }]), [], 'no-READY watcher reappeared')
+        assert.equal(fs.existsSync(watcherArtifacts.readyPath), false, 'no-READY watcher published READY after return')
+        assert.equal(fs.existsSync(watcherArtifacts.tempPath), false, 'no-READY watcher temp appeared after return')
+    }
+  )
+
+  it(
     'contains an external authenticated holder tree when the primary snapshot fails',
     { timeout: 15_000 },
     async () => {
@@ -870,6 +1512,9 @@ Start-Sleep -Seconds 20
       const sentinel = path.join(tmp, 'sentinel.txt')
       const rootPidPath = path.join(tmp, 'root.pid')
       const writerPidPath = path.join(tmp, 'writer.pid')
+      const startupPath = path.join(tmp, 'startup.status')
+      const startupErrorPath = path.join(tmp, 'startup.error')
+      const watcherLog = path.join(tmp, 'watcher.log')
       const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
       const quotePowerShellLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
       const rootScript = `
@@ -877,6 +1522,10 @@ $ErrorActionPreference = 'Stop'
 $sentinel = ${quotePowerShellLiteral(sentinel)}
 $rootPidPath = ${quotePowerShellLiteral(rootPidPath)}
 $writerPidPath = ${quotePowerShellLiteral(writerPidPath)}
+$startupPath = ${quotePowerShellLiteral(startupPath)}
+$startupErrorPath = ${quotePowerShellLiteral(startupErrorPath)}
+try {
+Set-Content -LiteralPath $startupPath -Value ('started:' + [string]$PID)
 Set-Content -LiteralPath $rootPidPath -Value ([string]$PID)
 $writer = Start-Process -FilePath ${quotePowerShellLiteral(ps)} -ArgumentList @(
   '-NoLogo','-NoProfile','-NonInteractive','-Command',
@@ -884,13 +1533,12 @@ $writer = Start-Process -FilePath ${quotePowerShellLiteral(ps)} -ArgumentList @(
 ) -PassThru -WindowStyle Hidden
 Set-Content -LiteralPath $writerPidPath -Value ([string]$writer.Id)
 Start-Sleep -Seconds 20
+} catch {
+  try { Set-Content -LiteralPath $startupErrorPath -Value $_.Exception.ToString() } catch {}
+  throw
+}
 `.trim()
-      const rootChild = execFile(
-        ps,
-        ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', rootScript],
-        { encoding: 'utf8', windowsHide: true },
-        () => undefined
-      )
+      let launchedRootPid: number | undefined
       const waitForFile = async (filePath: string, timeoutMs: number) => {
         const deadline = Date.now() + timeoutMs
         while (Date.now() < deadline) {
@@ -901,9 +1549,46 @@ Start-Sleep -Seconds 20
       }
 
       try {
-        assert.equal(await waitForFile(rootPidPath, 1_500), true, 'external holder root did not start')
-        assert.equal(await waitForFile(writerPidPath, 1_500), true, 'detached delayed writer did not start')
+        launchedRootPid = await launchPowerShellThroughWmi(ps, rootScript)
+        const fixtureDeadline = Date.now() + 8_000
+        let rootParentPid: number | null = null
+        let rootDetails = 'absent'
+        while (Date.now() < fixtureDeadline) {
+          const queriedDetails = await queryWindowsProcessDetails(ps, launchedRootPid)
+          rootParentPid = queriedDetails.parentPid
+          rootDetails = queriedDetails.raw
+          if (
+            rootParentPid != null &&
+            rootParentPid !== process.pid &&
+            rootDetails !== 'absent' &&
+            !rootDetails.startsWith('diagnostic-error:')
+          ) {
+            break
+          }
+          await new Promise(resolve => setTimeout(resolve, 50))
+        }
+        if (!(await waitForFile(rootPidPath, Math.max(0, fixtureDeadline - Date.now())))) {
+          const startupError = fs.existsSync(startupErrorPath)
+            ? fs.readFileSync(startupErrorPath, 'utf8').trim()
+            : 'none'
+          assert.fail(
+            `external holder root did not start launchedPid=${launchedRootPid} parentPid=${rootParentPid} details=${rootDetails} startupError=${startupError}`
+          )
+        }
+        const startupError = fs.existsSync(startupErrorPath)
+          ? fs.readFileSync(startupErrorPath, 'utf8').trim()
+          : 'none'
+        assert.ok(
+          rootParentPid != null && rootParentPid !== process.pid && rootDetails !== 'absent',
+          `external root was not live outside Vitest parent=${rootParentPid} details=${rootDetails} startupError=${startupError}`
+        )
+        assert.equal(
+          await waitForFile(writerPidPath, Math.max(0, fixtureDeadline - Date.now())),
+          true,
+          'detached delayed writer did not start'
+        )
         const rootPid = Number(fs.readFileSync(rootPidPath, 'utf8').trim())
+        assert.equal(rootPid, launchedRootPid, 'root PID marker did not match WMI broker PID')
         const writerPid = Number(fs.readFileSync(writerPidPath, 'utf8').trim())
         const rootCreatedAt = await queryWindowsProcessCreatedAt(rootPid, { platform: 'win32', timeoutMs: 2_000 })
         const writerCreatedAt = await queryWindowsProcessCreatedAt(writerPid, { platform: 'win32', timeoutMs: 2_000 })
@@ -911,7 +1596,9 @@ Start-Sleep -Seconds 20
         assert.ok(writerCreatedAt && writerCreatedAt > 0, 'could not authenticate detached writer generation')
 
         const priorSnapshotFailure = process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
+        const priorWatcherLog = process.env.HERMES_TERMINATE_WATCHER_LOG
         process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = '1'
+        process.env.HERMES_TERMINATE_WATCHER_LOG = watcherLog
         const started = Date.now()
         let result
         try {
@@ -925,12 +1612,19 @@ Start-Sleep -Seconds 20
         } finally {
           if (priorSnapshotFailure == null) delete process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
           else process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = priorSnapshotFailure
+          if (priorWatcherLog == null) delete process.env.HERMES_TERMINATE_WATCHER_LOG
+          else process.env.HERMES_TERMINATE_WATCHER_LOG = priorWatcherLog
         }
         const elapsed = Date.now() - started
+        const watcherDiagnostics = fs.existsSync(watcherLog) ? fs.readFileSync(watcherLog, 'utf8') : 'none'
         assert.deepEqual(
           result,
           { kind: 'terminated' },
-          'boundary result=' + JSON.stringify(result) + ' root=' + rootPid + ' writer=' + writerPid
+          'boundary result=' + JSON.stringify(result) +
+            ' elapsed=' + elapsed +
+            ' root=' + rootPid +
+            ' writer=' + writerPid +
+            ' watcher=' + watcherDiagnostics
         )
         assert.ok(elapsed <= 5_000, `external holder termination elapsed ${elapsed}`)
 
@@ -944,12 +1638,464 @@ Start-Sleep -Seconds 20
         assert.equal(fs.existsSync(sentinel), false)
         assert.deepEqual(await identitiesStillPresent(identities), [])
       } finally {
-        try {
-          rootChild.kill('SIGKILL')
-        } catch {
-          void 0
+        if (Number.isInteger(launchedRootPid) && (launchedRootPid as number) > 0) {
+          await execFileAsync('taskkill', ['/PID', String(launchedRootPid), '/T', '/F'], {
+            windowsHide: true,
+            timeout: 2_000
+          }).catch(() => undefined)
         }
         fs.rmSync(tmp, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it(
+    'closes the target job when a directly-killed helper dies at each child checkpoint',
+    { timeout: 35_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+
+      const os = await import('node:os')
+      const { identitiesStillPresent } = await import('./windows-process-terminate')
+      const phases = ['after-child-assignment', 'after-child-suspension'] as const
+      const ps = path.join(
+        process.env.SystemRoot || 'C:\\\\Windows',
+        'System32',
+        'WindowsPowerShell',
+        'v1.0',
+        'powershell.exe'
+      )
+      const quotePowerShellLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
+
+      for (const phase of phases) {
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-force-helper-death-${phase}-`))
+        const sentinel = path.join(tmp, 'sentinel.txt')
+        const rootPidPath = path.join(tmp, 'root.pid')
+        const writerPidPath = path.join(tmp, 'writer.pid')
+        const phaseMarker = path.join(tmp, 'phase.marker')
+        const watcherLog = path.join(tmp, 'watcher.log')
+        const watcherReadyPath = path.join(tmp, 'watcher.ready')
+        const watcherReadyNonce = randomBytes(16).toString('hex')
+        const wrapperPidMarkerPath = path.join(tmp, 'wrapper.pid')
+        const wrapperPidMarkerNonce = randomBytes(16).toString('hex')
+        const helperScriptPath = path.join(tmp, 'helper.ps1')
+        const helperGatePath = path.join(tmp, 'helper.go')
+        const watcherDeadlineAt = Date.now() + 20_000
+        const helperJobName = `HermesTestHelper-${randomBytes(16).toString('hex')}`
+        const targetJobName = `HermesTestTarget-${randomBytes(16).toString('hex')}`
+        const rootScript = `
+$ErrorActionPreference = 'Stop'
+$sentinel = ${quotePowerShellLiteral(sentinel)}
+$rootPidPath = ${quotePowerShellLiteral(rootPidPath)}
+$writerPidPath = ${quotePowerShellLiteral(writerPidPath)}
+Set-Content -LiteralPath $rootPidPath -Value ([string]$PID)
+$writer = Start-Process -FilePath ${quotePowerShellLiteral(ps)} -ArgumentList @(
+  '-NoLogo','-NoProfile','-NonInteractive','-Command',
+  ('Start-Sleep -Milliseconds 6000; Set-Content -LiteralPath ''' + $sentinel + ''' -Value LATE_MUTATION')
+) -PassThru -WindowStyle Hidden
+Set-Content -LiteralPath $writerPidPath -Value ([string]$writer.Id)
+Start-Sleep -Seconds 30
+`.trim()
+
+        const rootChild = execFile(
+          ps,
+          ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', rootScript],
+          { encoding: 'utf8', windowsHide: true },
+          () => undefined
+        )
+        let rootPid: number | undefined
+        let writerPid: number | undefined
+        let boundaryChild: ReturnType<typeof execFile> | undefined
+        let boundaryPromise: Promise<{ stdout: string; stderr: string; code: number }> | undefined
+        let watcherChild: ReturnType<typeof execFile> | undefined
+        let watcherPromise: Promise<{ stdout: string; stderr: string; code: number }> | undefined
+        const waitForFile = async (filePath: string, timeoutMs: number) => {
+          const deadline = Date.now() + timeoutMs
+          while (Date.now() < deadline) {
+            if (fs.existsSync(filePath)) return true
+            await new Promise(resolve => setTimeout(resolve, 25))
+          }
+          return fs.existsSync(filePath)
+        }
+        const savedEnvironment = {
+          snapshot: process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE,
+          phase: process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE,
+          marker: process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER,
+          pausePid: process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID
+        }
+
+        try {
+          assert.equal(await waitForFile(rootPidPath, 4_000), true, `${phase}: root did not start`)
+          assert.equal(await waitForFile(writerPidPath, 4_000), true, `${phase}: writer did not start`)
+          rootPid = Number(fs.readFileSync(rootPidPath, 'utf8').trim())
+          writerPid = Number(fs.readFileSync(writerPidPath, 'utf8').trim())
+          assert.ok(Number.isInteger(rootPid) && rootPid > 0, `${phase}: invalid root PID`)
+          assert.ok(Number.isInteger(writerPid) && writerPid > 0, `${phase}: invalid writer PID`)
+
+          const rootCreatedAt = await queryWindowsProcessCreatedAt(rootPid, { platform: 'win32', timeoutMs: 2_000 })
+          const writerCreatedAt = await queryWindowsProcessCreatedAt(writerPid, { platform: 'win32', timeoutMs: 2_000 })
+          assert.ok(rootCreatedAt && rootCreatedAt > 0, `${phase}: root generation unavailable`)
+          assert.ok(writerCreatedAt && writerCreatedAt > 0, `${phase}: writer generation unavailable`)
+
+          process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = '1'
+          process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE = phase
+          process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER = phaseMarker
+          process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID = String(writerPid)
+          boundaryPromise = new Promise(resolve => {
+            boundaryChild = execFile(
+              ps,
+              [
+                '-NoLogo',
+                '-NoProfile',
+                '-NonInteractive',
+                '-ExecutionPolicy',
+                'Bypass',
+                '-Command',
+                TERMINATE_JOB_WRAPPER_COMMAND
+              ],
+              {
+                encoding: 'utf8',
+                windowsHide: true,
+                env: {
+                  ...process.env,
+                  HERMES_TERMINATE_SCRIPT: buildExactTerminateScript(rootPid, rootCreatedAt, 1_500),
+                  HERMES_TERMINATE_JOB_NAME: helperJobName,
+                  HERMES_TERMINATE_TARGET_JOB_NAME: targetJobName,
+                  HERMES_TERMINATE_TARGET_WAIT_MS: '1500',
+                  HERMES_TERMINATE_DEADLINE_AT: String(watcherDeadlineAt),
+                  HERMES_TERMINATE_WATCHER_READY_PATH: watcherReadyPath,
+                  HERMES_TERMINATE_WATCHER_READY_NONCE: watcherReadyNonce,
+                  HERMES_TERMINATE_WRAPPER_PID_MARKER_PATH: wrapperPidMarkerPath,
+                  HERMES_TERMINATE_WRAPPER_PID_MARKER_NONCE: wrapperPidMarkerNonce,
+                  HERMES_TERMINATE_HELPER_SCRIPT_PATH: helperScriptPath,
+                  HERMES_TERMINATE_HELPER_GATE_PATH: helperGatePath
+                }
+              },
+              (error: any, stdout: string, stderr: string) =>
+                resolve({
+                  stdout: String(stdout ?? ''),
+                  stderr: String(stderr ?? error?.message ?? ''),
+                  code: typeof error?.code === 'number' ? error.code : error ? 1 : 0
+                })
+            )
+          })
+
+          assert.ok(boundaryChild && typeof boundaryChild.pid === 'number' && boundaryChild.pid > 0)
+          assert.equal(await waitForFile(wrapperPidMarkerPath, 4_000), true, `${phase}: wrapper marker missing`)
+          const wrapperIdentity = parseWrapperProcessMarker(
+            fs.readFileSync(wrapperPidMarkerPath, 'utf8'),
+            wrapperPidMarkerNonce
+          )
+          assert.ok(wrapperIdentity?.pid && wrapperIdentity.createdAt, `${phase}: wrapper marker invalid`)
+          watcherPromise = new Promise(resolve => {
+            watcherChild = execFile(
+              ps,
+              [
+                '-NoLogo',
+                '-NoProfile',
+                '-NonInteractive',
+                '-ExecutionPolicy',
+                'Bypass',
+                '-Command',
+                TERMINATE_JOB_WATCHER_COMMAND
+              ],
+              {
+                encoding: 'utf8',
+                windowsHide: true,
+                env: {
+                  ...process.env,
+                  HERMES_TERMINATE_OWNER_PID: String(wrapperIdentity.pid),
+                  HERMES_TERMINATE_OWNER_CREATED_AT: String(wrapperIdentity.createdAt),
+                  HERMES_TERMINATE_TARGET_JOB_NAME: targetJobName,
+                  HERMES_TERMINATE_WATCHER_READY_PATH: watcherReadyPath,
+                  HERMES_TERMINATE_WATCHER_READY_NONCE: watcherReadyNonce,
+                  HERMES_TERMINATE_WATCHER_DEADLINE_AT: String(watcherDeadlineAt),
+                  HERMES_TERMINATE_WATCHER_LOG: watcherLog
+                }
+              },
+              (error: any, stdout: string, stderr: string) =>
+                resolve({
+                  stdout: String(stdout ?? ''),
+                  stderr: String(stderr ?? error?.message ?? ''),
+                  code: typeof error?.code === 'number' ? error.code : error ? 1 : 0
+                })
+            )
+          })
+          const watcherPid = watcherChild?.pid ?? 0
+          assert.ok(Number.isInteger(watcherPid) && watcherPid > 0, `${phase}: invalid watcher PID`)
+
+          const markerReady = await waitForFile(phaseMarker, 4_000)
+          if (!markerReady) {
+            const earlyResult = await Promise.race([
+              boundaryPromise,
+              new Promise<{ stdout: string; stderr: string; code: number }>(resolve =>
+                setTimeout(() => resolve({ stdout: '', stderr: 'still-running', code: 1 }), 1_000)
+              )
+            ])
+            assert.fail(`${phase}: checkpoint marker missing result=${JSON.stringify(earlyResult)}`)
+          }
+          assert.equal(
+            fs.readFileSync(phaseMarker, 'utf8').trim(),
+            `${phase}:${writerPid}`,
+            `${phase}: wrong checkpoint marker`
+          )
+          await execFileAsync('taskkill', ['/PID', String(boundaryChild.pid), '/T', '/F'], {
+            windowsHide: true,
+            timeout: 2_000
+          }).catch(() => undefined)
+          const boundaryResult = await boundaryPromise
+          const boundaryPid = boundaryChild.pid
+          assert.equal(
+            boundaryResult.code,
+            1,
+            `${phase}: helper unexpectedly completed pid=${boundaryPid} targetJob=${targetJobName}: ${JSON.stringify(boundaryResult)}`
+          )
+          const watcherResult = await watcherPromise
+          assert.equal(
+            watcherResult.code,
+            0,
+            `${phase}: named target-job watcher failed: ${JSON.stringify(watcherResult)}`
+          )
+          const watcherLogContents = fs.readFileSync(watcherLog, 'utf8')
+          assert.match(watcherLogContents, new RegExp(`started owner=${boundaryPid} job=${targetJobName}`))
+          assert.match(watcherLogContents, new RegExp(`waiting owner=${boundaryPid}`))
+          assert.match(watcherLogContents, /completed result=0/)
+          assert.deepEqual(
+            await identitiesStillPresent([{ pid: watcherPid }]),
+            [],
+            `${phase}: target-job watcher leaked pid=${watcherPid}`
+          )
+
+          const identities = [
+            { pid: rootPid, createdAt: rootCreatedAt },
+            { pid: writerPid, createdAt: writerCreatedAt }
+          ]
+          const survivors = await identitiesStillPresent(identities)
+          let survivorDetails = ''
+          if (survivors.length > 0) {
+            try {
+              const details = await execFileAsync(
+                ps,
+                [
+                  '-NoLogo',
+                  '-NoProfile',
+                  '-NonInteractive',
+                  '-Command',
+                  `$ids = @(${survivors.map(entry => entry.pid).join(',')}); Get-CimInstance Win32_Process | Where-Object { $ids -contains $_.ProcessId } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress`
+                ],
+                { encoding: 'utf8', windowsHide: true, timeout: 1_000 }
+              )
+              survivorDetails = String(details.stdout ?? '')
+            } catch (error) {
+              survivorDetails = String((error as any)?.message ?? error)
+            }
+          }
+          assert.deepEqual(
+            survivors,
+            [],
+            `${phase}: target survived helper death boundaryPid=${boundaryPid} targetJob=${targetJobName} details=${survivorDetails}`
+          )
+          await new Promise(resolve => setTimeout(resolve, 6_500))
+          assert.equal(fs.existsSync(sentinel), false, `${phase}: delayed writer mutated after helper death`)
+          assert.deepEqual(await identitiesStillPresent(identities), [], `${phase}: target generation reappeared`)
+        } finally {
+          try {
+            boundaryChild?.kill('SIGKILL')
+            watcherChild?.kill('SIGKILL')
+          } catch {
+            void 0
+          }
+          await boundaryPromise?.catch(() => undefined)
+          await watcherPromise?.catch(() => undefined)
+          for (const pid of [writerPid, rootPid]) {
+            if (!Number.isInteger(pid) || (pid as number) <= 0) continue
+            try {
+              await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+                windowsHide: true,
+                timeout: 2_000
+              })
+            } catch {
+              void 0
+            }
+          }
+          if (savedEnvironment.snapshot == null) delete process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
+          else process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = savedEnvironment.snapshot
+          if (savedEnvironment.phase == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE
+          else process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE = savedEnvironment.phase
+          if (savedEnvironment.marker == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER
+          else process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER = savedEnvironment.marker
+          if (savedEnvironment.pausePid == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID
+          else process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID = savedEnvironment.pausePid
+          fs.rmSync(`${phaseMarker}.tmp`, { force: true })
+          try {
+            rootChild.kill('SIGKILL')
+          } catch {
+            void 0
+          }
+          fs.rmSync(tmp, { recursive: true, force: true })
+        }
+      }
+    }
+  )
+
+  it(
+    'uses the production runner to close the target job at each child checkpoint',
+    { timeout: 35_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+
+      const os = await import('node:os')
+      const { identitiesStillPresent } = await import('./windows-process-terminate')
+      const phases = ['after-child-assignment', 'after-child-suspension'] as const
+      const ps = path.join(
+        process.env.SystemRoot || 'C:\\\\Windows',
+        'System32',
+        'WindowsPowerShell',
+        'v1.0',
+        'powershell.exe'
+      )
+      const quotePowerShellLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
+
+      for (const phase of phases) {
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-force-production-helper-death-${phase}-`))
+        const sentinel = path.join(tmp, 'sentinel.txt')
+        const rootPidPath = path.join(tmp, 'root.pid')
+        const writerPidPath = path.join(tmp, 'writer.pid')
+        const phaseMarker = path.join(tmp, 'phase.marker')
+        const watcherLog = path.join(tmp, 'watcher.log')
+        const namedJobLog = path.join(tmp, 'named-job.log')
+        const rootScript = `
+$ErrorActionPreference = 'Stop'
+$sentinel = ${quotePowerShellLiteral(sentinel)}
+$rootPidPath = ${quotePowerShellLiteral(rootPidPath)}
+$writerPidPath = ${quotePowerShellLiteral(writerPidPath)}
+Set-Content -LiteralPath $rootPidPath -Value ([string]$PID)
+$writer = Start-Process -FilePath ${quotePowerShellLiteral(ps)} -ArgumentList @(
+  '-NoLogo','-NoProfile','-NonInteractive','-Command',
+  ('Start-Sleep -Milliseconds 6000; Set-Content -LiteralPath ''' + $sentinel + ''' -Value LATE_MUTATION')
+) -PassThru -WindowStyle Hidden
+Set-Content -LiteralPath $writerPidPath -Value ([string]$writer.Id)
+Start-Sleep -Seconds 30
+`.trim()
+        const rootChild = execFile(
+          ps,
+          ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', rootScript],
+          { encoding: 'utf8', windowsHide: true },
+          () => undefined
+        )
+        const controller = new AbortController()
+        let runPromise: Promise<{ stdout: string; stderr: string; code: number; pid?: number }> | undefined
+        const waitForFile = async (filePath: string, timeoutMs: number) => {
+          const deadline = Date.now() + timeoutMs
+          while (Date.now() < deadline) {
+            if (fs.existsSync(filePath)) return true
+            await new Promise(resolve => setTimeout(resolve, 25))
+          }
+          return fs.existsSync(filePath)
+        }
+        const savedEnvironment = {
+          snapshot: process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE,
+          phase: process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE,
+          marker: process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER,
+          pausePid: process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID,
+          watcherLog: process.env.HERMES_TERMINATE_WATCHER_LOG,
+          namedJobLog: process.env.HERMES_TERMINATE_NAMED_JOB_LOG
+        }
+
+        try {
+          assert.equal(await waitForFile(rootPidPath, 4_000), true, `${phase}: root did not start`)
+          assert.equal(await waitForFile(writerPidPath, 4_000), true, `${phase}: writer did not start`)
+          const rootPid = Number(fs.readFileSync(rootPidPath, 'utf8').trim())
+          const writerPid = Number(fs.readFileSync(writerPidPath, 'utf8').trim())
+          assert.ok(Number.isInteger(rootPid) && rootPid > 0, `${phase}: invalid root PID`)
+          assert.ok(Number.isInteger(writerPid) && writerPid > 0, `${phase}: invalid writer PID`)
+          const rootCreatedAt = await queryWindowsProcessCreatedAt(rootPid, { platform: 'win32', timeoutMs: 2_000 })
+          const writerCreatedAt = await queryWindowsProcessCreatedAt(writerPid, { platform: 'win32', timeoutMs: 2_000 })
+          assert.ok(rootCreatedAt && rootCreatedAt > 0, `${phase}: root generation unavailable`)
+          assert.ok(writerCreatedAt && writerCreatedAt > 0, `${phase}: writer generation unavailable`)
+
+          process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = '1'
+          process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE = phase
+          process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER = phaseMarker
+          process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID = String(writerPid)
+          process.env.HERMES_TERMINATE_WATCHER_LOG = watcherLog
+          process.env.HERMES_TERMINATE_NAMED_JOB_LOG = namedJobLog
+          runPromise = runPowerShellWithHardBoundary(
+            buildExactTerminateScript(rootPid, rootCreatedAt, 1_500),
+            5_000,
+            controller.signal
+          )
+          const markerReady = await waitForFile(phaseMarker, 4_000)
+          if (!markerReady) {
+            const earlyResult = await runPromise
+            assert.fail(
+              `${phase}: checkpoint marker missing code=${earlyResult.code} stdout=${earlyResult.stdout} stderr=${earlyResult.stderr}`
+            )
+          }
+          assert.equal(
+            fs.readFileSync(phaseMarker, 'utf8').trim(),
+            `${phase}:${writerPid}`,
+            `${phase}: wrong checkpoint marker`
+          )
+          controller.abort()
+          const boundaryResult = await runPromise
+          assert.equal(boundaryResult.code, 1, `${phase}: unexpected result ${JSON.stringify(boundaryResult)}`)
+
+          const identities = [
+            { pid: rootPid, createdAt: rootCreatedAt },
+            { pid: writerPid, createdAt: writerCreatedAt }
+          ]
+          const survivors = await identitiesStillPresent(identities)
+          const watcherDiagnostics = fs.existsSync(watcherLog) ? fs.readFileSync(watcherLog, 'utf8') : '<none>'
+          const namedJobDiagnostics = fs.existsSync(namedJobLog) ? fs.readFileSync(namedJobLog, 'utf8') : '<none>'
+          assert.deepEqual(
+            survivors,
+            [],
+            `${phase}: target survived production helper death root=${rootPid} writer=${writerPid} boundary=${JSON.stringify(boundaryResult)} watcher=${watcherDiagnostics} namedJob=${namedJobDiagnostics}`
+          )
+          await new Promise(resolve => setTimeout(resolve, 6_500))
+          assert.equal(fs.existsSync(sentinel), false, `${phase}: delayed writer mutated after helper death`)
+          assert.deepEqual(await identitiesStillPresent(identities), [], `${phase}: target generation reappeared`)
+        } finally {
+          controller.abort()
+          await runPromise?.catch(() => undefined)
+          for (const pid of [
+            Number.isInteger(Number(fs.existsSync(writerPidPath) ? fs.readFileSync(writerPidPath, 'utf8').trim() : ''))
+              ? Number(fs.readFileSync(writerPidPath, 'utf8').trim())
+              : undefined,
+            Number.isInteger(Number(fs.existsSync(rootPidPath) ? fs.readFileSync(rootPidPath, 'utf8').trim() : ''))
+              ? Number(fs.readFileSync(rootPidPath, 'utf8').trim())
+              : undefined
+          ]) {
+            if (!Number.isInteger(pid) || (pid as number) <= 0) continue
+            try {
+              await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+                windowsHide: true,
+                timeout: 2_000
+              })
+            } catch {
+              void 0
+            }
+          }
+          if (savedEnvironment.snapshot == null) delete process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE
+          else process.env.HERMES_FORCE_RELEASE_FORCE_SNAPSHOT_FAILURE = savedEnvironment.snapshot
+          if (savedEnvironment.phase == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE
+          else process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE = savedEnvironment.phase
+          if (savedEnvironment.marker == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER
+          else process.env.HERMES_FORCE_RELEASE_TEST_PHASE_MARKER = savedEnvironment.marker
+          if (savedEnvironment.pausePid == null) delete process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID
+          else process.env.HERMES_FORCE_RELEASE_TEST_PAUSE_PID = savedEnvironment.pausePid
+          if (savedEnvironment.watcherLog == null) delete process.env.HERMES_TERMINATE_WATCHER_LOG
+          else process.env.HERMES_TERMINATE_WATCHER_LOG = savedEnvironment.watcherLog
+          if (savedEnvironment.namedJobLog == null) delete process.env.HERMES_TERMINATE_NAMED_JOB_LOG
+          else process.env.HERMES_TERMINATE_NAMED_JOB_LOG = savedEnvironment.namedJobLog
+          try {
+            rootChild.kill('SIGKILL')
+          } catch {
+            void 0
+          }
+          fs.rmSync(tmp, { recursive: true, force: true })
+        }
       }
     }
   )
