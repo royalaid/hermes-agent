@@ -48,6 +48,26 @@ export type UpdatePreflightOutcome =
     }
   | { kind: 'probe-failure'; error: string; message: string }
 
+export interface UpdateMutationPermit {
+  readonly preflight: Extract<UpdatePreflightOutcome, { kind: 'clear' }>
+}
+
+const updateMutationPermits = new WeakSet<object>()
+
+export function authorizeUpdateMutation(preflight: UpdatePreflightOutcome): UpdateMutationPermit | null {
+  if (preflight.kind !== 'clear') return null
+  const permit: UpdateMutationPermit = Object.freeze({ preflight })
+  updateMutationPermits.add(permit)
+  return permit
+}
+
+export function runAuthorizedUpdateMutation<T>(permit: UpdateMutationPermit, operation: () => T): T {
+  if (!updateMutationPermits.has(permit)) {
+    throw new Error('update mutation requires a clear-preflight permit')
+  }
+  return operation()
+}
+
 const DEFAULT_COOPERATIVE_EXIT_MS = 1_500
 const DEFAULT_GENERIC_HOLDER_POLL_MS = 1_000
 const DEFAULT_GENERIC_HOLDER_TIMEOUT_MS = 30_000

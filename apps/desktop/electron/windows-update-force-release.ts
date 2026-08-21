@@ -263,68 +263,23 @@ function blockedMessage(holders: readonly ForceReleaseHolder[], detail: string):
 }
 
 /**
- * Race work against the remaining wall-clock budget.
- *
- * When `work` is a factory, the orchestrator passes an AbortSignal. Abort fires
- * early enough that kill-and-drain still fits inside `budgetMs`, so the
- * function returns within the wall-clock budget even when draining a real
- * child. Uncooperative deps that ignore AbortSignal are abandoned after the
- * bounded drain window — they must not stretch past the budget.
- * Plain promises remain supported for discovery calls (no drain wait).
+ * Bounds non-mutating probes against the remaining wall-clock budget. Mutating
+ * termination owns and drains its native process/Job boundary and must never be
+ * abandoned by this helper.
  */
-export function raceWithBudget<T>(
-  work: Promise<T> | ((signal: AbortSignal) => Promise<T>),
-  budgetMs: number,
-  onTimeout: () => T,
-  options?: { drainMs?: number }
-): Promise<T> {
+export function raceWithBudget<T>(work: Promise<T>, budgetMs: number, onTimeout: () => T): Promise<T> {
   const budget = Math.trunc(budgetMs)
-  if (budget <= 0) {
-    return Promise.resolve(onTimeout())
-  }
-
-  const isFactory = typeof work === 'function'
-  const controller = new AbortController()
-  const pending = isFactory ? work(controller.signal) : work
-  // Reserve drain room inside the budget so total elapsed stays <= budgetMs.
-  const requestedDrain = Math.max(
-    0,
-    Math.trunc(options?.drainMs ?? (isFactory ? Math.min(750, Math.max(100, Math.floor(budget * 0.2))) : 0))
-  )
-  const drainMs = isFactory ? Math.min(requestedDrain, Math.max(0, budget - 1)) : 0
-  const workBudget = Math.max(0, budget - drainMs)
-  let settled = false
-  const startedAt = Date.now()
+  if (budget <= 0) return Promise.resolve(onTimeout())
 
   return new Promise<T>((resolve, reject) => {
-    const finishTimeout = () => {
+    let settled = false
+    const timer = setTimeout(() => {
       if (settled) return
       settled = true
       resolve(onTimeout())
-    }
+    }, budget)
 
-    const timer = setTimeout(() => {
-      if (settled) return
-      controller.abort()
-      if (!isFactory || drainMs <= 0) {
-        finishTimeout()
-        return
-      }
-      const remainingDrain = Math.max(0, budget - (Date.now() - startedAt))
-      const drainTimer = setTimeout(finishTimeout, Math.min(drainMs, remainingDrain))
-      void pending.then(
-        () => {
-          clearTimeout(drainTimer)
-          finishTimeout()
-        },
-        () => {
-          clearTimeout(drainTimer)
-          finishTimeout()
-        }
-      )
-    }, workBudget)
-
-    void pending.then(
+    void work.then(
       value => {
         if (settled) return
         settled = true
@@ -424,16 +379,17 @@ export async function runWindowsUpdateForceRelease(
         break
       }
 
-      // The native boundary owns cancellation and terminal drainage. This outer
-      // race prevents a contract-violating dependency from stretching the API
-      // beyond the same absolute deadline; production termination handles the
-      // abort before this bounded drain completes.
-      const result = await raceWithBudget(
-        signal => deps.terminateHolder(target, budget, signal, deadline),
-        budget,
-        (): ForceReleaseTerminateResult => ({ kind: 'failed', detail: 'termination-deadline-exhausted' }),
-        { drainMs: Math.min(750, Math.max(1, Math.floor(budget * 0.2))) }
-      )
+      // The native boundary receives the same absolute deadline and does not
+      // resolve until its wrapper, Jobs, helpers, and authenticated descendants
+      // are terminal. Never race/abandon this mutating operation.
+      const controller = new AbortController()
+      const abortTimer = setTimeout(() => controller.abort(), budget)
+      let result: ForceReleaseTerminateResult
+      try {
+        result = await deps.terminateHolder(target, budget, controller.signal, deadline)
+      } finally {
+        clearTimeout(abortTimer)
+      }
 
       switch (result.kind) {
         case 'terminated':
