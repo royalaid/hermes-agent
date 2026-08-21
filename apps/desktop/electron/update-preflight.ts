@@ -417,7 +417,10 @@ export async function runWindowsUpdatePreflight(
 
     const outcome: Extract<UpdatePreflightOutcome, { kind: 'clear' }> = Object.freeze({
       kind: 'clear',
-      lease: Object.freeze({ ...lease })
+      // Preserve the exact capability-bearing lease object. The lease module
+      // binds its private nonce to object identity; cloning it here would keep
+      // the public fields while silently destroying handoff authority.
+      lease
     })
     const permit: UpdateMutationPermit = Object.freeze({ preflight: outcome })
     successfulPreflightPermits.set(outcome, permit)
