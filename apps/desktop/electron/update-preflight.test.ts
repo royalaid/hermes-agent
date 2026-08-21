@@ -138,7 +138,7 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
 }
 
 describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
-  it('fails closed before scanning when tracked backend trees do not unlock', async () => {
+  it('fails closed before scanning when tracked backend trees do not unlock and no force-release is wired', async () => {
     const { calls, deps } = makeDeps([], {
       releaseTrackedBackendTrees: async () => {
         calls.push('release')
@@ -152,6 +152,55 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     assert.equal(outcome.kind, 'blocked')
     assert.equal(outcome.reason, 'unlock-failed')
     assert.deepEqual(calls, ['release'])
+  })
+
+  it('force-releases exact holders when tracked unlock fails, then continues the scan path', async () => {
+    const { calls, deps } = makeDeps([clear(), clear(), clear()], {
+      releaseTrackedBackendTrees: async () => {
+        calls.push('release')
+        return { unlocked: false }
+      },
+      forceReleaseInstallHolders: async () => {
+        calls.push('force-release')
+        return { kind: 'clear' }
+      }
+    })
+
+    const outcome = await runWindowsUpdatePreflight(purpose, deps, {
+      cooperativeExitMs: 0,
+      respawnIntervalMs: 0,
+      terminationSettleMs: 0
+    })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.ok(calls.includes('force-release'))
+    assert.ok(calls.includes('scan'))
+  })
+
+  it('surfaces needs-elevation from the force-release quick path', async () => {
+    const { deps } = makeDeps([], {
+      releaseTrackedBackendTrees: async () => ({ unlocked: false }),
+      forceReleaseInstallHolders: async () => ({
+        kind: 'needs-elevation',
+        holders: [
+          {
+            pid: 901,
+            createdAt: 1,
+            name: 'python.exe',
+            cmdline: 'python.exe',
+            source: 'scanner'
+          }
+        ],
+        message: 'needs Administrator'
+      })
+    })
+
+    const outcome = await runWindowsUpdatePreflight(purpose, deps)
+    assert.equal(outcome.kind, 'blocked')
+    if (outcome.kind === 'blocked') {
+      assert.equal(outcome.reason, 'needs-elevation')
+      assert.equal(outcome.elevationHolders?.[0]?.pid, 901)
+    }
   })
 
   it('does not coerce a malformed unlock result into permission to scan', async () => {
