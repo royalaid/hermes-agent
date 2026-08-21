@@ -69,23 +69,6 @@ export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
 }
 
-/**
- * Bridge the POSIX Desktop handoff until the detached script adopts the
- * marker with its own process identity. The caller first rejects any live
- * foreign owner through updateHandoffConflict; a failed write is safe because
- * the script writes its authoritative marker as its first action.
- */
-export function writeUpdateMarker(hermesHome, pid, { now = Date.now } = {}) {
-  const file = markerPath(hermesHome)
-  const startedAt = Math.floor(now() / 1000)
-
-  try {
-    fs.writeFileSync(file, `${pid}\n${startedAt}\n`, 'utf8')
-  } catch {
-    // Best effort. The detached updater claims the marker itself on startup.
-  }
-}
-
 // Signal 0 does not deliver a signal — it probes existence/permission. Only
 // ESRCH proves that no process exists. EPERM/EACCES and unknown host errors are
 // inconclusive and therefore stay "alive" for this safety gate; otherwise a
