@@ -4951,6 +4951,61 @@ _LAZY_COMMAND_EXPORTS = {
         "_kill_stale_dashboard_processes",
         "_scan_dashboard_processes",
     ),
+    "hermes_cli.update_deferred_gateway": (
+        "_DEFERRED_GATEWAY_PLAN_PREFIX",
+        "_DEFERRED_GATEWAY_PLAN_TTL_SECONDS",
+        "_PROFILE_NAME_RE",
+        "_cmd_update_resume_deferred_gateway",
+        "_consume_deferred_gateway_plan",
+        "_deferred_gateway_plan_path",
+        "_gateway_plan_auth",
+        "_load_deferred_gateway_plan",
+        "_profile_process_still_matches",
+        "_resume_deferred_gateway_fleet",
+        "_running_gateway_profiles",
+        "_sanitize_deferred_gateway_plan",
+        "_spawn_deferred_gateway_profile",
+        "_validate_deferred_update_request",
+        "_wait_for_deferred_gateway_profile",
+        "_write_deferred_gateway_plan",
+        "_write_private_exclusive",
+    ),
+    "hermes_cli.update_quiesce": (
+        "_DEFAULT_DRAIN_TIMEOUT_SECONDS",
+        "_DRAIN_CLEAR_INTERVAL_SECONDS",
+        "_DRAIN_COOPERATIVE_WAIT_SECONDS",
+        "_UpdateLeaseHeartbeat",
+        "_WindowsMutationJob",
+        "_claim_update_quiesce_lease",
+        "_cmd_update_drain",
+        "_drain_under_update_lease",
+        "_prepare_atomic_windows_update",
+        "_release_update_quiesce_lease",
+        "_transfer_update_quiesce_lease",
+    ),
+    "hermes_cli.update_readiness": (
+        "_EXECUTABLE_GIT_CONFIG_RE",
+        "_GitRoutingEnvironmentGuard",
+        "_READINESS_KEYS",
+        "_READINESS_SCHEMA_VERSION",
+        "_REMOTE_NAME_RE",
+        "_UpdateTarget",
+        "_assert_safe_git_configuration",
+        "_build_update_preflight",
+        "_cmd_update_preflight",
+        "_git_cmd",
+        "_git_preflight_metadata",
+        "_is_safe_remote_name",
+        "_print_update_readiness",
+        "_public_quiesce_lease",
+        "_read_update_holder_read_only",
+        "_readiness_exit_code",
+        "_readiness_payload",
+        "_resolve_update_target",
+        "_sanitized_git_env",
+        "_with_sanitized_git_routing",
+        "validate_update_readiness",
+    ),
     "hermes_cli.update_cmd": (
         "_abort_dependency_sync_if_self_locked",
         "_add_upstream_remote",
@@ -10167,7 +10222,7 @@ def cmd_update(args):
     ``sys.exit`` or unhandled exceptions).
     """
     try:
-        _validate_deferred_update_request(args)
+        _self()._validate_deferred_update_request(args)
     except ValueError as exc:
         print(f"✗ {exc}")
         raise SystemExit(2)
@@ -10177,11 +10232,11 @@ def cmd_update(args):
     # work. Preflight is a read-only local snapshot; drain mutates process
     # state only under its dedicated owner-bound lease.
     if getattr(args, "preflight", False):
-        _cmd_update_preflight(args, root=PROJECT_ROOT)
+        _self()._cmd_update_preflight(args, root=PROJECT_ROOT)
     if getattr(args, "drain", False):
-        _cmd_update_drain(args, root=PROJECT_ROOT)
+        _self()._cmd_update_drain(args, root=PROJECT_ROOT)
     if getattr(args, "resume_deferred_gateway", False):
-        _cmd_update_resume_deferred_gateway(args, root=PROJECT_ROOT)
+        _self()._cmd_update_resume_deferred_gateway(args, root=PROJECT_ROOT)
 
     from hermes_cli.config import (
         detect_install_method,
@@ -10259,25 +10314,19 @@ def cmd_update(args):
     _update_quiesce_lease = None
     _update_lease_heartbeat = None
     _update_mutation_job = None
-    from hermes_cli.update_quiesce import (
-        _prepare_atomic_windows_update,
-        _release_update_quiesce_lease,
-        _transfer_update_quiesce_lease,
-        _UpdateLeaseHeartbeat,
-        _WindowsMutationJob,
-    )
-
     try:
         if _is_windows():
-            _update_quiesce_lease, _invocation_id = _prepare_atomic_windows_update(
+            _update_quiesce_lease, _invocation_id = (
+                _self()._prepare_atomic_windows_update(
                 args,
                 root=PROJECT_ROOT,
+                )
             )
             # Self-assignment makes every subsequently spawned git/uv/pip/npm
             # descendant part of the same kill-on-close job. Lease loss can
             # therefore fail-stop the whole mutation tree, not just orphan it.
-            _update_mutation_job = _WindowsMutationJob()
-            _update_lease_heartbeat = _UpdateLeaseHeartbeat(
+            _update_mutation_job = _self()._WindowsMutationJob()
+            _update_lease_heartbeat = _self()._UpdateLeaseHeartbeat(
                 PROJECT_ROOT,
                 _update_quiesce_lease,
                 fail_stop=_update_mutation_job.abort,
@@ -10319,13 +10368,15 @@ def cmd_update(args):
                             raise RuntimeError(
                                 "deferred gateway resume has no verified handoff owner"
                             )
-                        _update_quiesce_lease = _transfer_update_quiesce_lease(
-                            PROJECT_ROOT,
-                            _update_quiesce_lease,
-                            new_owner_pid=_handoff_owner,
+                        _update_quiesce_lease = (
+                            _self()._transfer_update_quiesce_lease(
+                                PROJECT_ROOT,
+                                _update_quiesce_lease,
+                                new_owner_pid=_handoff_owner,
+                            )
                         )
                     else:
-                        if not _release_update_quiesce_lease(
+                        if not _self()._release_update_quiesce_lease(
                             PROJECT_ROOT, _update_quiesce_lease
                         ):
                             raise RuntimeError(

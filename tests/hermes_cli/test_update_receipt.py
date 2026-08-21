@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 import hermes_cli.update_receipt as ur
+import hermes_cli.update_success_receipt as sur
 
 
 @pytest.fixture()
@@ -34,6 +35,47 @@ def receipt_home(tmp_path, monkeypatch):
 
 def _finalize(outcome="success", fleet=None):
     return ur.finalize_update_receipt(outcome, fleet=fleet)
+
+
+def test_observable_and_atomic_success_receipts_coexist(
+    receipt_home, tmp_path, monkeypatch
+):
+    root = tmp_path / "install"
+    root.mkdir()
+    handoff_path = tmp_path / "handoff.json"
+    monkeypatch.setattr(sur, "_receipt_path", lambda _root: handoff_path)
+
+    sha = "a" * 40
+    handoff = sur._write_update_receipt(
+        root,
+        invocation_id="invocation-123456",
+        lease_id="lease-identifier-123456",
+        mode="git",
+        branch="main",
+        remote="origin",
+        target_ref="refs/remotes/origin/main",
+        target_sha=sha,
+        resulting_head=sha,
+        archive_sha=None,
+        gateway_resume_deferred=False,
+        health={
+            "critical_syntax": True,
+            "critical_imports": True,
+            "dependencies": True,
+            "node_dependencies": True,
+        },
+    )
+
+    ur.begin_update_receipt()
+    ur.record_step("git_pull", True)
+    observable_path = _finalize("success")
+
+    assert json.loads(handoff_path.read_text(encoding="utf-8")) == handoff
+    assert observable_path is not None
+    observable = json.loads(observable_path.read_text(encoding="utf-8"))
+    assert observable["schema"] == 1
+    assert observable["steps"][0]["name"] == "git_pull"
+    assert observable_path != handoff_path
 
 
 class TestReceiptLifecycle:
