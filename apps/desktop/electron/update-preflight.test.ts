@@ -261,10 +261,25 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     assert.equal(outcome.kind, 'clear')
     const permit = authorizeUpdateMutation(outcome)
     assert.ok(permit)
+    assert.equal(authorizeUpdateMutation(outcome), null, 'a successful preflight permit is consumed exactly once')
     const mutations: string[] = []
     runAuthorizedUpdateMutation(permit, () => mutations.push('updater-launch'))
     runAuthorizedUpdateMutation(permit, () => mutations.push('desktop-shutdown'))
     assert.deepEqual(mutations, ['updater-launch', 'desktop-shutdown'])
+  })
+
+  it('rejects a fabricated structural clear outcome and never runs its mutation', () => {
+    const fabricated = { kind: 'clear' as const, lease }
+    const permit = authorizeUpdateMutation(fabricated)
+    assert.equal(permit, null)
+    let mutated = false
+    assert.throws(
+      () => runAuthorizedUpdateMutation(permit as never, () => {
+        mutated = true
+      }),
+      /clear-preflight permit/
+    )
+    assert.equal(mutated, false)
   })
 
   it('does not coerce a malformed unlock result into permission to scan', async () => {
