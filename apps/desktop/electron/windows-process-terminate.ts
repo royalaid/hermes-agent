@@ -861,8 +861,10 @@ public static class HermesForceReleaseNative {
     public IoCounters IoInfo;
     public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
   }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct FileTime { public uint Low; public uint High; }
   [DllImport("kernel32.dll", SetLastError = true)]
-  public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+  public static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
   public static extern IntPtr CreateJobObject(IntPtr attributes, string name);
   [DllImport("kernel32.dll", SetLastError = true)]
@@ -874,22 +876,56 @@ public static class HermesForceReleaseNative {
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
   [DllImport("kernel32.dll", SetLastError = true)]
-  public static extern bool CloseHandle(IntPtr hObject);
+  public static extern bool GetProcessTimes(IntPtr process, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool CloseHandle(IntPtr handle);
   [DllImport("ntdll.dll")]
   public static extern int NtSuspendProcess(IntPtr process);
   [DllImport("ntdll.dll")]
   public static extern int NtResumeProcess(IntPtr process);
-  public static int SuspendProcess(int pid) {
-    IntPtr process = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
-    if (process == IntPtr.Zero) { int error = Marshal.GetLastWin32Error(); return error == 0 ? -1 : -error; }
-    try { return NtSuspendProcess(process) == 0 ? 0 : -1; }
-    finally { CloseHandle(process); }
+  public static double ToUnixSeconds(FileTime time) {
+    long fileTicks = ((long)time.High << 32) | time.Low;
+    return (fileTicks - 116444736000000000L) / 10000000.0;
   }
-  public static int ResumeProcess(int pid) {
-    IntPtr process = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
-    if (process == IntPtr.Zero) return 0;
-    try { return NtResumeProcess(process) == 0 ? 0 : -1; }
-    finally { CloseHandle(process); }
+  public static IntPtr OpenAuthenticatedProcess(int pid, double expectedUnix, out double actualUnix, out int error) {
+    actualUnix = 0;
+    error = 0;
+    IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_SUSPEND_RESUME | PROCESS_TERMINATE | SYNCHRONIZE, false, pid);
+    if (process == IntPtr.Zero) {
+      error = Marshal.GetLastWin32Error();
+      return IntPtr.Zero;
+    }
+    FileTime creation, exit, kernel, user;
+    if (!GetProcessTimes(process, out creation, out exit, out kernel, out user)) {
+      error = Marshal.GetLastWin32Error();
+      CloseHandle(process);
+      return IntPtr.Zero;
+    }
+    actualUnix = ToUnixSeconds(creation);
+    if (Math.Abs(actualUnix - expectedUnix) > 1.5) {
+      error = 0x10001;
+      CloseHandle(process);
+      return IntPtr.Zero;
+    }
+    return process;
+  }
+  public static int SuspendProcess(IntPtr process) {
+    int status = NtSuspendProcess(process);
+    return status == 0 ? 0 : status;
+  }
+  public static int ResumeProcess(IntPtr process) {
+    int status = NtResumeProcess(process);
+    return status == 0 ? 0 : status;
+  }
+  public static int ReadCreatedAt(IntPtr process, out double createdUnix) {
+    createdUnix = 0;
+    FileTime creation, exit, kernel, user;
+    if (!GetProcessTimes(process, out creation, out exit, out kernel, out user)) {
+      int error = Marshal.GetLastWin32Error();
+      return error == 0 ? -1 : -error;
+    }
+    createdUnix = ToUnixSeconds(creation);
+    return 0;
   }
   public static IntPtr CreateKillOnCloseJob() {
     IntPtr job = CreateJobObject(IntPtr.Zero, null);
@@ -902,14 +938,10 @@ public static class HermesForceReleaseNative {
     }
     return job;
   }
-  public static int AssignProcess(IntPtr job, int pid) {
-    IntPtr process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, false, pid);
-    if (process == IntPtr.Zero) { int error = Marshal.GetLastWin32Error(); return error == 0 ? -1 : -error; }
-    try {
-      if (AssignProcessToJobObject(job, process)) return 0;
-      int error = Marshal.GetLastWin32Error();
-      return error == 0 ? -1 : -error;
-    } finally { CloseHandle(process); }
+  public static int AssignProcessHandle(IntPtr job, IntPtr process) {
+    if (AssignProcessToJobObject(job, process)) return 0;
+    int error = Marshal.GetLastWin32Error();
+    return error == 0 ? -1 : -error;
   }
   public static int TerminateJobAndWait(IntPtr job, int waitMs) {
     if (!TerminateJobObject(job, 1)) {
@@ -947,6 +979,7 @@ if ([math]::Abs($actualUnix - $expectedUnix) -gt 1.5) {
 }
 
 $job = [IntPtr]::Zero
+$handles = @{}
 $suspended = New-Object 'System.Collections.Generic.List[int]'
 $contained = New-Object 'System.Collections.Generic.HashSet[int]'
 $success = $false
@@ -967,22 +1000,65 @@ function Get-TreeChildren([int]$parentPid) {
   }
 }
 
+function Get-TreeRowCreationUnix($row) {
+  $raw = $row.CreationDate
+  if ($null -eq $raw -or [string]::IsNullOrWhiteSpace([string]$raw)) {
+    throw 'TREE_SNAPSHOT_MISSING_CREATE_TIME'
+  }
+  try {
+    if ($raw -is [DateTime]) {
+      return [DateTimeOffset]::new(([DateTime]$raw).ToUniversalTime()).ToUnixTimeSeconds()
+    }
+    return [DateTimeOffset]::new(
+      [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$raw).ToUniversalTime()
+    ).ToUnixTimeSeconds()
+  } catch {
+    throw 'TREE_SNAPSHOT_INVALID_CREATE_TIME'
+  }
+}
+
 function Assert-NativeSuccess([int]$code, [string]$operation) {
   if ($code -ne 0) { throw ($operation + ' win32=' + (-$code)) }
 }
 
-try {
-  $suspendCode = [HermesForceReleaseNative]::SuspendProcess($pidTarget)
-  Assert-NativeSuccess $suspendCode 'TREE_SUSPEND_FAILED'
-  [void]$suspended.Add($pidTarget)
+function Pause-BoundaryTest([string]$phase) {
+  $wanted = [Environment]::GetEnvironmentVariable('HERMES_FORCE_RELEASE_TEST_PAUSE_PHASE')
+  if ($wanted -ne $phase) { return }
+  $marker = [Environment]::GetEnvironmentVariable('HERMES_FORCE_RELEASE_TEST_PHASE_MARKER')
+  if (-not [string]::IsNullOrWhiteSpace($marker)) {
+    Set-Content -LiteralPath $marker -Value $phase -Encoding UTF8
+  }
+  Start-Sleep -Seconds 30
+}
 
-  # Assign the authenticated root before discovery. It is suspended, so it
-  # cannot create a new child between containment setup and the fixed-point walk.
+try {
   $job = [HermesForceReleaseNative]::CreateKillOnCloseJob()
   if ($job -eq [IntPtr]::Zero) { throw 'TREE_JOB_CREATE_FAILED win32=5' }
-  $assignRoot = [HermesForceReleaseNative]::AssignProcess($job, $pidTarget)
+
+  # Authenticate and assign each generation from one handle before suspending
+  # it. A helper death after assignment closes this job and kills the member;
+  # no suspended process can remain outside the terminal boundary.
+  $rootActual = 0.0
+  $rootOpenError = 0
+  $rootHandle = [HermesForceReleaseNative]::OpenAuthenticatedProcess($pidTarget, $expectedUnix, [ref]$rootActual, [ref]$rootOpenError)
+  if ($rootHandle -eq [IntPtr]::Zero) {
+    if ($rootOpenError -eq 0x10001) { throw ("CREATE_TIME_MISMATCH root=" + $pidTarget) }
+    throw ('TREE_OPEN_FAILED win32=' + $rootOpenError)
+  }
+  $handles[[string]$pidTarget] = $rootHandle
+  $assignRoot = [HermesForceReleaseNative]::AssignProcessHandle($job, $rootHandle)
   Assert-NativeSuccess $assignRoot 'TREE_ASSIGN_FAILED'
   [void]$contained.Add($pidTarget)
+  Pause-BoundaryTest 'after-root-assignment'
+  $suspendRoot = [HermesForceReleaseNative]::SuspendProcess($rootHandle)
+  Assert-NativeSuccess $suspendRoot 'TREE_SUSPEND_FAILED'
+  [void]$suspended.Add($pidTarget)
+  Pause-BoundaryTest 'after-root-suspension'
+  $rootRevalidated = 0.0
+  Assert-NativeSuccess ([HermesForceReleaseNative]::ReadCreatedAt($rootHandle, [ref]$rootRevalidated)) 'TREE_REVALIDATE_FAILED'
+  if ([math]::Abs($rootRevalidated - $expectedUnix) -gt 1.5) {
+    throw ("CREATE_TIME_MISMATCH root=" + $pidTarget)
+  }
 
   $rows = New-Object 'System.Collections.Generic.List[object]'
   $seen = @{}
@@ -995,12 +1071,29 @@ try {
       $childPid = [int]$child.ProcessId
       if ($childPid -le 0 -or $seen.ContainsKey([string]$childPid)) { continue }
       $seen[[string]$childPid] = $true
-      $childCreated = Get-IdentityUnix $childPid
-      $childSuspend = [HermesForceReleaseNative]::SuspendProcess($childPid)
+      # Use the creation timestamp from the same process-tree row that yielded
+      # this PID. Never turn a stale/reused PID into a fresh authenticated
+      # generation by probing it again before opening its boundary handle.
+      $childExpected = Get-TreeRowCreationUnix $child
+      $childActual = 0.0
+      $childOpenError = 0
+      $childHandle = [HermesForceReleaseNative]::OpenAuthenticatedProcess($childPid, $childExpected, [ref]$childActual, [ref]$childOpenError)
+      if ($childHandle -eq [IntPtr]::Zero) {
+        if ($childOpenError -eq 0x10001) { throw ("CREATE_TIME_MISMATCH child=" + $childPid) }
+        throw ('TREE_OPEN_FAILED win32=' + $childOpenError)
+      }
+      $handles[[string]$childPid] = $childHandle
+      $assignChild = [HermesForceReleaseNative]::AssignProcessHandle($job, $childHandle)
+      Assert-NativeSuccess $assignChild 'TREE_ASSIGN_FAILED'
+      [void]$contained.Add($childPid)
+      Pause-BoundaryTest 'after-child-assignment'
+      $childSuspend = [HermesForceReleaseNative]::SuspendProcess($childHandle)
       Assert-NativeSuccess $childSuspend 'TREE_SUSPEND_FAILED'
       [void]$suspended.Add($childPid)
-      $childRevalidated = Get-IdentityUnix $childPid
-      if ([math]::Abs($childRevalidated - $childCreated) -gt 1.5) {
+      Pause-BoundaryTest 'after-child-suspension'
+      $childRevalidated = 0.0
+      Assert-NativeSuccess ([HermesForceReleaseNative]::ReadCreatedAt($childHandle, [ref]$childRevalidated)) 'TREE_REVALIDATE_FAILED'
+      if ([math]::Abs($childRevalidated - $childExpected) -gt 1.5) {
         throw ("CREATE_TIME_MISMATCH child=" + $childPid)
       }
       [void]$rows.Add([pscustomobject]@{ pid = $childPid; created = $childRevalidated })
@@ -1008,15 +1101,9 @@ try {
     }
   }
 
-  foreach ($row in @($rows)) {
-    $assignChild = [HermesForceReleaseNative]::AssignProcess($job, [int]$row.pid)
-    Assert-NativeSuccess $assignChild 'TREE_ASSIGN_FAILED'
-    [void]$contained.Add([int]$row.pid)
-  }
-
   $terminateCode = [HermesForceReleaseNative]::TerminateJobAndWait($job, $waitMs)
   Assert-NativeSuccess $terminateCode 'TREE_TERMINATE_FAILED'
-  $allRows = @([pscustomobject]@{ pid = $pidTarget; created = $actualUnix }) + @($rows)
+  $allRows = @([pscustomobject]@{ pid = $pidTarget; created = $rootRevalidated }) + @($rows.ToArray())
   foreach ($row in $allRows) {
     $live = Get-Process -Id ([int]$row.pid) -ErrorAction SilentlyContinue
     if ($null -ne $live) {
@@ -1035,6 +1122,9 @@ try {
   if ($message -match 'Access is denied|AccessDenied|denied' -or $win32 -eq '5') {
     Write-Output 'ACCESS_DENIED'
     $exitCode = 5
+  } elseif ($message -match 'CREATE_TIME_MISMATCH') {
+    Write-Output $message
+    $exitCode = 3
   } else {
     Write-Output ('BOUNDARY_FAILED ' + $message)
     $exitCode = 1
@@ -1047,8 +1137,12 @@ try {
   for ($index = $suspended.Count - 1; $index -ge 0; $index--) {
     $suspendedPid = [int]$suspended[$index]
     if (-not $contained.Contains($suspendedPid)) {
-      [HermesForceReleaseNative]::ResumeProcess($suspendedPid) | Out-Null
+      $handle = $handles[[string]$suspendedPid]
+      if ($null -ne $handle) { [HermesForceReleaseNative]::ResumeProcess($handle) | Out-Null }
     }
+  }
+  foreach ($entry in $handles.GetEnumerator()) {
+    [HermesForceReleaseNative]::CloseHandle([IntPtr]$entry.Value)
   }
 }
 exit $exitCode
