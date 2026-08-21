@@ -8,6 +8,7 @@ import {
   type VenvBlockerProcess,
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
+import type { ForceReleaseHolder, WindowsUpdateForceReleaseOutcome } from './windows-update-force-release'
 
 export type UpdatePreflightPurpose = 'normal-update' | 'bootstrap-recovery'
 
@@ -16,6 +17,12 @@ export interface UpdatePreflightDeps {
   clearMcpBridgeLease: (lease: McpBridgeQuiesceLease) => void
   now?: () => number
   releaseTrackedBackendTrees: () => Promise<{ unlocked: boolean }>
+  /**
+   * Non-elevated ≤5s force-release of exact install holders when tracked
+   * backends alone did not unlock the install. Optional only for unit tests
+   * that intentionally exercise the legacy unlock-failed path.
+   */
+  forceReleaseInstallHolders?: () => Promise<WindowsUpdateForceReleaseOutcome>
   scan: () => Promise<ScanOutcome>
   terminateDesktopPluginService: (service: DesktopPluginServiceProcess) => Promise<boolean>
   terminateVenvHolder: (holder: VenvBlockerProcess) => Promise<boolean>
@@ -35,8 +42,9 @@ export type UpdatePreflightOutcome =
   | {
       kind: 'blocked'
       message: string
-      reason: 'unlock-failed' | 'holders' | 'lease-unavailable' | 'quiesce-incomplete'
+      reason: 'unlock-failed' | 'holders' | 'lease-unavailable' | 'quiesce-incomplete' | 'needs-elevation'
       result?: VenvBlockerScanResult
+      elevationHolders?: ForceReleaseHolder[]
     }
   | { kind: 'probe-failure'; error: string; message: string }
 
@@ -101,13 +109,46 @@ export async function runWindowsUpdatePreflight(
     lock = { unlocked: false }
   }
 
+  // Selecting Update authorizes a bounded force-release of exact install
+  // holders. Do not dead-end on the tracked-backend unlock wait alone — that
+  // is how a stale `hermes tools | head` tree blocked the scanner forever.
   if (lock?.unlocked !== true) {
-    return {
-      kind: 'blocked',
-      reason: 'unlock-failed',
-      message:
-        'Update aborted: Hermes could not release its tracked local processes. ' +
-        'Close other Hermes windows and terminals, then retry.'
+    if (typeof deps.forceReleaseInstallHolders === 'function') {
+      let forceOutcome: WindowsUpdateForceReleaseOutcome
+      try {
+        forceOutcome = await deps.forceReleaseInstallHolders()
+      } catch (error) {
+        return {
+          kind: 'probe-failure',
+          error: `force-release threw: ${errorText(error)}`,
+          message: formatProbeFailedMessage()
+        }
+      }
+
+      if (forceOutcome.kind === 'clear') {
+        lock = { unlocked: true }
+      } else if (forceOutcome.kind === 'needs-elevation') {
+        return {
+          kind: 'blocked',
+          reason: 'needs-elevation',
+          message: forceOutcome.message,
+          elevationHolders: forceOutcome.holders
+        }
+      } else {
+        return {
+          kind: 'blocked',
+          reason: 'unlock-failed',
+          message: forceOutcome.message
+        }
+      }
+    } else {
+      return {
+        kind: 'blocked',
+        reason: 'unlock-failed',
+        message:
+          'Update aborted: Hermes could not release its tracked local processes. ' +
+          'Close other Hermes windows and terminals, then retry.'
+      }
     }
   }
 
