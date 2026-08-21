@@ -4,6 +4,8 @@ import { describe, it } from 'vitest'
 
 import type { McpBridgeQuiesceLease } from './mcp-bridge-quiesce'
 import {
+  authorizeUpdateMutation,
+  runAuthorizedUpdateMutation,
   runWindowsUpdatePreflight,
   type UpdatePreflightDeps,
   type UpdatePreflightPurpose
@@ -234,6 +236,35 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     assert.ok(!calls.includes('scan'), 'scanner continuation would permit the updater handoff to progress')
     assert.ok(!calls.includes('lease'), 'no mutation-prevention lease starts while an authenticated holder survives')
     assert.ok(!calls.some(call => call.startsWith('terminate-holder:')))
+    const permit = authorizeUpdateMutation(outcome)
+    assert.equal(permit, null)
+    let updaterLaunched = false
+    let desktopShutdown = false
+    assert.throws(
+      () => runAuthorizedUpdateMutation(permit as never, () => {
+        updaterLaunched = true
+        desktopShutdown = true
+      }),
+      /clear-preflight permit/
+    )
+    assert.equal(updaterLaunched, false)
+    assert.equal(desktopShutdown, false)
+  })
+
+  it('mints a permit only after the clear production preflight and runs both handoff mutations', async () => {
+    const { deps } = makeDeps([clear(), clear(), clear()])
+    const outcome = await runWindowsUpdatePreflight(purpose, deps, {
+      cooperativeExitMs: 0,
+      respawnIntervalMs: 0,
+      terminationSettleMs: 0
+    })
+    assert.equal(outcome.kind, 'clear')
+    const permit = authorizeUpdateMutation(outcome)
+    assert.ok(permit)
+    const mutations: string[] = []
+    runAuthorizedUpdateMutation(permit, () => mutations.push('updater-launch'))
+    runAuthorizedUpdateMutation(permit, () => mutations.push('desktop-shutdown'))
+    assert.deepEqual(mutations, ['updater-launch', 'desktop-shutdown'])
   })
 
   it('does not coerce a malformed unlock result into permission to scan', async () => {

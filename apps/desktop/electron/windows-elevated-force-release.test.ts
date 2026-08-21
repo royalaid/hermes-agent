@@ -3,6 +3,7 @@ import fsNative from 'node:fs'
 import osNative from 'node:os'
 import path from 'node:path'
 import { execFile, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 
 import { describe, it, vi } from 'vitest'
@@ -11,6 +12,9 @@ import {
   buildForceReleaseRequest,
   canonicalForceReleasePayload,
   canonicalNumericToken,
+  ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE,
+  ELEVATED_FORCE_RELEASE_HELPER_SHA256,
+  ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE,
   formatElevatedForceReleaseFailure,
   parseForceReleaseResponse,
   verifyForceReleaseRequest
@@ -352,17 +356,11 @@ describe('elevated UAC launch argv safety', () => {
     { timeout: 20_000 },
     async () => {
       if (process.platform !== 'win32') return
-      const { ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND } = await import('./windows-elevated-force-release')
+      const { ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE, ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND } =
+        await import('./windows-elevated-force-release')
       const temp = fsNative.mkdtempSync(path.join(osNative.tmpdir(), 'hermes-elevated-job-'))
       const helper = path.join(temp, 'delayed-helper.ps1')
-      const bootstrap = path.resolve(
-        process.cwd(),
-        '..',
-        '..',
-        'scripts',
-        'desktop-update',
-        'windows-force-release-bootstrap.ps1'
-      )
+      const bootstrap = `${ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE}\n[IO.File]::WriteAllText($env:HERMES_JOB_READY, 'ready')\nStart-Sleep -Seconds 30\n[IO.File]::WriteAllText($env:HERMES_JOB_LATE, 'late')`
       const ready = path.join(temp, 'ready.txt')
       const late = path.join(temp, 'late.txt')
       fsNative.writeFileSync(
@@ -544,6 +542,17 @@ describe('force-release artifact cleanup', () => {
 })
 
 describe('elevated helper script shape', () => {
+  it('binds normalized helper bytes and performs no external mutation before Job assignment', () => {
+    const helperPath = path.resolve(__dirname, '../../../scripts/desktop-update/windows-force-release.ps1')
+    const helperText = fsNative.readFileSync(helperPath, 'utf8').replace(/\r\n?/g, '\n')
+    const digest = createHash('sha256').update(Buffer.from(helperText, 'utf8')).digest('hex')
+    assert.equal(digest, ELEVATED_FORCE_RELEASE_HELPER_SHA256)
+    assert.ok(ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE.startsWith(ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE))
+    const beforeAssignment = ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE.split('$native::AssignProcessToJobObject')[0] ?? ''
+    assert.doesNotMatch(beforeAssignment, /Add-Type|Start-Process|WriteAllText|WriteAllBytes|CreateText|OpenWrite/)
+    assert.match(ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE, /ScriptBlock\]::Create\(\$helperText\)/)
+  })
+
   it('does not broad path-scan installRoot and consumes signed excludePids', async () => {
     const fs = await import('node:fs')
     const path = await import('node:path')
