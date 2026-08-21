@@ -974,3 +974,20 @@ describe('MCP bridge drain', () => {
     ])
   })
 })
+
+describe('production update mutation permit wiring', () => {
+  it('gates normal and bootstrap-recovery updater launch and Desktop shutdown sites', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
+
+    assert.match(main, /runAuthorizedUpdateMutation\(mutationPermit, \(\) =>\s*launchWindowsUpdateTransport\(/)
+    assert.match(main, /runAuthorizedUpdateMutation\(mutationPermit, \(\) =>\s*spawnUpdaterProcess\(/)
+    assert.equal(
+      (main.match(/runAuthorizedUpdateMutation\(mutationPermit, \(\) =>\s*setTimeout\(/g) ?? []).length,
+      2,
+      'both normal-update and bootstrap-recovery shutdowns require the clear-preflight permit'
+    )
+    assert.doesNotMatch(main, /const launch = launchWindowsUpdateTransport\(/)
+  })
+})
