@@ -18,6 +18,7 @@
  */
 
 import { execFile, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
@@ -28,7 +29,8 @@ const execFileAsync = promisify(execFile)
 export type RunPowerShell = (
   script: string,
   timeoutMs?: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  deadlineAt?: number
 ) => Promise<{ stdout: string; stderr: string; code: number; pid?: number }>
 
 /** Shared kill/identity-confirm reserve used by the terminate boundary. */
@@ -37,10 +39,12 @@ export const TERMINATE_KILL_CONFIRM_MIN_MS = 400
 export const TERMINATE_KILL_CONFIRM_RATIO = 0.3
 
 export function terminateKillReserveMs(budgetMs: number): number {
-  const budget = Math.max(1, Math.trunc(budgetMs))
+  const budget = Math.max(0, Math.trunc(budgetMs))
+  if (budget <= 0) return 0
   return Math.min(
+    budget,
     TERMINATE_KILL_CONFIRM_MS,
-    Math.max(TERMINATE_KILL_CONFIRM_MIN_MS, Math.floor(budget * TERMINATE_KILL_CONFIRM_RATIO))
+    Math.max(Math.min(TERMINATE_KILL_CONFIRM_MIN_MS, budget), Math.floor(budget * TERMINATE_KILL_CONFIRM_RATIO))
   )
 }
 
@@ -48,6 +52,128 @@ function powershellExecutable(): string {
   const windowsRoot = process.env.SystemRoot || 'C:\\Windows'
   return path.join(windowsRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 }
+
+/**
+ * The mutating PowerShell script runs behind a KILL_ON_JOB_CLOSE supervisor.
+ * If the supervisor is killed during cancellation, Windows closes its job
+ * handle and terminates the nested script as a hard terminal boundary. The
+ * target script travels through an environment value and a temporary file so
+ * it is never interpolated into the supervisor's PowerShell source.
+ */
+const TERMINATE_JOB_WRAPPER_COMMAND = String.raw`
+$ErrorActionPreference = 'Stop'
+$targetScript = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_SCRIPT')
+$jobName = [Environment]::GetEnvironmentVariable('HERMES_TERMINATE_JOB_NAME')
+if ([string]::IsNullOrWhiteSpace($targetScript) -or [string]::IsNullOrWhiteSpace($jobName)) { exit 87 }
+
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class HermesTerminateJob {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicLimits {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass, SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoCounters {
+        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ExtendedLimits {
+        public BasicLimits BasicLimitInformation;
+        public IoCounters IoInfo;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimits info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static IntPtr CreateKillOnClose(string name) {
+        IntPtr job = CreateJobObject(IntPtr.Zero, name);
+        if (job == IntPtr.Zero) throw new Win32Exception();
+        var limits = new ExtendedLimits();
+        limits.BasicLimitInformation.LimitFlags = 0x00002000;
+        if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedLimits)))) {
+            int error = Marshal.GetLastWin32Error();
+            CloseHandle(job);
+            throw new Win32Exception(error);
+        }
+        return job;
+    }
+    public static void Assign(IntPtr job, IntPtr process) {
+        if (!AssignProcessToJobObject(job, process)) throw new Win32Exception();
+    }
+    public static void Close(IntPtr job) {
+        if (job != IntPtr.Zero) CloseHandle(job);
+    }
+    public static string QuoteArgument(string value) {
+        if (value == null) return "\"\"";
+        var quoted = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char current in value) {
+            if (current == '\\') { slashes++; continue; }
+            if (current == '"') {
+                quoted.Append('\\', slashes * 2 + 1).Append('"');
+                slashes = 0;
+                continue;
+            }
+            quoted.Append('\\', slashes).Append(current);
+            slashes = 0;
+        }
+        quoted.Append('\\', slashes * 2).Append('"');
+        return quoted.ToString();
+    }
+}
+'@ -ErrorAction Stop
+
+$job = [IntPtr]::Zero
+$child = $null
+$tempScript = Join-Path ([IO.Path]::GetTempPath()) ('hermes-terminate-' + [Guid]::NewGuid().ToString('N') + '.ps1')
+try {
+    [IO.File]::WriteAllText($tempScript, $targetScript, [Text.UTF8Encoding]::new($false))
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $psi.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + [HermesTerminateJob]::QuoteArgument($tempScript)
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $job = [HermesTerminateJob]::CreateKillOnClose($jobName)
+    $child = [System.Diagnostics.Process]::Start($psi)
+    [HermesTerminateJob]::Assign($job, $child.Handle)
+    $stdoutTask = $child.StandardOutput.ReadToEndAsync()
+    $stderrTask = $child.StandardError.ReadToEndAsync()
+    $child.WaitForExit()
+    [Console]::Out.Write($stdoutTask.Result)
+    [Console]::Error.Write($stderrTask.Result)
+    exit $child.ExitCode
+} catch {
+    if ($null -ne $child) {
+        try { if (!$child.HasExited) { $child.Kill() } } catch {}
+    }
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+} finally {
+    if ($null -ne $child) { $child.Dispose() }
+    [HermesTerminateJob]::Close($job)
+    Remove-Item -LiteralPath $tempScript -Force -ErrorAction SilentlyContinue
+}
+`.trim()
 
 export type ProcessIdentity = { pid: number; createdAt?: number }
 
@@ -246,20 +372,30 @@ export async function identitiesStillPresent(
  */
 export async function snapshotProcessTreeIdentities(
   rootPid: number,
-  { timeoutMs = 1_500 }: { timeoutMs?: number } = {}
+  {
+    timeoutMs = 1_500,
+    deadlineAt
+  }: { timeoutMs?: number; deadlineAt?: number } = {}
 ): Promise<ProcessIdentity[]> {
   if (!Number.isInteger(rootPid) || rootPid <= 0) return []
+  const requestedBudget = Math.max(0, Math.trunc(timeoutMs))
+  const remainingBudget =
+    typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
+      ? Math.max(0, Math.trunc(deadlineAt - Date.now()))
+      : requestedBudget
+  const budget = Math.min(requestedBudget, remainingBudget)
+  // A zero/negative caller budget is a hard no-probe condition on every
+  // platform. In particular, do not fall through to a fresh default-timeout
+  // probe after the shared deadline is exhausted.
+  if (budget <= 0) {
+    return [{ pid: rootPid }]
+  }
   if (process.platform !== 'win32') {
-    const createdAt = await readProcessCreatedAt(rootPid)
+    const createdAt = await readProcessCreatedAt(rootPid, budget)
     return createdAt == null ? [] : [{ pid: rootPid, createdAt }]
   }
 
-  // Never force a floor larger than the caller-supplied remaining budget.
-  if (timeoutMs <= 0) {
-    // Zero budget: do not probe. Return unknown-generation root identity only.
-    return [{ pid: rootPid }]
-  }
-  const budget = Math.max(1, Math.trunc(timeoutMs))
+  const startedAt = Date.now()
   try {
     const { stdout } = await execFileAsync(
       powershellExecutable(),
@@ -307,7 +443,13 @@ $rows -join ';'
     }
     return identities
   } catch {
-    const createdAt = await readProcessCreatedAt(rootPid)
+    // If the tree query failed, spend only the caller's remaining slice on an
+    // exact root-generation read; never fall back to readProcessCreatedAt's
+    // independent two-second default and overrun the absolute deadline.
+    const elapsed = Date.now() - startedAt
+    const fallbackBudget = Math.max(0, Math.min(budget, elapsed >= budget ? 0 : budget - elapsed))
+    if (fallbackBudget <= 0) return [{ pid: rootPid }]
+    const createdAt = await readProcessCreatedAt(rootPid, fallbackBudget)
     return createdAt == null ? [{ pid: rootPid }] : [{ pid: rootPid, createdAt }]
   }
 }
@@ -324,13 +466,19 @@ export async function killProcessTreeAndAwaitGone(
     confirmMs = TERMINATE_KILL_CONFIRM_MS,
     pollMs = 50,
     preSnapshot,
-    deadlineAt
+    deadlineAt,
+    snapshotProcessTree,
+    readCreatedAt
   }: {
     confirmMs?: number
     pollMs?: number
     preSnapshot?: readonly ProcessIdentity[]
     /** Absolute Date.now() deadline; overrides confirmMs window when provided. */
     deadlineAt?: number
+    /** Injectable only to force snapshot failure in the real boundary canary. */
+    snapshotProcessTree?: typeof snapshotProcessTreeIdentities
+    /** Injectable create-time reader for deadline regressions. */
+    readCreatedAt?: (pid: number, timeoutMs: number) => Promise<number | null>
   } = {}
 ): Promise<{ confirmed: boolean; identities: ProcessIdentity[]; survivors: ProcessIdentity[] }> {
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -350,17 +498,49 @@ export async function killProcessTreeAndAwaitGone(
     return { confirmed: false, identities, survivors: identities }
   }
 
-  const identities =
-    preSnapshot && preSnapshot.length > 0
-      ? [...preSnapshot]
-      : await snapshotProcessTreeIdentities(pid, { timeoutMs: Math.min(500, remaining()) })
+  const snapshot = snapshotProcessTree ?? snapshotProcessTreeIdentities
+  let captured: ProcessIdentity[] = []
+  if (preSnapshot && preSnapshot.length > 0) {
+    captured = [...preSnapshot]
+  } else {
+    const snapshotBudget = remaining()
+    if (snapshotBudget <= 0) {
+      return { confirmed: false, identities: [{ pid }], survivors: [{ pid }] }
+    }
+    const snapshotPromise = Promise.resolve().then(() =>
+      snapshot(pid, {
+        timeoutMs: Math.min(500, snapshotBudget),
+        deadlineAt: absoluteDeadline
+      })
+    )
+    try {
+      // Native execFile has its own timeout, but keep the boundary safe even
+      // if an injected/native adapter ignores that option. Snapshotting is
+      // read-only, so abandoning its late result cannot leave mutation work.
+      captured = await Promise.race([
+        snapshotPromise,
+        new Promise<ProcessIdentity[]>(resolve =>
+          setTimeout(() => resolve([]), Math.max(1, snapshotBudget))
+        )
+      ])
+    } catch {
+      // Snapshot failure is intentionally represented by the unknown root.
+      // The caller's Job Object boundary, when present, is the hard fallback.
+      captured = []
+    }
+    // A timed-out adapter may settle later; consume its rejection without
+    // extending this boundary or creating an unhandled-rejection side effect.
+    void snapshotPromise.catch(() => undefined)
+  }
+  const identities = captured
+  const createdAtReader = readCreatedAt ?? readProcessCreatedAt
 
   // Always include the root identity. Prefer a real create-time; if unavailable,
   // keep an unknown-generation identity (createdAt omitted) so liveness alone
   // keeps confirmation false while the PID lives.
   if (!identities.some(entry => entry.pid === pid)) {
     const left = remaining()
-    const createdAt = left > 0 ? await readProcessCreatedAt(pid, left) : null
+    const createdAt = left > 0 ? await createdAtReader(pid, left) : null
     identities.push(createdAt != null ? { pid, createdAt } : { pid })
   }
 
@@ -452,58 +632,100 @@ function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boole
 async function defaultRunPowerShell(
   script: string,
   timeoutMs = 4_000,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  deadlineAt?: number
 ): Promise<{ stdout: string; stderr: string; code: number; pid?: number }> {
-  const budget = Math.max(1, Math.trunc(timeoutMs))
+  const requestedBudget = Math.max(0, Math.trunc(timeoutMs))
+  const startedAt = Date.now()
+  const absoluteDeadline =
+    typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
+      ? Math.min(Math.trunc(deadlineAt), startedAt + requestedBudget)
+      : startedAt + requestedBudget
+  const budget = Math.max(0, absoluteDeadline - startedAt)
+  if (budget <= 0) {
+    return { stdout: '', stderr: 'aborted', code: 1 }
+  }
   if (signal?.aborted) {
     return { stdout: '', stderr: 'aborted', code: 1 }
   }
 
   // Reserve part of the budget for kill + confirmed absence of the whole tree.
-  const startedAt = Date.now()
-  const absoluteDeadline = startedAt + budget
   const killReserveMs = terminateKillReserveMs(budget)
   const runMs = Math.max(1, budget - killReserveMs)
+  const jobName = `HermesTerminate-${randomBytes(16).toString('hex')}`
 
   return await new Promise(resolve => {
     let settled = false
     let childPid: number | undefined
     let treeSnapshot: ProcessIdentity[] = []
     let killing = false
+    let terminalizing: Promise<void> | null = null
+    let childProcess: ChildProcess | undefined
 
     const finish = async (result: { stdout: string; stderr: string; code: number; pid?: number }) => {
-      if (settled) return
-      settled = true
-      signal?.removeEventListener('abort', onAbort)
+      if (settled || terminalizing) return
+      terminalizing = (async () => {
+        let finalResult = { ...result, pid: childPid }
 
-      if (killing && typeof childPid === 'number') {
-        const killResult = await killProcessTreeAndAwaitGone(childPid, {
-          confirmMs: killReserveMs,
-          preSnapshot: treeSnapshot,
-          deadlineAt: absoluteDeadline
-        })
-        if (!killResult.confirmed) {
-          resolve({
-            stdout: result.stdout,
-            stderr: `unconfirmed-tree-survivors:${killResult.survivors.map(s => s.pid).join(',')}`,
-            code: 1,
-            pid: childPid
+        if (killing && typeof childPid === 'number') {
+          // The outer command is a KILL_ON_JOB_CLOSE supervisor. Killing its
+          // identity closes the job handle before this await, so the nested
+          // mutating script cannot outlive this boundary even if an
+          // observation probe is inconclusive. Still await the complete
+          // taskkill/identity drain and report an unconfirmed observation;
+          // never resolve before the boundary has been applied.
+          const killResult = await killProcessTreeAndAwaitGone(childPid, {
+            confirmMs: killReserveMs,
+            preSnapshot: treeSnapshot,
+            deadlineAt: absoluteDeadline
           })
-          return
+          if (!killResult.confirmed) {
+            finalResult = {
+              stdout: result.stdout,
+              stderr: `unconfirmed-tree-survivors:${killResult.survivors.map(s => s.pid).join(',')}`,
+              code: 1,
+              pid: childPid
+            }
+          }
         }
-      }
-      resolve({ ...result, pid: childPid })
+
+        settled = true
+        signal?.removeEventListener('abort', onAbort)
+        resolve(finalResult)
+      })().catch(error => {
+        settled = true
+        signal?.removeEventListener('abort', onAbort)
+        resolve({
+          stdout: result.stdout,
+          stderr: `termination-boundary-error:${String(error?.message ?? error)}`,
+          code: 1,
+          pid: childPid
+        })
+      })
     }
 
-    const child = execFile(
+    childProcess = execFile(
       powershellExecutable(),
-      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        TERMINATE_JOB_WRAPPER_COMMAND
+      ],
       {
         encoding: 'utf8',
         timeout: runMs,
         windowsHide: true,
         maxBuffer: 1024 * 1024,
-        killSignal: 'SIGTERM'
+        killSignal: 'SIGTERM',
+        env: {
+          ...process.env,
+          HERMES_TERMINATE_SCRIPT: script,
+          HERMES_TERMINATE_JOB_NAME: jobName
+        }
       },
       (error: any, stdout, stderr) => {
         void (async () => {
@@ -532,8 +754,8 @@ async function defaultRunPowerShell(
       }
     )
 
-    if (typeof child.pid === 'number' && child.pid > 0) {
-      childPid = child.pid
+    if (typeof childProcess.pid === 'number' && childProcess.pid > 0) {
+      childPid = childProcess.pid
       // Capture identities promptly after spawn with a bounded slice; abort must
       // not wait for a fresh snapshot before killing.
       void snapshotProcessTreeIdentities(childPid, { timeoutMs: Math.min(400, killReserveMs) }).then(snapshot => {
@@ -544,6 +766,8 @@ async function defaultRunPowerShell(
     }
 
     const onAbort = () => {
+      if (settled || terminalizing) return
+      killing = true
       void (async () => {
         killing = true
         if (typeof childPid === 'number') {
@@ -553,15 +777,25 @@ async function defaultRunPowerShell(
           if (treeSnapshot.length === 0) {
             treeSnapshot = [{ pid: childPid }]
           }
+          // Do not wait for taskkill or an identity probe before closing the
+          // supervisor. The job-object wrapper makes this an immediate hard
+          // terminal boundary for the nested mutating script.
+          try {
+            childProcess?.kill('SIGKILL')
+          } catch {
+            void 0
+          }
           await finish({ stdout: '', stderr: 'aborted', code: 1, pid: childPid })
           return
         }
         try {
-          child.kill('SIGKILL')
+          childProcess?.kill('SIGKILL')
         } catch {
           void 0
         }
-        await waitForChildExit(child, Math.max(1, absoluteDeadline - Date.now()))
+        if (childProcess) {
+          await waitForChildExit(childProcess, Math.max(1, absoluteDeadline - Date.now()))
+        }
         await finish({ stdout: '', stderr: 'aborted', code: 1, pid: childPid })
       })()
     }
@@ -575,6 +809,9 @@ async function defaultRunPowerShell(
     }
   })
 }
+
+/** Testable production runner; callers should use terminateWindowsHolderExact. */
+export const runPowerShellWithHardBoundary = defaultRunPowerShell
 
 /**
  * Build a self-contained PowerShell script that terminates one PID only when
@@ -733,7 +970,8 @@ export async function terminateWindowsHolderExact(
     run = defaultRunPowerShell,
     waitMs = 1_500,
     timeoutMs,
-    signal
+    signal,
+    deadlineAt
   }: {
     platform?: NodeJS.Platform
     run?: RunPowerShell
@@ -742,6 +980,8 @@ export async function terminateWindowsHolderExact(
     timeoutMs?: number
     /** When aborted, kill the child tree, await confirmed absence, then return. */
     signal?: AbortSignal
+    /** Absolute deadline shared with the caller's orchestration budget. */
+    deadlineAt?: number
   } = {}
 ): Promise<ForceReleaseTerminateResult> {
   if (platform !== 'win32') {
@@ -757,7 +997,12 @@ export async function terminateWindowsHolderExact(
     return { kind: 'failed', detail: 'invalid createdAt' }
   }
 
-  const budget = Math.max(1, Math.trunc(timeoutMs ?? Math.max(2_000, waitMs + 1_000)))
+  const requestedBudget = Math.max(0, Math.trunc(timeoutMs ?? Math.max(2_000, waitMs + 1_000)))
+  const remainingBudget =
+    typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
+      ? Math.max(0, Math.trunc(deadlineAt - Date.now()))
+      : requestedBudget
+  const budget = Math.min(requestedBudget, remainingBudget)
   // Keep TerminateProcess wait short enough that kill-reserve still fits.
   const killReserveMs = terminateKillReserveMs(budget)
   const runBudget = Math.max(1, budget - killReserveMs)
@@ -767,7 +1012,7 @@ export async function terminateWindowsHolderExact(
   }
 
   const script = buildExactTerminateScript(target.pid, target.createdAt, effectiveWait)
-  const result = await run(script, budget, signal)
+  const result = await run(script, budget, signal, deadlineAt)
   if (signal?.aborted) {
     // Child tree must already be confirmed gone by run(); never claim mutation.
     return { kind: 'failed', detail: 'deadline-exhausted' }
@@ -780,4 +1025,44 @@ export async function terminateWindowsHolderExact(
     return { kind: 'failed', detail: 'deadline-exhausted' }
   }
   return parseTerminateScriptOutput(result.stdout + '\n' + result.stderr, result.code)
+}
+
+/**
+ * Execute exact termination using the caller's remaining absolute deadline.
+ * This is the production adapter used by the updater path; keeping the
+ * deadline calculation here prevents a stale per-holder timeout from
+ * extending the overall force-release contract.
+ */
+export async function terminateWindowsHolderWithinDeadline(
+  target: ForceReleaseHolder,
+  {
+    platform = process.platform,
+    run = defaultRunPowerShell,
+    budgetMs,
+    deadlineAt,
+    signal
+  }: {
+    platform?: NodeJS.Platform
+    run?: RunPowerShell
+    budgetMs: number
+    deadlineAt: number
+    signal?: AbortSignal
+  }
+): Promise<ForceReleaseTerminateResult> {
+  const requestedBudget = Math.max(0, Math.trunc(budgetMs))
+  const absoluteDeadline = Number.isFinite(deadlineAt) ? Math.trunc(deadlineAt) : Date.now() + requestedBudget
+  const remainingBudget = Math.max(0, absoluteDeadline - Date.now())
+  const budget = Math.min(requestedBudget, remainingBudget)
+  if (budget <= 50 || signal?.aborted) {
+    return { kind: 'failed', detail: 'deadline-exhausted' }
+  }
+
+  return terminateWindowsHolderExact(target, {
+    platform,
+    run,
+    timeoutMs: budget,
+    waitMs: Math.max(0, Math.min(1_500, budget - 250)),
+    signal,
+    deadlineAt: absoluteDeadline
+  })
 }
