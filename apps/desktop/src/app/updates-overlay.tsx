@@ -83,6 +83,7 @@ export function UpdatesOverlay() {
             : 'idle'
 
   const updateBlockers = !isBackend && apply.error === 'venv-blocked' && apply.blockers?.length ? apply.blockers : null
+
   const needsElevation =
     !isBackend &&
     (apply.error === 'venv-needs-elevation' || apply.error === 'venv-elevation-cancelled') &&

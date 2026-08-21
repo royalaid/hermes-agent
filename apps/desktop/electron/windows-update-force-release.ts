@@ -80,8 +80,10 @@ export function holdersMatchIdentity(
   right: Pick<ForceReleaseHolder, 'pid' | 'createdAt'>,
   toleranceSeconds = HOLDER_CREATE_TIME_MATCH_SECONDS
 ): boolean {
-  if (left.pid !== right.pid) return false
-  if (!Number.isFinite(left.createdAt) || !Number.isFinite(right.createdAt)) return false
+  if (left.pid !== right.pid) {return false}
+
+  if (!Number.isFinite(left.createdAt) || !Number.isFinite(right.createdAt)) {return false}
+
   return Math.abs(left.createdAt - right.createdAt) <= toleranceSeconds
 }
 
@@ -95,12 +97,15 @@ export function orderHoldersLeafFirst(holders: readonly ForceReleaseHolder[]): F
 
   const depthOf = (entry: ForceReleaseHolder, stack: Set<number> = new Set()): number => {
     const cached = depthMemo.get(entry.pid)
+
     if (cached !== undefined) {
       return cached
     }
+
     if (stack.has(entry.pid)) {
       return 0
     }
+
     stack.add(entry.pid)
 
     const parentRef =
@@ -109,6 +114,7 @@ export function orderHoldersLeafFirst(holders: readonly ForceReleaseHolder[]): F
       null
 
     let depth = 0
+
     if (parentRef) {
       depth = depthOf(parentRef, stack) + 1
     } else if (entry.role === 'worker') {
@@ -119,6 +125,7 @@ export function orderHoldersLeafFirst(holders: readonly ForceReleaseHolder[]): F
 
     depthMemo.set(entry.pid, depth)
     stack.delete(entry.pid)
+
     return depth
   }
 
@@ -143,7 +150,7 @@ export function orderHoldersLeafFirst(holders: readonly ForceReleaseHolder[]): F
 export function attachHolderTreeRelationships(
   holders: readonly ForceReleaseHolder[]
 ): ForceReleaseHolder[] {
-  if (holders.length === 0) return []
+  if (holders.length === 0) {return []}
 
   const byPid = new Map(holders.map(entry => [entry.pid, entry] as const))
   const childCount = new Map<number, number>()
@@ -152,9 +159,11 @@ export function attachHolderTreeRelationships(
     const parentPid =
       (entry.parentPid && byPid.has(entry.parentPid) ? entry.parentPid : undefined) ??
       (entry.wrapperPid && byPid.has(entry.wrapperPid) ? entry.wrapperPid : undefined)
+
     if (parentPid != null) {
       childCount.set(parentPid, (childCount.get(parentPid) ?? 0) + 1)
     }
+
     return {
       ...entry,
       ...(parentPid != null
@@ -168,6 +177,7 @@ export function attachHolderTreeRelationships(
 
   return withEdges.map(entry => {
     const isParent = (childCount.get(entry.pid) ?? 0) > 0
+
     const hasParent =
       (entry.parentPid != null && byPid.has(entry.parentPid)) ||
       (entry.wrapperPid != null && byPid.has(entry.wrapperPid))
@@ -175,12 +185,15 @@ export function attachHolderTreeRelationships(
     if (entry.role === 'worker' || entry.role === 'wrapper') {
       return entry
     }
+
     if (hasParent) {
       return { ...entry, role: 'worker' as const }
     }
+
     if (isParent) {
       return { ...entry, role: 'wrapper' as const }
     }
+
     return entry
   })
 }
@@ -205,14 +218,17 @@ export function mergeInstallHolders(
     }
 
     const existingIndex = merged.findIndex(candidate => holdersMatchIdentity(candidate, entry))
+
     if (existingIndex < 0) {
       merged.push({ ...entry })
+
       continue
     }
 
     const existing = merged[existingIndex]!
     const resources = [existing.resource, entry.resource].filter(Boolean) as string[]
     const preferredSource = existing.source === 'scanner' || entry.source === 'scanner' ? 'scanner' : entry.source
+
     // Prefer the more precise (fractional) create-time when both match within tolerance.
     const createdAt =
       !Number.isInteger(existing.createdAt) || Number.isInteger(entry.createdAt)
@@ -236,6 +252,7 @@ export function mergeInstallHolders(
 
 function formatHolderLine(holder: ForceReleaseHolder): string {
   const resource = holder.resource ? ` resource=${holder.resource}` : ''
+
   return `PID ${holder.pid} ${holder.name}${resource}`
 }
 
@@ -244,6 +261,7 @@ function elevationMessage(holders: readonly ForceReleaseHolder[]): string {
     .slice(0, 5)
     .map(formatHolderLine)
     .join('; ')
+
   return (
     'Update needs Administrator permission to stop processes still locking this Hermes install. ' +
     `Survivors: ${sample || 'unknown'}. Choose Force update (Administrator) to continue, or close those processes and retry.`
@@ -255,6 +273,7 @@ function blockedMessage(holders: readonly ForceReleaseHolder[], detail: string):
     .slice(0, 5)
     .map(formatHolderLine)
     .join('; ')
+
   return (
     `Update aborted: ${detail}. ` +
     `Still holding the install: ${sample || 'unknown'}. ` +
@@ -269,25 +288,27 @@ function blockedMessage(holders: readonly ForceReleaseHolder[], detail: string):
  */
 export function raceWithBudget<T>(work: Promise<T>, budgetMs: number, onTimeout: () => T): Promise<T> {
   const budget = Math.trunc(budgetMs)
-  if (budget <= 0) return Promise.resolve(onTimeout())
+
+  if (budget <= 0) {return Promise.resolve(onTimeout())}
 
   return new Promise<T>((resolve, reject) => {
     let settled = false
+
     const timer = setTimeout(() => {
-      if (settled) return
+      if (settled) {return}
       settled = true
       resolve(onTimeout())
     }, budget)
 
     void work.then(
       value => {
-        if (settled) return
+        if (settled) {return}
         settled = true
         clearTimeout(timer)
         resolve(value)
       },
       error => {
-        if (settled) return
+        if (settled) {return}
         settled = true
         clearTimeout(timer)
         reject(error)
@@ -307,14 +328,19 @@ export async function runWindowsUpdateForceRelease(
   const started = now()
   const deadline = started + deadlineMs
   const remaining = () => Math.max(0, deadline - now())
+
   const resourceLockedWithinDeadline = async (): Promise<boolean> => {
     const budget = remaining()
-    if (budget <= 0) return true
+
+    if (budget <= 0) {return true}
+
     return await raceWithBudget(deps.isResourceLocked(), budget, () => true)
   }
+
   const waitWithinDeadline = async (delayMs: number): Promise<void> => {
     const budget = Math.min(Math.max(0, delayMs), remaining())
-    if (budget <= 0) return
+
+    if (budget <= 0) {return}
     await raceWithBudget(sleep(budget), budget, () => undefined)
   }
 
@@ -334,23 +360,28 @@ export async function runWindowsUpdateForceRelease(
 
     const passStarted = now()
     const scanBudget = remaining()
-    if (scanBudget <= 0) break
+
+    if (scanBudget <= 0) {break}
 
     const scanned = await raceWithBudget(
       deps.listScannerHolders(scanBudget),
       scanBudget,
       () => [] as ForceReleaseHolder[]
     )
-    if (remaining() <= 0) break
+
+    if (remaining() <= 0) {break}
 
     const rmBudget = remaining()
+
     const fromRm = await raceWithBudget(
       deps.listRestartManagerHolders(rmBudget),
       rmBudget,
       () => [] as ForceReleaseHolder[]
     )
+
     if (remaining() <= 0) {
       lastHolders = orderHoldersLeafFirst(mergeInstallHolders([...scanned, ...fromRm], excludePids))
+
       break
     }
 
@@ -360,12 +391,15 @@ export async function runWindowsUpdateForceRelease(
     if (holders.length === 0) {
       // Locked with no enumerable holders: fail closed rather than mutate.
       const pause = Math.min(settleMs || 50, remaining())
+
       if (pause > 0) {
         await waitWithinDeadline(pause)
       }
+
       if (!(await resourceLockedWithinDeadline())) {
         return { kind: 'clear' }
       }
+
       break
     }
 
@@ -375,6 +409,7 @@ export async function runWindowsUpdateForceRelease(
 
     for (const target of holders) {
       const budget = remaining()
+
       if (budget <= 0) {
         break
       }
@@ -385,6 +420,7 @@ export async function runWindowsUpdateForceRelease(
       const controller = new AbortController()
       const abortTimer = setTimeout(() => controller.abort(), budget)
       let result: ForceReleaseTerminateResult
+
       try {
         result = await deps.terminateHolder(target, budget, controller.signal, deadline)
       } finally {
@@ -393,17 +429,25 @@ export async function runWindowsUpdateForceRelease(
 
       switch (result.kind) {
         case 'terminated':
+
         case 'already-gone':
           break
+
         case 'access-denied':
           accessDenied.push(target)
+
           break
+
         case 'protected':
           protectedHolders.push(target)
+
           break
+
         case 'create-time-mismatch':
           mismatchHolders.push(target)
+
           break
+
         case 'failed':
           // Keep trying others; final lock proof decides.
           break
@@ -411,6 +455,7 @@ export async function runWindowsUpdateForceRelease(
     }
 
     const settle = Math.min(Math.max(settleMs, 1), remaining())
+
     if (settle > 0) {
       await waitWithinDeadline(settle)
     }

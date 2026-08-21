@@ -278,7 +278,7 @@ export function resolveWindowsDevRelaunchAppPath(
 ): string | undefined {
   const appEntry = argv[1]
   if (!defaultApp || !appEntry || appEntry.startsWith('-')) return undefined
-  return path.resolve(appEntry)
+  return path.win32.resolve(appEntry)
 }
 
 /** Render argv for a PowerShell-facing manual instruction without creating
