@@ -333,6 +333,8 @@ import { resolveDefaultUpdateBranch } from './update-branch'
 import { UpdateInFlightTransaction, waitForLocalBackendClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import {
+  authorizeUpdateMutation,
+  runAuthorizedUpdateMutation,
   runWindowsUpdatePreflight,
   type UpdatePreflightOutcome,
   type UpdatePreflightPurpose
@@ -3934,14 +3936,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     'desktop-update',
     'windows-force-release.ps1'
   )
-  const bootstrapScriptPath = path.join(
-    updateRoot,
-    'scripts',
-    'desktop-update',
-    'windows-force-release-bootstrap.ps1'
-  )
-
-  if (!fs.existsSync(helperScriptPath) || !fs.existsSync(bootstrapScriptPath)) {
+  if (!fs.existsSync(helperScriptPath)) {
     return {
       ok: false,
       error: 'venv-unlock-failed',
@@ -3959,7 +3954,6 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
 
     const launch = await launchElevatedForceReleaseHelper({
       helperScriptPath,
-      bootstrapScriptPath,
       requestPath: written.requestPath,
       responsePath: written.responsePath
     })
@@ -4293,7 +4287,9 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       }
     }
 
-    bridgeLease = preflight.lease
+    const mutationPermit = authorizeUpdateMutation(preflight)
+    if (!mutationPermit) throw new Error('clear update preflight did not mint a mutation permit')
+    bridgeLease = mutationPermit.preflight.lease
 
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
@@ -4331,28 +4327,31 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     // child environment. The wrapper cmd.exe exits immediately, so child.pid
     // is NOT the script's pid — the script claims the update marker itself
     // with its own $PID as its first action, and a relaunched Desktop parks
-    // on that.
-    const launch = launchWindowsUpdateTransport(
-      windowsTransport,
-      {
-        bridgeLeaseId: bridgeLease.leaseId,
-        branch,
-        desktopPid: process.pid,
-        installRoot: updateRoot,
-        relaunchAppPath: resolveWindowsDevRelaunchAppPath(process.defaultApp, process.argv),
-        relaunchExe: process.execPath
-      },
-      {
-        cwd: HERMES_HOME,
-        env: {
-          ...process.env,
-          HERMES_HOME,
-          HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
-          PATH: pathWithHermesManagedNode(venvBin)
+    // on that. The clear-preflight mutation permit is required at the exact
+    // transport launch boundary.
+    const launch = runAuthorizedUpdateMutation(mutationPermit, () =>
+      launchWindowsUpdateTransport(
+        windowsTransport,
+        {
+          bridgeLeaseId: bridgeLease!.leaseId,
+          branch,
+          desktopPid: process.pid,
+          installRoot: updateRoot,
+          relaunchAppPath: resolveWindowsDevRelaunchAppPath(process.defaultApp, process.argv),
+          relaunchExe: process.execPath
         },
-        detached: true,
-        stdio: 'ignore'
-      }
+        {
+          cwd: HERMES_HOME,
+          env: {
+            ...process.env,
+            HERMES_HOME,
+            HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
+            PATH: pathWithHermesManagedNode(venvBin)
+          },
+          detached: true,
+          stdio: 'ignore'
+        }
+      )
     )
 
     if (launch.kind !== 'spawned') {
@@ -4443,11 +4442,13 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     }
 
     isQuittingForHandoff = true
-    setTimeout(
-      () => {
-        app.quit()
-      },
-      Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
+    runAuthorizedUpdateMutation(mutationPermit, () =>
+      setTimeout(
+        () => {
+          app.quit()
+        },
+        Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
+      )
     )
 
     return { ok: true, handedOff: true, updater: scriptHandoff.scriptPath }
