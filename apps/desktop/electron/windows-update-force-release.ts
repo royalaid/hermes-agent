@@ -43,7 +43,15 @@ export type WindowsUpdateForceReleaseDeps = {
    */
   listScannerHolders: (budgetMs: number) => Promise<ForceReleaseHolder[]>
   listRestartManagerHolders: (budgetMs: number) => Promise<ForceReleaseHolder[]>
-  terminateHolder: (holder: ForceReleaseHolder, budgetMs: number) => Promise<ForceReleaseTerminateResult>
+  /**
+   * Terminate one holder. Must honor `signal` by cancelling any child work and
+   * guaranteeing no process-mutation side effect after abort settles.
+   */
+  terminateHolder: (
+    holder: ForceReleaseHolder,
+    budgetMs: number,
+    signal?: AbortSignal
+  ) => Promise<ForceReleaseTerminateResult>
   excludePids?: ReadonlySet<number>
   /** Non-elevated budget. Spec: five seconds or less. */
   deadlineMs?: number
@@ -58,57 +66,21 @@ export type WindowsUpdateForceReleaseOutcome =
 
 const DEFAULT_DEADLINE_MS = 5_000
 const DEFAULT_SETTLE_MS = 150
+/** RM emits integer-second create times; scanner may be fractional. */
+export const HOLDER_CREATE_TIME_MATCH_SECONDS = 1.5
 
 function wait(delayMs: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, delayMs))
 }
 
-function holderKey(holder: ForceReleaseHolder): string {
-  return `${holder.pid}:${holder.createdAt}`
-}
-
-export function mergeInstallHolders(
-  holders: readonly ForceReleaseHolder[],
-  excludePids: ReadonlySet<number> = new Set()
-): ForceReleaseHolder[] {
-  const byKey = new Map<string, ForceReleaseHolder>()
-
-  for (const entry of holders) {
-    if (!Number.isInteger(entry.pid) || entry.pid <= 0) {
-      continue
-    }
-
-    if (!Number.isFinite(entry.createdAt) || entry.createdAt <= 0) {
-      continue
-    }
-
-    if (excludePids.has(entry.pid)) {
-      continue
-    }
-
-    const key = holderKey(entry)
-    const existing = byKey.get(key)
-
-    if (!existing) {
-      byKey.set(key, { ...entry })
-      continue
-    }
-
-    const resources = [existing.resource, entry.resource].filter(Boolean) as string[]
-    const preferredSource = existing.source === 'scanner' || entry.source === 'scanner' ? 'scanner' : entry.source
-
-    byKey.set(key, {
-      ...existing,
-      ...entry,
-      source: preferredSource,
-      resource: resources.length ? Array.from(new Set(resources)).join('; ') : existing.resource,
-      parentPid: existing.parentPid ?? entry.parentPid,
-      wrapperPid: existing.wrapperPid ?? entry.wrapperPid,
-      role: existing.role ?? entry.role
-    })
-  }
-
-  return [...byKey.values()]
+export function holdersMatchIdentity(
+  left: Pick<ForceReleaseHolder, 'pid' | 'createdAt'>,
+  right: Pick<ForceReleaseHolder, 'pid' | 'createdAt'>,
+  toleranceSeconds = HOLDER_CREATE_TIME_MATCH_SECONDS
+): boolean {
+  if (left.pid !== right.pid) return false
+  if (!Number.isFinite(left.createdAt) || !Number.isFinite(right.createdAt)) return false
+  return Math.abs(left.createdAt - right.createdAt) <= toleranceSeconds
 }
 
 /**
@@ -162,6 +134,104 @@ export function orderHoldersLeafFirst(holders: readonly ForceReleaseHolder[]): F
     .map(item => item.entry)
 }
 
+/**
+ * When holders carry parent/wrapper edges among the set, annotate roles so
+ * orderHoldersLeafFirst can drain leaves before roots in production mappings.
+ */
+export function attachHolderTreeRelationships(
+  holders: readonly ForceReleaseHolder[]
+): ForceReleaseHolder[] {
+  if (holders.length === 0) return []
+
+  const byPid = new Map(holders.map(entry => [entry.pid, entry] as const))
+  const childCount = new Map<number, number>()
+
+  const withEdges = holders.map(entry => {
+    const parentPid =
+      (entry.parentPid && byPid.has(entry.parentPid) ? entry.parentPid : undefined) ??
+      (entry.wrapperPid && byPid.has(entry.wrapperPid) ? entry.wrapperPid : undefined)
+    if (parentPid != null) {
+      childCount.set(parentPid, (childCount.get(parentPid) ?? 0) + 1)
+    }
+    return {
+      ...entry,
+      ...(parentPid != null
+        ? {
+            parentPid: entry.parentPid ?? parentPid,
+            wrapperPid: entry.wrapperPid ?? (entry.wrapperPid === parentPid ? parentPid : entry.wrapperPid)
+          }
+        : {})
+    }
+  })
+
+  return withEdges.map(entry => {
+    const isParent = (childCount.get(entry.pid) ?? 0) > 0
+    const hasParent =
+      (entry.parentPid != null && byPid.has(entry.parentPid)) ||
+      (entry.wrapperPid != null && byPid.has(entry.wrapperPid))
+
+    if (entry.role === 'worker' || entry.role === 'wrapper') {
+      return entry
+    }
+    if (hasParent) {
+      return { ...entry, role: 'worker' as const }
+    }
+    if (isParent) {
+      return { ...entry, role: 'wrapper' as const }
+    }
+    return entry
+  })
+}
+
+export function mergeInstallHolders(
+  holders: readonly ForceReleaseHolder[],
+  excludePids: ReadonlySet<number> = new Set()
+): ForceReleaseHolder[] {
+  const merged: ForceReleaseHolder[] = []
+
+  for (const entry of holders) {
+    if (!Number.isInteger(entry.pid) || entry.pid <= 0) {
+      continue
+    }
+
+    if (!Number.isFinite(entry.createdAt) || entry.createdAt <= 0) {
+      continue
+    }
+
+    if (excludePids.has(entry.pid)) {
+      continue
+    }
+
+    const existingIndex = merged.findIndex(candidate => holdersMatchIdentity(candidate, entry))
+    if (existingIndex < 0) {
+      merged.push({ ...entry })
+      continue
+    }
+
+    const existing = merged[existingIndex]!
+    const resources = [existing.resource, entry.resource].filter(Boolean) as string[]
+    const preferredSource = existing.source === 'scanner' || entry.source === 'scanner' ? 'scanner' : entry.source
+    // Prefer the more precise (fractional) create-time when both match within tolerance.
+    const createdAt =
+      !Number.isInteger(existing.createdAt) || Number.isInteger(entry.createdAt)
+        ? existing.createdAt
+        : entry.createdAt
+
+    merged[existingIndex] = {
+      ...existing,
+      ...entry,
+      createdAt,
+      source: preferredSource,
+      resource: resources.length ? Array.from(new Set(resources)).join('; ') : existing.resource,
+      parentPid: existing.parentPid ?? entry.parentPid,
+      wrapperPid: existing.wrapperPid ?? entry.wrapperPid,
+      role: existing.role === 'other' || existing.role == null ? entry.role ?? existing.role : existing.role
+    }
+  }
+
+  return attachHolderTreeRelationships(merged)
+}
+
 function formatHolderLine(holder: ForceReleaseHolder): string {
   const resource = holder.resource ? ` resource=${holder.resource}` : ''
   return `PID ${holder.pid} ${holder.name}${resource}`
@@ -191,31 +261,68 @@ function blockedMessage(holders: readonly ForceReleaseHolder[], detail: string):
 }
 
 /**
- * Race a dependency against the remaining wall-clock budget. Hung/slow
- * scanners, RM queries, or terminations must not exceed the five-second path.
+ * Race work against the remaining wall-clock budget.
  *
- * Uses a real timer (not deps.wait) so fake-clock unit tests that complete
- * work synchronously are not charged the full budget by the hang guard.
+ * When `work` is a factory, the orchestrator passes an AbortSignal. Abort fires
+ * early enough that kill-and-drain still fits inside `budgetMs`, so the
+ * function returns within the wall-clock budget even when draining a real
+ * child. Uncooperative deps that ignore AbortSignal are abandoned after the
+ * bounded drain window — they must not stretch past the budget.
+ * Plain promises remain supported for discovery calls (no drain wait).
  */
 export function raceWithBudget<T>(
-  work: Promise<T>,
+  work: Promise<T> | ((signal: AbortSignal) => Promise<T>),
   budgetMs: number,
-  onTimeout: () => T
+  onTimeout: () => T,
+  options?: { drainMs?: number }
 ): Promise<T> {
   const budget = Math.trunc(budgetMs)
   if (budget <= 0) {
     return Promise.resolve(onTimeout())
   }
 
+  const isFactory = typeof work === 'function'
+  const controller = new AbortController()
+  const pending = isFactory ? work(controller.signal) : work
+  // Reserve drain room inside the budget so total elapsed stays <= budgetMs.
+  const requestedDrain = Math.max(
+    0,
+    Math.trunc(options?.drainMs ?? (isFactory ? Math.min(750, Math.max(100, Math.floor(budget * 0.2))) : 0))
+  )
+  const drainMs = isFactory ? Math.min(requestedDrain, Math.max(0, budget - 1)) : 0
+  const workBudget = Math.max(0, budget - drainMs)
   let settled = false
+  const startedAt = Date.now()
+
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
+    const finishTimeout = () => {
       if (settled) return
       settled = true
       resolve(onTimeout())
-    }, budget)
+    }
 
-    void work.then(
+    const timer = setTimeout(() => {
+      if (settled) return
+      controller.abort()
+      if (!isFactory || drainMs <= 0) {
+        finishTimeout()
+        return
+      }
+      const remainingDrain = Math.max(0, budget - (Date.now() - startedAt))
+      const drainTimer = setTimeout(finishTimeout, Math.min(drainMs, remainingDrain))
+      void pending.then(
+        () => {
+          clearTimeout(drainTimer)
+          finishTimeout()
+        },
+        () => {
+          clearTimeout(drainTimer)
+          finishTimeout()
+        }
+      )
+    }, workBudget)
+
+    void pending.then(
       value => {
         if (settled) return
         settled = true
@@ -305,11 +412,10 @@ export async function runWindowsUpdateForceRelease(
         break
       }
 
-      const result = await raceWithBudget(
-        deps.terminateHolder(target, budget),
-        budget,
-        () => ({ kind: 'failed', detail: 'deadline-exhausted' }) as ForceReleaseTerminateResult
-      )
+      // Mutating termination is NOT raced-and-abandoned. The native boundary
+      // owns the budget, kills on expiry, and returns only after confirmed
+      // child exit/tree absence (or a hard Windows job-object terminal).
+      const result = await deps.terminateHolder(target, budget)
 
       switch (result.kind) {
         case 'terminated':

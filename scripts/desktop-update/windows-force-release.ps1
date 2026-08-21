@@ -90,6 +90,16 @@ try {
     $res = if ($h.PSObject.Properties['resource'] -and $h.resource) { [string]$h.resource } else { '' }
     $holderLines += ("{0}`t{1}`t{2}`t{3}" -f [int]$h.pid, (Format-CanonicalNumber ([double]$h.createdAt)), [string]$h.name, $res)
   }
+  $excludeList = @()
+  if ($request.PSObject.Properties['excludePids'] -and $request.excludePids) {
+    foreach ($ex in @($request.excludePids)) {
+      try {
+        $exPid = [int]$ex
+        if ($exPid -gt 0) { $excludeList += $exPid }
+      } catch {}
+    }
+  }
+  $excludeLine = (($excludeList | Sort-Object -Unique) -join ',')
   $canonical = @(
     [string][int]$request.schemaVersion
     $nonce
@@ -98,6 +108,7 @@ try {
     $installRoot
     $expectedHash
     ($holderLines -join "`n")
+    $excludeLine
   ) -join "`n"
   $macSrc = $secret + "`n" + $canonical
   $sha2 = [System.Security.Cryptography.SHA256]::Create()
@@ -209,6 +220,15 @@ public static class HermesElevatedTerminate {
     $ppid = (Get-CimInstance Win32_Process -Filter "ProcessId = $selfPid" -ErrorAction SilentlyContinue).ParentProcessId
     if ($ppid) { [void]$exclude.Add([int]$ppid) }
   } catch {}
+  # Signed exclude list from Desktop (Desktop main PID, updater helper, etc.).
+  if ($request.PSObject.Properties['excludePids'] -and $request.excludePids) {
+    foreach ($ex in @($request.excludePids)) {
+      try {
+        $exPid = [int]$ex
+        if ($exPid -gt 0) { [void]$exclude.Add($exPid) }
+      } catch {}
+    }
+  }
 
   $resourceList = New-Object System.Collections.Generic.List[string]
   foreach ($rel in @('venv\Scripts\hermes.exe', 'venv\Scripts\python.exe', 'venv\python.exe')) {
@@ -237,82 +257,70 @@ public static class HermesElevatedTerminate {
     }
   }
 
-  # Re-enumerate live holders: Restart Manager on install resources + process Path under install root.
+  # Re-enumerate live holders ONLY against authenticated claims:
+  # Restart Manager on install resources, then identity match against signed claims.
+  # Do NOT path-scan the entire installRoot for unclaimed processes (that can
+  # target Desktop electron.exe under a dev SOURCE_REPO_ROOT).
   $live = @{}
   if ($resourceList.Count -gt 0) {
-    foreach ($row in [HermesElevatedTerminate]::QueryRestartManager([string[]]$resourceList.ToArray())) {
-      if (-not $row) { continue }
-      $bits = $row.Split([char]'|', 3)
-      if ($bits.Count -lt 2) { continue }
-      $rmPid = 0
-      $rmCreated = 0.0
-      if (-not [int]::TryParse($bits[0], [ref]$rmPid)) { continue }
-      if (-not [double]::TryParse($bits[1], [ref]$rmCreated)) { continue }
-      if ($rmPid -le 0 -or $exclude.Contains($rmPid)) { continue }
-      $rmName = if ($bits.Count -ge 3) { $bits[2] } else { 'unknown' }
-      $live[$rmPid] = [pscustomobject]@{
-        pid = $rmPid
-        createdAt = $rmCreated
-        name = $rmName
-        resource = $resourceList[0]
-        source = 'restart-manager'
+    foreach ($resPath in $resourceList) {
+      foreach ($row in [HermesElevatedTerminate]::QueryRestartManager([string[]]@($resPath))) {
+        if (-not $row) { continue }
+        $bits = $row.Split([char]'|', 3)
+        if ($bits.Count -lt 2) { continue }
+        $rmPid = 0
+        $rmCreated = 0.0
+        if (-not [int]::TryParse($bits[0], [ref]$rmPid)) { continue }
+        if (-not [double]::TryParse($bits[1], [ref]$rmCreated)) { continue }
+        if ($rmPid -le 0 -or $exclude.Contains($rmPid)) { continue }
+        if (-not $claims.ContainsKey($rmPid)) { continue }
+        $rmName = if ($bits.Count -ge 3) { $bits[2] } else { 'unknown' }
+        $live[$rmPid] = [pscustomobject]@{
+          pid = $rmPid
+          createdAt = $rmCreated
+          name = $rmName
+          resource = $resPath
+          source = 'restart-manager'
+        }
       }
     }
   }
 
-  $installPrefix = $installRootFull.TrimEnd('\') + '\'
-  try {
-    Get-CimInstance Win32_Process | ForEach-Object {
-      $procPid = [int]$_.ProcessId
-      if ($procPid -le 0 -or $exclude.Contains($procPid)) { return }
-      $exe = $null
-      try { $exe = $_.ExecutablePath } catch { $exe = $null }
-      if (-not $exe) { return }
-      try {
-        $fullExe = [IO.Path]::GetFullPath($exe)
-      } catch { return }
-      if (-not $fullExe.StartsWith($installPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { return }
-      try {
-        $proc = Get-Process -Id $procPid -ErrorAction Stop
-        $created = [DateTimeOffset]::new($proc.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
-      } catch { return }
-      if (-not $live.ContainsKey($procPid)) {
-        $live[$procPid] = [pscustomobject]@{
-          pid = $procPid
-          createdAt = [double]$created
-          name = [string]$_.Name
-          resource = $fullExe
-          source = 'path'
-        }
+  # Also revalidate each signed claim by direct process identity (no broad path scan).
+  foreach ($claimPid in @($claims.Keys)) {
+    if ($exclude.Contains([int]$claimPid)) { continue }
+    if ($live.ContainsKey([int]$claimPid)) { continue }
+    try {
+      $proc = Get-Process -Id ([int]$claimPid) -ErrorAction Stop
+      $created = [DateTimeOffset]::new($proc.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
+      $live[[int]$claimPid] = [pscustomobject]@{
+        pid = [int]$claimPid
+        createdAt = [double]$created
+        name = [string]$proc.ProcessName
+        resource = $claims[[int]$claimPid].resource
+        source = 'claim-revalidate'
       }
+    } catch {
+      # Gone or inaccessible — skip; clearance proof decides final outcome.
     }
-  } catch {}
+  }
 
-  # Eligible targets: currently live holders that still match a signed claim (or are live under the MAC-bound install root).
-  # Fail-closed: only terminate processes that are currently holding install resources after re-enumeration.
+  # Eligible targets: currently live holders that still match a signed claim.
+  # Fail-closed: never terminate unauthenticated/unclaimed installRoot processes.
   $targets = @()
   foreach ($entry in $live.Values) {
     $targetPid = [int]$entry.pid
     if ($exclude.Contains($targetPid)) { continue }
-    if ($claims.ContainsKey($targetPid)) {
-      $claim = $claims[$targetPid]
-      if ([math]::Abs([double]$entry.createdAt - [double]$claim.createdAt) -gt 1.5) {
-        continue
-      }
-      $targets += [pscustomobject]@{
-        pid = $targetPid
-        createdAt = [double]$entry.createdAt
-        name = $entry.name
-        resource = if ($claim.resource) { $claim.resource } else { $entry.resource }
-      }
+    if (-not $claims.ContainsKey($targetPid)) { continue }
+    $claim = $claims[$targetPid]
+    if ([math]::Abs([double]$entry.createdAt - [double]$claim.createdAt) -gt 1.5) {
       continue
     }
-    # Live install-root holder not in the original claim set still must be cleared (fail closed).
     $targets += [pscustomobject]@{
       pid = $targetPid
       createdAt = [double]$entry.createdAt
       name = $entry.name
-      resource = $entry.resource
+      resource = if ($claim.resource) { $claim.resource } else { $entry.resource }
     }
   }
 

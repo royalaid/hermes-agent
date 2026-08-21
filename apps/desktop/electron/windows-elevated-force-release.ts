@@ -32,6 +32,8 @@ export type ForceReleaseRequest = {
     name: string
     resource?: string
   }>
+  /** PIDs the elevated helper must never terminate (Desktop main, updater helper). */
+  excludePids?: number[]
   /** HMAC-like integrity over the body using a one-shot secret written beside the request. */
   requestMac: string
 }
@@ -78,6 +80,7 @@ export function canonicalForceReleasePayload(input: {
   installRoot: string
   installRootHash: string
   holders: ReadonlyArray<{ pid: number; createdAt: number; name: string; resource?: string }>
+  excludePids?: readonly number[]
 }): string {
   const holderLines = input.holders
     .map(
@@ -85,6 +88,11 @@ export function canonicalForceReleasePayload(input: {
         `${holder.pid}\t${canonicalNumericToken(holder.createdAt)}\t${holder.name}\t${holder.resource ?? ''}`
     )
     .join('\n')
+  const excludeLine = (input.excludePids ?? [])
+    .filter(pid => Number.isInteger(pid) && pid > 0)
+    .slice()
+    .sort((a, b) => a - b)
+    .join(',')
   return [
     String(input.schemaVersion),
     input.nonce,
@@ -92,7 +100,8 @@ export function canonicalForceReleasePayload(input: {
     canonicalNumericToken(input.expiresAt),
     input.installRoot,
     input.installRootHash,
-    holderLines
+    holderLines,
+    excludeLine
   ].join('\n')
 }
 
@@ -103,6 +112,7 @@ export function buildForceReleaseRequest(input: {
   ttlMs?: number
   nonce?: string
   secret: string
+  excludePids?: readonly number[]
 }): ForceReleaseRequest {
   const now = input.now ?? Date.now()
   const ttlMs = input.ttlMs ?? 120_000
@@ -114,6 +124,9 @@ export function buildForceReleaseRequest(input: {
     name: holder.name,
     ...(holder.resource ? { resource: holder.resource } : {})
   }))
+  const excludePids = Array.from(
+    new Set((input.excludePids ?? []).filter(pid => Number.isInteger(pid) && pid > 0))
+  ).sort((a, b) => a - b)
   const body = {
     schemaVersion: FORCE_RELEASE_REQUEST_SCHEMA,
     nonce,
@@ -121,7 +134,8 @@ export function buildForceReleaseRequest(input: {
     expiresAt: now + ttlMs,
     installRoot,
     installRootHash: hashInstallRoot(installRoot),
-    holders
+    holders,
+    ...(excludePids.length > 0 ? { excludePids } : {})
   }
   const requestMac = createHash('sha256')
     .update(input.secret)
@@ -184,24 +198,33 @@ export function forceReleasePaths(dir: string, nonce: string) {
   }
 }
 
-export async function writeForceReleaseRequestFiles(input: {
-  installRoot: string
-  holders: readonly ForceReleaseHolder[]
-  directory?: string
-}): Promise<{
+export type ForceReleaseRequestFiles = {
   directory: string
   request: ForceReleaseRequest
+  /** Present only until cleanup; never log or return this after launch. */
   secret: string
   requestPath: string
   secretPath: string
   responsePath: string
-}> {
+  /** True when writeForceReleaseRequestFiles created the directory via mkdtemp. */
+  ownedDirectory: boolean
+}
+
+export async function writeForceReleaseRequestFiles(input: {
+  installRoot: string
+  holders: readonly ForceReleaseHolder[]
+  directory?: string
+  /** PIDs the elevated helper must never target (Desktop main, updater helper, etc.). */
+  excludePids?: readonly number[]
+}): Promise<ForceReleaseRequestFiles> {
+  const ownedDirectory = input.directory == null
   const directory = input.directory ?? fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-release-'))
   const secret = randomBytes(32).toString('hex')
   const request = buildForceReleaseRequest({
     installRoot: input.installRoot,
     holders: input.holders,
-    secret
+    secret,
+    excludePids: input.excludePids
   })
   const paths = forceReleasePaths(directory, request.nonce)
   fs.writeFileSync(paths.secretPath, secret, { encoding: 'utf8', mode: 0o600 })
@@ -210,7 +233,43 @@ export async function writeForceReleaseRequestFiles(input: {
     directory,
     request,
     secret,
+    ownedDirectory,
     ...paths
+  }
+}
+
+/**
+ * Idempotent cleanup of nonce request/secret/response artifacts.
+ * Removes only the exact owned files. Never recursive-deletes a directory.
+ * If the directory was owned (mkdtemp) and is empty after file removal, remove
+ * the empty directory non-recursively; otherwise leave it (and any unexpected
+ * sentinel/reparse entries) intact.
+ */
+export function cleanupForceReleaseArtifacts(files: {
+  directory?: string
+  requestPath?: string
+  secretPath?: string
+  responsePath?: string
+  ownedDirectory?: boolean
+}): void {
+  for (const filePath of [files.requestPath, files.secretPath, files.responsePath]) {
+    if (!filePath) continue
+    try {
+      fs.rmSync(filePath, { force: true })
+    } catch {
+      void 0
+    }
+  }
+
+  if (files.ownedDirectory && files.directory) {
+    try {
+      const remaining = fs.readdirSync(files.directory)
+      if (remaining.length === 0) {
+        fs.rmdirSync(files.directory)
+      }
+    } catch {
+      void 0
+    }
   }
 }
 
@@ -267,26 +326,65 @@ export function formatElevatedForceReleaseFailure(response: ForceReleaseResponse
 }
 
 /**
+ * Environment variable names used by the constant elevated launcher.
+ * Dynamic filesystem paths travel ONLY through these env vars — never as
+ * PowerShell source text — so metacharacters cannot be evaluated.
+ */
+export const ELEVATED_FORCE_RELEASE_LAUNCH_ENV = {
+  helper: 'HERMES_FORCE_RELEASE_HELPER',
+  request: 'HERMES_FORCE_RELEASE_REQUEST',
+  response: 'HERMES_FORCE_RELEASE_RESPONSE'
+} as const
+
+/**
+ * Constant outer launcher. Paths are read from env and passed as ArgumentList
+ * array elements (data), never interpolated into PowerShell source.
+ */
+export const ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND = [
+  "$ErrorActionPreference = 'Stop'",
+  `$helper = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper}')`,
+  `$request = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request}')`,
+  `$response = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response}')`,
+  "if ([string]::IsNullOrWhiteSpace($helper) -or [string]::IsNullOrWhiteSpace($request) -or [string]::IsNullOrWhiteSpace($response)) { throw 'missing force-release launch env' }",
+  "$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+  "$argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$helper,'-RequestPath',$request,'-ResponsePath',$response)",
+  '$p = Start-Process -FilePath $ps -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList $argList',
+  'if ($null -eq $p) { exit 1223 }',
+  'exit $p.ExitCode'
+].join('; ')
+
+export type ElevatedForceReleaseRun = (
+  command: string,
+  args: string[],
+  options?: { env?: NodeJS.ProcessEnv }
+) => Promise<{ code: number }>
+
+/**
  * Launch the elevated helper via ShellExecuteEx runas. The helper path must be
- * a repo-owned script; only the request file path is passed on the command line.
+ * a repo-owned script. Dynamic paths travel only via environment variables into
+ * a constant launcher; they never become PowerShell source.
  */
 export async function launchElevatedForceReleaseHelper(input: {
   helperScriptPath: string
   requestPath: string
   responsePath: string
   platform?: NodeJS.Platform
-  run?: (command: string, args: string[]) => Promise<{ code: number }>
+  run?: ElevatedForceReleaseRun
 }): Promise<{ kind: 'launched' } | { kind: 'cancelled' } | { kind: 'failed'; detail: string }> {
   const platform = input.platform ?? process.platform
   if (platform !== 'win32') {
     return { kind: 'failed', detail: 'windows-only' }
   }
 
-  const run =
+  const run: ElevatedForceReleaseRun =
     input.run ??
-    (async (command: string, args: string[]) => {
+    (async (command, args, options) => {
       try {
-        await execFileAsync(command, args, { windowsHide: true, timeout: 180_000 })
+        await execFileAsync(command, args, {
+          windowsHide: true,
+          timeout: 180_000,
+          env: options?.env
+        })
         return { code: 0 }
       } catch (error: any) {
         const code = typeof error?.code === 'number' ? error.code : 1
@@ -298,16 +396,34 @@ export async function launchElevatedForceReleaseHelper(input: {
       }
     })
 
-  // powershell Start-Process -Verb RunAs waits for elevation consent and the child.
   const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  const script = `
-$p = Start-Process -FilePath ${JSON.stringify(ps)} -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',${JSON.stringify(input.helperScriptPath)},'-RequestPath',${JSON.stringify(input.requestPath)},'-ResponsePath',${JSON.stringify(input.responsePath)})
-if ($null -eq $p) { exit 1223 }
-exit $p.ExitCode
-`.trim()
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request]: input.requestPath,
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath
+  }
 
-  const result = await run(ps, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script])
+  const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND]
+  const result = await run(ps, args, { env })
   if (result.code === 1223) return { kind: 'cancelled' }
   if (result.code === 0) return { kind: 'launched' }
   return { kind: 'failed', detail: `elevated helper exit ${result.code}` }
+}
+
+/** Pure helper for tests: capture argv + env without launching. */
+export function buildElevatedForceReleaseLaunchInvocation(input: {
+  helperScriptPath: string
+  requestPath: string
+  responsePath: string
+}): { args: string[]; env: Record<string, string>; command: string } {
+  return {
+    command: ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND,
+    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND],
+    env: {
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request]: input.requestPath,
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath
+    }
+  }
 }
