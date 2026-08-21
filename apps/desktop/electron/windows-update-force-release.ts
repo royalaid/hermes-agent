@@ -29,7 +29,7 @@ export type ForceReleaseTerminateResult =
   | { kind: 'terminated' }
   | { kind: 'already-gone' }
   | { kind: 'create-time-mismatch' }
-  | { kind: 'access-denied'; win32Error: number }
+  | { kind: 'access-denied'; win32Error: number; detail?: string }
   | { kind: 'protected'; win32Error: number }
   | { kind: 'failed'; detail: string; win32Error?: number }
 
