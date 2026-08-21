@@ -3934,8 +3934,14 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     'desktop-update',
     'windows-force-release.ps1'
   )
+  const bootstrapScriptPath = path.join(
+    updateRoot,
+    'scripts',
+    'desktop-update',
+    'windows-force-release-bootstrap.ps1'
+  )
 
-  if (!fs.existsSync(helperScriptPath)) {
+  if (!fs.existsSync(helperScriptPath) || !fs.existsSync(bootstrapScriptPath)) {
     return {
       ok: false,
       error: 'venv-unlock-failed',
@@ -3953,6 +3959,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
 
     const launch = await launchElevatedForceReleaseHelper({
       helperScriptPath,
+      bootstrapScriptPath,
       requestPath: written.requestPath,
       responsePath: written.responsePath
     })

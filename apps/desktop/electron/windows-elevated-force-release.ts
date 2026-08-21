@@ -13,6 +13,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import type { ForceReleaseHolder } from './windows-update-force-release'
+import { identitiesStillPresent } from './windows-process-terminate'
 
 export const FORCE_RELEASE_REQUEST_SCHEMA = 1 as const
 
@@ -346,8 +347,53 @@ export function formatElevatedForceReleaseFailure(response: ForceReleaseResponse
 export const ELEVATED_FORCE_RELEASE_LAUNCH_ENV = {
   helper: 'HERMES_FORCE_RELEASE_HELPER',
   request: 'HERMES_FORCE_RELEASE_REQUEST',
-  response: 'HERMES_FORCE_RELEASE_RESPONSE'
+  response: 'HERMES_FORCE_RELEASE_RESPONSE',
+  job: 'HERMES_FORCE_RELEASE_JOB',
+  bootstrap: 'HERMES_FORCE_RELEASE_BOOTSTRAP'
 } as const
+
+export const ELEVATED_FORCE_RELEASE_JOB_NATIVE_SOURCE = String.raw`
+using System;
+using System.Runtime.InteropServices;
+public static class HermesElevatedBoundaryJob {
+  const int JobObjectExtendedLimitInformation = 9;
+  const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+  const uint JOB_OBJECT_ALL_ACCESS = 0x001F001F;
+  [StructLayout(LayoutKind.Sequential)] struct IO_COUNTERS { public ulong a,b,c,d,e,f; }
+  [StructLayout(LayoutKind.Sequential)] struct BASIC_LIMIT {
+    public long perProcessUserTime, perJobUserTime;
+    public uint limitFlags;
+    public UIntPtr minimumWorkingSet, maximumWorkingSet;
+    public uint activeProcessLimit;
+    public UIntPtr affinity;
+    public uint priorityClass, schedulingClass;
+  }
+  [StructLayout(LayoutKind.Sequential)] struct EXTENDED_LIMIT { public BASIC_LIMIT basic; public IO_COUNTERS io; public UIntPtr processMemory, jobMemory, peakProcess, peakJob; }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr handle);
+  public static IntPtr CreateKillOnClose(string name) {
+    IntPtr job = CreateJobObject(IntPtr.Zero, name);
+    if (job == IntPtr.Zero) return IntPtr.Zero;
+    var info = new EXTENDED_LIMIT(); info.basic.limitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    int size = Marshal.SizeOf(info); IntPtr ptr = Marshal.AllocHGlobal(size);
+    try {
+      Marshal.StructureToPtr(info, ptr, false);
+      if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ptr, (uint)size)) { CloseHandle(job); return IntPtr.Zero; }
+      return job;
+    } finally { Marshal.FreeHGlobal(ptr); }
+  }
+  public static bool JoinCurrent(string name) {
+    IntPtr job = OpenJobObject(JOB_OBJECT_ALL_ACCESS, false, name);
+    if (job == IntPtr.Zero) return false;
+    try { return AssignProcessToJobObject(job, GetCurrentProcess()); }
+    finally { CloseHandle(job); }
+  }
+}`.trim()
+
 
 /**
  * Windows PowerShell's Start-Process joins -ArgumentList elements into one
@@ -380,19 +426,27 @@ export const ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER = WINDOWS_ARGUMENT_QUOTER_FU
  */
 export const ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND = [
   "$ErrorActionPreference = 'Stop'",
+  `Add-Type -TypeDefinition @'\n${ELEVATED_FORCE_RELEASE_JOB_NATIVE_SOURCE}\n'@`,
   `$helper = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper}')`,
+  `$bootstrap = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap}')`,
   `$request = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request}')`,
   `$response = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response}')`,
-  "if ([string]::IsNullOrWhiteSpace($helper) -or [string]::IsNullOrWhiteSpace($request) -or [string]::IsNullOrWhiteSpace($response)) { throw 'missing force-release launch env' }",
+  "if ([string]::IsNullOrWhiteSpace($bootstrap) -or [string]::IsNullOrWhiteSpace($helper) -or [string]::IsNullOrWhiteSpace($request) -or [string]::IsNullOrWhiteSpace($response)) { throw 'missing force-release launch env' }",
   "$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
   WINDOWS_ARGUMENT_QUOTER_FUNCTION,
-  "$argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(ConvertTo-WindowsArgument $helper),'-RequestPath',(ConvertTo-WindowsArgument $request),'-ResponsePath',(ConvertTo-WindowsArgument $response))",
-  '$p = Start-Process -FilePath $ps -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList $argList',
-  'if ($null -eq $p) { exit 1223 }',
-  'Write-Output ("HERMES_ELEVATED_PID=" + $p.Id)',
-  '[Console]::Out.Flush()',
-  '$p.WaitForExit()',
-  'exit $p.ExitCode'
+  `$jobName = 'Local\\HermesForceRelease-' + [guid]::NewGuid().ToString('N')`,
+  '$job = [HermesElevatedBoundaryJob]::CreateKillOnClose($jobName)',
+  "if ($job -eq [IntPtr]::Zero) { throw 'elevated boundary job create failed' }",
+  'try {',
+  "  $argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(ConvertTo-WindowsArgument $bootstrap),'-JobName',(ConvertTo-WindowsArgument $jobName),'-HelperPath',(ConvertTo-WindowsArgument $helper),'-RequestPath',(ConvertTo-WindowsArgument $request),'-ResponsePath',(ConvertTo-WindowsArgument $response))",
+  '  $p = Start-Process -FilePath $ps -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList $argList',
+  '  if ($null -eq $p) { exit 1223 }',
+  '  Write-Output ("HERMES_ELEVATED_PID=" + $p.Id)',
+  '  Write-Output ("HERMES_ELEVATED_CREATED_AT=" + ([DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() / 1000.0).ToString("R", [Globalization.CultureInfo]::InvariantCulture))',
+  '  [Console]::Out.Flush()',
+  '  $p.WaitForExit()',
+  '  exit $p.ExitCode',
+  '} finally { if ($job -ne [IntPtr]::Zero) { [HermesElevatedBoundaryJob]::CloseHandle($job) | Out-Null } }'
 ].join('; ')
 
 export type ElevatedForceReleaseRun = (
@@ -408,10 +462,12 @@ export type ElevatedForceReleaseRun = (
  */
 export async function launchElevatedForceReleaseHelper(input: {
   helperScriptPath: string
+  bootstrapScriptPath?: string
   requestPath: string
   responsePath: string
   platform?: NodeJS.Platform
   run?: ElevatedForceReleaseRun
+  confirmIdentityAbsent?: (identity: { pid: number; createdAt: number }) => Promise<boolean>
 }): Promise<
   | { kind: 'launched'; responseTempPath?: string }
   | { kind: 'cancelled'; responseTempPath?: string }
@@ -448,18 +504,37 @@ export async function launchElevatedForceReleaseHelper(input: {
       }))
 
   const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const bootstrapScriptPath =
+    input.bootstrapScriptPath ?? path.join(path.dirname(input.helperScriptPath), 'windows-force-release-bootstrap.ps1')
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
     [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request]: input.requestPath,
-    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath,
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap]: bootstrapScriptPath
   }
 
   const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND]
   const result = await run(ps, args, { env })
-  const helperPid = String(result.stdout ?? '').match(/HERMES_ELEVATED_PID=(\d+)/i)?.[1]
-  const responseTempPath = helperPid ? `${input.responsePath}.${helperPid}.tmp` : undefined
+  const helperPidToken = String(result.stdout ?? '').match(/HERMES_ELEVATED_PID=(\d+)/i)?.[1]
+  const helperCreatedToken = String(result.stdout ?? '').match(/HERMES_ELEVATED_CREATED_AT=([0-9]+(?:\.[0-9]+)?)/i)?.[1]
+  const helperPid = Number(helperPidToken)
+  const helperCreatedAt = Number(helperCreatedToken)
+  const responseTempPath = helperPidToken ? `${input.responsePath}.${helperPidToken}.tmp` : undefined
   if (result.code === 1223) return { kind: 'cancelled', responseTempPath }
+  if (helperPidToken) {
+    if (!Number.isInteger(helperPid) || helperPid <= 0 || !Number.isFinite(helperCreatedAt) || helperCreatedAt <= 0) {
+      return { kind: 'failed', detail: 'elevated helper identity missing', responseTempPath }
+    }
+    const confirmIdentityAbsent =
+      input.confirmIdentityAbsent ??
+      (async identity => (await identitiesStillPresent([identity])).length === 0)
+    if (!(await confirmIdentityAbsent({ pid: helperPid, createdAt: helperCreatedAt }))) {
+      return { kind: 'failed', detail: 'elevated helper survived terminal boundary', responseTempPath }
+    }
+  } else if (result.code === 0) {
+    return { kind: 'failed', detail: 'elevated helper identity missing', responseTempPath }
+  }
   if (result.code === 0) return { kind: 'launched', responseTempPath }
   return { kind: 'failed', detail: `elevated helper exit ${result.code}`, responseTempPath }
 }
@@ -467,16 +542,20 @@ export async function launchElevatedForceReleaseHelper(input: {
 /** Pure helper for tests: capture argv + env without launching. */
 export function buildElevatedForceReleaseLaunchInvocation(input: {
   helperScriptPath: string
+  bootstrapScriptPath?: string
   requestPath: string
   responsePath: string
 }): { args: string[]; env: Record<string, string>; command: string } {
+  const bootstrapScriptPath =
+    input.bootstrapScriptPath ?? path.join(path.dirname(input.helperScriptPath), 'windows-force-release-bootstrap.ps1')
   return {
     command: ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND,
     args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND],
     env: {
       [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
       [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request]: input.requestPath,
-      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath,
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap]: bootstrapScriptPath
     }
   }
 }
