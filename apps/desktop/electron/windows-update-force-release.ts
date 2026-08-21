@@ -31,15 +31,19 @@ export type ForceReleaseTerminateResult =
   | { kind: 'create-time-mismatch' }
   | { kind: 'access-denied'; win32Error: number }
   | { kind: 'protected'; win32Error: number }
-  | { kind: 'failed'; detail: string }
+  | { kind: 'failed'; detail: string; win32Error?: number }
 
 export type WindowsUpdateForceReleaseDeps = {
   now?: () => number
   wait?: (delayMs: number) => Promise<void>
   isResourceLocked: () => Promise<boolean>
-  listScannerHolders: () => Promise<ForceReleaseHolder[]>
-  listRestartManagerHolders: () => Promise<ForceReleaseHolder[]>
-  terminateHolder: (holder: ForceReleaseHolder) => Promise<ForceReleaseTerminateResult>
+  /**
+   * Discover scanner holders. `budgetMs` is the hard remaining wall-clock
+   * budget; implementations must honor it (or the orchestrator races them).
+   */
+  listScannerHolders: (budgetMs: number) => Promise<ForceReleaseHolder[]>
+  listRestartManagerHolders: (budgetMs: number) => Promise<ForceReleaseHolder[]>
+  terminateHolder: (holder: ForceReleaseHolder, budgetMs: number) => Promise<ForceReleaseTerminateResult>
   excludePids?: ReadonlySet<number>
   /** Non-elevated budget. Spec: five seconds or less. */
   deadlineMs?: number
@@ -186,6 +190,48 @@ function blockedMessage(holders: readonly ForceReleaseHolder[], detail: string):
   )
 }
 
+/**
+ * Race a dependency against the remaining wall-clock budget. Hung/slow
+ * scanners, RM queries, or terminations must not exceed the five-second path.
+ *
+ * Uses a real timer (not deps.wait) so fake-clock unit tests that complete
+ * work synchronously are not charged the full budget by the hang guard.
+ */
+export function raceWithBudget<T>(
+  work: Promise<T>,
+  budgetMs: number,
+  onTimeout: () => T
+): Promise<T> {
+  const budget = Math.trunc(budgetMs)
+  if (budget <= 0) {
+    return Promise.resolve(onTimeout())
+  }
+
+  let settled = false
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      resolve(onTimeout())
+    }, budget)
+
+    void work.then(
+      value => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(value)
+      },
+      error => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+}
+
 export async function runWindowsUpdateForceRelease(
   deps: WindowsUpdateForceReleaseDeps
 ): Promise<WindowsUpdateForceReleaseOutcome> {
@@ -196,6 +242,7 @@ export async function runWindowsUpdateForceRelease(
   const excludePids = deps.excludePids ?? new Set<number>()
   const started = now()
   const deadline = started + deadlineMs
+  const remaining = () => Math.max(0, deadline - now())
 
   if (!(await deps.isResourceLocked())) {
     return { kind: 'clear' }
@@ -206,20 +253,39 @@ export async function runWindowsUpdateForceRelease(
   let mismatchHolders: ForceReleaseHolder[] = []
   let lastHolders: ForceReleaseHolder[] = []
 
-  while (now() < deadline) {
+  while (remaining() > 0) {
     if (!(await deps.isResourceLocked())) {
       return { kind: 'clear' }
     }
 
     const passStarted = now()
-    const scanned = await deps.listScannerHolders()
-    const fromRm = await deps.listRestartManagerHolders()
+    const scanBudget = remaining()
+    if (scanBudget <= 0) break
+
+    const scanned = await raceWithBudget(
+      deps.listScannerHolders(scanBudget),
+      scanBudget,
+      () => [] as ForceReleaseHolder[]
+    )
+    if (remaining() <= 0) break
+
+    const rmBudget = remaining()
+    const fromRm = await raceWithBudget(
+      deps.listRestartManagerHolders(rmBudget),
+      rmBudget,
+      () => [] as ForceReleaseHolder[]
+    )
+    if (remaining() <= 0) {
+      lastHolders = orderHoldersLeafFirst(mergeInstallHolders([...scanned, ...fromRm], excludePids))
+      break
+    }
+
     const holders = orderHoldersLeafFirst(mergeInstallHolders([...scanned, ...fromRm], excludePids))
     lastHolders = holders
 
     if (holders.length === 0) {
       // Locked with no enumerable holders: fail closed rather than mutate.
-      const pause = Math.min(settleMs || 50, Math.max(0, deadline - now()))
+      const pause = Math.min(settleMs || 50, remaining())
       if (pause > 0) {
         await sleep(pause)
       }
@@ -234,11 +300,16 @@ export async function runWindowsUpdateForceRelease(
     mismatchHolders = []
 
     for (const target of holders) {
-      if (now() >= deadline) {
+      const budget = remaining()
+      if (budget <= 0) {
         break
       }
 
-      const result = await deps.terminateHolder(target)
+      const result = await raceWithBudget(
+        deps.terminateHolder(target, budget),
+        budget,
+        () => ({ kind: 'failed', detail: 'deadline-exhausted' }) as ForceReleaseTerminateResult
+      )
 
       switch (result.kind) {
         case 'terminated':
@@ -259,7 +330,7 @@ export async function runWindowsUpdateForceRelease(
       }
     }
 
-    const settle = Math.min(Math.max(settleMs, 1), Math.max(0, deadline - now()))
+    const settle = Math.min(Math.max(settleMs, 1), remaining())
     if (settle > 0) {
       await sleep(settle)
     }
