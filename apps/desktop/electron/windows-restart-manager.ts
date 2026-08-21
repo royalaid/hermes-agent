@@ -20,6 +20,7 @@ export type RunPowerShell = (
 
 function powershellExecutable(): string {
   const windowsRoot = process.env.SystemRoot || 'C:\\Windows'
+
   return path.join(windowsRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 }
 
@@ -28,12 +29,14 @@ async function defaultRunPowerShell(
   timeoutMs = 4_000
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   const budget = Math.max(1, Math.trunc(timeoutMs))
+
   try {
     const { stdout, stderr } = await execFileAsync(
       powershellExecutable(),
       ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
       { encoding: 'utf8', timeout: budget, windowsHide: true, maxBuffer: 2 * 1024 * 1024 }
     )
+
     return { stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code: 0 }
   } catch (error: any) {
     return {
@@ -57,6 +60,7 @@ export const RESTART_MANAGER_ROW_SPLIT_EXPRESSION = "$part.Split([char]'|', 4)"
 
 export function buildRestartManagerScript(resources: readonly string[]): string {
   const list = resources.map(escapePsSingleQuoted).join(',')
+
   return `
 $ErrorActionPreference = 'Stop'
 $resources = @(${list})
@@ -151,9 +155,11 @@ export function parseRestartManagerOutput(
   resources: readonly string[]
 ): ForceReleaseHolder[] {
   const text = String(stdout || '').trim()
-  if (!text || text === '[]') return []
+
+  if (!text || text === '[]') {return []}
 
   let parsed: any
+
   try {
     parsed = JSON.parse(text)
   } catch {
@@ -168,12 +174,15 @@ export function parseRestartManagerOutput(
     const pid = Number(row?.pid)
     const createdAt = Number(row?.createdAt)
     const name = typeof row?.name === 'string' && row.name ? row.name : 'unknown'
+
     const resource =
       typeof row?.resource === 'string' && row.resource
         ? row.resource
         : fallbackResource
-    if (!Number.isInteger(pid) || pid <= 0) continue
-    if (!Number.isFinite(createdAt) || createdAt <= 0) continue
+
+    if (!Number.isInteger(pid) || pid <= 0) {continue}
+
+    if (!Number.isFinite(createdAt) || createdAt <= 0) {continue}
     holders.push({
       pid,
       createdAt,
@@ -205,10 +214,12 @@ export async function listRestartManagerHoldersForResources(
   }
 
   const existing = resources.filter(Boolean)
-  if (existing.length === 0) return []
+
+  if (existing.length === 0) {return []}
 
   const budget = Math.max(1, Math.trunc(timeoutMs))
   const script = buildRestartManagerScript(existing)
   const result = await run(script, budget)
+
   return parseRestartManagerOutput(result.stdout, existing)
 }

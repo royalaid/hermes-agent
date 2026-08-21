@@ -6,14 +6,14 @@
  * Never accepts arbitrary command text.
  */
 
-import { createHash, randomBytes } from 'node:crypto'
 import { execFile } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import type { ForceReleaseHolder } from './windows-update-force-release'
 import { identitiesStillPresent } from './windows-process-terminate'
+import type { ForceReleaseHolder } from './windows-update-force-release'
 
 export const FORCE_RELEASE_REQUEST_SCHEMA = 1 as const
 
@@ -64,9 +64,12 @@ export function hashInstallRoot(installRoot: string): string {
  * matches .NET `double.ToString("R", InvariantCulture)`.
  */
 export function canonicalNumericToken(value: number): string {
-  if (!Number.isFinite(value)) return '0'
-  if (Object.is(value, -0)) return '0'
-  if (Number.isInteger(value)) return String(value)
+  if (!Number.isFinite(value)) {return '0'}
+
+  if (Object.is(value, -0)) {return '0'}
+
+  if (Number.isInteger(value)) {return String(value)}
+
   return String(value)
 }
 
@@ -86,11 +89,13 @@ export function canonicalForceReleasePayload(input: {
         `${holder.pid}\t${canonicalNumericToken(holder.createdAt)}\t${holder.name}\t${holder.resource ?? ''}`
     )
     .join('\n')
+
   const excludeLine = (input.excludePids ?? [])
     .filter(pid => Number.isInteger(pid) && pid > 0)
     .slice()
     .sort((a, b) => a - b)
     .join(',')
+
   return [
     String(input.schemaVersion),
     input.nonce,
@@ -116,15 +121,18 @@ export function buildForceReleaseRequest(input: {
   const ttlMs = input.ttlMs ?? 120_000
   const nonce = input.nonce ?? randomBytes(16).toString('hex')
   const installRoot = path.resolve(input.installRoot)
+
   const holders = input.holders.map(holder => ({
     pid: holder.pid,
     createdAt: holder.createdAt,
     name: holder.name,
     ...(holder.resource ? { resource: holder.resource } : {})
   }))
+
   const excludePids = Array.from(
     new Set((input.excludePids ?? []).filter(pid => Number.isInteger(pid) && pid > 0))
   ).sort((a, b) => a - b)
+
   const body = {
     schemaVersion: FORCE_RELEASE_REQUEST_SCHEMA,
     nonce,
@@ -135,6 +143,7 @@ export function buildForceReleaseRequest(input: {
     holders,
     ...(excludePids.length > 0 ? { excludePids } : {})
   }
+
   const requestMac = createHash('sha256')
     .update(input.secret)
     .update('\n')
@@ -153,38 +162,49 @@ export function verifyForceReleaseRequest(
   if (request.schemaVersion !== FORCE_RELEASE_REQUEST_SCHEMA) {
     return { ok: false, reason: 'schema' }
   }
+
   if (!request.nonce || typeof request.nonce !== 'string') {
     return { ok: false, reason: 'nonce' }
   }
+
   if (now > request.expiresAt) {
     return { ok: false, reason: 'expired' }
   }
+
   if (path.resolve(request.installRoot) !== path.resolve(expectedInstallRoot)) {
     return { ok: false, reason: 'install-root-mismatch' }
   }
+
   if (request.installRootHash !== hashInstallRoot(expectedInstallRoot)) {
     return { ok: false, reason: 'install-root-hash-mismatch' }
   }
+
   const { requestMac, ...body } = request
+
   const expectedMac = createHash('sha256')
     .update(secret)
     .update('\n')
     .update(canonicalForceReleasePayload(body))
     .digest('hex')
+
   if (requestMac !== expectedMac) {
     return { ok: false, reason: 'mac-mismatch' }
   }
+
   if (!Array.isArray(request.holders) || request.holders.length === 0) {
     return { ok: false, reason: 'holders' }
   }
+
   for (const holder of request.holders) {
     if (!Number.isInteger(holder.pid) || holder.pid <= 0) {
       return { ok: false, reason: 'holder-pid' }
     }
+
     if (!Number.isFinite(holder.createdAt) || holder.createdAt <= 0) {
       return { ok: false, reason: 'holder-created-at' }
     }
   }
+
   return { ok: true }
 }
 
@@ -220,13 +240,16 @@ export async function writeForceReleaseRequestFiles(input: {
   const ownedDirectory = input.directory == null
   const directory = input.directory ?? fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-release-'))
   const secret = randomBytes(32).toString('hex')
+
   const request = buildForceReleaseRequest({
     installRoot: input.installRoot,
     holders: input.holders,
     secret,
     excludePids: input.excludePids
   })
+
   const paths = forceReleasePaths(directory, request.nonce)
+
   try {
     fs.writeFileSync(paths.secretPath, secret, { encoding: 'utf8', mode: 0o600 })
     fs.writeFileSync(paths.requestPath, JSON.stringify(request, null, 2), { encoding: 'utf8', mode: 0o600 })
@@ -242,6 +265,7 @@ export async function writeForceReleaseRequestFiles(input: {
     })
     throw error
   }
+
   return {
     directory,
     request,
@@ -267,7 +291,8 @@ export function cleanupForceReleaseArtifacts(files: {
   ownedDirectory?: boolean
 }): void {
   for (const filePath of [files.requestPath, files.secretPath, files.responsePath, files.responseTempPath]) {
-    if (!filePath) continue
+    if (!filePath) {continue}
+
     try {
       fs.rmSync(filePath, { force: true })
     } catch {
@@ -278,6 +303,7 @@ export function cleanupForceReleaseArtifacts(files: {
   if (files.ownedDirectory && files.directory) {
     try {
       const remaining = fs.readdirSync(files.directory)
+
       if (remaining.length === 0) {
         fs.rmdirSync(files.directory)
       }
@@ -290,9 +316,13 @@ export function cleanupForceReleaseArtifacts(files: {
 export function parseForceReleaseResponse(raw: string, expectedNonce: string): ForceReleaseResponse | null {
   try {
     const parsed = JSON.parse(raw)
-    if (parsed?.schemaVersion !== FORCE_RELEASE_REQUEST_SCHEMA) return null
-    if (parsed?.nonce !== expectedNonce) return null
-    if (typeof parsed.ok !== 'boolean' || typeof parsed.cleared !== 'boolean') return null
+
+    if (parsed?.schemaVersion !== FORCE_RELEASE_REQUEST_SCHEMA) {return null}
+
+    if (parsed?.nonce !== expectedNonce) {return null}
+
+    if (typeof parsed.ok !== 'boolean' || typeof parsed.cleared !== 'boolean') {return null}
+
     return parsed as ForceReleaseResponse
   } catch {
     return null
@@ -304,16 +334,19 @@ export function formatElevatedForceReleaseFailure(response: ForceReleaseResponse
   protectedHolders: boolean
 } {
   const survivors = Array.isArray(response?.survivors) ? response!.survivors! : []
+
   const survivorText = survivors
     .slice(0, 8)
     .map(entry => {
       const resource = entry.resource ? ` resource=${entry.resource}` : ''
+
       const win32 =
         typeof entry.win32Error === 'number'
           ? ` win32=${entry.win32Error}`
           : /win32=(\d+)/i.test(entry.detail || '')
             ? ''
             : ''
+
       return `PID ${entry.pid}${resource} ${entry.detail || 'survived'}${win32}`.trim()
     })
     .join('; ')
@@ -526,6 +559,7 @@ export async function launchElevatedForceReleaseHelper(input: {
   | { kind: 'failed'; detail: string; responseTempPath?: string }
 > {
   const platform = input.platform ?? process.platform
+
   if (platform !== 'win32') {
     return { kind: 'failed', detail: 'windows-only' }
   }
@@ -545,17 +579,21 @@ export async function launchElevatedForceReleaseHelper(input: {
           },
           (error: any, stdout: string) => {
             const code = typeof error?.code === 'number' ? error.code : error ? 1 : 0
+
             // 1223 = ERROR_CANCELLED (UAC denied)
             if (code === 1223 || /canceled|cancelled/i.test(String(error?.message ?? ''))) {
               resolve({ code: 1223, stdout: String(stdout ?? '') })
+
               return
             }
+
             resolve({ code, stdout: String(stdout ?? '') })
           }
         )
       }))
 
   const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
@@ -571,26 +609,34 @@ export async function launchElevatedForceReleaseHelper(input: {
   const helperPid = Number(helperPidToken)
   const helperCreatedAt = Number(helperCreatedToken)
   const responseTempPath = helperPidToken ? `${input.responsePath}.${helperPidToken}.tmp` : undefined
-  if (result.code === 1223) return { kind: 'cancelled', responseTempPath }
+
+  if (result.code === 1223) {return { kind: 'cancelled', responseTempPath }}
+
   if (helperPidToken) {
     if (!Number.isInteger(helperPid) || helperPid <= 0 || !Number.isFinite(helperCreatedAt) || helperCreatedAt <= 0) {
       return { kind: 'failed', detail: 'elevated helper identity missing', responseTempPath }
     }
+
     const confirmIdentityAbsent = input.confirmIdentityAbsent ?? (async identity => {
       const expiresAt = Date.now() + 5_000
+
       do {
-        if ((await identitiesStillPresent([identity])).length === 0) return true
+        if ((await identitiesStillPresent([identity])).length === 0) {return true}
         await new Promise(resolve => setTimeout(resolve, 25))
       } while (Date.now() < expiresAt)
+
       return false
     })
+
     if (!(await confirmIdentityAbsent({ pid: helperPid, createdAt: helperCreatedAt }))) {
       return { kind: 'failed', detail: 'elevated helper survived terminal boundary', responseTempPath }
     }
   } else if (result.code === 0) {
     return { kind: 'failed', detail: 'elevated helper identity missing', responseTempPath }
   }
-  if (result.code === 0) return { kind: 'launched', responseTempPath }
+
+  if (result.code === 0) {return { kind: 'launched', responseTempPath }}
+
   return { kind: 'failed', detail: `elevated helper exit ${result.code}`, responseTempPath }
 }
 
