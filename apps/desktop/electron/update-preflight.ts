@@ -52,12 +52,13 @@ export interface UpdateMutationPermit {
   readonly preflight: Extract<UpdatePreflightOutcome, { kind: 'clear' }>
 }
 
+const successfulPreflightPermits = new WeakMap<object, UpdateMutationPermit>()
 const updateMutationPermits = new WeakSet<object>()
 
 export function authorizeUpdateMutation(preflight: UpdatePreflightOutcome): UpdateMutationPermit | null {
-  if (preflight.kind !== 'clear') return null
-  const permit: UpdateMutationPermit = Object.freeze({ preflight })
-  updateMutationPermits.add(permit)
+  const permit = successfulPreflightPermits.get(preflight) ?? null
+  if (!permit) return null
+  successfulPreflightPermits.delete(preflight)
   return permit
 }
 
@@ -414,7 +415,14 @@ export async function runWindowsUpdatePreflight(
 
     returnLease = true
 
-    return { kind: 'clear', lease }
+    const outcome: Extract<UpdatePreflightOutcome, { kind: 'clear' }> = Object.freeze({
+      kind: 'clear',
+      lease: Object.freeze({ ...lease })
+    })
+    const permit: UpdateMutationPermit = Object.freeze({ preflight: outcome })
+    successfulPreflightPermits.set(outcome, permit)
+    updateMutationPermits.add(permit)
+    return outcome
   } catch (error) {
     const detail = `preflight transaction failed: ${errorText(error)}`
 
