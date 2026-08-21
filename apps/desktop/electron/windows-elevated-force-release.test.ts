@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fsNative from 'node:fs'
 import osNative from 'node:os'
 import path from 'node:path'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 import { describe, it, vi } from 'vitest'
@@ -212,8 +212,9 @@ describe('elevated UAC launch argv safety', () => {
       platform: 'win32',
       run: async (_command, args, options) => {
         captured = { args, env: options?.env }
-        return { code: 0 }
-      }
+        return { code: 0, stdout: 'HERMES_ELEVATED_PID=41111\nHERMES_ELEVATED_CREATED_AT=1700000000.5' }
+      },
+      confirmIdentityAbsent: async identity => identity.pid === 41111 && identity.createdAt === 1_700_000_000.5
     })
     assert.equal(result.kind, 'launched')
     assert.ok(captured)
@@ -304,7 +305,11 @@ describe('elevated UAC launch argv safety', () => {
         requestPath: 'C:\\request.json',
         responsePath,
         platform: 'win32',
-        run: async () => ({ code: 1, stdout: `HERMES_ELEVATED_PID=${helperPid}` })
+        run: async () => ({
+          code: 1,
+          stdout: `HERMES_ELEVATED_PID=${helperPid}\nHERMES_ELEVATED_CREATED_AT=1700000000.5`
+        }),
+        confirmIdentityAbsent: async () => true
       })
       assert.equal(launch.kind, 'failed')
       assert.equal(launch.responseTempPath, responseTempPath)
@@ -321,6 +326,128 @@ describe('elevated UAC launch argv safety', () => {
       fsNative.rmSync(directory, { recursive: true, force: true })
     }
   })
+
+  it('fails closed when the authenticated elevated identity survives launcher return', async () => {
+    const { launchElevatedForceReleaseHelper } = await import('./windows-elevated-force-release')
+    const result = await launchElevatedForceReleaseHelper({
+      helperScriptPath: 'C:\\helper.ps1',
+      requestPath: 'C:\\request.json',
+      responsePath: 'C:\\response.json',
+      platform: 'win32',
+      run: async () => ({
+        code: 1,
+        stdout: 'HERMES_ELEVATED_PID=41212\nHERMES_ELEVATED_CREATED_AT=1700000001.25'
+      }),
+      confirmIdentityAbsent: async identity => {
+        assert.deepEqual(identity, { pid: 41212, createdAt: 1_700_000_001.25 })
+        return false
+      }
+    })
+    assert.equal(result.kind, 'failed')
+    if (result.kind === 'failed') assert.equal(result.detail, 'elevated helper survived terminal boundary')
+  })
+
+  it(
+    'kills the job-assigned bootstrap before it can write after launcher death',
+    { timeout: 20_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+      const { ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND } = await import('./windows-elevated-force-release')
+      const temp = fsNative.mkdtempSync(path.join(osNative.tmpdir(), 'hermes-elevated-job-'))
+      const helper = path.join(temp, 'delayed-helper.ps1')
+      const bootstrap = path.resolve(
+        process.cwd(),
+        '..',
+        '..',
+        'scripts',
+        'desktop-update',
+        'windows-force-release-bootstrap.ps1'
+      )
+      const ready = path.join(temp, 'ready.txt')
+      const late = path.join(temp, 'late.txt')
+      fsNative.writeFileSync(
+        helper,
+        [
+          'param([string]$RequestPath,[string]$ResponsePath)',
+          '[IO.File]::WriteAllText($env:HERMES_JOB_READY, "ready")',
+          'Start-Sleep -Seconds 30',
+          '[IO.File]::WriteAllText($env:HERMES_JOB_LATE, "late")'
+        ].join('\n'),
+        'utf8'
+      )
+
+      const ps = path.join(
+        process.env.SystemRoot || 'C:\\Windows',
+        'System32',
+        'WindowsPowerShell',
+        'v1.0',
+        'powershell.exe'
+      )
+      const nonElevatedLauncher = ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND.replace(' -Verb RunAs', '')
+      const child = spawn(
+        ps,
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', nonElevatedLauncher],
+        {
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            HERMES_FORCE_RELEASE_HELPER: helper,
+            HERMES_FORCE_RELEASE_REQUEST: path.join(temp, 'request.json'),
+            HERMES_FORCE_RELEASE_RESPONSE: path.join(temp, 'response.json'),
+            HERMES_FORCE_RELEASE_BOOTSTRAP: bootstrap,
+            HERMES_JOB_READY: ready,
+            HERMES_JOB_LATE: late
+          }
+        }
+      )
+      let stdout = ''
+      let stderr = ''
+      child.stdout?.on('data', chunk => {
+        stdout += String(chunk)
+      })
+      child.stderr?.on('data', chunk => {
+        stderr += String(chunk)
+      })
+
+      try {
+        const readyDeadline = Date.now() + 10_000
+        while (!fsNative.existsSync(ready) && Date.now() < readyDeadline && child.exitCode == null) {
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        assert.equal(
+          fsNative.existsSync(ready),
+          true,
+          `bootstrap did not start code=${child.exitCode} stdout=${stdout} stderr=${stderr}`
+        )
+        const helperPid = Number(stdout.match(/HERMES_ELEVATED_PID=(\d+)/)?.[1])
+        assert.ok(Number.isInteger(helperPid) && helperPid > 0, `missing helper PID: ${stdout}`)
+
+        child.kill()
+        await new Promise<void>(resolve => {
+          if (child.exitCode != null) return resolve()
+          child.once('close', () => resolve())
+        })
+        const absenceDeadline = Date.now() + 5_000
+        let alive = true
+        while (Date.now() < absenceDeadline) {
+          try {
+            process.kill(helperPid, 0)
+          } catch {
+            alive = false
+            break
+          }
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        assert.equal(alive, false, `job-assigned helper ${helperPid} survived launcher death`)
+        await new Promise(resolve => setTimeout(resolve, 250))
+        assert.equal(fsNative.existsSync(late), false, 'helper performed a delayed write after launcher death')
+      } finally {
+        if (child.exitCode == null) child.kill()
+        fsNative.rmSync(temp, { recursive: true, force: true })
+      }
+    }
+  )
 
 })
 

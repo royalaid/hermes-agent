@@ -203,6 +203,39 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     }
   })
 
+  it('never advances toward updater mutation while a verified holder survives force-release', async () => {
+    const survivor = {
+      pid: 902,
+      createdAt: 2,
+      name: 'python.exe',
+      cmdline: 'python.exe -m hermes_cli',
+      source: 'scanner' as const,
+      resource: 'C:\\Hermes\\venv\\Scripts\\hermes.exe'
+    }
+    const { calls, deps } = makeDeps([], {
+      releaseTrackedBackendTrees: async () => {
+        calls.push('release')
+        return { unlocked: false }
+      },
+      forceReleaseInstallHolders: async () => {
+        calls.push('force-release')
+        return {
+          kind: 'timeout',
+          holders: [survivor],
+          message: 'verified holder survived the deadline'
+        }
+      }
+    })
+
+    const outcome = await runWindowsUpdatePreflight(purpose, deps)
+
+    assert.equal(outcome.kind, 'blocked')
+    assert.deepEqual(calls, ['release', 'force-release'])
+    assert.ok(!calls.includes('scan'), 'scanner continuation would permit the updater handoff to progress')
+    assert.ok(!calls.includes('lease'), 'no mutation-prevention lease starts while an authenticated holder survives')
+    assert.ok(!calls.some(call => call.startsWith('terminate-holder:')))
+  })
+
   it('does not coerce a malformed unlock result into permission to scan', async () => {
     const { calls, deps } = makeDeps([], {
       releaseTrackedBackendTrees: (async () => {

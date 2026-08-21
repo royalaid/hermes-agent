@@ -567,6 +567,55 @@ describe('runWindowsUpdateForceRelease', () => {
     assert.ok(elapsed >= 300, `elapsed ${elapsed}ms should wait roughly the budget`)
   })
 
+  it('bounds an uncooperative termination promise at the outer absolute deadline', async () => {
+    const target = holder({ pid: 71, createdAt: 72 })
+    let aborted = false
+    let settled = false
+    const started = Date.now()
+    const outcome = await runWindowsUpdateForceRelease({
+      deadlineMs: 80,
+      settleMs: 0,
+      isResourceLocked: async () => true,
+      listScannerHolders: async () => [target],
+      listRestartManagerHolders: async () => [],
+      terminateHolder: async (_holder, _budget, signal) => {
+        signal?.addEventListener('abort', () => {
+          aborted = true
+        })
+        await new Promise(resolve => setTimeout(resolve, 250))
+        settled = true
+        return { kind: 'terminated' }
+      }
+    })
+
+    const elapsed = Date.now() - started
+    assert.equal(outcome.kind, 'timeout')
+    assert.equal(aborted, true)
+    assert.equal(settled, false, 'outer API did not wait for a contract-violating late settlement')
+    assert.ok(elapsed < 180, `elapsed ${elapsed}ms exceeded the 80ms absolute deadline envelope`)
+    await new Promise(resolve => setTimeout(resolve, 220))
+    assert.equal(settled, true, 'test dependency eventually settled without product mutation authority')
+  })
+
+  it('bounds a stalled lock probe at the same absolute deadline', async () => {
+    const started = Date.now()
+    const outcome = await runWindowsUpdateForceRelease({
+      deadlineMs: 80,
+      settleMs: 0,
+      isResourceLocked: async () => {
+        await new Promise(resolve => setTimeout(resolve, 250))
+        return false
+      },
+      listScannerHolders: async () => [],
+      listRestartManagerHolders: async () => [],
+      terminateHolder: async () => ({ kind: 'terminated' })
+    })
+
+    const elapsed = Date.now() - started
+    assert.equal(outcome.kind, 'timeout')
+    assert.ok(elapsed < 180, `elapsed ${elapsed}ms exceeded the 80ms absolute deadline envelope`)
+  })
+
   it('passes remaining budget into terminateHolder', async () => {
     const budgets: number[] = []
     const target = holder({ pid: 3, createdAt: 4 })

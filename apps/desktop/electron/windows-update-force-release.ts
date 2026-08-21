@@ -352,8 +352,18 @@ export async function runWindowsUpdateForceRelease(
   const started = now()
   const deadline = started + deadlineMs
   const remaining = () => Math.max(0, deadline - now())
+  const resourceLockedWithinDeadline = async (): Promise<boolean> => {
+    const budget = remaining()
+    if (budget <= 0) return true
+    return await raceWithBudget(deps.isResourceLocked(), budget, () => true)
+  }
+  const waitWithinDeadline = async (delayMs: number): Promise<void> => {
+    const budget = Math.min(Math.max(0, delayMs), remaining())
+    if (budget <= 0) return
+    await raceWithBudget(sleep(budget), budget, () => undefined)
+  }
 
-  if (!(await deps.isResourceLocked())) {
+  if (!(await resourceLockedWithinDeadline())) {
     return { kind: 'clear' }
   }
 
@@ -363,7 +373,7 @@ export async function runWindowsUpdateForceRelease(
   let lastHolders: ForceReleaseHolder[] = []
 
   while (remaining() > 0) {
-    if (!(await deps.isResourceLocked())) {
+    if (!(await resourceLockedWithinDeadline())) {
       return { kind: 'clear' }
     }
 
@@ -396,9 +406,9 @@ export async function runWindowsUpdateForceRelease(
       // Locked with no enumerable holders: fail closed rather than mutate.
       const pause = Math.min(settleMs || 50, remaining())
       if (pause > 0) {
-        await sleep(pause)
+        await waitWithinDeadline(pause)
       }
-      if (!(await deps.isResourceLocked())) {
+      if (!(await resourceLockedWithinDeadline())) {
         return { kind: 'clear' }
       }
       break
@@ -414,20 +424,16 @@ export async function runWindowsUpdateForceRelease(
         break
       }
 
-      // Mutating termination owns the remaining budget. The controller is
-      // cancelled at the same absolute deadline that is passed to the native
-      // boundary; the boundary must return before this deadline or fail closed.
-      const terminateController = new AbortController()
-      const terminateTimer = setTimeout(
-        () => terminateController.abort(),
-        Math.max(1, Math.trunc(budget))
+      // The native boundary owns cancellation and terminal drainage. This outer
+      // race prevents a contract-violating dependency from stretching the API
+      // beyond the same absolute deadline; production termination handles the
+      // abort before this bounded drain completes.
+      const result = await raceWithBudget(
+        signal => deps.terminateHolder(target, budget, signal, deadline),
+        budget,
+        (): ForceReleaseTerminateResult => ({ kind: 'failed', detail: 'termination-deadline-exhausted' }),
+        { drainMs: Math.min(750, Math.max(1, Math.floor(budget * 0.2))) }
       )
-      let result: ForceReleaseTerminateResult
-      try {
-        result = await deps.terminateHolder(target, budget, terminateController.signal, deadline)
-      } finally {
-        clearTimeout(terminateTimer)
-      }
 
       switch (result.kind) {
         case 'terminated':
@@ -450,10 +456,10 @@ export async function runWindowsUpdateForceRelease(
 
     const settle = Math.min(Math.max(settleMs, 1), remaining())
     if (settle > 0) {
-      await sleep(settle)
+      await waitWithinDeadline(settle)
     }
 
-    if (!(await deps.isResourceLocked())) {
+    if (!(await resourceLockedWithinDeadline())) {
       return { kind: 'clear' }
     }
 
@@ -495,7 +501,7 @@ export async function runWindowsUpdateForceRelease(
     }
   }
 
-  if (!(await deps.isResourceLocked())) {
+  if (!(await resourceLockedWithinDeadline())) {
     return { kind: 'clear' }
   }
 
