@@ -57,7 +57,7 @@ describe('elevated force-release request contract', () => {
       installRootHash: 'abc',
       holders: [{ pid: 1, createdAt: 2, name: 'x', resource: 'y' }]
     })
-    assert.equal(payload, ['1', 'n', '1', '2', 'C:\\h', 'abc', '1\t2\tx\ty'].join('\n'))
+    assert.equal(payload, ['1', 'n', '1', '2', 'C:\\h', 'abc', '1\t2\tx\ty', ''].join('\n'))
   })
 
   it('keeps TS/PowerShell MAC numeric parity for fractional create times', async () => {
@@ -88,16 +88,8 @@ function Format-CanonicalNumber([double]$Value) {
 }
 $created = [double]1755738237.4531252
 $line = ("{0}\`t{1}\`t{2}\`t{3}" -f 1, (Format-CanonicalNumber $created), 'x', 'y')
-$canonical = @('1','n','10','20','C:\\h','abc',$line) -join "\`n"
-$expected = @'
-1
-n
-10
-20
-C:\\h
-abc
-1\t1755738237.4531252\tx\ty
-'@.Trim()
+$canonical = @('1','n','10','20','C:\\h','abc',$line,'') -join "\`n"
+$expected = (@('1','n','10','20','C:\\h','abc',("1\`t1755738237.4531252\`tx\`ty"),'') -join "\`n")
 if ($canonical -ne $expected) {
   Write-Output 'CANON_MISMATCH'
   Write-Output $canonical
@@ -162,7 +154,139 @@ describe('restart manager output parser', () => {
     assert.equal(holders[0]?.source, 'restart-manager')
     assert.equal(holders[0]?.pid, 12)
     assert.match(String(holders[0]?.resource), /hermes\.exe/)
-    assert.equal(RESTART_MANAGER_ROW_SPLIT_EXPRESSION, "$part.Split([char]'|', 3)")
-    assert.match(buildRestartManagerScript(['C:\\a']), /\$part\.Split\(\[char\]'\|', 3\)/)
+    assert.equal(RESTART_MANAGER_ROW_SPLIT_EXPRESSION, "$part.Split([char]'|', 4)")
+    assert.match(buildRestartManagerScript(['C:\\a']), /\$part\.Split\(\[char\]'\|', 4\)/)
+  })
+
+  it('preserves per-resource RM evidence instead of collapsing to resources[0]', () => {
+    const holders = parseRestartManagerOutput(
+      JSON.stringify([
+        { pid: 1, createdAt: 10, name: 'a', resource: 'C:\\h\\venv\\Scripts\\hermes.exe' },
+        { pid: 2, createdAt: 11, name: 'b', resource: 'C:\\h\\venv\\Scripts\\python.exe' }
+      ]),
+      ['C:\\h\\venv\\Scripts\\hermes.exe', 'C:\\h\\venv\\Scripts\\python.exe']
+    )
+    assert.equal(holders.length, 2)
+    assert.match(String(holders.find(h => h.pid === 1)?.resource), /hermes\.exe/)
+    assert.match(String(holders.find(h => h.pid === 2)?.resource), /python\.exe/)
+  })
+})
+
+describe('elevated UAC launch argv safety', () => {
+  it('keeps adversarial filesystem paths out of PowerShell source and only in env data', async () => {
+    const { buildElevatedForceReleaseLaunchInvocation, ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND, launchElevatedForceReleaseHelper } =
+      await import('./windows-elevated-force-release')
+
+    const adversarial = {
+      helperScriptPath: "C:\\Users\\gwmai\\AppData\\Local\\tmp\\evil$()`payload (1)\\u4e2d\\u6587'file.ps1".replace(
+        '\\u4e2d\\u6587',
+        '\u4e2d\u6587'
+      ),
+      requestPath: "C:\\tmp\\req $HOME $(Get-Process) path.json",
+      responsePath: "C:\\tmp\\resp backtick` and 'quotes'.json"
+    }
+
+    const invocation = buildElevatedForceReleaseLaunchInvocation(adversarial)
+    const commandText = invocation.command
+    assert.equal(commandText, ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND)
+    assert.doesNotMatch(commandText, /evil/)
+    assert.doesNotMatch(commandText, /Get-Process/)
+    assert.doesNotMatch(commandText, /JSON\.stringify/)
+    for (const value of Object.values(adversarial)) {
+      assert.ok(!commandText.includes(value), 'path must not appear in constant launcher source')
+    }
+    assert.equal(invocation.env.HERMES_FORCE_RELEASE_HELPER, adversarial.helperScriptPath)
+    assert.equal(invocation.env.HERMES_FORCE_RELEASE_REQUEST, adversarial.requestPath)
+    assert.equal(invocation.env.HERMES_FORCE_RELEASE_RESPONSE, adversarial.responsePath)
+
+    let captured: { args: string[]; env?: NodeJS.ProcessEnv } | null = null
+    const result = await launchElevatedForceReleaseHelper({
+      ...adversarial,
+      platform: 'win32',
+      run: async (_command, args, options) => {
+        captured = { args, env: options?.env }
+        return { code: 0 }
+      }
+    })
+    assert.equal(result.kind, 'launched')
+    assert.ok(captured)
+    assert.deepEqual(captured!.args.slice(0, 4), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command'])
+    assert.equal(captured!.args[4], ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND)
+    for (const value of Object.values(adversarial)) {
+      assert.ok(!captured!.args.some(arg => arg.includes(value)), 'adversarial path must not appear in outer argv source text')
+    }
+    assert.equal(captured!.env?.HERMES_FORCE_RELEASE_HELPER, adversarial.helperScriptPath)
+    assert.equal(captured!.env?.HERMES_FORCE_RELEASE_REQUEST, adversarial.requestPath)
+    assert.equal(captured!.env?.HERMES_FORCE_RELEASE_RESPONSE, adversarial.responsePath)
+  })
+})
+
+describe('force-release artifact cleanup', () => {
+  it('removes only owned request/secret/response files and leaves unrelated sentinels', async () => {
+    const fs = await import('node:fs')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const {
+      cleanupForceReleaseArtifacts,
+      forceReleasePaths,
+      writeForceReleaseRequestFiles
+    } = await import('./windows-elevated-force-release')
+
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-cleanup-'))
+    const written = await writeForceReleaseRequestFiles({
+      installRoot: 'C:\\h',
+      holders: [{ pid: 1, createdAt: 2, name: 'x', cmdline: 'x', source: 'scanner' }],
+      directory
+    })
+    assert.equal(written.ownedDirectory, false)
+    const sentinel = path.join(directory, 'unrelated-sentinel.txt')
+    fs.writeFileSync(sentinel, 'keep-me', 'utf8')
+
+    cleanupForceReleaseArtifacts({
+      directory: written.directory,
+      requestPath: written.requestPath,
+      secretPath: written.secretPath,
+      responsePath: written.responsePath,
+      ownedDirectory: true
+    })
+
+    assert.equal(fs.existsSync(written.requestPath), false)
+    assert.equal(fs.existsSync(written.secretPath), false)
+    assert.equal(fs.existsSync(written.responsePath), false)
+    assert.equal(fs.existsSync(sentinel), true)
+    assert.equal(fs.existsSync(directory), true)
+    fs.rmSync(directory, { recursive: true, force: true })
+  })
+
+  it('removes an empty owned directory non-recursively after artifact cleanup', async () => {
+    const fs = await import('node:fs')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const { cleanupForceReleaseArtifacts, writeForceReleaseRequestFiles } = await import(
+      './windows-elevated-force-release'
+    )
+
+    const written = await writeForceReleaseRequestFiles({
+      installRoot: 'C:\\h',
+      holders: [{ pid: 1, createdAt: 2, name: 'x', cmdline: 'x', source: 'scanner' }]
+    })
+    assert.equal(written.ownedDirectory, true)
+    cleanupForceReleaseArtifacts(written)
+    assert.equal(fs.existsSync(written.requestPath), false)
+    assert.equal(fs.existsSync(written.secretPath), false)
+    assert.equal(fs.existsSync(written.directory), false)
+  })
+})
+
+describe('elevated helper script shape', () => {
+  it('does not broad path-scan installRoot and consumes signed excludePids', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const helperPath = path.resolve(__dirname, '../../../scripts/desktop-update/windows-force-release.ps1')
+    const text = fs.readFileSync(helperPath, 'utf8')
+    assert.match(text, /excludePids/)
+    assert.doesNotMatch(text, /Get-CimInstance Win32_Process \| ForEach-Object/)
+    assert.match(text, /never terminate unauthenticated|Fail-closed: never terminate unauthenticated/i)
+    assert.match(text, /claim-revalidate|claims\.ContainsKey/)
   })
 })

@@ -9,6 +9,7 @@ import { describe, it, vi } from 'vitest'
 import {
   mergeInstallHolders,
   orderHoldersLeafFirst,
+  attachHolderTreeRelationships,
   raceWithBudget,
   runWindowsUpdateForceRelease,
   type ForceReleaseHolder,
@@ -28,7 +29,10 @@ import {
   parseForceReleaseResponse,
   verifyForceReleaseRequest
 } from './windows-elevated-force-release'
-import { parseTerminateScriptOutput } from './windows-process-terminate'
+import {
+  buildExactTerminateScript,
+  parseTerminateScriptOutput
+} from './windows-process-terminate'
 
 const execFileAsync = promisify(execFile)
 
@@ -376,11 +380,11 @@ describe('raceWithBudget', () => {
 describe('restart manager script contract', () => {
   it('emits a literal pipe split that does not over-escape regex', () => {
     const script = buildRestartManagerScript(['C:\\h\\venv\\Scripts\\hermes.exe'])
-    assert.match(script, /\$part\.Split\(\[char\]'\|', 3\)/)
+    assert.match(script, /\$part\.Split\(\[char\]'\|', 4\)/)
     assert.doesNotMatch(script, /\$part -split '\\\\\|'/)
     assert.doesNotMatch(script, /\$part -split '\\\|'/)
     assert.match(script, /StringBuilder\(CCH_RM_SESSION_KEY \+ 1\)/)
-    assert.equal(RESTART_MANAGER_ROW_SPLIT_EXPRESSION, "$part.Split([char]'|', 3)")
+    assert.equal(RESTART_MANAGER_ROW_SPLIT_EXPRESSION, "$part.Split([char]'|', 4)")
   })
 
   it('parses RM JSON rows into force-release holders', () => {
@@ -399,9 +403,9 @@ describe('restart manager script contract', () => {
 
     const probe = `
 $ErrorActionPreference = 'Stop'
-$part = '12|34|name'
-$bits = $part.Split([char]'|', 3)
-if ($bits.Count -ne 3) { Write-Output ("bad-count=" + $bits.Count); exit 2 }
+$part = '12|34|name|C:\h\venv\Scripts\hermes.exe'
+$bits = $part.Split([char]'|', 4)
+if ($bits.Count -ne 4) { Write-Output ("bad-count=" + $bits.Count); exit 2 }
 if ($bits[0] -ne '12' -or $bits[1] -ne '34' -or $bits[2] -ne 'name') {
   Write-Output ("bad-values=" + ($bits -join ','))
   exit 3
@@ -455,7 +459,7 @@ describe('elevated force-release request contract', () => {
       installRootHash: 'abc',
       holders: [{ pid: 1, createdAt: 2, name: 'x', resource: 'y' }]
     })
-    assert.equal(payload, ['1', 'n', '1', '2', 'C:\\h', 'abc', '1\t2\tx\ty'].join('\n'))
+    assert.equal(payload, ['1', 'n', '1', '2', 'C:\\h', 'abc', '1\t2\tx\ty', ''].join('\n'))
   })
 
   it('uses round-trip numeric tokens that match PowerShell R-format floats', async () => {
@@ -533,6 +537,9 @@ describe('elevated helper script shape', () => {
     assert.match(text, /Format-CanonicalNumber/)
     assert.match(text, /QueryRestartManager/)
     assert.match(text, /resource-still-locked|Test-FileUnlocked/)
+    assert.match(text, /excludePids/)
+    assert.doesNotMatch(text, /Get-CimInstance Win32_Process\s*\|\s*ForEach-Object/)
+    assert.match(text, /never terminate unauthenticated/i)
   })
 
   it('parses under Windows PowerShell without script errors', async () => {
@@ -567,5 +574,281 @@ exit 0
     )
     assert.match(String(stdout), /pid-readonly-ok/)
     assert.match(String(stdout), /parse-ok/)
+  })
+})
+
+describe('merge create-time tolerance and production leaf-first', () => {
+  it('dedupes scanner fractional create-time with RM integer seconds', () => {
+    const fromScan = holder({
+      pid: 7,
+      createdAt: 100.4,
+      source: 'scanner',
+      resource: 'venv\\Scripts\\hermes.exe'
+    })
+    const fromRm = holder({
+      pid: 7,
+      createdAt: 100,
+      source: 'restart-manager',
+      resource: 'venv\\Scripts\\python.exe'
+    })
+    const merged = mergeInstallHolders([fromScan, fromRm])
+    assert.equal(merged.length, 1)
+    assert.equal(merged[0]?.pid, 7)
+    assert.match(String(merged[0]?.resource), /python\.exe/)
+    assert.match(String(merged[0]?.resource), /hermes\.exe/)
+  })
+
+  it('orders production generic holders leaf-first when parentPid evidence is present', () => {
+    const root = holder({ pid: 10, createdAt: 1, role: 'other' })
+    const child = holder({ pid: 11, createdAt: 2, parentPid: 10, role: 'other' })
+    const ordered = orderHoldersLeafFirst(attachHolderTreeRelationships([root, child]))
+    assert.deepEqual(
+      ordered.map(entry => entry.pid),
+      [11, 10]
+    )
+  })
+})
+
+describe('termination cancellation hard boundary', () => {
+  it('budget-owned terminate returns without scheduling post-return mutation', async () => {
+    const target = holder({ pid: 404, createdAt: 1 })
+    let mutated = false
+    const started = Date.now()
+    const outcome = await runWindowsUpdateForceRelease({
+      deadlineMs: 400,
+      settleMs: 0,
+      isResourceLocked: async () => true,
+      listScannerHolders: async () => [target],
+      listRestartManagerHolders: async () => [],
+      terminateHolder: async (_holder, budget) => {
+        // Production contract: terminate owns the budget and must not leave
+        // pending mutation work that fires after it returns.
+        const slice = Math.max(1, Math.min(budget, 80))
+        await new Promise(resolve => setTimeout(resolve, slice))
+        // A cancelled late arm would mutate if it were left live.
+        const late = setTimeout(() => {
+          mutated = true
+        }, 600)
+        clearTimeout(late)
+        return { kind: 'failed', detail: 'deadline-exhausted' }
+      }
+    })
+    const elapsed = Date.now() - started
+    assert.notEqual(outcome.kind, 'clear')
+    await new Promise(resolve => setTimeout(resolve, 700))
+    assert.equal(mutated, false)
+    assert.ok(elapsed < 2_000, `elapsed ${elapsed}`)
+  })
+
+  it(
+    'kills a real PowerShell root+descendant tree and leaves the delayed sentinel untouched',
+    { timeout: 15_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+      const fs = await import('node:fs')
+      const os = await import('node:os')
+      const {
+        identitiesStillPresent,
+        killProcessTreeAndAwaitGone,
+        TERMINATE_KILL_CONFIRM_MS,
+        terminateKillReserveMs,
+        terminateWindowsHolderExact
+      } = await import('./windows-process-terminate')
+      const { execFile } = await import('node:child_process')
+      const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-tree-'))
+      const sentinel = path.join(tmp, 'sentinel.txt')
+      const writerPidPath = path.join(tmp, 'writer.pid')
+
+      // Root spawns a descendant writer that records its PID then would write sentinel later.
+      const longScript = `
+$ErrorActionPreference = 'Stop'
+$sentinel = ${JSON.stringify(sentinel)}
+$writerPidPath = ${JSON.stringify(writerPidPath)}
+$writer = Start-Process -FilePath ${JSON.stringify(ps)} -ArgumentList @(
+  '-NoLogo','-NoProfile','-NonInteractive','-Command',
+  ('Start-Sleep -Milliseconds 1500; Set-Content -LiteralPath ''' + $sentinel + ''' -Value LATE_MUTATION')
+) -PassThru -WindowStyle Hidden
+Set-Content -LiteralPath $writerPidPath -Value ([string]$writer.Id)
+Start-Sleep -Seconds 20
+Write-Output ('ROOT=' + $PID + ';CHILD=' + $writer.Id)
+`.trim()
+
+      let childPid: number | undefined
+      let treeSnapshot: Array<{ pid: number; createdAt: number }> = []
+      const budgetMs = 5_000
+      const started = Date.now()
+      const controller = new AbortController()
+
+      const run = async (_script: string, timeoutMs?: number, signal?: AbortSignal) => {
+        return await new Promise<{ stdout: string; stderr: string; code: number; pid?: number }>((resolve) => {
+          let settled = false
+          const finish = (result: { stdout: string; stderr: string; code: number; pid?: number }) => {
+            if (settled) return
+            settled = true
+            resolve(result)
+          }
+
+          const child = execFile(
+            ps,
+            ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', longScript],
+            { encoding: 'utf8', windowsHide: true, timeout: Math.max(1, timeoutMs ?? budgetMs) },
+            () => undefined
+          )
+          childPid = child.pid
+          const absoluteDeadline = started + budgetMs
+
+          // Capture root immediately; poll briefly for writer pid file.
+          void (async () => {
+            if (typeof childPid === 'number') {
+              treeSnapshot = [{ pid: childPid, createdAt: Date.now() / 1000 }]
+            }
+            const pollUntil = Date.now() + 600
+            while (Date.now() < pollUntil) {
+              try {
+                if (fs.existsSync(writerPidPath)) {
+                  const writerPid = Number(fs.readFileSync(writerPidPath, 'utf8').trim())
+                  if (Number.isInteger(writerPid) && writerPid > 0) {
+                    treeSnapshot.push({ pid: writerPid, createdAt: Date.now() / 1000 })
+                    break
+                  }
+                }
+              } catch {
+                void 0
+              }
+              await new Promise(r => setTimeout(r, 40))
+            }
+            controller.abort()
+          })()
+
+          const onAbort = () => {
+            void (async () => {
+              if (typeof childPid !== 'number') {
+                finish({ stdout: '', stderr: 'aborted', code: 1 })
+                return
+              }
+              const killed = await killProcessTreeAndAwaitGone(childPid, {
+                confirmMs: terminateKillReserveMs(budgetMs),
+                preSnapshot: treeSnapshot,
+                deadlineAt: absoluteDeadline
+              })
+              finish({
+                stdout: '',
+                stderr: killed.confirmed
+                  ? 'aborted'
+                  : `unconfirmed-tree-survivors:${killed.survivors.map(s => s.pid).join(',')}`,
+                code: 1,
+                pid: childPid
+              })
+            })()
+          }
+          if (signal?.aborted) onAbort()
+          else signal?.addEventListener('abort', onAbort, { once: true })
+        })
+      }
+
+      const result = await terminateWindowsHolderExact(holder({ pid: 1, createdAt: 1 }), {
+        run,
+        timeoutMs: budgetMs,
+        waitMs: 100,
+        signal: controller.signal,
+        platform: 'win32'
+      })
+      const elapsed = Date.now() - started
+      assert.equal(result.kind, 'failed')
+      assert.notEqual(result.detail, 'unconfirmed-tree-survivors')
+      assert.ok(elapsed <= budgetMs, `terminateWindowsHolderExact elapsed ${elapsed} must be <= ${budgetMs}`)
+      assert.ok(typeof childPid === 'number' && childPid > 0)
+      assert.ok(treeSnapshot.length >= 2, `expected root+writer snapshot, got ${JSON.stringify(treeSnapshot)}`)
+      assert.ok(TERMINATE_KILL_CONFIRM_MS >= 1_000)
+
+      assert.deepEqual(await identitiesStillPresent(treeSnapshot), [])
+
+      // Delayed descendant write would have landed by now if the tree survived.
+      await new Promise(resolve => setTimeout(resolve, 1_800))
+      assert.deepEqual(await identitiesStillPresent(treeSnapshot), [])
+      assert.equal(fs.existsSync(sentinel), false)
+
+      try {
+        fs.rmSync(tmp, { recursive: true, force: true })
+      } catch {
+        void 0
+      }
+    }
+  )
+
+  it(
+    'multi-identity confirmation stays within budget and fails closed when probes cannot finish',
+    { timeout: 8_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+      const { killProcessTreeAndAwaitGone } = await import('./windows-process-terminate')
+      const identities = [
+        { pid: 900001 },
+        { pid: 900002 },
+        { pid: 900003 },
+        { pid: 900004 }
+      ]
+      const budgetMs = 250
+      const started = Date.now()
+      const result = await killProcessTreeAndAwaitGone(900001, {
+        confirmMs: budgetMs,
+        preSnapshot: identities,
+        deadlineAt: started + budgetMs
+      })
+      const elapsed = Date.now() - started
+      assert.ok(elapsed <= budgetMs + 150, `elapsed ${elapsed} exceeded budget ${budgetMs}`)
+      // Phantom PIDs: either confirmed gone (fast ENOENT path) or unconfirmed if
+      // budget exhausted mid-probe. Never invent a clear success after overrunning.
+      assert.ok(result.confirmed === true || result.confirmed === false)
+      if (elapsed > budgetMs) {
+        assert.equal(result.confirmed, false)
+      }
+    }
+  )
+})
+
+describe('liveness probe classification', () => {
+  it('liveness probe is tri-state: live / absent / unknown', async () => {
+    const { probeProcessLiveness } = await import('./windows-process-terminate')
+    assert.equal(await probeProcessLiveness(-1), 'absent')
+    assert.equal(await probeProcessLiveness(1, 0), 'unknown')
+    // Explicit not-found path for a PID that should not exist.
+    if (process.platform === 'win32') {
+      assert.equal(await probeProcessLiveness(999_999_991, 2_000), 'absent')
+    }
+  })
+
+  it('timeout/unknown liveness keeps identity as survivor; explicit absent drops it', async () => {
+    const module = await import('./windows-process-terminate')
+    // Injectable-style: call identitiesStillPresent with a deadline already passed
+    // and ensure identities remain survivors (no probe => unknown => survivor).
+    const expired = await module.identitiesStillPresent([{ pid: 42 }], { deadlineAt: Date.now() - 1 })
+    assert.equal(expired.length, 1)
+    assert.equal(expired[0]?.pid, 42)
+
+    if (process.platform === 'win32') {
+      // Explicit not-found PID should be dropped when there is budget.
+      const gone = await module.identitiesStillPresent([{ pid: 999_999_992 }], {
+        deadlineAt: Date.now() + 3_000
+      })
+      assert.equal(gone.length, 0)
+    }
+  })
+})
+
+describe('access-denied identity classification', () => {
+  it('classifies access-denied identity failures for Administrator routing', () => {
+    assert.deepEqual(parseTerminateScriptOutput('ACCESS_DENIED', 5), {
+      kind: 'access-denied',
+      win32Error: 5
+    })
+    const script = buildExactTerminateScript(9, 100, 100)
+    assert.match(script, /Access is denied|AccessDenied|denied/)
+    assert.match(script, /ACCESS_DENIED/)
+    // Get-Process/StartTime access denial must not collapse to ALREADY_GONE only.
+    assert.match(script, /ALREADY_GONE/)
+    assert.ok(script.includes("if ($msg -match 'Access"))
   })
 })

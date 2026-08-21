@@ -363,6 +363,7 @@ import {
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
 import {
+  cleanupForceReleaseArtifacts,
   formatElevatedForceReleaseFailure,
   launchElevatedForceReleaseHelper,
   parseForceReleaseResponse,
@@ -371,6 +372,8 @@ import {
 import { listRestartManagerHoldersForResources } from './windows-restart-manager'
 import { terminateWindowsHolderExact } from './windows-process-terminate'
 import {
+  attachHolderTreeRelationships,
+  mergeInstallHolders,
   runWindowsUpdateForceRelease,
   type ForceReleaseHolder
 } from './windows-update-force-release'
@@ -3403,7 +3406,7 @@ function windowsPowerShellPath() {
 // .exe on Windows refuses an O_RDWR open with a sharing violation. On POSIX
 // this practically always succeeds (no mandatory locking), so it returns false
 // — correct, since the shim-contention brick is Windows-only.
-function isShimLocked(shimPath) {
+function isFileLocked(filePath) {
   if (!IS_WINDOWS) {
     return false
   }
@@ -3411,7 +3414,7 @@ function isShimLocked(shimPath) {
   let fd
 
   try {
-    fd = fs.openSync(shimPath, 'r+')
+    fd = fs.openSync(filePath, 'r+')
 
     return false
   } catch (err) {
@@ -3427,6 +3430,36 @@ function isShimLocked(shimPath) {
       }
     }
   }
+}
+
+function isShimLocked(shimPath) {
+  return isFileLocked(shimPath)
+}
+
+/** Install resources that must be clear before updater mutation begins. */
+function installLockResources(updateRoot) {
+  const candidates = [
+    path.join(updateRoot, 'venv', 'Scripts', 'hermes.exe'),
+    path.join(updateRoot, 'venv', 'Scripts', 'python.exe'),
+    path.join(updateRoot, 'venv', 'python.exe')
+  ]
+  const existing = []
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) existing.push(candidate)
+    } catch {
+      void 0
+    }
+  }
+  return existing
+}
+
+function isAnyInstallResourceLocked(updateRoot) {
+  const resources = installLockResources(updateRoot)
+  if (resources.length === 0) {
+    return isShimLocked(venvHermesShimPath(updateRoot))
+  }
+  return resources.some(resource => isFileLocked(resource))
 }
 
 // Force-kill the entire process TREE rooted at each PID. Node's child.kill()
@@ -3781,16 +3814,19 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
   const holders: ForceReleaseHolder[] = []
 
   for (const process of result.processes) {
-    if (!isExactVenvHolder(process)) continue
-    holders.push({
-      pid: process.pid,
-      createdAt: process.createdAt,
-      name: process.name,
-      cmdline: process.cmdline,
-      source: 'scanner',
-      role: 'other'
-    })
-  }
+      if (!isExactVenvHolder(process)) continue
+      holders.push({
+        pid: process.pid,
+        createdAt: process.createdAt,
+        name: process.name,
+        cmdline: process.cmdline,
+        source: 'scanner',
+        ...(typeof process.parentPid === 'number' && process.parentPid > 0
+          ? { parentPid: process.parentPid }
+          : {}),
+        role: 'other'
+      })
+    }
 
   for (const bridge of result.mcpBridges) {
     if (!isExactVenvHolder(bridge)) continue
@@ -3818,26 +3854,27 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
     })
   }
 
-  return holders
+  return attachHolderTreeRelationships(holders)
 }
 
 function forceReleaseHoldersFromScan(updateRoot: string, result: VenvBlockerScanResult): ForceReleaseHolder[] {
-  const shim = venvHermesShimPath(updateRoot)
+  const resources = installLockResources(updateRoot)
+  const defaultResource = resources[0] ?? venvHermesShimPath(updateRoot)
   return scanResultToForceReleaseHolders(result).map(holder => ({
     ...holder,
-    resource: holder.resource ?? shim
+    resource: holder.resource ?? defaultResource
   }))
 }
 
 async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
-  const shim = venvHermesShimPath(updateRoot)
+  const resources = installLockResources(updateRoot)
   const exclude = new Set<number>([process.pid].filter(pid => Number.isInteger(pid) && pid > 0))
 
   return runWindowsUpdateForceRelease({
     deadlineMs: 5_000,
     settleMs: 150,
     excludePids: exclude,
-    isResourceLocked: async () => isShimLocked(shim),
+    isResourceLocked: async () => isAnyInstallResourceLocked(updateRoot),
     listScannerHolders: async (_budgetMs) => {
       // Orchestrator races this call against the remaining <=5s budget.
       const outcome = await scanVenvBlockers(updateRoot)
@@ -3845,21 +3882,16 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
       return forceReleaseHoldersFromScan(updateRoot, outcome.result)
     },
     listRestartManagerHolders: async (budgetMs) => {
-      const resources = [shim]
-      try {
-        const python = path.join(updateRoot, 'venv', 'Scripts', 'python.exe')
-        if (fs.existsSync(python)) resources.push(python)
-      } catch {
-        void 0
-      }
-      return listRestartManagerHoldersForResources(resources, {
+      const rmResources = resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
+      return listRestartManagerHoldersForResources(rmResources, {
         timeoutMs: Math.max(250, Math.min(3_500, budgetMs))
       })
     },
-    terminateHolder: (holder, budgetMs) =>
+    terminateHolder: (holder, budgetMs, signal) =>
       terminateWindowsHolderExact(holder, {
         timeoutMs: Math.max(250, Math.min(2_500, budgetMs)),
-        waitMs: Math.max(100, Math.min(1_500, budgetMs - 200))
+        waitMs: Math.max(100, Math.min(1_500, budgetMs - 200)),
+        signal
       })
   })
 }
@@ -3870,20 +3902,20 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
   message: string
   elevationHolders?: ForceReleaseHolder[]
 }> {
-  const shim = venvHermesShimPath(updateRoot)
-  if (!isShimLocked(shim)) {
+  if (!isAnyInstallResourceLocked(updateRoot)) {
     return { ok: true, message: 'already clear' }
   }
 
+  const resources = installLockResources(updateRoot)
+  const excludePids = [process.pid].filter(pid => Number.isInteger(pid) && pid > 0)
   const scanOutcome = await scanVenvBlockers(updateRoot)
   const scannerHolders =
     scanOutcome.kind === 'blocked' ? forceReleaseHoldersFromScan(updateRoot, scanOutcome.result) : []
-  const rmHolders = await listRestartManagerHoldersForResources([
-    shim,
-    path.join(updateRoot, 'venv', 'Scripts', 'python.exe')
-  ])
-  const holders = [...scannerHolders, ...rmHolders].filter(
-    holder => Number.isInteger(holder.pid) && holder.pid > 0 && holder.pid !== process.pid
+  const rmHolders = await listRestartManagerHoldersForResources(
+    resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
+  )
+  const holders = mergeInstallHolders([...scannerHolders, ...rmHolders], new Set(excludePids)).filter(
+    holder => Number.isInteger(holder.pid) && holder.pid > 0
   )
 
   if (holders.length === 0) {
@@ -3911,9 +3943,77 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     }
   }
 
-  let written: Awaited<ReturnType<typeof writeForceReleaseRequestFiles>>
+  let written: Awaited<ReturnType<typeof writeForceReleaseRequestFiles>> | null = null
   try {
-    written = await writeForceReleaseRequestFiles({ installRoot: updateRoot, holders })
+    written = await writeForceReleaseRequestFiles({
+      installRoot: updateRoot,
+      holders,
+      excludePids
+    })
+
+    const launch = await launchElevatedForceReleaseHelper({
+      helperScriptPath,
+      requestPath: written.requestPath,
+      responsePath: written.responsePath
+    })
+
+    if (launch.kind === 'cancelled') {
+      return {
+        ok: false,
+        error: 'venv-elevation-cancelled',
+        message: 'Update cancelled: Administrator permission was not granted.',
+        elevationHolders: holders
+      }
+    }
+
+    if (launch.kind === 'failed') {
+      return {
+        ok: false,
+        error: 'venv-needs-elevation',
+        message: `Update aborted: elevated force-release failed (${launch.detail}).`,
+        elevationHolders: holders
+      }
+    }
+
+    let responseRaw = ''
+    try {
+      responseRaw = fs.readFileSync(written.responsePath, 'utf8')
+    } catch {
+      return {
+        ok: false,
+        error: 'venv-needs-elevation',
+        message: 'Update aborted: elevated helper produced no response.',
+        elevationHolders: holders
+      }
+    }
+
+    const response = parseForceReleaseResponse(responseRaw, written.request.nonce)
+    if (!response || !response.ok || !response.cleared) {
+      const failure = formatElevatedForceReleaseFailure(response)
+      return {
+        ok: false,
+        error: 'venv-unlock-failed',
+        message: failure.message,
+        elevationHolders: holders
+      }
+    }
+
+    if (isAnyInstallResourceLocked(updateRoot)) {
+      const survivorDetail = (response.survivors ?? [])
+        .map(entry => `PID ${entry.pid}${entry.resource ? ` resource=${entry.resource}` : ''} ${entry.detail || 'locked'}`.trim())
+        .join('; ')
+      return {
+        ok: false,
+        error: 'venv-unlock-failed',
+        message:
+          survivorDetail
+            ? `Update aborted: install files remain locked after elevated force-release (${survivorDetail}). The virtual environment was not modified.`
+            : 'Update aborted: install files remain locked after elevated force-release. The virtual environment was not modified.',
+        elevationHolders: holders
+      }
+    }
+
+    return { ok: true, message: 'cleared' }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     return {
@@ -3922,71 +4022,11 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
       message: `Update aborted: could not prepare the elevated force-release request (${detail}).`,
       elevationHolders: holders
     }
-  }
-
-  const launch = await launchElevatedForceReleaseHelper({
-    helperScriptPath,
-    requestPath: written.requestPath,
-    responsePath: written.responsePath
-  })
-
-  if (launch.kind === 'cancelled') {
-    return {
-      ok: false,
-      error: 'venv-elevation-cancelled',
-      message: 'Update cancelled: Administrator permission was not granted.',
-      elevationHolders: holders
+  } finally {
+    if (written) {
+      cleanupForceReleaseArtifacts(written)
     }
   }
-
-  if (launch.kind === 'failed') {
-    return {
-      ok: false,
-      error: 'venv-needs-elevation',
-      message: `Update aborted: elevated force-release failed (${launch.detail}).`,
-      elevationHolders: holders
-    }
-  }
-
-  let responseRaw = ''
-  try {
-    responseRaw = fs.readFileSync(written.responsePath, 'utf8')
-  } catch {
-    return {
-      ok: false,
-      error: 'venv-needs-elevation',
-      message: 'Update aborted: elevated helper produced no response.',
-      elevationHolders: holders
-    }
-  }
-
-  const response = parseForceReleaseResponse(responseRaw, written.request.nonce)
-  if (!response || !response.ok || !response.cleared) {
-    const failure = formatElevatedForceReleaseFailure(response)
-    return {
-      ok: false,
-      error: 'venv-unlock-failed',
-      message: failure.message,
-      elevationHolders: holders
-    }
-  }
-
-  if (isShimLocked(shim)) {
-    const survivorDetail = (response.survivors ?? [])
-      .map(entry => `PID ${entry.pid}${entry.resource ? ` resource=${entry.resource}` : ''} ${entry.detail || 'locked'}`.trim())
-      .join('; ')
-    return {
-      ok: false,
-      error: 'venv-unlock-failed',
-      message:
-        survivorDetail
-          ? `Update aborted: install files remain locked after elevated force-release (${survivorDetail}). The virtual environment was not modified.`
-          : 'Update aborted: install files remain locked after elevated force-release. The virtual environment was not modified.',
-      elevationHolders: holders
-    }
-  }
-
-  return { ok: true, message: 'cleared' }
 }
 
 function runWindowsHandoffPreflight(updateRoot: string, purpose: UpdatePreflightPurpose) {
@@ -4014,7 +4054,11 @@ function runWindowsHandoffPreflight(updateRoot: string, purpose: UpdatePreflight
 //
 // `tag` only flavors the log lines. No-op off Windows (POSIX has no mandatory
 // locks — the before-quit SIGTERM + the cleanup script's own PID-wait suffice).
-async function releaseBackendLock(updateRoot, tag) {
+//
+// settleMs: updater uses a short tracked-backend settle (force-release handles
+// foreign holders). Uninstall keeps the longer historical wait because it has
+// no force-release fallback and proceeds even when unlocked is false.
+async function releaseBackendLock(updateRoot, tag, options: { settleMs?: number } = {}) {
   if (!IS_WINDOWS) {
     return { unlocked: true }
   }
@@ -4027,12 +4071,12 @@ async function releaseBackendLock(updateRoot, tag) {
   })
 
   const shim = venvHermesShimPath(updateRoot)
-  // Tracked backends only: short settle. Exact foreign holders are handled by
-  // the ≤5s force-release path in preflight (not a 15s dead-end wait).
-  const deadlineMs = Date.now() + 2_000
+  const defaultSettleMs = tag === 'uninstall' ? 15_000 : 2_000
+  const settleMs = Math.max(0, options.settleMs ?? defaultSettleMs)
+  const deadlineMs = Date.now() + settleMs
 
   while (Date.now() < deadlineMs) {
-    if (!isShimLocked(shim)) {
+    if (!isAnyInstallResourceLocked(updateRoot) && !isShimLocked(shim)) {
       rememberLog(`[${tag}] venv shim unlocked; safe to proceed`)
 
       return { unlocked: true }
