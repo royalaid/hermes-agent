@@ -284,6 +284,44 @@ describe('elevated UAC launch argv safety', () => {
     }
   })
 
+  it('retains the early elevated PID for exact response-temp cleanup after interruption', async () => {
+    const {
+      cleanupForceReleaseArtifacts,
+      forceReleasePaths,
+      launchElevatedForceReleaseHelper
+    } = await import('./windows-elevated-force-release')
+    const directory = fsNative.mkdtempSync(path.join(osNative.tmpdir(), 'hermes-force-response-temp-'))
+    const responsePath = forceReleasePaths(directory, 'interrupted').responsePath
+    const helperPid = 47111
+    const responseTempPath = `${responsePath}.${helperPid}.tmp`
+    const sentinelPath = path.join(directory, 'unrelated-sentinel.txt')
+    fsNative.writeFileSync(responseTempPath, 'partial response', 'utf8')
+    fsNative.writeFileSync(sentinelPath, 'keep', 'utf8')
+
+    try {
+      const launch = await launchElevatedForceReleaseHelper({
+        helperScriptPath: 'C:\\helper.ps1',
+        requestPath: 'C:\\request.json',
+        responsePath,
+        platform: 'win32',
+        run: async () => ({ code: 1, stdout: `HERMES_ELEVATED_PID=${helperPid}` })
+      })
+      assert.equal(launch.kind, 'failed')
+      assert.equal(launch.responseTempPath, responseTempPath)
+
+      cleanupForceReleaseArtifacts({
+        directory,
+        responsePath,
+        responseTempPath: launch.responseTempPath,
+        ownedDirectory: false
+      })
+      assert.equal(fsNative.existsSync(responseTempPath), false)
+      assert.equal(fsNative.existsSync(sentinelPath), true)
+    } finally {
+      fsNative.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
 })
 
 describe('force-release artifact cleanup', () => {
