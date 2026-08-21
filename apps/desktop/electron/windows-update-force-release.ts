@@ -50,7 +50,9 @@ export type WindowsUpdateForceReleaseDeps = {
   terminateHolder: (
     holder: ForceReleaseHolder,
     budgetMs: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    /** One absolute deadline shared with the native mutation boundary. */
+    deadlineAt?: number
   ) => Promise<ForceReleaseTerminateResult>
   excludePids?: ReadonlySet<number>
   /** Non-elevated budget. Spec: five seconds or less. */
@@ -412,10 +414,20 @@ export async function runWindowsUpdateForceRelease(
         break
       }
 
-      // Mutating termination is NOT raced-and-abandoned. The native boundary
-      // owns the budget, kills on expiry, and returns only after confirmed
-      // child exit/tree absence (or a hard Windows job-object terminal).
-      const result = await deps.terminateHolder(target, budget)
+      // Mutating termination owns the remaining budget. The controller is
+      // cancelled at the same absolute deadline that is passed to the native
+      // boundary; the boundary must return before this deadline or fail closed.
+      const terminateController = new AbortController()
+      const terminateTimer = setTimeout(
+        () => terminateController.abort(),
+        Math.max(1, Math.trunc(budget))
+      )
+      let result: ForceReleaseTerminateResult
+      try {
+        result = await deps.terminateHolder(target, budget, terminateController.signal, deadline)
+      } finally {
+        clearTimeout(terminateTimer)
+      }
 
       switch (result.kind) {
         case 'terminated':

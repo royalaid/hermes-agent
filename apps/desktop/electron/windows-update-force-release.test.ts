@@ -31,7 +31,8 @@ import {
 } from './windows-elevated-force-release'
 import {
   buildExactTerminateScript,
-  parseTerminateScriptOutput
+  parseTerminateScriptOutput,
+  runPowerShellWithHardBoundary
 } from './windows-process-terminate'
 
 const execFileAsync = promisify(execFile)
@@ -779,6 +780,85 @@ Write-Output ('ROOT=' + $PID + ';CHILD=' + $writer.Id)
   )
 
   it(
+    'uses the production job-object runner to prevent late descendant mutation',
+    { timeout: 15_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+
+      const os = await import('node:os')
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-job-boundary-'))
+      const sentinel = path.join(tmp, 'sentinel.txt')
+      const rootPidPath = path.join(tmp, 'root.pid')
+      const writerPidPath = path.join(tmp, 'writer.pid')
+      const quotePowerShellLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
+      const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+      const script = `
+$ErrorActionPreference = 'Stop'
+$sentinel = ${quotePowerShellLiteral(sentinel)}
+$rootPidPath = ${quotePowerShellLiteral(rootPidPath)}
+$writerPidPath = ${quotePowerShellLiteral(writerPidPath)}
+Set-Content -LiteralPath $rootPidPath -Value ([string]$PID)
+$writer = Start-Process -FilePath ${quotePowerShellLiteral(ps)} -ArgumentList @(
+  '-NoLogo','-NoProfile','-NonInteractive','-Command',
+  ('Start-Sleep -Milliseconds 1500; Set-Content -LiteralPath ''' + $sentinel + ''' -Value LATE_MUTATION')
+) -PassThru -WindowStyle Hidden
+Set-Content -LiteralPath $writerPidPath -Value ([string]$writer.Id)
+Start-Sleep -Seconds 20
+`.trim()
+
+      const controller = new AbortController()
+      const started = Date.now()
+      const runPromise = runPowerShellWithHardBoundary(script, 5_000, controller.signal)
+      const waitForFile = async (filePath: string, timeoutMs: number) => {
+        const deadline = Date.now() + timeoutMs
+        while (Date.now() < deadline) {
+          if (fs.existsSync(filePath)) return true
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        return fs.existsSync(filePath)
+      }
+
+      try {
+        const rootReady = await waitForFile(rootPidPath, 1_500)
+        if (!rootReady) {
+          const earlyResult = await runPromise
+          throw new Error(`production root did not start: code=${earlyResult.code} stdout=${earlyResult.stdout} stderr=${earlyResult.stderr}`)
+        }
+        assert.equal(await waitForFile(writerPidPath, 1_500), true, 'production descendant did not start')
+        const rootPid = Number(fs.readFileSync(rootPidPath, 'utf8').trim())
+        const writerPid = Number(fs.readFileSync(writerPidPath, 'utf8').trim())
+        assert.ok(Number.isInteger(rootPid) && rootPid > 0)
+        assert.ok(Number.isInteger(writerPid) && writerPid > 0)
+
+        // Abort only after the descendant is real, so the production runner's
+        // tree snapshot and the delayed-write safety check cover both nodes.
+        controller.abort()
+        const result = await runPromise
+        const elapsed = Date.now() - started
+        assert.equal(result.code, 1)
+        assert.doesNotMatch(result.stderr, /unconfirmed-tree-survivors/i)
+        assert.ok(elapsed <= 5_000, `production runner elapsed ${elapsed}`)
+
+        const { identitiesStillPresent } = await import('./windows-process-terminate')
+        const identities = [
+          { pid: rootPid },
+          { pid: writerPid },
+          ...(typeof result.pid === 'number' ? [{ pid: result.pid }] : [])
+        ]
+        assert.deepEqual(await identitiesStillPresent(identities), [])
+
+        await new Promise(resolve => setTimeout(resolve, 1_800))
+        assert.equal(fs.existsSync(sentinel), false)
+        assert.deepEqual(await identitiesStillPresent(identities), [])
+      } finally {
+        controller.abort()
+        await runPromise.catch(() => undefined)
+        fs.rmSync(tmp, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it(
     'multi-identity confirmation stays within budget and fails closed when probes cannot finish',
     { timeout: 8_000 },
     async () => {
@@ -805,6 +885,38 @@ Write-Output ('ROOT=' + $PID + ';CHILD=' + $writer.Id)
       if (elapsed > budgetMs) {
         assert.equal(result.confirmed, false)
       }
+    }
+  )
+
+  it(
+    'does not start a post-deadline root probe after snapshot timeout',
+    { timeout: 5_000 },
+    async () => {
+      if (process.platform !== 'win32') return
+      const { killProcessTreeAndAwaitGone } = await import('./windows-process-terminate')
+      const budgetMs = 180
+      const started = Date.now()
+      let rootProbeCalls = 0
+      const result = await killProcessTreeAndAwaitGone(900101, {
+        confirmMs: budgetMs,
+        deadlineAt: started + budgetMs,
+        snapshotProcessTree: async () => {
+          // Deliberately ignore the adapter timeout; the boundary must not
+          // await this read or launch a fresh default-timeout fallback.
+          await new Promise(resolve => setTimeout(resolve, budgetMs * 3))
+          return []
+        },
+        readCreatedAt: async () => {
+          rootProbeCalls += 1
+          return 1
+        }
+      })
+      const elapsed = Date.now() - started
+
+      assert.equal(result.confirmed, false)
+      assert.deepEqual(result.survivors.map(entry => entry.pid), [900101])
+      assert.equal(rootProbeCalls, 0)
+      assert.ok(elapsed <= budgetMs + 100, `snapshot boundary elapsed ${elapsed}ms > ${budgetMs}ms budget`)
     }
   )
 })

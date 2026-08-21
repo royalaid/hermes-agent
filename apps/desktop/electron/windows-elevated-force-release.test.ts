@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import fsNative from 'node:fs'
+import osNative from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import { describe, it } from 'vitest'
+import { describe, it, vi } from 'vitest'
 
 import {
   buildForceReleaseRequest,
@@ -174,7 +176,12 @@ describe('restart manager output parser', () => {
 
 describe('elevated UAC launch argv safety', () => {
   it('keeps adversarial filesystem paths out of PowerShell source and only in env data', async () => {
-    const { buildElevatedForceReleaseLaunchInvocation, ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND, launchElevatedForceReleaseHelper } =
+    const {
+      buildElevatedForceReleaseLaunchInvocation,
+      ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER,
+      ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND,
+      launchElevatedForceReleaseHelper
+    } =
       await import('./windows-elevated-force-release')
 
     const adversarial = {
@@ -219,6 +226,64 @@ describe('elevated UAC launch argv safety', () => {
     assert.equal(captured!.env?.HERMES_FORCE_RELEASE_REQUEST, adversarial.requestPath)
     assert.equal(captured!.env?.HERMES_FORCE_RELEASE_RESPONSE, adversarial.responsePath)
   })
+
+  it('preserves adversarial paths through the real non-UAC Start-Process boundary', async () => {
+    if (process.platform !== 'win32') return
+
+    const {
+      ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER
+    } = await import('./windows-elevated-force-release')
+    const temp = fsNative.mkdtempSync(path.join(osNative.tmpdir(), 'hermes force-args '))
+    const captureScript = path.join(temp, 'capture arguments.ps1')
+    const outputPath = path.join(temp, 'captured output.json')
+    const expected = [
+      path.join(temp, "helper $() `tick (1) '中文'.ps1"),
+      path.join(temp, "request $HOME (2) 'quoted'.json"),
+      path.join(temp, "response backtick` $() 中文.json")
+    ]
+
+    fsNative.writeFileSync(
+      captureScript,
+      [
+        'param([string]$A, [string]$B, [string]$C)',
+        "[IO.File]::WriteAllText($env:PROBE_OUTPUT, (ConvertTo-Json @($A, $B, $C) -Compress), [Text.UTF8Encoding]::new($false))"
+      ].join('\n'),
+      'utf8'
+    )
+
+    const probe = [
+      ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER,
+      "$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+      "$argList = @('-NoLogo','-NoProfile','-NonInteractive','-File',(ConvertTo-WindowsArgument $env:CAPTURE_SCRIPT),(ConvertTo-WindowsArgument $env:PROBE_A),(ConvertTo-WindowsArgument $env:PROBE_B),(ConvertTo-WindowsArgument $env:PROBE_C))",
+      "$p = Start-Process -FilePath $ps -Wait -PassThru -WindowStyle Hidden -ArgumentList $argList",
+      'exit $p.ExitCode'
+    ].join('; ')
+
+    try {
+      await execFileAsync(
+        path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', probe],
+        {
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 10_000,
+          env: {
+            ...process.env,
+            CAPTURE_SCRIPT: captureScript,
+            PROBE_OUTPUT: outputPath,
+            PROBE_A: expected[0],
+            PROBE_B: expected[1],
+            PROBE_C: expected[2]
+          }
+        }
+      )
+
+      assert.deepEqual(JSON.parse(fsNative.readFileSync(outputPath, 'utf8')), expected)
+    } finally {
+      fsNative.rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
 })
 
 describe('force-release artifact cleanup', () => {
@@ -275,6 +340,41 @@ describe('force-release artifact cleanup', () => {
     assert.equal(fs.existsSync(written.requestPath), false)
     assert.equal(fs.existsSync(written.secretPath), false)
     assert.equal(fs.existsSync(written.directory), false)
+  })
+
+  it('cleans partial artifacts when request serialization fails', async () => {
+    const { writeForceReleaseRequestFiles } = await import('./windows-elevated-force-release')
+    const originalWrite = fsNative.writeFileSync.bind(fsNative)
+    const originalMkdtemp = fsNative.mkdtempSync.bind(fsNative)
+    const writeSpy = vi.spyOn(fsNative, 'writeFileSync')
+    const mkdtempSpy = vi.spyOn(fsNative, 'mkdtempSync')
+    let writes = 0
+    let createdDirectory: string | undefined
+    writeSpy.mockImplementation(((filePath: any, data: any, options?: any) => {
+      writes += 1
+      if (writes === 2) throw new Error('injected request write failure')
+      return originalWrite(filePath, data, options)
+    }) as typeof fsNative.writeFileSync)
+    mkdtempSpy.mockImplementation(((prefix: string, options?: any) => {
+      const created = originalMkdtemp(prefix, options)
+      createdDirectory = typeof created === 'string' ? created : undefined
+      return created
+    }) as typeof fsNative.mkdtempSync)
+
+    try {
+      await assert.rejects(
+        writeForceReleaseRequestFiles({
+          installRoot: 'C:\\h',
+          holders: [{ pid: 1, createdAt: 2, name: 'x', cmdline: 'x', source: 'scanner' }]
+        }),
+        /injected request write failure/
+      )
+      assert.ok(createdDirectory, 'request writer did not create an owned directory')
+      assert.equal(fsNative.existsSync(createdDirectory!), false)
+    } finally {
+      writeSpy.mockRestore()
+      mkdtempSpy.mockRestore()
+    }
   })
 })
 
