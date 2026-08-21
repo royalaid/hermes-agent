@@ -387,9 +387,11 @@ export const ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND = [
   "$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
   WINDOWS_ARGUMENT_QUOTER_FUNCTION,
   "$argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(ConvertTo-WindowsArgument $helper),'-RequestPath',(ConvertTo-WindowsArgument $request),'-ResponsePath',(ConvertTo-WindowsArgument $response))",
-  '$p = Start-Process -FilePath $ps -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList $argList',
+  '$p = Start-Process -FilePath $ps -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList $argList',
   'if ($null -eq $p) { exit 1223 }',
   'Write-Output ("HERMES_ELEVATED_PID=" + $p.Id)',
+  '[Console]::Out.Flush()',
+  '$p.WaitForExit()',
   'exit $p.ExitCode'
 ].join('; ')
 
