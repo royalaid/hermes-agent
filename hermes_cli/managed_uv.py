@@ -852,7 +852,6 @@ def _stage_candidate_venv(
             str(python),
             "--managed-python",
             "--no-python-downloads",
-            "--relocatable",
             "--allow-existing",
             "--no-config",
         ],
@@ -896,6 +895,35 @@ def _stage_candidate_venv(
     )
     if synced.returncode != 0:
         logger.warning("candidate dependency sync failed (rc=%d)", synced.returncode)
+        _remove_tree(candidate, boundary=runtime_root)
+        return None
+
+    # Mark the fully-synced environment relocatable only after dependency
+    # installation. uv rebuilds an already-relocatable project environment
+    # during `sync`, which changes the directory identity frozen in the crash
+    # journal. This ordering preserves both the exact directory generation and
+    # the completed package set.
+    relocated = subprocess.run(
+        [
+            uv_bin,
+            "venv",
+            str(candidate),
+            "--python",
+            str(python),
+            "--managed-python",
+            "--no-python-downloads",
+            "--relocatable",
+            "--allow-existing",
+            "--no-config",
+        ],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if relocated.returncode != 0:
+        logger.warning("candidate relocation failed (rc=%d)", relocated.returncode)
         _remove_tree(candidate, boundary=runtime_root)
         return None
 
