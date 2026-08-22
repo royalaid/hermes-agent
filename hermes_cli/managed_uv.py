@@ -853,6 +853,7 @@ def _stage_candidate_venv(
             "--managed-python",
             "--no-python-downloads",
             "--relocatable",
+            "--allow-existing",
             "--no-config",
         ],
         cwd=project_root,
