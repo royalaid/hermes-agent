@@ -3,6 +3,8 @@
 # These tests run the handoff in a temporary install with a tiny fake
 # hermes.exe. No real checkout, venv, Desktop process, or update is touched.
 
+param([switch]$DeferredGatewayContainmentOnly)
+
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
 $handoffScript = Join-Path $repoRoot 'scripts\desktop-update.ps1'
@@ -31,7 +33,74 @@ function Assert-True {
     }
 }
 
-function Compile-TestExecutable([string]$Destination, [string]$Source, [string]$Label) {
+function Assert-NoDeferredGateArtifacts([string]$GatePath, [string]$Label) {
+    if ([string]::IsNullOrWhiteSpace($GatePath)) {
+        Assert-True $false "$Label records its exact gate path"
+        return
+    }
+    $parent = Split-Path -Parent $GatePath
+    $leaf = Split-Path -Leaf $GatePath
+    $artifacts = @(
+        Get-ChildItem -LiteralPath $parent -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq $leaf -or $_.Name -like "$leaf.next-*" -or $_.Name -like "$leaf.previous-*" }
+    )
+    Assert-Equal 0 $artifacts.Count "$Label leaves no startup gate or transition sibling"
+}
+
+function Get-TestWriterIdentity([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $lines = @([System.IO.File]::ReadAllLines($Path))
+    if ($lines.Count -ne 3) { return $null }
+    $pidValue = 0
+    $startedAtTicks = 0L
+    if (-not [int]::TryParse($lines[0], [ref]$pidValue) -or $pidValue -le 0 -or
+        -not [int64]::TryParse($lines[2], [ref]$startedAtTicks) -or $startedAtTicks -le 0) {
+        return $null
+    }
+    return [pscustomobject]@{
+        Pid = $pidValue
+        Membership = $lines[1]
+        StartedAtTicks = $startedAtTicks
+    }
+}
+
+function Test-TestWriterLive([AllowNull()][object]$Identity) {
+    if (-not $Identity) { return $false }
+    try {
+        $process = [System.Diagnostics.Process]::GetProcessById([int]$Identity.Pid)
+        return -not $process.HasExited -and
+            $process.StartTime.ToUniversalTime().Ticks -eq [int64]$Identity.StartedAtTicks
+    } catch {
+        return $false
+    }
+}
+
+function Stop-TestWriterExact([AllowNull()][object]$Identity, [string]$ReleasePath) {
+    if (-not $Identity) { return }
+    try {
+        [System.IO.File]::WriteAllText($ReleasePath, 'release')
+    } catch {}
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Test-TestWriterLive $Identity) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 25
+    }
+    if (-not (Test-TestWriterLive $Identity)) { return }
+    try {
+        $process = [System.Diagnostics.Process]::GetProcessById([int]$Identity.Pid)
+        if (-not $process.HasExited -and
+            $process.StartTime.ToUniversalTime().Ticks -eq [int64]$Identity.StartedAtTicks) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
+    } catch {}
+}
+
+function Compile-TestExecutable(
+    [string]$Destination,
+    [string]$Source,
+    [string]$Label,
+    [switch]$Windowless
+) {
     if ($PSVersionTable.PSEdition -eq 'Core') {
         # PowerShell 7's Add-Type cannot emit an executable. Use the inbox .NET
         # Framework compiler so the same behavior fixture runs under PS5 + pwsh.
@@ -39,14 +108,16 @@ function Compile-TestExecutable([string]$Destination, [string]$Source, [string]$
         [System.IO.File]::WriteAllText($sourcePath, $Source)
         $windowsDirectory = [Environment]::GetFolderPath('Windows')
         $compiler = Join-Path $windowsDirectory 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-        & $compiler /nologo /target:exe "/out:$Destination" $sourcePath
+        $target = if ($Windowless) { 'winexe' } else { 'exe' }
+        & $compiler /nologo "/target:$target" "/out:$Destination" $sourcePath
         $compileCode = $LASTEXITCODE
         Remove-Item -LiteralPath $sourcePath -Force -ErrorAction SilentlyContinue
         if ($compileCode -ne 0 -or -not (Test-Path -LiteralPath $Destination)) {
             throw "$Label compilation failed with exit $compileCode"
         }
     } else {
-        Add-Type -TypeDefinition $Source -Language CSharp -OutputAssembly $Destination -OutputType ConsoleApplication
+        $outputType = if ($Windowless) { 'WindowsApplication' } else { 'ConsoleApplication' }
+        Add-Type -TypeDefinition $Source -Language CSharp -OutputAssembly $Destination -OutputType $outputType
     }
 }
 
@@ -63,8 +134,35 @@ using System.Text.RegularExpressions;
 using System.Threading;
 
 public static class FakeHermes {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars;
+        public int dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2;
+        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_INFORMATION {
+        public IntPtr hProcess, hThread;
+        public int dwProcessId, dwThreadId;
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool IsProcessInJob(IntPtr processHandle, IntPtr jobHandle, out bool result);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetProcessTimes(IntPtr processHandle, out long creation, out long exit, out long kernel, out long user);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateProcess(string applicationName, StringBuilder commandLine,
+        IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles,
+        uint creationFlags, IntPtr environment, string currentDirectory,
+        ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr handle);
 
     static string Arg(string[] args, string name) {
         var index = Array.IndexOf(args, name);
@@ -89,6 +187,149 @@ public static class FakeHermes {
         }
     }
 
+    static string HmacHex(string payload, string key) {
+        using (var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(key))) {
+            return String.Concat(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload)).Select(b => b.ToString("x2")));
+        }
+    }
+
+    static string JsonString(string value) {
+        return "\"" + Escape(value) + "\"";
+    }
+
+    static string CreationFileTime(Process process) {
+        long creation, exit, kernel, user;
+        if (!GetProcessTimes(process.Handle, out creation, out exit, out kernel, out user))
+            throw new System.ComponentModel.Win32Exception();
+        return ((ulong)creation).ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    static void AppendContainmentState(string value) {
+        var capture = Environment.GetEnvironmentVariable("HERMES_TEST_RESUME_CONTAINMENT_CAPTURE");
+        if (!String.IsNullOrEmpty(capture))
+            File.AppendAllText(capture, value + Environment.NewLine);
+    }
+
+    static int AwaitContainmentGate(string mode) {
+        var gate = Environment.GetEnvironmentVariable("HERMES_DEFERRED_GATEWAY_STARTUP_GATE");
+        if (String.IsNullOrEmpty(gate)) {
+            AppendContainmentState("missing");
+            return 20;
+        }
+        var gateCapture = Environment.GetEnvironmentVariable("HERMES_TEST_RESUME_TARGET_GATE_CAPTURE");
+        if (!String.IsNullOrEmpty(gateCapture)) File.WriteAllText(gateCapture, gate);
+        AppendContainmentState("waiting:" + Process.GetCurrentProcess().Id + ":" +
+            Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks);
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        DateTime? unreadableSince = null;
+        while (DateTime.UtcNow < deadline) {
+            string state;
+            try {
+                using (var stream = new FileStream(
+                    gate, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete)) {
+                    if (stream.Length <= 0 || stream.Length > 6) {
+                        AppendContainmentState("malformed");
+                        return 23;
+                    }
+                    var bytes = new byte[(int)stream.Length];
+                    if (stream.Read(bytes, 0, bytes.Length) != bytes.Length) {
+                        AppendContainmentState("malformed");
+                        return 23;
+                    }
+                    state = Encoding.UTF8.GetString(bytes);
+                }
+                unreadableSince = null;
+            } catch (Exception error) {
+                if (!(error is IOException) && !(error is UnauthorizedAccessException))
+                    throw;
+                if (!unreadableSince.HasValue) unreadableSince = DateTime.UtcNow;
+                if (DateTime.UtcNow >= unreadableSince.Value.AddMilliseconds(2250)) {
+                    AppendContainmentState("unreadable");
+                    return 21;
+                }
+                Thread.Sleep(25);
+                continue;
+            }
+            if (state == "wait") {
+                Thread.Sleep(25);
+                continue;
+            }
+            if (state == "abort") {
+                AppendContainmentState("aborted");
+                return 22;
+            }
+            if (state != "armed") {
+                AppendContainmentState("malformed");
+                return 23;
+            }
+            bool inJob;
+            var known = IsProcessInJob(Process.GetCurrentProcess().Handle, IntPtr.Zero, out inJob);
+            AppendContainmentState(known && inJob ? "armed:in-job" : "armed:not-in-job");
+            return known && inJob ? 0 : 24;
+        }
+        AppendContainmentState("timeout");
+        return 25;
+    }
+
+    static Process StartHeldWriter() {
+        var executable = Process.GetCurrentProcess().MainModule.FileName;
+        var commandLine = new StringBuilder("\"" + executable + "\" --test-held-writer");
+        var startup = new STARTUPINFO { cb = Marshal.SizeOf(typeof(STARTUPINFO)) };
+        PROCESS_INFORMATION created;
+        // bInheritHandles=false is the behavior under test: the descendant
+        // inherits Job membership, but never the wrapper's outer pipe handles.
+        if (!CreateProcess(executable, commandLine, IntPtr.Zero, IntPtr.Zero, false,
+            // DETACHED_PROCESS guarantees this long-lived writer cannot keep
+            // the short-lived console target's conhost alive.
+            0x00000008, IntPtr.Zero, Directory.GetCurrentDirectory(), ref startup, out created))
+            throw new System.ComponentModel.Win32Exception();
+        Process process;
+        try {
+            process = Process.GetProcessById(created.dwProcessId);
+        } finally {
+            CloseHandle(created.hThread);
+            CloseHandle(created.hProcess);
+        }
+        var capture = Environment.GetEnvironmentVariable("HERMES_TEST_RESUME_WRITER_CAPTURE");
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (process != null && !String.IsNullOrEmpty(capture) && !File.Exists(capture) &&
+            DateTime.UtcNow < deadline && !process.HasExited)
+            Thread.Sleep(10);
+        return process;
+    }
+
+    static int HoldWriter() {
+        var capture = Environment.GetEnvironmentVariable("HERMES_TEST_RESUME_WRITER_CAPTURE");
+        var release = Environment.GetEnvironmentVariable("HERMES_TEST_RESUME_WRITER_RELEASE");
+        bool inJob;
+        var known = IsProcessInJob(Process.GetCurrentProcess().Handle, IntPtr.Zero, out inJob);
+        if (!String.IsNullOrEmpty(capture))
+            File.WriteAllText(capture, Process.GetCurrentProcess().Id + Environment.NewLine +
+                (known && inJob ? "in-job" : "not-in-job") + Environment.NewLine +
+                Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks + Environment.NewLine);
+        var home = Environment.GetEnvironmentVariable("HERMES_HOME");
+        if (!String.IsNullOrEmpty(home)) {
+            var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var created = (Process.GetCurrentProcess().StartTime.ToUniversalTime() - epoch).TotalSeconds;
+            var status = "{\"kind\":\"hermes-gateway\",\"gateway_state\":\"running\",\"pid\":" +
+                Process.GetCurrentProcess().Id + ",\"start_time\":" + Math.Round(created * 100) +
+                ",\"hermes_home\":" + JsonString(Path.GetFullPath(home).ToLowerInvariant()) + "}";
+            File.WriteAllText(Path.Combine(home, "gateway_state.json"), status);
+        }
+        var delayedWrite = Environment.GetEnvironmentVariable("HERMES_TEST_DELAYED_WRITE_PATH");
+        var delayedAt = DateTime.UtcNow.AddSeconds(2);
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < deadline && (String.IsNullOrEmpty(release) || !File.Exists(release))) {
+            if (!String.IsNullOrEmpty(delayedWrite) && DateTime.UtcNow >= delayedAt) {
+                File.WriteAllText(delayedWrite, "late-write");
+                delayedWrite = null;
+            }
+            Thread.Sleep(25);
+        }
+        return 0;
+    }
+
     static void WritePlan(string home, string root, string invocationId, string leaseId) {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var plan = "{\"schema_version\":1,\"invocation_id\":\"" + invocationId +
@@ -100,6 +341,17 @@ public static class FakeHermes {
     }
 
     static int Resume(string[] args, string leasePath, string leaseId, string invocationId, string mode) {
+        if (mode == "containment-noncooperative-success" || mode == "containment-fast-success") {
+            var gate = Environment.GetEnvironmentVariable("HERMES_DEFERRED_GATEWAY_STARTUP_GATE") ?? "";
+            var gateCapture = Environment.GetEnvironmentVariable("HERMES_TEST_RESUME_TARGET_GATE_CAPTURE");
+            if (!String.IsNullOrEmpty(gateCapture)) File.WriteAllText(gateCapture, gate);
+            bool inJob;
+            var known = IsProcessInJob(Process.GetCurrentProcess().Handle, IntPtr.Zero, out inJob);
+            AppendContainmentState(known && inJob ? "started:in-job" : "started:not-in-job");
+        } else {
+            var gateResult = AwaitContainmentGate(mode);
+            if (gateResult != 0) return gateResult;
+        }
         if (String.IsNullOrEmpty(leasePath) || String.IsNullOrEmpty(leaseId) ||
             String.IsNullOrEmpty(invocationId) || !File.Exists(leasePath)) return 1;
         var home = Path.GetDirectoryName(leasePath);
@@ -115,8 +367,24 @@ public static class FakeHermes {
             invocationId + "\",\"owner_pid\":" + framePid + "}";
         Console.WriteLine(frame);
         Console.Out.Flush();
+        if (mode == "containment-success") {
+            var gate = Environment.GetEnvironmentVariable("HERMES_DEFERRED_GATEWAY_STARTUP_GATE") ?? "";
+            Console.WriteLine("Deferred gateway resume failed: home=" + home.ToUpperInvariant() +
+                " temp=" + Path.GetTempPath().ToUpperInvariant() + " invocation=" + invocationId +
+                " lease=" + leaseId + " gate=" + gate + " secret=CHILD_DIAGNOSTIC_SECRET_8f86b783");
+            Console.Error.WriteLine("child stderr home=" + home.ToUpperInvariant() +
+                " temp=" + Path.GetTempPath().ToUpperInvariant() +
+                " token=CHILD_DIAGNOSTIC_SECRET_8f86b783 " + new string('z', 4096));
+        }
+        Process writer = null;
+        if (mode == "containment-success" || mode == "containment-noncooperative-success" ||
+            mode == "containment-failure-drain") {
+            writer = StartHeldWriter();
+            if (writer == null) return 26;
+        }
         if (mode == "resume-duplicate-frame") Console.WriteLine(frame);
-        if (mode == "resume-fail" || mode == "receipt-clock-rollback-resume-fail") {
+        if (mode == "resume-fail" || mode == "receipt-clock-rollback-resume-fail" ||
+            mode == "containment-failure-drain") {
             if (parentPid > 0 && File.Exists(leasePath)) {
                 var returned = Regex.Replace(File.ReadAllText(leasePath), "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + parentPid);
                 ReplaceLease(leasePath, returned, "resume-return");
@@ -129,15 +397,41 @@ public static class FakeHermes {
             return 0;
         }
         var pending = Path.Combine(home, ".hermes-gateway-resume-" + invocationId + ".json");
-        var completed = Path.Combine(home, ".hermes-gateway-resume-" + invocationId + ".completed");
+        var prepared = Path.Combine(home, ".hermes-gateway-resume-" + invocationId + ".prepared");
+        var manifestPath = Path.Combine(home, ".hermes-gateway-resume-" + invocationId + ".prepared-runtime.json");
         if (!File.Exists(pending)) return 1;
-        File.Move(pending, completed);
+        var planRaw = File.ReadAllText(pending);
+        File.Move(pending, prepared);
+        var root = Path.Combine(home, "hermes-agent").ToLowerInvariant();
+        var runtimes = "[]";
+        if (writer != null) {
+            var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var created = Math.Round((writer.StartTime.ToUniversalTime() - epoch).TotalSeconds, 2);
+            // Python json.dumps preserves the .0 for a rounded float. Mirror
+            // that canonical representation exactly for the HMAC fixture.
+            var createdText = created.ToString("0.0#", System.Globalization.CultureInfo.InvariantCulture);
+            runtimes = "[{\"created_at\":" + createdText + ",\"creation_file_time\":" +
+                JsonString(CreationFileTime(writer)) + ",\"executable_path\":" +
+                JsonString(writer.MainModule.FileName.ToLowerInvariant()) + ",\"pid\":" + writer.Id +
+                ",\"profile\":\"default\",\"profile_home\":" + JsonString(home.ToLowerInvariant()) + "}]";
+        }
+        var unsigned = "{\"install_root\":" + JsonString(root) + ",\"invocation_id\":" +
+            JsonString(invocationId) + ",\"plan_sha256\":\"" + Fingerprint(planRaw) +
+            "\",\"runtimes\":" + runtimes + ",\"schema_version\":1}";
+        var unsignedCapture = Environment.GetEnvironmentVariable("HERMES_TEST_MANIFEST_UNSIGNED_CAPTURE");
+        if (!String.IsNullOrEmpty(unsignedCapture)) File.WriteAllText(unsignedCapture, unsigned);
+        var manifest = "{\"auth\":\"" + HmacHex(unsigned, leaseId) + "\",\"install_root\":" +
+            JsonString(root) + ",\"invocation_id\":" + JsonString(invocationId) +
+            ",\"plan_sha256\":\"" + Fingerprint(planRaw) + "\",\"runtimes\":" + runtimes +
+            ",\"schema_version\":1}";
+        File.WriteAllText(manifestPath, manifest);
         if (File.Exists(leasePath)) File.Delete(leasePath);
-        Console.WriteLine("Deferred gateway fleet resumed.");
+        Console.WriteLine("Deferred gateway fleet prepared for native commit.");
         return 0;
     }
 
     public static int Main(string[] args) {
+        if (args.Contains("--test-held-writer")) return HoldWriter();
         if (args.Contains("--preflight")) {
             var output = Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_OUTPUT") ?? "";
             var argsCapture = Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_ARGS_CAPTURE");
@@ -169,6 +463,10 @@ public static class FakeHermes {
         var leaseId = Arg(args, "--bridge-lease-id");
         var invocationId = Arg(args, "--invocation-id");
         var mode = Environment.GetEnvironmentVariable("HERMES_TEST_UPDATE_MODE") ?? "normal";
+        if (mode == "pre-plan-fail") {
+            Console.Error.WriteLine("simulated pre-plan updater refusal");
+            return 2;
+        }
         if (args.Contains("--resume-deferred-gateway") && mode == "resume-trampoline" &&
             Process.GetCurrentProcess().MainModule.FileName.IndexOf(
                 "\\venv\\Scripts\\", StringComparison.OrdinalIgnoreCase
@@ -210,6 +508,33 @@ public static class FakeHermes {
             raw = Regex.Replace(raw, "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + Process.GetCurrentProcess().Id);
             ReplaceLease(leasePath, raw, "update-adopt");
             Thread.Sleep(750);
+        }
+        if ((mode == "invalid-plan-fail" || mode == "ambiguous-plan-fail") &&
+            !String.IsNullOrEmpty(leaseId) && !String.IsNullOrEmpty(invocationId) &&
+            !String.IsNullOrEmpty(leasePath)) {
+            var home = Path.GetDirectoryName(leasePath);
+            var pending = Path.Combine(home, ".hermes-gateway-resume-" + invocationId + ".json");
+            if (mode == "invalid-plan-fail") {
+                File.WriteAllText(pending, "{invalid-plan");
+            } else {
+                WritePlan(home, Path.Combine(home, "hermes-agent"), invocationId, leaseId);
+                File.Copy(
+                    pending,
+                    Path.Combine(home, ".hermes-gateway-resume-" + invocationId + ".completed"),
+                    true
+                );
+            }
+            if (File.Exists(leasePath) && parentLeaseOwnerPid > 0) {
+                var returned = File.ReadAllText(leasePath);
+                returned = Regex.Replace(
+                    returned,
+                    "\"owner_pid\"\\s*:\\s*\\d+",
+                    "\"owner_pid\":" + parentLeaseOwnerPid
+                );
+                ReplaceLease(leasePath, returned, "update-return-invalid-plan");
+            }
+            Console.Error.WriteLine("simulated unproved recovery plan");
+            return 2;
         }
         if (!String.IsNullOrEmpty(leaseId) && !String.IsNullOrEmpty(invocationId) && !String.IsNullOrEmpty(leasePath)) {
             var home = Path.GetDirectoryName(leasePath);
@@ -281,7 +606,12 @@ public static class FakeDesktop {
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (DateTime.UtcNow < deadline) {
             foreach (var requestPath in Directory.GetFiles(home, ".hermes-update-relaunch-request-*.json")) {
-                var requestRaw = File.ReadAllText(requestPath);
+                string requestRaw;
+                try {
+                    requestRaw = File.ReadAllText(requestPath);
+                } catch (IOException) {
+                    continue;
+                }
                 Func<string, string> requestValue = pattern => {
                     var match = Regex.Match(requestRaw, pattern);
                     return match.Success ? match.Groups[1].Value : "";
@@ -304,7 +634,15 @@ public static class FakeDesktop {
                             requestAttempt + "-" + Process.GetCurrentProcess().Id + ".json");
                         var exitTemp = exitAckPath + ".tmp-" + Guid.NewGuid().ToString("N");
                         File.WriteAllText(exitTemp, exitAck);
-                        if (File.Exists(requestPath) && File.ReadAllText(requestPath) == requestRaw)
+                        string currentRequest = null;
+                        try {
+                            if (File.Exists(requestPath))
+                                currentRequest = File.ReadAllText(requestPath);
+                        } catch (IOException) {
+                            File.Delete(exitTemp);
+                            continue;
+                        }
+                        if (currentRequest == requestRaw)
                             File.Move(exitTemp, exitAckPath);
                         else
                             File.Delete(exitTemp);
@@ -351,7 +689,7 @@ public static class FakeDesktop {
     }
 }
 '@
-    Compile-TestExecutable $Destination $source 'fake Desktop'
+    Compile-TestExecutable $Destination $source 'fake Desktop' -Windowless
 }
 
 function New-TestInstall([string]$Tag, [string]$FakeHermes) {
@@ -382,6 +720,13 @@ function New-TestInstall([string]$Tag, [string]$FakeHermes) {
         TopologyCapture = Join-Path $testHome 'contained-process-topology.txt'
         ResumeCapture = Join-Path $testHome 'deferred-resume-args.txt'
         ResumeRedirectorCapture = Join-Path $testHome 'deferred-resume-redirector.txt'
+        ResumeContainmentCapture = Join-Path $testHome 'deferred-resume-containment.txt'
+        ResumeGateCapture = Join-Path $testHome 'deferred-resume-gate.txt'
+        ResumeTargetGateCapture = Join-Path $testHome 'deferred-resume-target-gate.txt'
+        ResumeWriterCapture = Join-Path $testHome 'deferred-resume-writer.txt'
+        ResumeWriterRelease = Join-Path $testHome 'deferred-resume-writer.release'
+        ManifestUnsignedCapture = Join-Path $testHome 'deferred-resume-manifest-unsigned.txt'
+        DelayedWrite = Join-Path $testHome 'deferred-resume-delayed-write.txt'
         BuildShaCapture = Join-Path $testHome 'desktop-build-sha.txt'
         UpdateMarker = Join-Path $testHome '.hermes-update-in-progress'
         Result = Join-Path $testHome '.hermes-update-result.json'
@@ -453,7 +798,8 @@ function Invoke-TestHandoff(
     [string]$BridgeLeaseId = '',
     [string]$UpdateMode = 'normal',
     [string]$RelaunchExe = '',
-    [AllowNull()][object]$SelfPreclaimAgeSeconds = $null
+    [AllowNull()][object]$SelfPreclaimAgeSeconds = $null,
+    [string[]]$AdditionalArguments = @()
 ) {
     $oldOutput = $env:HERMES_TEST_PREFLIGHT_OUTPUT
     $oldCode = $env:HERMES_TEST_PREFLIGHT_CODE
@@ -467,6 +813,13 @@ function Invoke-TestHandoff(
     $oldTopologyCapture = $env:HERMES_TEST_TOPOLOGY_CAPTURE
     $oldResumeCapture = $env:HERMES_TEST_RESUME_CAPTURE
     $oldResumeRedirectorCapture = $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE
+    $oldResumeContainmentCapture = $env:HERMES_TEST_RESUME_CONTAINMENT_CAPTURE
+    $oldResumeGateCapture = $env:HERMES_TEST_RESUME_GATE_CAPTURE
+    $oldResumeTargetGateCapture = $env:HERMES_TEST_RESUME_TARGET_GATE_CAPTURE
+    $oldResumeWriterCapture = $env:HERMES_TEST_RESUME_WRITER_CAPTURE
+    $oldResumeWriterRelease = $env:HERMES_TEST_RESUME_WRITER_RELEASE
+    $oldDelayedWrite = $env:HERMES_TEST_DELAYED_WRITE_PATH
+    $oldManifestUnsignedCapture = $env:HERMES_TEST_MANIFEST_UNSIGNED_CAPTURE
     $oldBuildShaCapture = $env:HERMES_TEST_BUILD_SHA_CAPTURE
     $oldUpdateMode = $env:HERMES_TEST_UPDATE_MODE
     $oldTestMode = $env:HERMES_DESKTOP_UPDATE_TEST
@@ -487,6 +840,13 @@ function Invoke-TestHandoff(
         $env:HERMES_TEST_TOPOLOGY_CAPTURE = $Install.TopologyCapture
         $env:HERMES_TEST_RESUME_CAPTURE = $Install.ResumeCapture
         $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE = $Install.ResumeRedirectorCapture
+        $env:HERMES_TEST_RESUME_CONTAINMENT_CAPTURE = $Install.ResumeContainmentCapture
+        $env:HERMES_TEST_RESUME_GATE_CAPTURE = $Install.ResumeGateCapture
+        $env:HERMES_TEST_RESUME_TARGET_GATE_CAPTURE = $Install.ResumeTargetGateCapture
+        $env:HERMES_TEST_RESUME_WRITER_CAPTURE = $Install.ResumeWriterCapture
+        $env:HERMES_TEST_RESUME_WRITER_RELEASE = $Install.ResumeWriterRelease
+        $env:HERMES_TEST_DELAYED_WRITE_PATH = $Install.DelayedWrite
+        $env:HERMES_TEST_MANIFEST_UNSIGNED_CAPTURE = $Install.ManifestUnsignedCapture
         $env:HERMES_TEST_BUILD_SHA_CAPTURE = $Install.BuildShaCapture
         $env:HERMES_TEST_UPDATE_MODE = $UpdateMode
         $env:HERMES_DESKTOP_UPDATE_TEST = '1'
@@ -521,10 +881,11 @@ exit $LASTEXITCODE
         }
         $arguments = @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptToRun,
-            '-InstallRoot', $Install.Root, '-DesktopPid', '0', '-NoUi'
+            '-InstallRoot', $Install.Root, '-DesktopPid', '0', '-NoUi', '-TestMode'
         )
         if ($BridgeLeaseId) { $arguments += @('-BridgeLeaseId', $BridgeLeaseId) }
         if ($RelaunchExe) { $arguments += @('-RelaunchExe', $RelaunchExe) }
+        if ($AdditionalArguments.Count -gt 0) { $arguments += $AdditionalArguments }
         & $powershellExe @arguments | Out-Null
         return $LASTEXITCODE
     } finally {
@@ -540,6 +901,13 @@ exit $LASTEXITCODE
         $env:HERMES_TEST_TOPOLOGY_CAPTURE = $oldTopologyCapture
         $env:HERMES_TEST_RESUME_CAPTURE = $oldResumeCapture
         $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE = $oldResumeRedirectorCapture
+        $env:HERMES_TEST_RESUME_CONTAINMENT_CAPTURE = $oldResumeContainmentCapture
+        $env:HERMES_TEST_RESUME_GATE_CAPTURE = $oldResumeGateCapture
+        $env:HERMES_TEST_RESUME_TARGET_GATE_CAPTURE = $oldResumeTargetGateCapture
+        $env:HERMES_TEST_RESUME_WRITER_CAPTURE = $oldResumeWriterCapture
+        $env:HERMES_TEST_RESUME_WRITER_RELEASE = $oldResumeWriterRelease
+        $env:HERMES_TEST_DELAYED_WRITE_PATH = $oldDelayedWrite
+        $env:HERMES_TEST_MANIFEST_UNSIGNED_CAPTURE = $oldManifestUnsignedCapture
         $env:HERMES_TEST_BUILD_SHA_CAPTURE = $oldBuildShaCapture
         $env:HERMES_TEST_UPDATE_MODE = $oldUpdateMode
         $env:HERMES_DESKTOP_UPDATE_TEST = $oldTestMode
@@ -565,11 +933,338 @@ $suiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-desktop-update
 New-Item -ItemType Directory -Path $suiteRoot -Force | Out-Null
 $fakeHermes = Join-Path $suiteRoot 'fake-hermes.exe'
 $invalidVenvHomes = @()
+$containmentWriterIdentities = @()
 
 try {
     New-FakeHermes $fakeHermes
     $fakeDesktopTemplate = Join-Path $suiteRoot 'fake-desktop-template.exe'
     New-FakeDesktop $fakeDesktopTemplate
+
+    $realPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
+    Assert-True (Test-Path -LiteralPath $realPython -PathType Leaf) 'real managed Python is available for the containment gate integration test'
+    if (Test-Path -LiteralPath $realPython -PathType Leaf) {
+        $realGate = Join-Path $suiteRoot 'real-python-containment.gate'
+        $realGateCapture = Join-Path $suiteRoot 'real-python-containment-armed.txt'
+        $realGateProbe = Join-Path $suiteRoot 'real-python-containment-probe.py'
+        [System.IO.File]::WriteAllText($realGate, 'wait', (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText(
+            $realGateProbe,
+            @'
+import os
+from pathlib import Path
+from hermes_cli.update_cmd import _await_parent_gateway_containment
+_await_parent_gateway_containment()
+Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="utf-8")
+'@,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $realPsi = New-Object System.Diagnostics.ProcessStartInfo
+        $realPsi.FileName = $realPython
+        $realPsi.Arguments = '"' + $realGateProbe + '"'
+        $realPsi.WorkingDirectory = $repoRoot
+        $realPsi.UseShellExecute = $false
+        $realPsi.CreateNoWindow = $true
+        $realPsi.RedirectStandardOutput = $true
+        $realPsi.RedirectStandardError = $true
+        $realPsi.EnvironmentVariables['PYTHONPATH'] = $repoRoot
+        $realPsi.EnvironmentVariables['HERMES_DEFERRED_GATEWAY_STARTUP_GATE'] = $realGate
+        $realPsi.EnvironmentVariables['HERMES_TEST_REAL_GATE_CAPTURE'] = $realGateCapture
+        $realGateProcess = [System.Diagnostics.Process]::Start($realPsi)
+        Start-Sleep -Milliseconds 400
+        Assert-True (-not $realGateProcess.HasExited -and -not (Test-Path -LiteralPath $realGateCapture)) 'real Python waits while the exact startup gate remains wait'
+        $realGateNext = $realGate + '.next'
+        $realGatePrevious = $realGate + '.previous'
+        [System.IO.File]::WriteAllText($realGateNext, 'armed', (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::Replace($realGateNext, $realGate, $realGatePrevious, $true)
+        Remove-Item -LiteralPath $realGatePrevious -Force
+        $realGateProcess.WaitForExit(5000) | Out-Null
+        Assert-True ($realGateProcess.HasExited -and $realGateProcess.ExitCode -eq 0 -and
+            (Test-Path -LiteralPath $realGateCapture) -and
+            [System.IO.File]::ReadAllText($realGateCapture) -eq 'armed') 'real Python proceeds only after the exact wait-to-armed transition'
+        $realGateProcess.Dispose()
+    }
+
+    $containmentNoncooperative = New-TestInstall 'deferred-containment-noncooperative' $fakeHermes
+    $containmentNoncooperativeDesktop = Join-Path $containmentNoncooperative.Home 'fake-desktop.exe'
+    Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $containmentNoncooperativeDesktop
+    $containmentNoncooperativeLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $containmentNoncooperative $containmentNoncooperativeLeaseId
+    $code = Invoke-TestHandoff `
+        -Install $containmentNoncooperative `
+        -PreflightOutput (New-PreflightJson $containmentNoncooperative $true $true) `
+        -PreflightCode 0 `
+        -BridgeLeaseId $containmentNoncooperativeLeaseId `
+        -UpdateMode 'containment-noncooperative-success' `
+        -RelaunchExe $containmentNoncooperativeDesktop `
+        -AdditionalArguments @('-TestDeferredGatewayPreAssignHoldMilliseconds', '500')
+    Assert-Equal 0 $code 'a gate-ignorant recovery target starts only after its trusted wrapper is contained'
+    $containmentNoncooperativeStates = if (Test-Path -LiteralPath $containmentNoncooperative.ResumeContainmentCapture) {
+        @([System.IO.File]::ReadAllLines($containmentNoncooperative.ResumeContainmentCapture) | Where-Object { $_ })
+    } else { @() }
+    Assert-True ($containmentNoncooperativeStates -contains 'started:in-job' -and
+        $containmentNoncooperativeStates -notcontains 'started:not-in-job') 'non-cooperative target first executes as a member of the private recovery Job'
+    $containmentNoncooperativeWriter = Get-TestWriterIdentity $containmentNoncooperative.ResumeWriterCapture
+    if ($containmentNoncooperativeWriter) { $containmentWriterIdentities += $containmentNoncooperativeWriter }
+    Assert-Equal 'in-job' $(if ($containmentNoncooperativeWriter) { $containmentNoncooperativeWriter.Membership } else { '' }) 'a gate-ignorant target can spawn only contained descendants'
+    Stop-TestWriterExact $containmentNoncooperativeWriter $containmentNoncooperative.ResumeWriterRelease
+    $containmentNoncooperativeGatePath = [System.IO.File]::ReadAllText($containmentNoncooperative.ResumeGateCapture)
+    Assert-NoDeferredGateArtifacts $containmentNoncooperativeGatePath 'gate-ignorant success'
+    $containmentNoncooperativeTargetGatePath = if (Test-Path -LiteralPath $containmentNoncooperative.ResumeTargetGateCapture) {
+        [System.IO.File]::ReadAllText($containmentNoncooperative.ResumeTargetGateCapture)
+    } else { '' }
+    Assert-True ($containmentNoncooperativeTargetGatePath -and
+        -not [string]::Equals($containmentNoncooperativeGatePath, $containmentNoncooperativeTargetGatePath, [StringComparison]::OrdinalIgnoreCase)) 'gate-ignorant target receives only the separate target-retention gate'
+    Assert-NoDeferredGateArtifacts $containmentNoncooperativeTargetGatePath 'gate-ignorant target success'
+
+    $bufferedAdoption = New-TestInstall 'deferred-buffered-adoption' $fakeHermes
+    $bufferedAdoptionDesktop = Join-Path $bufferedAdoption.Home 'fake-desktop.exe'
+    Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $bufferedAdoptionDesktop
+    $bufferedAdoptionLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $bufferedAdoption $bufferedAdoptionLeaseId
+    $code = Invoke-TestHandoff `
+        -Install $bufferedAdoption `
+        -PreflightOutput (New-PreflightJson $bufferedAdoption $true $true) `
+        -PreflightCode 0 `
+        -BridgeLeaseId $bufferedAdoptionLeaseId `
+        -UpdateMode 'normal' `
+        -RelaunchExe $bufferedAdoptionDesktop `
+        -AdditionalArguments @('-TestDeferredGatewayPostTargetGateHoldMilliseconds', '500')
+    Assert-Equal 0 $code 'a buffered adoption frame proves the exact child after it clears the lease'
+    $bufferedAdoptionLog = Get-Content -LiteralPath (Join-Path $bufferedAdoption.Home 'logs\desktop-update-handoff.log') -Raw
+    Assert-True ($bufferedAdoptionLog -notmatch 'lost its bridge-quiesce lease') 'buffered adoption is not misclassified as lease loss'
+
+    $containmentFastSuccess = New-TestInstall 'deferred-containment-fast-success' $fakeHermes
+    $containmentFastSuccessLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $containmentFastSuccess $containmentFastSuccessLeaseId
+    $code = Invoke-TestHandoff `
+        -Install $containmentFastSuccess `
+        -PreflightOutput (New-PreflightJson $containmentFastSuccess $true $true) `
+        -PreflightCode 0 `
+        -BridgeLeaseId $containmentFastSuccessLeaseId `
+        -UpdateMode 'containment-fast-success' `
+        -AdditionalArguments @('-TestDeferredGatewayTargetRetentionHoldMilliseconds', '500')
+    Assert-Equal 13 $code 'fast target exit during parent retention fails closed without reopening its PID'
+    $fastWrapperGatePath = if (Test-Path -LiteralPath $containmentFastSuccess.ResumeGateCapture) {
+        [System.IO.File]::ReadAllText($containmentFastSuccess.ResumeGateCapture)
+    } else { '' }
+    $fastTargetGatePath = if (Test-Path -LiteralPath $containmentFastSuccess.ResumeTargetGateCapture) {
+        [System.IO.File]::ReadAllText($containmentFastSuccess.ResumeTargetGateCapture)
+    } else { '' }
+    Assert-True ($fastWrapperGatePath -and $fastTargetGatePath -and
+        -not [string]::Equals($fastWrapperGatePath, $fastTargetGatePath, [StringComparison]::OrdinalIgnoreCase)) 'fast target remains behind a distinct parent-retention gate'
+    Assert-NoDeferredGateArtifacts $fastWrapperGatePath 'fast target wrapper failure'
+    Assert-NoDeferredGateArtifacts $fastTargetGatePath 'fast target retention failure'
+    $fastArgs = if (Test-Path -LiteralPath $containmentFastSuccess.ResumeCapture) {
+        [System.IO.File]::ReadAllText($containmentFastSuccess.ResumeCapture)
+    } else { '' }
+    $fastInvocationMatch = [regex]::Match($fastArgs, '--invocation-id\s+([^\s]+)')
+    $fastStateRestored = $false
+    if ($fastInvocationMatch.Success) {
+        $fastPrefix = Join-Path $containmentFastSuccess.Home ('.hermes-gateway-resume-' + $fastInvocationMatch.Groups[1].Value)
+        $fastStateRestored = (Test-Path -LiteralPath ($fastPrefix + '.json') -PathType Leaf) -and
+            -not (Test-Path -LiteralPath ($fastPrefix + '.prepared')) -and
+            -not (Test-Path -LiteralPath ($fastPrefix + '.prepared-runtime.json')) -and
+            -not (Test-Path -LiteralPath ($fastPrefix + '.completed'))
+    }
+    Assert-True $fastStateRestored 'fast target failure restores pending authority and removes prepared state'
+
+    $containmentSuccess = New-TestInstall 'deferred-containment-success' $fakeHermes
+    $containmentSuccessDesktop = Join-Path $containmentSuccess.Home 'fake-desktop.exe'
+    Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $containmentSuccessDesktop
+    $containmentSuccessLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $containmentSuccess $containmentSuccessLeaseId
+    $code = Invoke-TestHandoff `
+        -Install $containmentSuccess `
+        -PreflightOutput (New-PreflightJson $containmentSuccess $true $true) `
+        -PreflightCode 0 `
+        -BridgeLeaseId $containmentSuccessLeaseId `
+        -UpdateMode 'containment-success' `
+        -RelaunchExe $containmentSuccessDesktop `
+        -AdditionalArguments @(
+            '-TestDeferredGatewayPreAssignHoldMilliseconds', '250',
+            '-TestDeferredGatewayWrapperExitHoldMilliseconds', '1250'
+        )
+    if ($code -ne 0) {
+        Get-Content -LiteralPath (Join-Path $containmentSuccess.Home 'logs\desktop-update-handoff.log') -ErrorAction SilentlyContinue
+    }
+    Assert-Equal 0 $code 'deferred gateway writer starts only after its parent is assigned and terminal proof disarms containment'
+    $nativeUnsignedCapture = $containmentSuccess.ManifestUnsignedCapture + '.native'
+    Assert-True ((Test-Path -LiteralPath $containmentSuccess.ManifestUnsignedCapture -PathType Leaf) -and
+        (Test-Path -LiteralPath $nativeUnsignedCapture -PathType Leaf) -and
+        [string]::Equals(
+            [System.IO.File]::ReadAllText($containmentSuccess.ManifestUnsignedCapture),
+            [System.IO.File]::ReadAllText($nativeUnsignedCapture),
+            [StringComparison]::Ordinal
+        )) 'native survivor proof authenticates the publisher canonical bytes exactly'
+    $containmentSuccessStates = if (Test-Path -LiteralPath $containmentSuccess.ResumeContainmentCapture) {
+        @([System.IO.File]::ReadAllLines($containmentSuccess.ResumeContainmentCapture) | Where-Object { $_ })
+    } else { @() }
+    Assert-True ($containmentSuccessStates.Count -ge 3 -and
+        @($containmentSuccessStates | Where-Object { $_ -match '^waiting:' }).Count -ge 1 -and
+        $containmentSuccessStates -contains 'armed:in-job') 'resume observes wait then exact inherited Job membership before any writer spawn'
+    $containmentSuccessWriter = Get-TestWriterIdentity $containmentSuccess.ResumeWriterCapture
+    if ($containmentSuccessWriter) { $containmentWriterIdentities += $containmentSuccessWriter }
+    Assert-True ($null -ne $containmentSuccessWriter) 'contained success records the exact writer generation'
+    Assert-Equal 'in-job' $(if ($containmentSuccessWriter) { $containmentSuccessWriter.Membership } else { '' }) 'successful writer inherits the private recovery Job'
+    Assert-True (Test-TestWriterLive $containmentSuccessWriter) 'terminal proof disarms kill-on-close before the recovery Job handle is released'
+    $containmentSuccessLogPath = Join-Path $containmentSuccess.Home 'logs\desktop-update-handoff.log'
+    $containmentSuccessLog = [System.IO.File]::ReadAllText($containmentSuccessLogPath)
+    $containmentSuccessResumeArgs = [System.IO.File]::ReadAllText($containmentSuccess.ResumeCapture)
+    $containmentInvocationMatch = [regex]::Match($containmentSuccessResumeArgs, '--invocation-id\s+([^\s]+)')
+    $containmentSuccessGatePath = [System.IO.File]::ReadAllText($containmentSuccess.ResumeGateCapture)
+    $containmentSuccessTargetGatePath = if (Test-Path -LiteralPath $containmentSuccess.ResumeTargetGateCapture) {
+        [System.IO.File]::ReadAllText($containmentSuccess.ResumeTargetGateCapture)
+    } else { '' }
+    Assert-True ($containmentSuccessTargetGatePath -and
+        -not [string]::Equals($containmentSuccessGatePath, $containmentSuccessTargetGatePath, [StringComparison]::OrdinalIgnoreCase)) 'target starts behind a second gate distinct from wrapper assignment authorization'
+    $gatewayDiagnosticLines = @([System.IO.File]::ReadAllLines($containmentSuccessLogPath) |
+        Where-Object { $_ -match 'gateway-resume(?:!?)\|' })
+    Assert-True ($containmentInvocationMatch.Success -and
+        $containmentSuccessLog.IndexOf($containmentInvocationMatch.Groups[1].Value, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'handoff diagnostics never expose the exact deferred invocation capability'
+    Assert-True ($containmentSuccessLog.IndexOf($containmentSuccessLeaseId, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'handoff diagnostics never expose the exact bridge lease capability'
+    Assert-True ($containmentSuccessLog.IndexOf($containmentSuccessGatePath, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'handoff diagnostics never expose the exact deferred startup gate path'
+    Assert-True ($containmentSuccessLog.IndexOf('CHILD_DIAGNOSTIC_SECRET_8f86b783', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'handoff diagnostics redact secret-like child output'
+    Assert-True ($containmentSuccessLog -match '\[HERMES_HOME\]' -and
+        $containmentSuccessLog -match '\[TEMP\]') 'handoff diagnostics redact mixed-case Hermes and TEMP paths to fixed labels'
+    Assert-True ($containmentSuccessLog -notmatch '"event"\s*:\s*"deferred-gateway-lease-adopted"') 'handoff diagnostics replace the raw adoption protocol frame with a symbolic status'
+    Assert-True ($gatewayDiagnosticLines.Count -le 8 -and
+        @($gatewayDiagnosticLines | Where-Object { $_.Length -gt 640 }).Count -eq 0) 'gateway recovery diagnostics have a fixed line-count and line-length bound'
+    Stop-TestWriterExact $containmentSuccessWriter $containmentSuccess.ResumeWriterRelease
+    Assert-NoDeferredGateArtifacts $containmentSuccessGatePath 'contained success'
+    Assert-NoDeferredGateArtifacts $containmentSuccessTargetGatePath 'contained target success'
+
+    $containmentBoundaryFailure = New-TestInstall 'deferred-containment-native-boundary-failure' $fakeHermes
+    $containmentBoundaryLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $containmentBoundaryFailure $containmentBoundaryLeaseId
+    $code = Invoke-TestHandoff `
+        -Install $containmentBoundaryFailure `
+        -PreflightOutput (New-PreflightJson $containmentBoundaryFailure $true $true) `
+        -PreflightCode 0 `
+        -BridgeLeaseId $containmentBoundaryLeaseId `
+        -UpdateMode 'containment-success' `
+        -AdditionalArguments @('-TestDeferredGatewayNativeBoundaryFailure')
+    Assert-Equal 13 $code 'a runtime identity change at the final native boundary fails closed'
+    $containmentBoundaryWriter = Get-TestWriterIdentity $containmentBoundaryFailure.ResumeWriterCapture
+    if ($containmentBoundaryWriter) { $containmentWriterIdentities += $containmentBoundaryWriter }
+    Assert-True ($null -ne $containmentBoundaryWriter -and
+        -not (Test-TestWriterLive $containmentBoundaryWriter)) 'native-boundary failure drains every retained runtime generation before return'
+    $containmentBoundaryArgs = [System.IO.File]::ReadAllText($containmentBoundaryFailure.ResumeCapture)
+    $containmentBoundaryInvocation = [regex]::Match($containmentBoundaryArgs, '--invocation-id\s+([^\s]+)').Groups[1].Value
+    $containmentBoundaryPrefix = Join-Path $containmentBoundaryFailure.Home ('.hermes-gateway-resume-' + $containmentBoundaryInvocation)
+    Assert-True ((Test-Path -LiteralPath ($containmentBoundaryPrefix + '.json') -PathType Leaf) -and
+        -not (Test-Path -LiteralPath ($containmentBoundaryPrefix + '.prepared')) -and
+        -not (Test-Path -LiteralPath ($containmentBoundaryPrefix + '.prepared-runtime.json')) -and
+        -not (Test-Path -LiteralPath ($containmentBoundaryPrefix + '.completed')) -and
+        @(Get-ChildItem -LiteralPath $containmentBoundaryFailure.Home -Filter ('.hermes-gateway-resume-' + $containmentBoundaryInvocation + '.consume-*') -File -ErrorAction SilentlyContinue).Count -eq 0) 'native-boundary failure restores exact pending authority and retires prepared artifacts'
+    $containmentBoundaryGatePath = [System.IO.File]::ReadAllText($containmentBoundaryFailure.ResumeGateCapture)
+    Assert-NoDeferredGateArtifacts $containmentBoundaryGatePath 'native-boundary failure'
+
+    $containmentDrain = New-TestInstall 'deferred-containment-drain' $fakeHermes
+    $containmentDrainLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $containmentDrain $containmentDrainLeaseId
+    $code = Invoke-TestHandoff `
+        -Install $containmentDrain `
+        -PreflightOutput (New-PreflightJson $containmentDrain $true $true) `
+        -PreflightCode 0 `
+        -BridgeLeaseId $containmentDrainLeaseId `
+        -UpdateMode 'containment-failure-drain'
+    Assert-Equal 13 $code 'failed deferred gateway recovery remains a terminal recovery failure'
+    $containmentDrainWriter = Get-TestWriterIdentity $containmentDrain.ResumeWriterCapture
+    if ($containmentDrainWriter) { $containmentWriterIdentities += $containmentDrainWriter }
+    Assert-True ($null -ne $containmentDrainWriter) 'failed recovery starts one contained writer fixture'
+    Assert-Equal 'in-job' $(if ($containmentDrainWriter) { $containmentDrainWriter.Membership } else { '' }) 'failed writer inherits the private recovery Job'
+    Assert-True (-not (Test-TestWriterLive $containmentDrainWriter)) 'failure drains every recovery Job process before the handoff returns'
+    $containmentDrainGatePath = [System.IO.File]::ReadAllText($containmentDrain.ResumeGateCapture)
+    Assert-NoDeferredGateArtifacts $containmentDrainGatePath 'contained failure'
+    Assert-True (-not (Test-Path -LiteralPath $containmentDrain.DelayedWrite)) 'failed recovery returns before no delayed descendant write is possible'
+
+    $containmentAssignFailure = New-TestInstall 'deferred-containment-assign-failure' $fakeHermes
+    $containmentAssignFailureLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $containmentAssignFailure $containmentAssignFailureLeaseId
+    $code = Invoke-TestHandoff `
+        -Install $containmentAssignFailure `
+        -PreflightOutput (New-PreflightJson $containmentAssignFailure $true $true) `
+        -PreflightCode 0 `
+        -BridgeLeaseId $containmentAssignFailureLeaseId `
+        -UpdateMode 'containment-success' `
+        -AdditionalArguments @('-TestDeferredGatewayAssignFailure', '-TestDeferredGatewayInitialKillFailure')
+    Assert-Equal 13 $code 'assignment failure cannot escape into an uncontained gateway recovery'
+    $containmentAssignStates = if (Test-Path -LiteralPath $containmentAssignFailure.ResumeContainmentCapture) {
+        @([System.IO.File]::ReadAllLines($containmentAssignFailure.ResumeContainmentCapture) | Where-Object { $_ })
+    } else { @() }
+    Assert-True ($containmentAssignStates.Count -ge 1 -and
+        @($containmentAssignStates | Where-Object { $_ -match '^waiting:' }).Count -ge 1 -and
+        @($containmentAssignStates | Where-Object { $_ -match 'armed' }).Count -eq 0) 'assignment failure leaves its trusted wrapper waiting and never arms target launch'
+    Assert-True (-not (Test-Path -LiteralPath $containmentAssignFailure.ResumeWriterCapture)) 'assignment and initial-kill failure never permit a writer to spawn'
+    $waitingState = @($containmentAssignStates | Where-Object { $_ -match '^waiting:' } | Select-Object -First 1)
+    $waitingMatch = if ($waitingState.Count -eq 1) {
+        [regex]::Match($waitingState[0], '^waiting:(\d+):(\d+)$')
+    } else { $null }
+    $waitingIdentity = if ($waitingMatch -and $waitingMatch.Success) {
+        [pscustomobject]@{ Pid = [int]$waitingMatch.Groups[1].Value; StartedAtTicks = [int64]$waitingMatch.Groups[2].Value }
+    } else { $null }
+    Assert-True ($null -ne $waitingIdentity -and -not (Test-TestWriterLive $waitingIdentity)) 'unassigned resume child is proven dead before the handoff returns'
+    $assignmentGatePath = if (Test-Path -LiteralPath $containmentAssignFailure.ResumeGateCapture) {
+        [System.IO.File]::ReadAllText($containmentAssignFailure.ResumeGateCapture)
+    } else { '' }
+    Assert-True ($assignmentGatePath -and -not (Test-Path -LiteralPath $assignmentGatePath)) 'assignment failure removes its exact startup gate only after the child is dead'
+    Assert-NoDeferredGateArtifacts $assignmentGatePath 'assignment failure'
+    Start-Sleep -Seconds 7
+    Assert-True (-not (Test-TestWriterLive $containmentSuccessWriter)) 'released success fixture has no delayed writer seven seconds later'
+    Assert-True (-not (Test-TestWriterLive $containmentNoncooperativeWriter)) 'gate-ignorant writer has no delayed process seven seconds later'
+    Assert-True (-not (Test-TestWriterLive $containmentDrainWriter)) 'failed recovery writer remains absent seven seconds after return'
+    Assert-True (-not (Test-TestWriterLive $containmentBoundaryWriter)) 'native-boundary runtime remains absent seven seconds after return'
+    Assert-True (-not (Test-Path -LiteralPath $containmentAssignFailure.ResumeWriterCapture)) 'assignment failure creates no delayed writer seven seconds after return'
+    Assert-True (-not (Test-TestWriterLive $waitingIdentity)) 'unassigned resume generation remains absent seven seconds after return'
+    Assert-True (-not $assignmentGatePath -or -not (Test-Path -LiteralPath $assignmentGatePath)) 'startup gate is not recreated seven seconds after return'
+    Assert-True (-not (Test-Path -LiteralPath $containmentDrain.DelayedWrite)) 'failed recovery descendant cannot perform a delayed post-return write'
+    Assert-True (-not (Test-Path -LiteralPath $containmentBoundaryFailure.DelayedWrite)) 'native-boundary failure cannot perform a delayed post-return write'
+    Assert-NoDeferredGateArtifacts $containmentNoncooperativeGatePath 'gate-ignorant success after seven seconds'
+    Assert-NoDeferredGateArtifacts $containmentNoncooperativeTargetGatePath 'gate-ignorant target success after seven seconds'
+    Assert-NoDeferredGateArtifacts $fastWrapperGatePath 'fast target wrapper failure after seven seconds'
+    Assert-NoDeferredGateArtifacts $fastTargetGatePath 'fast target retention failure after seven seconds'
+    Assert-NoDeferredGateArtifacts $containmentSuccessGatePath 'contained success after seven seconds'
+    Assert-NoDeferredGateArtifacts $containmentSuccessTargetGatePath 'contained target success after seven seconds'
+    Assert-NoDeferredGateArtifacts $containmentDrainGatePath 'contained failure after seven seconds'
+    Assert-NoDeferredGateArtifacts $containmentBoundaryGatePath 'native-boundary failure after seven seconds'
+    Assert-NoDeferredGateArtifacts $assignmentGatePath 'assignment failure after seven seconds'
+
+    $logContention = New-TestInstall 'handoff-log-contention' $fakeHermes
+    $logContentionLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $logContention $logContentionLeaseId
+    $logContentionDir = Join-Path $logContention.Home 'logs'
+    New-Item -ItemType Directory -Path $logContentionDir -Force | Out-Null
+    $logContentionPrimary = Join-Path $logContentionDir 'desktop-update-handoff.log'
+    [System.IO.File]::WriteAllText($logContentionPrimary, 'locked-primary')
+    $logLock = [System.IO.File]::Open(
+        $logContentionPrimary,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $code = Invoke-TestHandoff `
+            -Install $logContention `
+            -PreflightOutput (New-PreflightJson $logContention $true $true) `
+            -PreflightCode 0 `
+            -BridgeLeaseId $logContentionLeaseId `
+            -UpdateMode 'pre-plan-fail'
+    } finally {
+        $logLock.Dispose()
+    }
+    Assert-Equal 13 $code 'primary handoff-log contention does not alter the updater terminal result'
+    Assert-Equal 'locked-primary' ([System.IO.File]::ReadAllText($logContentionPrimary)) 'contended primary handoff log is never overwritten or truncated'
+    $fallbackLogs = @(Get-ChildItem -LiteralPath $logContentionDir -Filter 'desktop-update-handoff-fallback-*.log' -File -ErrorAction SilentlyContinue)
+    Assert-Equal 1 $fallbackLogs.Count 'one durable per-attempt fallback log records primary-log contention'
+    if ($fallbackLogs.Count -eq 1) {
+        $fallbackRaw = [System.IO.File]::ReadAllText($fallbackLogs[0].FullName)
+        Assert-True ($fallbackLogs[0].Length -le 131072) 'fallback handoff diagnostics remain byte-bounded'
+        Assert-True ($fallbackRaw -match 'primary handoff log unavailable' -and
+            $fallbackRaw -notmatch 'Add-Content|being used by another process|IOException') 'fallback honestly signals omission without raw PowerShell or system errors'
+    }
+    Assert-True (Test-Path -LiteralPath $logContention.Result) 'log contention still publishes the ordinary terminal handoff result'
+
+    if (-not $DeferredGatewayContainmentOnly) {
 
     $fixture = [System.IO.File]::ReadAllText($leaseFixture) | ConvertFrom-Json
     $fixtureFields = @($fixture.PSObject.Properties | ForEach-Object { $_.Name })
@@ -1077,8 +1772,12 @@ try {
     Assert-Equal 8 $code 'mismatched lease capability aborts before mutation'
     Assert-True (-not (Test-Path -LiteralPath $foreign.Sentinel)) 'foreign lease is never followed by mutation'
     Assert-Equal $before ([System.IO.File]::ReadAllText($foreign.Lease)) 'foreign live lease is neither rewritten nor deleted'
+    }
 } finally {
-    $cleanupPaths = @($noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $selfPreclaim.Home, $impossibleSelfPreclaim.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $deadMarker.Home, $leased.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $rollbackReceipt.Home, $prePlanFailure.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
+    foreach ($identity in $containmentWriterIdentities) {
+        Stop-TestWriterExact $identity (Join-Path $suiteRoot 'cleanup-writer.release')
+    }
+    $cleanupPaths = @($containmentSuccess.Home, $containmentDrain.Home, $containmentAssignFailure.Home, $noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $selfPreclaim.Home, $impossibleSelfPreclaim.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $deadMarker.Home, $leased.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $rollbackReceipt.Home, $prePlanFailure.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
     foreach ($path in $cleanupPaths) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue

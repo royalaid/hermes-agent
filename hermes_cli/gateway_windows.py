@@ -360,7 +360,9 @@ def _legacy_startup_entry_path() -> Path:
 # Stable working directory
 # ---------------------------------------------------------------------------
 
-def _stable_gateway_working_dir(project_root: Path) -> str:
+def _stable_gateway_working_dir(
+    project_root: Path, *, hermes_home: Path | None = None
+) -> str:
     """Return a stable cwd for detached/startup gateway runs.
 
     Mirror the POSIX service invariant: anchor at ``HERMES_HOME`` whenever it
@@ -373,7 +375,7 @@ def _stable_gateway_working_dir(project_root: Path) -> str:
     from hermes_cli.config import get_hermes_home
 
     try:
-        home = get_hermes_home()
+        home = hermes_home if hermes_home is not None else get_hermes_home()
         if home:
             home_path = Path(home)
             if home_path.is_dir():
@@ -782,7 +784,9 @@ def _prepend_pythonpath(env_overlay: dict[str, str], entries: list[str]) -> None
     env_overlay["PYTHONPATH"] = os.pathsep.join(clean_entries)
 
 
-def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
+def _build_gateway_argv(
+    *, hermes_home: Path | None = None
+) -> tuple[list[str], str, dict[str, str]]:
     """Build (argv, working_dir, env_overlay) for the gateway subprocess.
 
     Same logical command as what gateway.cmd runs, but assembled as a
@@ -801,9 +805,14 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
         _preserve_hermes_home_path(get_python_path())
     )
     project_root = _preserve_hermes_home_path(PROJECT_ROOT)
-    working_dir = _stable_gateway_working_dir(PROJECT_ROOT)
-    hermes_home = str(Path(get_hermes_home()))
-    profile_arg = _profile_arg(hermes_home)
+    selected_home = Path(
+        hermes_home if hermes_home is not None else get_hermes_home()
+    )
+    working_dir = _stable_gateway_working_dir(
+        PROJECT_ROOT, hermes_home=selected_home
+    )
+    resolved_home = str(selected_home)
+    profile_arg = _profile_arg(resolved_home)
 
     argv = [python_exe, "-m", "hermes_cli.main"]
     if profile_arg:
@@ -811,7 +820,7 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
     argv.extend(["gateway", "run"])
 
     env_overlay = {
-        "HERMES_HOME": hermes_home,
+        "HERMES_HOME": resolved_home,
         "PYTHONIOENCODING": "utf-8",
         "HERMES_GATEWAY_DETACHED": "1",
         "VIRTUAL_ENV": _preserve_hermes_home_path(venv_dir),
@@ -892,7 +901,12 @@ def windowless_gateway_restart_spec(
     return new_argv, working_dir, env_overlay
 
 
-def _spawn_detached(script_path: Path | None = None) -> int:
+def _spawn_detached_process(
+    script_path: Path | None = None,
+    *,
+    hermes_home: Path | None = None,
+    allow_breakaway: bool = True,
+) -> subprocess.Popen:
     """Launch the gateway as a fully detached background process.
 
     We spawn ``python.exe -m hermes_cli.main gateway run`` directly — NOT
@@ -909,15 +923,25 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     Arg ``script_path`` is accepted for API symmetry with older callers
     but ignored — we don't need it now that we go direct.
 
-    Returns the spawned PID so callers can verify the process actually
-    came up.
+    Returns the live ``Popen`` so security-sensitive callers can retain the
+    exact Windows process handle until readiness is proven. Ordinary callers
+    should keep using :func:`_spawn_detached`, which preserves the PID-only
+    API.
     """
     _assert_windows()
-    argv, working_dir, env_overlay = _build_gateway_argv()
+    if hermes_home is None:
+        argv, working_dir, env_overlay = _build_gateway_argv()
+    else:
+        argv, working_dir, env_overlay = _build_gateway_argv(
+            hermes_home=hermes_home
+        )
 
     # Inherit PATH etc. from the current env, overlay our required vars.
     env = {**os.environ, **env_overlay}
-    primary_env = {**env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1"}
+    primary_env = {
+        **env,
+        _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1" if allow_breakaway else "0",
+    }
 
     # CREATE_NEW_PROCESS_GROUP 0x00000200 — child gets its own group, won't
     #                                       receive Ctrl+C from our group
@@ -930,7 +954,11 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     #                                       job teardown from reaping us;
     #                                       some Windows Terminal versions
     #                                       wrap their children in a job).
-    flags = windows_detach_flags()
+    flags = (
+        windows_detach_flags()
+        if allow_breakaway
+        else windows_detach_flags_without_breakaway()
+    )
 
     # Redirect any stray stdout/stderr output to a sidecar log. Python's
     # logging module writes to gateway.log through a FileHandler, so the
@@ -938,7 +966,7 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     # that goes to print() or native stderr.
     from hermes_cli.config import get_hermes_home
 
-    log_dir = Path(get_hermes_home()) / "logs"
+    log_dir = Path(hermes_home if hermes_home is not None else get_hermes_home()) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stray_log = log_dir / "gateway-stdio.log"
 
@@ -960,6 +988,8 @@ def _spawn_detached(script_path: Path | None = None) -> int:
         # Terminal configs). Retry without the breakaway flag — in most
         # setups the hidden-console CREATE_NO_WINDOW spawn is enough on
         # its own.
+        if not allow_breakaway:
+            raise
         error_code = getattr(exc, "winerror", None)
         if error_code is None:
             error_code = exc.errno
@@ -981,7 +1011,12 @@ def _spawn_detached(script_path: Path | None = None) -> int:
                 stdout=log_fh,
                 stderr=log_fh,
             )
-    return proc.pid
+    return proc
+
+
+def _spawn_detached(script_path: Path | None = None) -> int:
+    """Launch a detached gateway and return its PID."""
+    return int(_spawn_detached_process(script_path).pid)
 
 
 def _install_choice_from_env(name: str) -> bool | None:
