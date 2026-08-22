@@ -1,7 +1,10 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
 import hashlib
+import os
+import shutil
 import subprocess
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
@@ -10,6 +13,19 @@ import pytest
 
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 from hermes_cli.update_transaction import _UpdateTransaction
+
+
+def _transaction_lease(root, lease_id, *, owner_pid=None, created_at=100):
+    owner_pid = os.getpid() if owner_pid is None else owner_pid
+    return {
+        "schema_version": 1,
+        "lease_id": lease_id,
+        "owner_pid": owner_pid,
+        "created_at": created_at,
+        "expires_at": created_at + 120,
+        "handoff_grace_until": created_at + 60,
+        "install_root": str(root.resolve()),
+    }
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -273,6 +289,1041 @@ class TestCmdUpdateTermuxUvBootstrap:
 
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
+
+    def test_source_mutation_state_blocks_archive_after_failed_operation(self):
+        from hermes_cli import update_cmd
+
+        state = update_cmd._SourceMutationState()
+
+        with pytest.raises(RuntimeError, match="injected mutation failure"):
+            state.run(
+                lambda: (_ for _ in ()).throw(
+                    RuntimeError("injected mutation failure")
+                )
+            )
+
+        assert state.phase is update_cmd._SourcePhase.MUTATION_STARTED
+        assert not update_cmd._archive_fallback_is_safe(
+            is_windows=True,
+            deferred_gateway_resume=False,
+            source_phase=state.phase,
+        )
+
+    @pytest.mark.windows_only
+    def test_transactional_acquisition_freezes_target_before_live_ref_update(
+        self, tmp_path, monkeypatch
+    ):
+        """A moving remote cannot change the target proven in isolation."""
+        from hermes_cli import update_cmd
+
+        home = tmp_path / "home"
+        remote = tmp_path / "remote.git"
+        writer = tmp_path / "writer"
+        live = tmp_path / "live"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "init", "-b", "main", str(writer)], check=True)
+        subprocess.run(
+            ["git", "-C", str(writer), "config", "user.name", "Hermes Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(writer), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        (writer / "payload.txt").write_text("first", encoding="utf-8")
+        subprocess.run(["git", "-C", str(writer), "add", "payload.txt"], check=True)
+        subprocess.run(["git", "-C", str(writer), "commit", "-m", "first"], check=True)
+        first_sha = subprocess.run(
+            ["git", "-C", str(writer), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(writer), "remote", "add", "origin", str(remote)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(writer), "push", "-u", "origin", "main"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "--git-dir", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
+            check=True,
+        )
+        subprocess.run(["git", "clone", str(remote), str(live)], check=True)
+
+        target = update_cmd._UpdateTarget(
+            branch="main",
+            remote="origin",
+            tracking_ref="refs/remotes/origin/main",
+            refspec="+refs/heads/main:refs/remotes/origin/main",
+        )
+        acquisition = update_cmd._acquire_transactional_git_target(
+            update_cmd._git_cmd(),
+            live,
+            target,
+            remote_url=str(remote),
+            invocation_id="invocation-acquisition-123456",
+            lease=_transaction_lease(live, "lease-acquisition-123456"),
+        )
+        try:
+            assert acquisition.target_sha == first_sha
+
+            (writer / "payload.txt").write_text("second", encoding="utf-8")
+            subprocess.run(["git", "-C", str(writer), "add", "payload.txt"], check=True)
+            subprocess.run(["git", "-C", str(writer), "commit", "-m", "second"], check=True)
+            subprocess.run(["git", "-C", str(writer), "push", "origin", "main"], check=True)
+
+            update_cmd._import_transactional_git_target(
+                update_cmd._git_cmd(),
+                live,
+                target,
+                acquisition,
+            )
+        finally:
+            acquisition.cleanup()
+
+        assert not (home / ".hermes-update-acquisition.json").exists()
+        assert not acquisition.workspace.exists()
+
+        imported = subprocess.run(
+            ["git", "-C", str(live), "rev-parse", "refs/remotes/origin/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert imported == first_sha
+
+    @pytest.mark.windows_only
+    def test_transactional_acquisition_never_persists_or_argv_logs_remote_secret(
+        self, tmp_path, monkeypatch, caplog, capsys
+    ):
+        from hermes_cli import update_cmd
+
+        secret = "https://credential-shaped.invalid/user:token-value@example/repo.git"
+        home = tmp_path / "home"
+        live = tmp_path / "live"
+        home.mkdir()
+        live.mkdir()
+        monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+        monkeypatch.setattr(update_cmd, "_tracking_ref_sha", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            update_cmd,
+            "_verify_complete_git_graph",
+            lambda *_a, **_k: True,
+        )
+        commands = []
+
+        def quiet_git(command, *, cwd, env, timeout=120):
+            commands.append(list(command))
+            if "init" in command:
+                repository = update_cmd.Path(command[-1])
+                repository.mkdir()
+                (repository / "config").write_text(
+                    "[core]\n\tbare = true\n",
+                    encoding="utf-8",
+                )
+            assert env["GIT_CONFIG_VALUE_0"] == secret
+            return True
+
+        monkeypatch.setattr(update_cmd, "_run_quiet_git", quiet_git)
+        real_run = update_cmd.subprocess.run
+
+        def fake_run(command, **kwargs):
+            if "rev-parse" in command:
+                return subprocess.CompletedProcess(command, 0, "d" * 40 + "\n", "")
+            return real_run(command, **kwargs)
+
+        monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+        target = update_cmd._UpdateTarget(
+            branch="codex/disposable",
+            remote="origin",
+            tracking_ref="refs/remotes/origin/codex/disposable",
+            refspec=(
+                "+refs/heads/codex/disposable:"
+                "refs/remotes/origin/codex/disposable"
+            ),
+        )
+
+        acquisition = update_cmd._acquire_transactional_git_target(
+            update_cmd._git_cmd(),
+            live,
+            target,
+            remote_url=secret,
+            invocation_id="invocation-acquisition-secret-1234",
+            lease=_transaction_lease(live, "lease-acquisition-secret-1234"),
+        )
+        try:
+            assert all(secret not in str(argument) for command in commands for argument in command)
+            for path in acquisition.workspace.rglob("*"):
+                if path.is_file():
+                    assert secret.encode() not in path.read_bytes()
+            captured = capsys.readouterr()
+            assert secret not in captured.out
+            assert secret not in captured.err
+            assert secret not in caplog.text
+        finally:
+            acquisition.cleanup()
+
+        assert not (home / ".hermes-update-acquisition.json").exists()
+        assert not acquisition.repository.exists()
+
+    @pytest.mark.windows_only
+    def test_complete_graph_proof_rejects_missing_object(self, tmp_path):
+        from hermes_cli import update_cmd
+
+        source = tmp_path / "source"
+        repository = tmp_path / "repository.git"
+        subprocess.run(["git", "init", "-b", "main", str(source)], check=True)
+        subprocess.run(["git", "-C", str(source), "config", "user.name", "Hermes Test"], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        (source / "payload.txt").write_text("reachable object", encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "payload.txt"], check=True)
+        subprocess.run(["git", "-C", str(source), "commit", "-m", "payload"], check=True)
+        target_sha = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        blob_sha = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD:payload.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "clone", "--bare", str(source), str(repository)], check=True)
+        env = update_cmd._acquisition_git_env()
+        assert update_cmd._verify_complete_git_graph(
+            update_cmd._git_cmd(), repository, target_sha, env=env
+        )
+
+        blob_object = repository / "objects" / blob_sha[:2] / blob_sha[2:]
+        assert blob_object.is_file()
+        os.chmod(blob_object, 0o700)
+        blob_object.unlink()
+
+        assert not update_cmd._verify_complete_git_graph(
+            update_cmd._git_cmd(), repository, target_sha, env=env
+        )
+
+    @pytest.mark.windows_only
+    def test_complete_graph_proof_requires_fsck_success(self, tmp_path, monkeypatch):
+        from hermes_cli import update_cmd
+
+        repository = tmp_path / "repository.git"
+        repository.mkdir()
+        seen = []
+        monkeypatch.setattr(
+            update_cmd.subprocess,
+            "run",
+            lambda command, **_kwargs: subprocess.CompletedProcess(command, 1),
+        )
+
+        def proof(command, **_kwargs):
+            seen.append(command)
+            return "fsck" not in command
+
+        monkeypatch.setattr(update_cmd, "_run_quiet_git", proof)
+
+        assert not update_cmd._verify_complete_git_graph(
+            update_cmd._git_cmd(), repository, "d" * 40, env={}
+        )
+        assert any("fsck" in command for command in seen)
+
+    @pytest.mark.windows_only
+    @pytest.mark.parametrize("unsafe", ["shallow", "alternates", "promisor"])
+    def test_complete_graph_proof_rejects_partial_repository_modes(
+        self, tmp_path, unsafe
+    ):
+        from hermes_cli import update_cmd
+
+        repository = tmp_path / "repository.git"
+        subprocess.run(["git", "init", "--bare", str(repository)], check=True)
+        if unsafe == "shallow":
+            (repository / "shallow").write_text("d" * 40 + "\n", encoding="ascii")
+        elif unsafe == "alternates":
+            alternates = repository / "objects" / "info" / "alternates"
+            alternates.parent.mkdir(parents=True, exist_ok=True)
+            alternates.write_text(str(tmp_path / "foreign-objects"), encoding="utf-8")
+        else:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "config",
+                    "remote.source.promisor",
+                    "true",
+                ],
+                check=True,
+            )
+
+        assert not update_cmd._verify_complete_git_graph(
+            update_cmd._git_cmd(),
+            repository,
+            "d" * 40,
+            env=update_cmd._acquisition_git_env(),
+        )
+
+    @pytest.mark.windows_only
+    @pytest.mark.parametrize(
+        ("commit_count", "handed_off_sync", "stage_fails"),
+        [("0", True, False), ("1", False, False), ("1", False, True)],
+        ids=("current-checkout-repair", "changed-checkout", "changed-stage-failure"),
+    )
+    def test_deferred_windows_update_stages_without_live_venv_mutation(
+        self,
+        monkeypatch,
+        commit_count,
+        handed_off_sync,
+        stage_fails,
+    ):
+        """The real deferred Desktop route ends after publishing a candidate."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        transaction = _UpdateTransaction(
+            invocation_id="invocation-stage-route-123456",
+            lease={
+                "schema_version": 1,
+                "lease_id": "lease-stage-route-123456",
+                "owner_pid": __import__("os").getpid(),
+            },
+        )
+        events = []
+        commands = []
+        staged = []
+        live_mutations = []
+        target_sha = "b" * 40
+        target = update_cmd._UpdateTarget(
+            branch="main",
+            remote="origin",
+            tracking_ref="refs/remotes/origin/main",
+            refspec="+refs/heads/main:refs/remotes/origin/main",
+        )
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(
+            hm,
+            "_pause_windows_gateways_for_update",
+            lambda **_kwargs: None,
+        )
+        monkeypatch.setattr(hm, "_capture_active_lazy_features", lambda: [])
+        monkeypatch.setattr(hm, "_capture_active_tool_dependencies", lambda: [])
+        monkeypatch.setattr(update_cmd, "_desktop_app_present", lambda _path: False)
+        monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
+        monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
+        monkeypatch.setattr(
+            update_cmd,
+            "_get_remote_url",
+            lambda *_args: "https://example.invalid/hermes-agent.git",
+        )
+        monkeypatch.setattr(update_cmd, "_is_fork", lambda _url: False)
+        monkeypatch.setattr(
+            update_cmd,
+            "_resolve_update_target",
+            lambda *_args, **_kwargs: target,
+        )
+        monkeypatch.setattr(
+            update_cmd, "_assert_safe_git_configuration", lambda *_a, **_k: None
+        )
+        from hermes_cli import gitlock
+
+        monkeypatch.setattr(gitlock, "clear_stale_git_locks", lambda _root: [])
+        acquisition = SimpleNamespace(
+            target_sha=target_sha,
+            cleanup=lambda: events.append("acquisition-cleaned"),
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_acquire_transactional_git_target",
+            lambda *_args, **_kwargs: events.append("package-verified")
+            or acquisition,
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_import_transactional_git_target",
+            lambda *_args, **_kwargs: events.append("package-imported"),
+        )
+        monkeypatch.setattr(
+            hm,
+            "_stash_local_changes_if_needed",
+            lambda *_args: events.append("source-prepared"),
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_write_deferred_gateway_plan",
+            lambda *_args, **_kwargs: None,
+        )
+        def stage(**kwargs):
+            kwargs["source_mutation"].run(lambda: None)
+            events.append("candidate-staged")
+            staged.append(kwargs)
+            if stage_fails:
+                raise RuntimeError("injected candidate staging failure")
+
+        monkeypatch.setattr(
+            update_cmd, "_run_transactional_desktop_route", stage
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_write_update_incomplete_marker",
+            lambda: live_mutations.append("core-marker"),
+        )
+        monkeypatch.setattr(
+            hm,
+            "_install_python_dependencies_with_optional_fallback",
+            lambda *_args, **_kwargs: live_mutations.append("live-install"),
+        )
+        monkeypatch.setattr(update_cmd, "_venv_core_imports_healthy", lambda: (True, ""))
+        monkeypatch.setattr(
+            update_cmd,
+            "_validate_critical_files_syntax",
+            lambda *_args: (True, None, None),
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_validate_critical_modules_import",
+            lambda *_args: (True, None, None),
+        )
+        monkeypatch.setattr(update_cmd, "_node_dependencies_healthy_read_only", lambda: True)
+        monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+        monkeypatch.setattr(update_cmd, "_record_update_success", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr(update_cmd, "_print_update_completion", lambda *_args: None)
+        fake_run = _make_run_side_effect(commit_count=commit_count)
+
+        def traced_run(command, **kwargs):
+            commands.append([str(value) for value in command])
+            return fake_run(command, **kwargs)
+
+        monkeypatch.setattr(update_cmd.subprocess, "run", traced_run)
+        if handed_off_sync:
+            monkeypatch.setenv(hm._UPDATE_REEXEC_ENV, "1")
+        else:
+            monkeypatch.delenv(hm._UPDATE_REEXEC_ENV, raising=False)
+
+        call = lambda: update_cmd._cmd_update_impl(
+                SimpleNamespace(
+                    branch="main",
+                    defer_gateway_resume=True,
+                    force=True,
+                    force_venv=True,
+                    gateway=True,
+                    keep_stash=True,
+                    switch_branch=False,
+                    yes=True,
+                ),
+                gateway_mode=True,
+                transaction=transaction,
+            )
+        if stage_fails:
+            with pytest.raises(RuntimeError, match="injected candidate staging failure"):
+                call()
+        else:
+            call()
+
+        assert len(staged) == 1
+        assert live_mutations == []
+        assert events == [
+            "package-verified",
+            "package-imported",
+            "acquisition-cleaned",
+            "candidate-staged",
+        ]
+        assert not any("fetch" in command for command in commands)
+
+    @pytest.mark.windows_only
+    def test_deferred_windows_update_refuses_archive_without_git(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        root = tmp_path / "not-a-git-checkout"
+        root.mkdir()
+        archive_calls = []
+        monkeypatch.setattr(hm, "PROJECT_ROOT", root)
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(
+            hm, "_pause_windows_gateways_for_update", lambda **_kwargs: None
+        )
+        monkeypatch.setattr(hm, "_capture_active_lazy_features", lambda: [])
+        monkeypatch.setattr(hm, "_capture_active_tool_dependencies", lambda: [])
+        monkeypatch.setattr(update_cmd, "_desktop_app_present", lambda _path: False)
+        monkeypatch.setattr(
+            update_cmd,
+            "_update_via_zip",
+            lambda *_args, **_kwargs: archive_calls.append(True),
+        )
+
+        with pytest.raises(SystemExit) as exit_info:
+            update_cmd._cmd_update_impl(
+                SimpleNamespace(
+                    branch="main",
+                    defer_gateway_resume=True,
+                    force=True,
+                    force_venv=True,
+                    gateway=True,
+                    keep_stash=True,
+                    switch_branch=False,
+                    yes=True,
+                ),
+                gateway_mode=True,
+                transaction=_UpdateTransaction(
+                    invocation_id="invocation-no-archive-123456",
+                    lease={
+                        "schema_version": 1,
+                        "lease_id": "lease-no-archive-123456",
+                        "owner_pid": __import__("os").getpid(),
+                    },
+                ),
+            )
+
+        assert exit_info.value.code == 1
+        assert archive_calls == []
+
+    @pytest.mark.windows_only
+    @pytest.mark.parametrize("stage_fails", [False, True])
+    def test_deferred_windows_update_retargets_without_rewriting_custom_branch(
+        self, tmp_path, monkeypatch, stage_fails
+    ):
+        from hermes_cli import desktop_update_activation as activation
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        root = tmp_path / "checkout"
+        home = tmp_path / "home"
+        home.mkdir()
+        subprocess.run(["git", "init", "-b", "fork-integration", str(root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.name", "Hermes Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        (root / "base.txt").write_text("base", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "base.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", str(root), "branch", "main"], check=True)
+        (root / "custom.txt").write_text("custom", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "custom.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "custom"], check=True)
+        custom_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(root), "checkout", "main"], check=True)
+        (root / "target.txt").write_text("target", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "target.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "target"], check=True)
+        target_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(root), "checkout", "fork-integration"], check=True)
+        target = update_cmd._UpdateTarget(
+            branch="main",
+            remote="origin",
+            tracking_ref="refs/remotes/origin/main",
+            refspec="refs/heads/main:refs/remotes/origin/main",
+        )
+        monkeypatch.setattr(hm, "PROJECT_ROOT", root)
+        monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+        transaction = _UpdateTransaction(
+            invocation_id="invocation-custom-branch-123456",
+            lease=_transaction_lease(root, "lease-custom-branch-123456"),
+        )
+
+        def stage(**kwargs):
+            assert update_cmd._capture_head_sha(update_cmd._git_cmd(), root) == target_sha
+            if stage_fails:
+                raise RuntimeError("injected staging failure")
+            activation.retire_staging_journal(
+                root,
+                home=home,
+                invocation_id=transaction.invocation_id,
+                lease_id=transaction.lease["lease_id"],
+            )
+
+        monkeypatch.setattr(update_cmd, "_stage_transactional_desktop_environment", stage)
+        call = lambda: update_cmd._run_transactional_desktop_route(
+            git_cmd=update_cmd._git_cmd(),
+            git_env=update_cmd._sanitized_git_env(),
+            transaction=transaction,
+            update_target=target,
+            target_sha=target_sha,
+            source_mutation=update_cmd._SourceMutationState(),
+            active_lazy_features=[],
+            active_tool_dependencies=[],
+        )
+        if stage_fails:
+            from hermes_cli.update_diagnostics import UpdateDiagnosticError
+
+            with pytest.raises(UpdateDiagnosticError) as failure:
+                call()
+            assert failure.value.code == "HDU201"
+            assert failure.value.stage == "candidate-staging"
+            assert failure.value.__cause__ is None
+        else:
+            call()
+
+        branch = subprocess.run(
+            ["git", "-C", str(root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert branch == ("fork-integration" if stage_fails else "main")
+        assert subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "refs/heads/fork-integration"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == custom_sha
+
+    @pytest.mark.windows_only
+    def test_divergent_selected_branch_failure_restores_original_branch(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        root = tmp_path / "checkout"
+        home = tmp_path / "home"
+        home.mkdir()
+        subprocess.run(["git", "init", "-b", "fork-integration", str(root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.name", "Hermes Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        (root / "base.txt").write_text("base", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "base.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "base"], check=True)
+        base_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(root), "branch", "main"], check=True)
+
+        (root / "custom.txt").write_text("custom", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "custom.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "custom"], check=True)
+        original_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        subprocess.run(["git", "-C", str(root), "checkout", "main"], check=True)
+        (root / "main-only.txt").write_text("main", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "main-only.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "main-only"], check=True)
+        selected_pre_head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        subprocess.run(["git", "-C", str(root), "checkout", "--detach", base_sha], check=True)
+        (root / "target.txt").write_text("target", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "target.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "target"], check=True)
+        target_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "fork-integration"], check=True
+        )
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", root)
+        monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+        monkeypatch.setattr(
+            update_cmd,
+            "_stage_transactional_desktop_environment",
+            lambda **_kwargs: pytest.fail("divergent source must not reach staging"),
+        )
+        transaction = _UpdateTransaction(
+            invocation_id="invocation-divergent-branch-123456",
+            lease=_transaction_lease(root, "lease-divergent-branch-123456"),
+        )
+        target = update_cmd._UpdateTarget(
+            branch="main",
+            remote="origin",
+            tracking_ref="refs/remotes/origin/main",
+            refspec="+refs/heads/main:refs/remotes/origin/main",
+        )
+
+        from hermes_cli.update_diagnostics import UpdateDiagnosticError
+
+        with pytest.raises(UpdateDiagnosticError) as failure:
+            update_cmd._run_transactional_desktop_route(
+                git_cmd=update_cmd._git_cmd(),
+                git_env=update_cmd._sanitized_git_env(),
+                transaction=transaction,
+                update_target=target,
+                target_sha=target_sha,
+                source_mutation=update_cmd._SourceMutationState(),
+                active_lazy_features=[],
+                active_tool_dependencies=[],
+            )
+        assert failure.value.code == "HDU301"
+        assert failure.value.stage == "source-route"
+        assert failure.value.__cause__ is None
+
+        assert subprocess.run(
+            ["git", "-C", str(root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == "fork-integration"
+        assert subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == original_sha
+        assert subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == selected_pre_head
+
+    @pytest.mark.windows_only
+    def test_crash_after_selected_branch_checkout_restores_exact_original(
+        self, tmp_path
+    ):
+        from hermes_cli import desktop_update_activation as activation
+
+        root = tmp_path / "checkout"
+        home = tmp_path / "home"
+        home.mkdir()
+        subprocess.run(["git", "init", "-b", "fork-integration", str(root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.name", "Hermes Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        (root / "base.txt").write_text("base", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "base.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "base"], check=True)
+        selected_pre_head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(root), "branch", "main"], check=True)
+        (root / "custom.txt").write_text("custom", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "custom.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "custom"], check=True)
+        original_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        invocation = "invocation-crash-after-checkout-123456"
+        lease = _transaction_lease(root, "lease-crash-after-checkout-123456")
+        activation.write_staging_journal(
+            root,
+            home=home,
+            invocation_id=invocation,
+            lease=lease,
+            pre_update_head=original_sha,
+            pre_update_branch="fork-integration",
+            branch="main",
+            selected_pre_head=selected_pre_head,
+            target_head=selected_pre_head,
+        )
+        activation.update_staging_journal(
+            root,
+            home=home,
+            invocation_id=invocation,
+            lease_id=lease["lease_id"],
+            phase="source-selecting",
+        )
+        subprocess.run(["git", "-C", str(root), "checkout", "main"], check=True)
+
+        activation.recover_staging_journal(
+            root, home, invocation, lease["lease_id"]
+        )
+
+        assert subprocess.run(
+            ["git", "-C", str(root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == "fork-integration"
+        assert subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == original_sha
+        assert subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "refs/heads/main"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == selected_pre_head
+        assert not (home / ".hermes-update-staging.json").exists()
+
+    @pytest.mark.windows_only
+    def test_real_windows_transactional_route_preserves_live_venv_and_publishes_recovery_first(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import desktop_update_activation as activation
+        from hermes_cli import main as hm
+        from hermes_cli import managed_uv
+        from hermes_cli import update_cmd
+        import hermes_mcp_update_gate as gate
+        import importlib
+
+        gate = importlib.reload(gate)
+
+        remote = tmp_path / "remote.git"
+        writer = tmp_path / "writer"
+        root = tmp_path / "install"
+        home = tmp_path / "home"
+        home.mkdir()
+        installed_uv = (
+            update_cmd.Path(os.environ["LOCALAPPDATA"])
+            / "hermes"
+            / "bin"
+            / "uv.exe"
+        )
+        uv_source = str(installed_uv) if installed_uv.is_file() else shutil.which("uv")
+        assert update_cmd.Path(uv_source).is_file(), "real uv executable is required"
+        managed_uv_path = home / "bin" / "uv.exe"
+        managed_uv_path.parent.mkdir()
+        shutil.copy2(uv_source, managed_uv_path)
+        uv_cache = tmp_path / "uv-cache"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "init", "-b", "main", str(writer)], check=True)
+        subprocess.run(["git", "-C", str(writer), "config", "user.name", "Hermes Test"], check=True)
+        subprocess.run(
+            ["git", "-C", str(writer), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        for relative in (
+            "hermes_cli/__init__.py",
+            "hermes_cli/config.py",
+            "hermes_cli/main.py",
+            "hermes_cli/web_server.py",
+            "cli.py",
+            "hermes_constants.py",
+            "hermes_state.py",
+            "model_tools.py",
+            "run_agent.py",
+            "toolsets.py",
+        ):
+            (writer / relative).parent.mkdir(parents=True, exist_ok=True)
+            (writer / relative).write_text("# integration smoke module\n", encoding="utf-8")
+        (writer / "pyproject.toml").write_text(
+            """[project]
+name = "hermes-route-fixture"
+version = "0.0.0"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.104.0,<1",
+  "openai==2.24.0",
+  "prompt_toolkit==3.0.52",
+  "pydantic==2.13.4",
+  "python-dotenv==1.2.2",
+  "pyyaml==6.0.3",
+  "rich==14.3.3",
+  "uvicorn>=0.24.0,<1",
+]
+
+[project.optional-dependencies]
+all = []
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hermes_cli"]
+py-modules = [
+  "cli",
+  "hermes_constants",
+  "hermes_state",
+  "model_tools",
+  "run_agent",
+  "toolsets",
+]
+""",
+            encoding="utf-8",
+        )
+        (writer / ".gitignore").write_text(
+            "venv/\n.hermes-runtime/\n__pycache__/\n*.pyc*\n*.egg-info/\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [str(managed_uv_path), "lock", "--python", sys.executable],
+            cwd=writer,
+            env={**os.environ, "UV_CACHE_DIR": str(uv_cache), "UV_NO_CONFIG": "true"},
+            check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        subprocess.run(["git", "-C", str(writer), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(writer), "commit", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", str(writer), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(writer), "push", "-u", "origin", "main"], check=True)
+        subprocess.run(["git", "clone", "--branch", "main", str(remote), str(root)], check=True)
+        pre_head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (writer / "integration-target.txt").write_text("target", encoding="utf-8")
+        subprocess.run(["git", "-C", str(writer), "add", "integration-target.txt"], check=True)
+        subprocess.run(["git", "-C", str(writer), "commit", "-m", "integration target"], check=True)
+        subprocess.run(["git", "-C", str(writer), "push", "origin", "main"], check=True)
+
+        live = root / "venv"
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(live)],
+            check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        (live / "live-sentinel.txt").write_text("unchanged", encoding="utf-8")
+
+        def tree_digest(path):
+            digest = hashlib.sha256()
+            for item in sorted(path.rglob("*")):
+                if item.is_file():
+                    digest.update(item.relative_to(path).as_posix().encode())
+                    digest.update(item.read_bytes())
+            return digest.hexdigest()
+
+        before_live = tree_digest(live)
+        marker = home / ".quiesce-lease.json"
+        lease = gate.write_quiesce_lease(root, marker=marker, owner_pid=os.getpid())
+        transaction = _UpdateTransaction(
+            invocation_id="invocation-real-route-123456",
+            lease=lease,
+        )
+        target = update_cmd._UpdateTarget(
+            branch="main",
+            remote="origin",
+            tracking_ref="refs/remotes/origin/main",
+            refspec="+refs/heads/main:refs/remotes/origin/main",
+        )
+        monkeypatch.setattr(hm, "PROJECT_ROOT", root)
+        monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+        monkeypatch.setattr(managed_uv, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(managed_uv, "resolve_uv", lambda: str(managed_uv_path))
+        monkeypatch.setenv("UV_CACHE_DIR", str(uv_cache))
+        monkeypatch.setattr(gate, "marker_path", lambda: marker)
+        monkeypatch.setattr(update_cmd, "_active_memory_provider_specs", lambda: ())
+        assert managed_uv.ensure_uv_without_runtime_cutover() == str(managed_uv_path)
+        uv_commands = []
+        real_run = subprocess.run
+
+        def trace_uv(command, *args, **kwargs):
+            argv = [str(value) for value in command]
+            if argv and os.path.normcase(argv[0]) == os.path.normcase(str(managed_uv_path)):
+                uv_commands.append(argv)
+            return real_run(command, *args, **kwargs)
+
+        monkeypatch.setattr(managed_uv.subprocess, "run", trace_uv)
+        acquisition = update_cmd._acquire_transactional_git_target(
+            update_cmd._git_cmd(),
+            root,
+            target,
+            remote_url=str(remote),
+            invocation_id=transaction.invocation_id,
+            lease=lease,
+        )
+        try:
+            target_sha = acquisition.target_sha
+            update_cmd._import_transactional_git_target(
+                update_cmd._git_cmd(), root, target, acquisition
+            )
+        finally:
+            acquisition.cleanup()
+
+        lease = gate.write_quiesce_lease(
+            root,
+            marker=marker,
+            lease_id=lease["lease_id"],
+            owner_pid=os.getpid(),
+            expected_owner_pid=os.getpid(),
+        )
+        transaction.lease = lease
+        assert gate.marker_path() == marker
+        assert gate.live_quiesce_lease(marker, install_root=root) == lease
+
+        update_cmd._run_transactional_desktop_route(
+            git_cmd=update_cmd._git_cmd(),
+            git_env=update_cmd._sanitized_git_env(),
+            transaction=transaction,
+            update_target=target,
+            target_sha=target_sha,
+            source_mutation=update_cmd._SourceMutationState(),
+            active_lazy_features=[],
+            active_tool_dependencies=[],
+        )
+
+        manifest_path = home / activation._MANIFEST_NAME
+        plan_path = transaction.deferred_gateway_plan_path
+        assert isinstance(plan_path, update_cmd.Path) and plan_path.is_file()
+        assert manifest_path.is_file()
+        assert plan_path.stat().st_mtime_ns <= manifest_path.stat().st_mtime_ns
+        manifest, _ = activation._validated_manifest(
+            root,
+            home,
+            transaction.invocation_id,
+            lease["lease_id"],
+        )
+        assert manifest["pre_update_head"] == pre_head
+        assert manifest["target_head"] == target_sha
+        assert any(
+            command[1] == "venv"
+            and "--relocatable" in command
+            for command in uv_commands
+        )
+        assert any(
+            command[1] == "sync"
+            and "--frozen" in command
+            for command in uv_commands
+        )
+        candidate = root / manifest["candidate_rel"]
+        assert (candidate / "Scripts" / "python.exe").is_file()
+        assert tree_digest(live) == before_live
+        assert not (home / activation._STAGING_NAME).exists()
+        assert not (home / activation._ACQUISITION_NAME).exists()
 
 
     def test_foreign_upstream_remote_refuses_before_fetch_or_merge(

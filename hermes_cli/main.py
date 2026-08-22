@@ -10316,10 +10316,16 @@ def cmd_update(args):
             # Production heartbeat loss invokes os._exit immediately. Keep
             # this explicit guard for injected/test fail-stop callbacks and
             # any platform where process termination unexpectedly returns.
-            raise RuntimeError(
-                _update_lease_heartbeat.loss_reason
-                or "update quiesce lease was lost during mutation"
-            )
+            from hermes_cli.update_diagnostics import UpdateDiagnosticError
+
+            failure = getattr(_update_lease_heartbeat, "loss_error", None)
+            if not isinstance(failure, UpdateDiagnosticError):
+                failure = UpdateDiagnosticError(
+                    code="HDU401",
+                    stage="heartbeat-probe",
+                    kind="internal",
+                )
+            raise failure from None
     except SystemExit as _update_exit:
         # Receipt boundary (#91283 review): the impl has many early
         # sys.exit paths (concurrent-instance preflight, venv-holder
@@ -10331,25 +10337,43 @@ def cmd_update(args):
             from hermes_cli.update_receipt import finalize_pending_update_receipt
 
             _code = _update_exit.code if isinstance(_update_exit.code, int) else 1
-            finalize_pending_update_receipt(_code, f"sys.exit({_code})")
+            reason = ""
+            if _code != 0:
+                from hermes_cli.update_diagnostics import UpdateDiagnosticError
+
+                failure = UpdateDiagnosticError(
+                    code="HDU999",
+                    stage="command-boundary",
+                    error=_update_exit,
+                )
+                failure.log(logger)
+                reason = failure.reason
+            finalize_pending_update_receipt(_code, reason)
         except Exception:
             pass
         raise
     except BaseException as _update_exc:
+        from hermes_cli.update_diagnostics import diagnostic_error
+
+        failure = diagnostic_error(
+            _update_exc,
+            code="HDU999",
+            stage="command-boundary",
+        )
+        if not failure.emitted:
+            failure.log(logger)
         try:
             from hermes_cli.update_receipt import finalize_pending_update_receipt
 
-            finalize_pending_update_receipt(
-                1, f"{type(_update_exc).__name__}: {_update_exc}"
-            )
+            finalize_pending_update_receipt(1, failure.reason)
         except Exception:
             pass
-        raise
+        raise SystemExit(1) from None
     else:
         try:
             from hermes_cli.update_receipt import finalize_pending_update_receipt
 
-            finalize_pending_update_receipt(0, "completed at command boundary")
+            finalize_pending_update_receipt(0, "")
         except Exception:
             pass
     finally:

@@ -36,12 +36,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time as _time
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Callable, Mapping, NoReturn, Optional
+from typing import Callable, Mapping, NoReturn, Optional, TypeVar
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import get_default_hermes_root, venv_bin_dir, venv_python_path
@@ -124,6 +126,73 @@ class _UpdateTarget:
     refspec: str
 
 
+class _SourcePhase(Enum):
+    """Whether this request may still use a second acquisition transport."""
+
+    PRE_MUTATION = "pre-mutation"
+    MUTATION_STARTED = "mutation-started"
+
+
+_MutationResult = TypeVar("_MutationResult")
+
+
+@dataclass
+class _SourceMutationState:
+    """Mark source mutation before entering its central operation boundary."""
+
+    phase: _SourcePhase = _SourcePhase.PRE_MUTATION
+
+    def run(self, operation: Callable[[], _MutationResult]) -> _MutationResult:
+        self.phase = _SourcePhase.MUTATION_STARTED
+        return operation()
+
+
+@dataclass(frozen=True)
+class _AcquiredGitTarget:
+    """One complete frozen remote graph proven outside the live repository."""
+
+    workspace: Path
+    repository: Path
+    frozen_ref: str
+    target_sha: str
+    expected_tracking_sha: str | None
+    live_root: Path
+    home: Path
+    invocation_id: str
+    lease_id: str
+
+    def cleanup(self) -> None:
+        if self.repository.parent != self.workspace:
+            raise RuntimeError("transactional acquisition cleanup scope changed")
+        from hermes_cli.desktop_update_activation import recover_acquisition_journal
+
+        last_error: OSError | None = None
+        for delay in (0.0, 0.05, 0.15, 0.3, 0.6, 1.0):
+            if delay:
+                _time.sleep(delay)
+            try:
+                recover_acquisition_journal(
+                    self.live_root,
+                    self.home,
+                    self.invocation_id,
+                    self.lease_id,
+                )
+                return
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                last_error = exc
+        raise RuntimeError("transactional acquisition cleanup failed") from last_error
+
+
+@dataclass(frozen=True)
+class _TransactionalSourceIdentity:
+    pre_update_head: str
+    pre_update_branch: str
+    selected_pre_head: str | None
+    target_head: str
+
+
 @dataclass(frozen=True)
 class _VerifiedProcessIdentity:
     """One live process identity authorized for a narrowly scoped stop."""
@@ -140,6 +209,509 @@ class _VerifiedProcessIdentity:
     venv_ancestor_created_at: float = 0.0
     venv_ancestor_argv: tuple[str, ...] = ()
     venv_ancestor_executable: str = ""
+
+
+def _is_transactional_desktop_update(*, deferred_gateway_resume: bool) -> bool:
+    """Return whether the outer Windows handoff owns side-by-side activation."""
+    return bool(sys.platform == "win32" and deferred_gateway_resume)
+
+
+def _candidate_install_env(candidate: Path) -> dict[str, str]:
+    """Build a clean uv environment that can address only the candidate."""
+    toxic = {
+        "CONDA_DEFAULT_ENV",
+        "CONDA_PREFIX",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+    }
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in toxic and not key.upper().startswith("UV_")
+    }
+    from hermes_cli.managed_uv import managed_python_env
+
+    env = managed_python_env(Path(_m().PROJECT_ROOT), base_env=env)
+    env["VIRTUAL_ENV"] = str(candidate)
+    env["UV_PROJECT_ENVIRONMENT"] = str(candidate)
+    return env
+
+
+def _active_memory_provider_specs() -> tuple[str, ...]:
+    """Resolve the active provider's trusted manifest specs for staging."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        memory = cfg.get("memory") if isinstance(cfg, dict) else None
+        if not isinstance(memory, dict) or memory.get("enabled") is False:
+            return ()
+        provider = str(memory.get("provider") or "").strip()
+        if not provider or provider in {"default", "builtin", "none"}:
+            return ()
+
+        from hermes_cli.memory_setup import _provider_pip_dependencies
+        from plugins.memory import find_provider_dir
+        import yaml
+
+        plugin_dir = find_provider_dir(provider)
+        if plugin_dir is None:
+            raise RuntimeError("active memory provider manifest is missing")
+        yaml_path = plugin_dir / "plugin.yaml"
+        with yaml_path.open(encoding="utf-8") as handle:
+            metadata = yaml.safe_load(handle) or {}
+        if not isinstance(metadata, dict):
+            raise RuntimeError("active memory provider manifest is malformed")
+        specs = _provider_pip_dependencies(
+            provider,
+            metadata.get("pip_dependencies", []),
+        )
+        return tuple(str(spec).strip() for spec in specs if str(spec).strip())
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        from hermes_cli.update_diagnostics import diagnostic_error
+
+        raise diagnostic_error(
+            exc,
+            code="HDU101",
+            stage="provider-proof",
+        ) from None
+
+
+def _install_candidate_optional_dependencies(
+    uv_bin: str,
+    candidate: Path,
+    *,
+    active_lazy_features: list[str],
+    active_tool_dependencies: list[str],
+) -> None:
+    """Restore captured optional capabilities without touching the live venv."""
+    env = _candidate_install_env(candidate)
+    groups: list[tuple[str, ...]] = []
+
+    from tools import lazy_deps
+
+    lazy_specs: list[str] = []
+    for feature in active_lazy_features:
+        specs = lazy_deps.LAZY_DEPS.get(feature)
+        if specs is None:
+            raise RuntimeError("captured lazy dependency is no longer allowlisted")
+        lazy_specs.extend(str(spec) for spec in specs)
+    if lazy_specs:
+        groups.append(tuple(dict.fromkeys(lazy_specs)))
+
+    from hermes_cli import tools_config
+
+    for name in active_tool_dependencies:
+        spec = tools_config.restorable_python_tool_dependency(name)
+        if spec is None:
+            raise RuntimeError("captured tool dependency is no longer allowlisted")
+        _module_name, install_args = spec
+        groups.append(tuple(str(value) for value in install_args))
+
+    memory_specs = _active_memory_provider_specs()
+    if memory_specs:
+        from tools.lazy_deps import _spec_is_safe
+
+        if any(not _spec_is_safe(spec) for spec in memory_specs):
+            raise RuntimeError("active memory provider declared an unsafe dependency")
+        groups.append(memory_specs)
+
+    for install_args in groups:
+        try:
+            result = subprocess.run(
+                [uv_bin, "pip", "install", *install_args],
+                cwd=_m().PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=900,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("candidate optional dependency install failed") from exc
+        if result.returncode != 0:
+            raise RuntimeError("candidate optional dependency install failed")
+
+
+def _git_worktree_is_clean(git_cmd: list[str], root: Path) -> bool:
+    try:
+        status = subprocess.run(
+            git_cmd + ["status", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=_sanitized_git_env(read_only=True),
+        )
+    except OSError:
+        return False
+    return status.returncode == 0 and not status.stdout.strip()
+
+
+def _stage_transactional_desktop_environment(
+    *,
+    transaction: _UpdateTransaction,
+    source_identity: _TransactionalSourceIdentity,
+    update_target: _UpdateTarget,
+    active_lazy_features: list[str],
+    active_tool_dependencies: list[str],
+) -> None:
+    """Prepare and authenticate a candidate; never mutate the live venv."""
+    root = Path(_m().PROJECT_ROOT)
+    git_cmd = _git_cmd()
+    pre_update_head = source_identity.pre_update_head
+    target_sha = source_identity.target_head
+    if (
+        re.fullmatch(r"[0-9a-fA-F]{40}", pre_update_head or "") is None
+        or re.fullmatch(r"[0-9a-fA-F]{40}", target_sha or "") is None
+        or _capture_head_sha(git_cmd, root) != target_sha
+        or not _git_worktree_is_clean(git_cmd, root)
+    ):
+        raise RuntimeError("transactional source identity is not clean and exact")
+
+    invocation_id = transaction.invocation_id
+    lease = transaction.lease
+    lease_id = lease.get("lease_id") if isinstance(lease, dict) else None
+    if not isinstance(invocation_id, str) or not isinstance(lease_id, str):
+        raise RuntimeError("transactional staging lacks update ownership")
+    from hermes_mcp_update_gate import live_quiesce_lease, marker_path
+
+    live = live_quiesce_lease(marker_path(), install_root=root)
+    if not (
+        isinstance(live, dict)
+        and live.get("schema_version") == 1
+        and live.get("lease_id") == lease_id
+        and live.get("owner_pid") == os.getpid()
+    ):
+        raise RuntimeError("update quiesce lease ownership was lost before staging")
+
+    from hermes_cli.desktop_update_activation import (
+        retire_staging_journal,
+        update_staging_journal,
+    )
+    from hermes_cli.managed_uv import (
+        _smoke_candidate_venv,
+        ensure_uv_without_runtime_cutover,
+        stage_update_candidate_venv,
+    )
+
+    uv_bin = ensure_uv_without_runtime_cutover()
+    if not uv_bin:
+        raise RuntimeError("managed uv is unavailable for transactional staging")
+    observed_candidate: Path | None = None
+    observed_generation: Path | None = None
+
+    def observe_staging(
+        candidate: Path | None,
+        provisioned_generation: Path | None,
+    ) -> None:
+        nonlocal observed_candidate, observed_generation
+        if candidate is not None:
+            observed_candidate = candidate
+        if provisioned_generation is not None:
+            observed_generation = provisioned_generation
+        update_staging_journal(
+            root,
+            home=get_default_hermes_root(),
+            invocation_id=invocation_id,
+            lease_id=lease_id,
+            phase="candidate-staging",
+            candidate=observed_candidate,
+            provisioned_generation=observed_generation,
+        )
+
+    staged = stage_update_candidate_venv(
+        uv_bin,
+        project_root=root,
+        staging_observer=observe_staging,
+    )
+    if staged is None:
+        raise RuntimeError("replacement environment could not be staged")
+
+    _install_candidate_optional_dependencies(
+        uv_bin,
+        staged.candidate,
+        active_lazy_features=active_lazy_features,
+        active_tool_dependencies=active_tool_dependencies,
+    )
+    healthy, _detail, _runtime = _smoke_candidate_venv(staged.candidate)
+    if not healthy:
+        raise RuntimeError("replacement environment failed its final smoke test")
+    from hermes_cli.desktop_update_activation import _smoke_live
+
+    if not _smoke_live(staged.candidate, root):
+        raise RuntimeError("replacement environment failed critical import validation")
+    syntax_ok, _failing_path, _syntax_error = _validate_critical_files_syntax(root)
+    if syntax_ok is not True:
+        raise RuntimeError("replacement source failed critical syntax validation")
+
+    # Re-read every mutable authority immediately before publication.
+    live = live_quiesce_lease(marker_path(), install_root=root)
+    if not (
+        isinstance(live, dict)
+        and live.get("schema_version") == 1
+        and live.get("lease_id") == lease_id
+        and live.get("owner_pid") == os.getpid()
+        and _capture_head_sha(git_cmd, root) == target_sha
+        and _git_worktree_is_clean(git_cmd, root)
+    ):
+        raise RuntimeError("transactional authority changed during staging")
+
+    # Recovery must be durable before a native reader can observe a
+    # candidate that may replace the live environment.
+    _write_deferred_gateway_plan(root, transaction=transaction)
+    from hermes_cli.desktop_update_activation import write_activation_manifest
+
+    write_activation_manifest(
+        root,
+        home=get_default_hermes_root(),
+        invocation_id=invocation_id,
+        lease_id=lease_id,
+        candidate=staged.candidate,
+        provisioned_generation=staged.provisioned_generation,
+        pre_update_head=pre_update_head,
+        pre_update_branch=source_identity.pre_update_branch,
+        selected_pre_head=source_identity.selected_pre_head,
+        branch=update_target.branch,
+        remote=update_target.remote,
+        target_ref=update_target.tracking_ref,
+        target_sha=target_sha,
+        python_health={
+            "critical_syntax": syntax_ok,
+            "critical_imports": True,
+            "dependencies": True,
+        },
+    )
+    retire_staging_journal(
+        root,
+        home=get_default_hermes_root(),
+        invocation_id=invocation_id,
+        lease_id=lease_id,
+    )
+    print("  ✓ Replacement environment staged for atomic Desktop activation")
+
+
+def _transactional_local_branch_head(
+    git_cmd: list[str], root: Path, branch: str, *, env: dict[str, str]
+) -> str | None:
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"refs/heads/{branch}"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode in {1, 128}:
+        return None
+    value = result.stdout.strip().lower()
+    if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise RuntimeError("selected local branch identity is unreadable")
+    return value
+
+
+def _transactional_current_branch(
+    git_cmd: list[str], root: Path, *, env: dict[str, str]
+) -> str:
+    result = subprocess.run(
+        git_cmd + ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        raise RuntimeError("transactional update requires an attached source branch")
+    validated = subprocess.run(
+        git_cmd + ["check-ref-format", "--branch", value],
+        cwd=root,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if validated.returncode != 0:
+        raise RuntimeError("transactional source branch identity is invalid")
+    return value
+
+
+def _run_transactional_desktop_route(
+    *,
+    git_cmd: list[str],
+    git_env: dict[str, str],
+    transaction: _UpdateTransaction,
+    update_target: _UpdateTarget,
+    target_sha: str,
+    source_mutation: _SourceMutationState,
+    active_lazy_features: list[str],
+    active_tool_dependencies: list[str],
+) -> None:
+    """Retarget a clean checkout, then publish one recoverable activation."""
+    from hermes_cli.desktop_update_activation import (
+        recover_staging_journal,
+        update_staging_journal,
+        write_staging_journal,
+    )
+
+    root = Path(_m().PROJECT_ROOT).resolve()
+    home = get_default_hermes_root().resolve()
+    lease = transaction.lease if isinstance(transaction.lease, dict) else {}
+    invocation_id = transaction.invocation_id
+    lease_id = lease.get("lease_id")
+    if not isinstance(invocation_id, str) or not isinstance(lease_id, str):
+        raise RuntimeError("transactional update ownership is unavailable")
+    if re.fullmatch(r"[0-9a-f]{40}", target_sha or "") is None:
+        raise RuntimeError("transactional target identity is invalid")
+
+    pre_update_branch = _transactional_current_branch(
+        git_cmd, root, env=git_env
+    )
+    pre_update_head = _capture_head_sha(git_cmd, root)
+    selected_pre_head = _transactional_local_branch_head(
+        git_cmd, root, update_target.branch, env=git_env
+    )
+    if (
+        pre_update_head is None
+        or re.fullmatch(r"[0-9a-f]{40}", pre_update_head) is None
+        or not _git_worktree_is_clean(git_cmd, root)
+    ):
+        raise RuntimeError("transactional source identity is not clean and exact")
+
+    write_staging_journal(
+        root,
+        home=home,
+        invocation_id=invocation_id,
+        lease=lease,
+        pre_update_head=pre_update_head,
+        pre_update_branch=pre_update_branch,
+        branch=update_target.branch,
+        selected_pre_head=selected_pre_head,
+        target_head=target_sha,
+    )
+    source_identity = _TransactionalSourceIdentity(
+        pre_update_head=pre_update_head,
+        pre_update_branch=pre_update_branch,
+        selected_pre_head=selected_pre_head,
+        target_head=target_sha,
+    )
+
+    failure_code = "HDU301"
+    failure_stage = "source-route"
+    try:
+        def retarget_source() -> None:
+            if pre_update_branch != update_target.branch:
+                update_staging_journal(
+                    root,
+                    home=home,
+                    invocation_id=invocation_id,
+                    lease_id=lease_id,
+                    phase="source-selecting",
+                )
+                if selected_pre_head is None:
+                    command = ["checkout", "-b", update_target.branch, target_sha]
+                else:
+                    command = ["checkout", update_target.branch]
+                checkout = subprocess.run(
+                    git_cmd + command,
+                    cwd=root,
+                    env=git_env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if checkout.returncode != 0:
+                    raise RuntimeError("selected update branch could not be activated")
+                update_staging_journal(
+                    root,
+                    home=home,
+                    invocation_id=invocation_id,
+                    lease_id=lease_id,
+                    phase="source-selected",
+                )
+            current_head = _capture_head_sha(git_cmd, root)
+            if current_head != target_sha:
+                update_staging_journal(
+                    root,
+                    home=home,
+                    invocation_id=invocation_id,
+                    lease_id=lease_id,
+                    phase="source-fast-forwarding",
+                )
+                merged = subprocess.run(
+                    git_cmd + ["merge", "--ff-only", target_sha],
+                    cwd=root,
+                    env=git_env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if merged.returncode != 0:
+                    raise RuntimeError("selected update branch cannot fast-forward")
+
+        source_mutation.run(retarget_source)
+        if (
+            _transactional_current_branch(git_cmd, root, env=git_env)
+            != update_target.branch
+            or _capture_head_sha(git_cmd, root) != target_sha
+            or _transactional_local_branch_head(
+                git_cmd, root, update_target.branch, env=git_env
+            )
+            != target_sha
+            or not _git_worktree_is_clean(git_cmd, root)
+        ):
+            raise RuntimeError("transactional source retargeting was not exact")
+        update_staging_journal(
+            root,
+            home=home,
+            invocation_id=invocation_id,
+            lease_id=lease_id,
+            phase="source-active",
+        )
+        failure_code = "HDU201"
+        failure_stage = "candidate-staging"
+        _stage_transactional_desktop_environment(
+            transaction=transaction,
+            source_identity=source_identity,
+            update_target=update_target,
+            active_lazy_features=active_lazy_features,
+            active_tool_dependencies=active_tool_dependencies,
+        )
+    except BaseException as exc:
+        try:
+            recover_staging_journal(
+                root,
+                home,
+                invocation_id,
+                lease_id,
+            )
+        except Exception as recovery_error:
+            from hermes_cli.update_diagnostics import diagnostic_error
+
+            raise diagnostic_error(
+                recovery_error,
+                code="HDU302",
+                stage="source-recovery",
+            ) from None
+        from hermes_cli.update_diagnostics import diagnostic_error
+
+        raise diagnostic_error(
+            exc,
+            code=failure_code,
+            stage=failure_stage,
+        ) from None
 
 
 def _is_safe_remote_name(remote: str) -> bool:
@@ -2554,6 +3126,7 @@ class _UpdateLeaseHeartbeat:
         self.interval_seconds = interval_seconds
         self.lost = False
         self.loss_reason: str | None = None
+        self.loss_error = None
         self._fail_stop = fail_stop or self._exit_process
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -2569,8 +3142,13 @@ class _UpdateLeaseHeartbeat:
         self._stop.set()
         self._thread.join(timeout=5.0)
         if self._thread.is_alive():
-            self._lose("update lease heartbeat did not stop cleanly")
-            raise RuntimeError("update lease heartbeat did not stop cleanly")
+            self._lose(
+                code="HDU401",
+                stage="heartbeat-probe",
+                kind="timeout",
+            )
+            assert self.loss_error is not None
+            raise self.loss_error from None
 
     @staticmethod
     def _exit_process(_reason: str) -> NoReturn:
@@ -2581,11 +3159,25 @@ class _UpdateLeaseHeartbeat:
         # bridges gated while any already-started child process unwinds.
         os._exit(1)
 
-    def _lose(self, reason: str) -> None:
+    def _lose(
+        self,
+        *,
+        code: str,
+        stage: str,
+        error: BaseException | None = None,
+        kind: str | None = None,
+    ) -> None:
         if self.lost:
             return
         self.lost = True
-        self.loss_reason = reason
+        from hermes_cli.update_diagnostics import UpdateDiagnosticError
+
+        diagnostic = UpdateDiagnosticError(
+            code=code,
+            stage=stage,
+            error=error,
+            kind=kind,
+        )
         try:
             from hermes_mcp_update_gate import write_emergency_quiesce_shadow
 
@@ -2594,12 +3186,16 @@ class _UpdateLeaseHeartbeat:
                 lease_id=str(self.lease.get("lease_id", "")),
                 owner_pid=os.getpid(),
             )
-        except Exception as exc:
-            logger.critical(
-                "Update lease was lost and the emergency bridge gate failed: %s",
-                exc,
+        except Exception as emergency_error:
+            diagnostic = UpdateDiagnosticError(
+                code="HDU403",
+                stage="emergency-gate",
+                error=emergency_error,
             )
-        self._fail_stop(reason)
+        diagnostic.log(logger, level=logging.CRITICAL)
+        self.loss_error = diagnostic
+        self.loss_reason = diagnostic.reason
+        self._fail_stop(diagnostic.reason)
 
     def _renew_once(self) -> bool:
         from hermes_mcp_update_gate import (
@@ -2611,7 +3207,11 @@ class _UpdateLeaseHeartbeat:
         try:
             current = read_quiesce_lease(marker_path())
         except Exception as exc:
-            self._lose(f"bridge quiesce lease probe failed: {exc}")
+            self._lose(
+                code="HDU401",
+                stage="heartbeat-probe",
+                error=exc,
+            )
             return False
         if not isinstance(current, dict) or (
             current.get("schema_version") != 1
@@ -2620,7 +3220,11 @@ class _UpdateLeaseHeartbeat:
             or os.path.normcase(os.path.realpath(str(current.get("install_root", ""))))
             != os.path.normcase(os.path.realpath(self.root))
         ):
-            self._lose("bridge quiesce lease identity changed")
+            self._lose(
+                code="HDU401",
+                stage="heartbeat-probe",
+                kind="protocol",
+            )
             return False
         try:
             self.lease = write_quiesce_lease(
@@ -2632,7 +3236,11 @@ class _UpdateLeaseHeartbeat:
                 handoff_grace_seconds=0,
             )
         except Exception as exc:
-            self._lose(f"bridge quiesce lease renewal failed: {exc}")
+            self._lose(
+                code="HDU402",
+                stage="heartbeat-renewal",
+                error=exc,
+            )
             return False
         return True
 
@@ -2930,6 +3538,15 @@ def _prepare_atomic_windows_update(
         ):
             raise RuntimeError("invalid update invocation identity")
         invocation_id = requested_invocation or secrets.token_urlsafe(24)
+        from hermes_cli.desktop_update_activation import (
+            recover_stale_transaction_journals,
+        )
+
+        recover_stale_transaction_journals(
+            root,
+            home=get_default_hermes_root(),
+            current_lease=lease,
+        )
         transaction.lease = lease
         transaction.invocation_id = invocation_id
         transaction.handoff_owner_pid = handoff_owner_pid
@@ -3939,6 +4556,383 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
     """`` [<branch> @ <sha>]`` suffix for summary lines ("" when unknown)."""
     label = _branch_head_label(git_cmd, cwd)
     return f" [{label}]" if label else ""
+
+
+def _bounded_remote_url(value: str | None) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 8_192
+        or any(character in value for character in "\x00\r\n")
+    ):
+        raise RuntimeError("transactional update remote is invalid")
+    return value
+
+
+def _acquisition_git_env(*, remote_url: str | None = None) -> dict[str, str]:
+    env = _sanitized_git_env(read_only=True)
+    for key in list(env):
+        if key.upper() in {
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+        }:
+            env.pop(key, None)
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GCM_INTERACTIVE": "never",
+        }
+    )
+    if remote_url is not None:
+        env.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "remote.source.url",
+                "GIT_CONFIG_VALUE_0": _bounded_remote_url(remote_url),
+            }
+        )
+    return env
+
+
+def _run_quiet_git(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float = 120,
+) -> bool:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _verify_complete_git_graph(
+    git_cmd: list[str],
+    repository: Path,
+    target_sha: str,
+    *,
+    env: dict[str, str],
+    require_isolated: bool = True,
+) -> bool:
+    if re.fullmatch(r"[0-9a-fA-F]{40}", target_sha or "") is None:
+        return False
+    if require_isolated and (
+        (repository / "shallow").exists()
+        or (repository / "objects" / "info" / "alternates").exists()
+    ):
+        return False
+    unsafe_config = subprocess.run(
+        git_cmd
+        + [
+            "config",
+            "--local",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ],
+        cwd=repository,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if require_isolated and unsafe_config.returncode not in {1}:
+        return False
+    proofs = (
+        ["cat-file", "-e", f"{target_sha}^{{commit}}"],
+        ["cat-file", "-e", f"{target_sha}^{{tree}}"],
+        [
+            "fsck",
+            "--full",
+            "--strict",
+            "--no-reflogs",
+            "--no-dangling",
+            "--no-progress",
+            target_sha,
+        ],
+        ["rev-list", "--objects", "--missing=error", "--quiet", target_sha, "--"],
+    )
+    return all(
+        _run_quiet_git(git_cmd + proof, cwd=repository, env=env)
+        for proof in proofs
+    )
+
+
+def _tracking_ref_sha(
+    git_cmd: list[str], root: Path, tracking_ref: str, *, env: dict[str, str]
+) -> str | None:
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", tracking_ref],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode == 1 or result.returncode == 128:
+        return None
+    value = result.stdout.strip()
+    if result.returncode != 0 or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+        raise RuntimeError("transactional tracking identity is unreadable")
+    return value.lower()
+
+
+def _acquire_transactional_git_target(
+    git_cmd: list[str],
+    live_root: Path,
+    update_target: _UpdateTarget,
+    *,
+    remote_url: str,
+    invocation_id: str,
+    lease: dict,
+) -> _AcquiredGitTarget:
+    """Fetch and prove one full remote graph without touching live `.git`."""
+    remote_url = _bounded_remote_url(remote_url)
+    read_env = _sanitized_git_env(read_only=True)
+    expected_tracking_sha = _tracking_ref_sha(
+        git_cmd,
+        live_root,
+        update_target.tracking_ref,
+        env=read_env,
+    )
+    temp_parent = get_default_hermes_root() / "tmp"
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    home = get_default_hermes_root().resolve()
+    lease_id = str(lease.get("lease_id", ""))
+    workspace = temp_parent / f"update-acquisition-{secrets.token_hex(12)}"
+    from hermes_cli.desktop_update_activation import (
+        bind_acquisition_workspace,
+        write_acquisition_journal,
+    )
+
+    write_acquisition_journal(
+        live_root,
+        home=home,
+        invocation_id=invocation_id,
+        lease=lease,
+        workspace=workspace,
+    )
+    repository = workspace / "repository.git"
+    acquisition = _AcquiredGitTarget(
+        workspace=workspace,
+        repository=repository,
+        frozen_ref="refs/hermes-acquisition/target",
+        target_sha="",
+        expected_tracking_sha=expected_tracking_sha,
+        live_root=live_root.resolve(),
+        home=home,
+        invocation_id=invocation_id,
+        lease_id=lease_id,
+    )
+    env = _acquisition_git_env(remote_url=remote_url)
+    try:
+        workspace.mkdir(parents=False, exist_ok=False)
+        bind_acquisition_workspace(
+            live_root,
+            home=home,
+            invocation_id=invocation_id,
+            lease_id=lease_id,
+        )
+        if not _run_quiet_git(
+            git_cmd + ["init", "--bare", "--quiet", "--object-format=sha1", str(repository)],
+            cwd=workspace,
+            env=env,
+        ):
+            raise RuntimeError("transactional package acquisition could not start")
+        refspec = f"+refs/heads/{update_target.branch}:{acquisition.frozen_ref}"
+        fetch_command = git_cmd + [
+            "-c",
+            "fetch.fsckObjects=true",
+            "-c",
+            "transfer.fsckObjects=true",
+            "-c",
+            "fetch.writeCommitGraph=false",
+            "-c",
+            "maintenance.auto=false",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--",
+            "source",
+            refspec,
+        ]
+        if not _run_quiet_git(fetch_command, cwd=repository, env=env, timeout=300):
+            raise RuntimeError("transactional package acquisition failed")
+        resolved = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", f"{acquisition.frozen_ref}^{{commit}}"],
+            cwd=repository,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        target_sha = resolved.stdout.strip().lower()
+        if resolved.returncode != 0 or not _verify_complete_git_graph(
+            git_cmd,
+            repository,
+            target_sha,
+            env=env,
+        ):
+            raise RuntimeError("transactional package graph could not be verified")
+        return _AcquiredGitTarget(
+            workspace=workspace,
+            repository=repository,
+            frozen_ref=acquisition.frozen_ref,
+            target_sha=target_sha,
+            expected_tracking_sha=expected_tracking_sha,
+            live_root=live_root.resolve(),
+            home=home,
+            invocation_id=invocation_id,
+            lease_id=lease_id,
+        )
+    except BaseException:
+        acquisition.cleanup()
+        raise
+
+
+def _import_transactional_git_target(
+    git_cmd: list[str],
+    live_root: Path,
+    update_target: _UpdateTarget,
+    acquisition: _AcquiredGitTarget,
+) -> None:
+    """Import a proven local graph, then CAS-update only its selected ref."""
+    env = _sanitized_git_env()
+    source_uri = acquisition.repository.resolve().as_uri()
+    imported = _run_quiet_git(
+        git_cmd
+        + [
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "fetch.fsckObjects=true",
+            "-c",
+            "transfer.fsckObjects=true",
+            "-c",
+            "fetch.writeCommitGraph=false",
+            "-c",
+            "maintenance.auto=false",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--",
+            source_uri,
+            acquisition.frozen_ref,
+        ],
+        cwd=live_root,
+        env=env,
+    )
+    if not imported or not _verify_complete_git_graph(
+        git_cmd,
+        live_root,
+        acquisition.target_sha,
+        env=env,
+        require_isolated=False,
+    ):
+        raise RuntimeError("verified package could not be imported into the install")
+    old_sha = acquisition.expected_tracking_sha or ("0" * 40)
+    updated = subprocess.run(
+        git_cmd
+        + [
+            "update-ref",
+            "--no-deref",
+            update_target.tracking_ref,
+            acquisition.target_sha,
+            old_sha,
+        ],
+        cwd=live_root,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if updated.returncode != 0:
+        raise RuntimeError("the selected tracking identity changed during import")
+    if _tracking_ref_sha(
+        git_cmd,
+        live_root,
+        update_target.tracking_ref,
+        env=_sanitized_git_env(read_only=True),
+    ) != acquisition.target_sha:
+        raise RuntimeError("the selected tracking identity was not frozen")
+
+
+def _verify_fetched_git_update_target(
+    git_cmd: list[str],
+    cwd: Path,
+    target_sha: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Prove the selected fetched object is a complete commit and tree."""
+    if re.fullmatch(r"[0-9a-fA-F]{40}", target_sha or "") is None:
+        return False
+    for args in (
+        ["cat-file", "-e", f"{target_sha}^{{commit}}"],
+        ["cat-file", "-e", f"{target_sha}^{{tree}}"],
+    ):
+        try:
+            result = subprocess.run(
+                git_cmd + args,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                check=False,
+            )
+        except OSError:
+            return False
+        if result.returncode != 0:
+            return False
+    return True
+
+
+def _archive_fallback_is_safe(
+    *,
+    is_windows: bool,
+    deferred_gateway_resume: bool,
+    source_phase: _SourcePhase,
+) -> bool:
+    """Allow the legacy archive only before mutation and outside Desktop handoff."""
+    return bool(
+        is_windows
+        and not deferred_gateway_resume
+        and source_phase is _SourcePhase.PRE_MUTATION
+    )
 
 
 def _assess_parked_branch_switch(
@@ -9492,6 +10486,9 @@ def _cmd_update_impl(
     deferred_gateway_resume = bool(
         getattr(args, "defer_gateway_resume", False)
     )
+    transactional_desktop_update = _is_transactional_desktop_update(
+        deferred_gateway_resume=deferred_gateway_resume
+    )
 
     def _publish_gateway_resume_plan_before_stop(token: dict) -> None:
         # The outer command's finally block is the rollback owner. Publish the
@@ -9714,6 +10711,14 @@ def _cmd_update_impl(
 
     if not git_dir.exists():
         if sys.platform == "win32":
+            if _is_transactional_desktop_update(
+                deferred_gateway_resume=deferred_gateway_resume
+            ):
+                print(
+                    "✗ Desktop update requires a verified Git checkout; "
+                    "archive fallback is disabled. Nothing was changed."
+                )
+                sys.exit(1)
             use_zip_update = True
         else:
             print("✗ Not a git repository. Please reinstall:")
@@ -9724,7 +10729,11 @@ def _cmd_update_impl(
 
     # On Windows, git can fail with "unable to write loose object file: Invalid argument"
     # due to filesystem atomicity issues. Set the recommended workaround.
-    if sys.platform == "win32" and git_dir.exists():
+    if (
+        sys.platform == "win32"
+        and git_dir.exists()
+        and not transactional_desktop_update
+    ):
         subprocess.run(
             _git_cmd() + ["config", "windows.appendAtomically", "false"],
             cwd=_m().PROJECT_ROOT,
@@ -9762,11 +10771,12 @@ def _cmd_update_impl(
     # tree dirty — forcing an autostash on every update and making branch
     # switches fragile. Restoring them first lets the common case (only
     # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
-    # Same rationale, different generator: line-ending churn is machine-made
-    # dirt on a managed checkout, so clear it (and stop generating it) before
-    # the stash/branch logic rather than autostashing the entire tree.
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+    if not transactional_desktop_update:
+        _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+        # Same rationale, different generator: line-ending churn is machine-made
+        # dirt on a managed checkout, so clear it (and stop generating it) before
+        # the stash/branch logic rather than autostashing the entire tree.
+        _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
     # Detect whether the selected update remote is a fork (before any branch
     # logic). ZIP recovery has no resolved target and retains origin as its
@@ -9779,7 +10789,10 @@ def _cmd_update_impl(
 
     if is_fork:
         print("⚠ Updating from fork:")
-        print(f"  {selected_remote_url}")
+        if transactional_desktop_update:
+            print(f"  configured remote '{selected_remote}'")
+        else:
+            print(f"  {selected_remote_url}")
         print()
 
     if use_zip_update:
@@ -9794,6 +10807,7 @@ def _cmd_update_impl(
         return
 
     # Fetch and pull
+    source_mutation = _SourceMutationState()
     try:
 
         # Resolve the target branch up front so the fetch can be scoped to it.
@@ -9803,40 +10817,92 @@ def _cmd_update_impl(
         # against.
         assert update_target is not None
 
-        # Self-heal abandoned git lock files (e.g. .git/shallow.lock left by a
-        # crashed fetch) before the fetch — otherwise the update fails with
-        # "Unable to create .../shallow.lock: File exists" and never reaches
-        # the network.
         from hermes_cli.gitlock import clear_stale_git_locks
 
-        cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
-        if cleared:
-            print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
+        if transactional_desktop_update:
+            print("→ Acquiring and verifying the complete update package...")
+            acquisition = _acquire_transactional_git_target(
+                git_cmd,
+                Path(_m().PROJECT_ROOT),
+                update_target,
+                remote_url=_bounded_remote_url(selected_remote_url),
+                invocation_id=transaction.invocation_id,
+                lease=transaction.lease,
+            )
+            try:
+                # Live Git lock cleanup and ref/object mutation are forbidden
+                # until the isolated graph has passed the complete proof.
+                cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
+                if cleared:
+                    print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
+                _import_transactional_git_target(
+                    git_cmd,
+                    Path(_m().PROJECT_ROOT),
+                    update_target,
+                    acquisition,
+                )
+                target_sha = acquisition.target_sha
+            finally:
+                acquisition.cleanup()
+            _run_transactional_desktop_route(
+                git_cmd=git_cmd,
+                git_env=git_env,
+                transaction=transaction,
+                update_target=update_target,
+                target_sha=target_sha,
+                source_mutation=source_mutation,
+                active_lazy_features=active_lazy_features,
+                active_tool_dependencies=active_tool_dependencies,
+            )
+            return
+        else:
+            # Legacy updates retain their ordinary live-repository fetch.
+            cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
+            if cleared:
+                print("  (removed stale git lock(s): %s)" % ", ".join(cleared))
 
-        print("→ Fetching updates...")
-        fetch_result = subprocess.run(
-            git_cmd
-            + ["fetch", "--", update_target.remote, update_target.refspec],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            env=git_env,
-        )
-        if fetch_result.returncode != 0:
-            _print_fetch_failure(fetch_result.stderr)
-            sys.exit(1)
+            print("→ Fetching updates...")
+            fetch_result = subprocess.run(
+                git_cmd
+                + [
+                    "-c",
+                    "fetch.fsckObjects=true",
+                    "fetch",
+                    "--",
+                    update_target.remote,
+                    update_target.refspec,
+                ],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                env=git_env,
+            )
+            if fetch_result.returncode != 0:
+                _print_fetch_failure(fetch_result.stderr)
+                sys.exit(1)
 
-        target_sha_result = subprocess.run(
-            git_cmd + ["rev-parse", "--verify", update_target.tracking_ref],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-            env=git_env,
-        )
-        target_sha = target_sha_result.stdout.strip()
+            target_sha_result = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", update_target.tracking_ref],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+                env=git_env,
+            )
+            target_sha = target_sha_result.stdout.strip()
+            if not _verify_fetched_git_update_target(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                target_sha,
+                env=git_env,
+            ):
+                print(
+                    "✗ Fetched update package integrity could not be verified; "
+                    "nothing was changed."
+                )
+                sys.exit(1)
 
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
@@ -9848,7 +10914,6 @@ def _cmd_update_impl(
             env=git_env,
         )
         current_branch = result.stdout.strip()
-
         # Parked-branch guard (2026-08-17 live incident): the checkout can be
         # left parked on a stale feature branch by earlier tooling. Blindly
         # stash-switch-pull-switch-back "updates" main while the running code
@@ -10073,10 +11138,12 @@ def _cmd_update_impl(
             # it changed (or cannot be proven unchanged), continue through the
             # same dependency/build/health pipeline as any fetched update.
             before_fork_sync = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                fork_remote=update_target.remote,
+            source_mutation.run(
+                lambda: _m()._sync_with_upstream_if_needed(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    fork_remote=update_target.remote,
+                )
             )
             fork_sync_performed = True
             fork_synced_head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
@@ -10413,12 +11480,14 @@ def _cmd_update_impl(
             # `merge --ff-only origin/<branch>` is byte-identical in effect to
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
-            pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", update_target.tracking_ref],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                env=git_env,
+            pull_result = source_mutation.run(
+                lambda: subprocess.run(
+                    git_cmd + ["merge", "--ff-only", update_target.tracking_ref],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    env=git_env,
+                )
             )
             if pull_result.returncode != 0:
                 # ff-only failed — local and remote have diverged. Before
@@ -10667,10 +11736,12 @@ def _cmd_update_impl(
             and update_target.remote == "origin"
         ):
             if not fork_sync_performed:
-                _m()._sync_with_upstream_if_needed(
-                    git_cmd,
-                    _m().PROJECT_ROOT,
-                    fork_remote=update_target.remote,
+                source_mutation.run(
+                    lambda: _m()._sync_with_upstream_if_needed(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        fork_remote=update_target.remote,
+                    )
                 )
                 target_sha = _refresh_update_target_sha(
                     git_cmd,
@@ -12327,7 +13398,11 @@ def _cmd_update_impl(
 
     except subprocess.CalledProcessError as e:
         stage = _format_update_failure_stage(e)
-        if _should_zip_fallback_on_update_error(e):
+        if _should_zip_fallback_on_update_error(e) and _archive_fallback_is_safe(
+            is_windows=_m()._is_windows(),
+            deferred_gateway_resume=deferred_gateway_resume,
+            source_phase=source_mutation.phase,
+        ):
             print(f"⚠ {stage}: {e}")
             print("→ Falling back to ZIP download...")
             print()
@@ -12339,7 +13414,18 @@ def _cmd_update_impl(
             if gateway_mode:
                 _write_gateway_update_exit_code(desktop_build_ok)
         else:
-            print(f"✗ {stage}: {e}")
+            if source_mutation.phase is _SourcePhase.MUTATION_STARTED:
+                print(
+                    "✗ Update failed after source mutation began; refusing to "
+                    "replay the update through another transport."
+                )
+            elif deferred_gateway_resume:
+                print(
+                    "✗ Verified Git update failed; the Desktop will not fall "
+                    "back to an archive."
+                )
+            else:
+                print(f"✗ {stage}: {e}")
             _print_called_process_error_tail(e)
             if _called_process_error_is_python_dep_install(e):
                 print(

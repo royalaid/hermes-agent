@@ -527,6 +527,7 @@ def _attempt_install_generation(
     current: SQLiteRuntimeInfo,
     allow_minor_upgrade: bool = False,
     tried_versions: set[tuple[int, int, int]] | None = None,
+    staging_observer: Callable[[Path | None, Path | None], None] | None = None,
 ) -> tuple[Path, Path, SQLiteRuntimeInfo] | None:
     """One install+probe attempt for a specific version request (bare minor
     like "3.11", or an explicit patch like "3.11.15"). Each attempt gets its
@@ -543,7 +544,11 @@ def _attempt_install_generation(
     """
     token = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     generation = python_root / f"generation-{token}"
+    if staging_observer is not None:
+        staging_observer(None, generation)
     generation.mkdir(parents=True, exist_ok=False)
+    if staging_observer is not None:
+        staging_observer(None, generation)
     _make_world_traversable(generation)
 
     env = managed_python_env(project_root, install_dir=generation)
@@ -651,6 +656,7 @@ def _install_safe_python_generation(
     *,
     project_root: Path,
     current: SQLiteRuntimeInfo,
+    staging_observer: Callable[[Path | None, Path | None], None] | None = None,
 ) -> tuple[Path, Path, SQLiteRuntimeInfo] | None:
     runtime_root = project_root / _RUNTIME_DIR_NAME
     python_root = managed_python_install_dir(project_root)
@@ -664,6 +670,7 @@ def _install_safe_python_generation(
         uv_bin, request, project_root=project_root,
         python_root=python_root, current=current,
         tried_versions=tried_versions,
+        staging_observer=staging_observer,
     )
     if result is not None:
         return result
@@ -703,6 +710,7 @@ def _install_safe_python_generation(
         result = _attempt_install_generation(
             uv_bin, explicit_request, project_root=project_root,
             python_root=python_root, current=current,
+            staging_observer=staging_observer,
         )
         if result is not None:
             return result
@@ -726,6 +734,7 @@ def _install_safe_python_generation(
             python_root=python_root, current=current,
             allow_minor_upgrade=True,
             tried_versions=fb_tried,
+            staging_observer=staging_observer,
         )
         if result is not None:
             return result
@@ -751,6 +760,7 @@ def _install_safe_python_generation(
                 uv_bin, explicit, project_root=project_root,
                 python_root=python_root, current=current,
                 allow_minor_upgrade=True,
+                staging_observer=staging_observer,
             )
             if result is not None:
                 return result
@@ -810,10 +820,17 @@ def _stage_candidate_venv(
     project_root: Path,
     generation: Path,
     python: Path,
+    staging_observer: Callable[[Path | None, Path | None], None] | None = None,
+    provisioned_generation: Path | None = None,
 ) -> Path | None:
     runtime_root = project_root / _RUNTIME_DIR_NAME
     token = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     candidate = runtime_root / f"venv-candidate-{token}"
+    if staging_observer is not None:
+        staging_observer(candidate, provisioned_generation)
+    candidate.mkdir(parents=True, exist_ok=False)
+    if staging_observer is not None:
+        staging_observer(candidate, provisioned_generation)
     env = managed_python_env(
         project_root,
         install_dir=generation,
@@ -902,6 +919,7 @@ def stage_update_candidate_venv(
     uv_bin: str,
     *,
     project_root: Path,
+    staging_observer: Callable[[Path | None, Path | None], None] | None = None,
 ) -> StagedUpdateVenv | None:
     """Build a relocatable update venv without touching the live venv."""
     root = Path(project_root).resolve()
@@ -932,6 +950,7 @@ def stage_update_candidate_venv(
             uv_bin,
             project_root=root,
             current=current,
+            staging_observer=staging_observer,
         )
         if provisioned is None:
             return None
@@ -943,6 +962,8 @@ def stage_update_candidate_venv(
         project_root=root,
         generation=generation,
         python=python,
+        staging_observer=staging_observer,
+        provisioned_generation=provisioned_generation,
     )
     if candidate is None:
         if provisioned_generation is not None:

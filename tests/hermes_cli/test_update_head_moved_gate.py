@@ -17,7 +17,13 @@ from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
 
 
-def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
+PRE_UPDATE_SHA = "a" * 40
+UPDATE_TARGET_SHA = "d" * 40
+
+
+def _make_head_moved_side_effect(
+    pre_sha=PRE_UPDATE_SHA, post_sha=UPDATE_TARGET_SHA
+):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
     calls = {"n": 0}
 
@@ -50,7 +56,9 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     return side_effect
 
 
-def _make_head_pinned_side_effect(sha="abc123"):
+def _make_head_pinned_side_effect(
+    sha=PRE_UPDATE_SHA, target_sha=UPDATE_TARGET_SHA
+):
     """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
 
     def side_effect(cmd, **kwargs):
@@ -58,6 +66,11 @@ def _make_head_pinned_side_effect(sha="abc123"):
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")
+
+        if "rev-parse --verify refs/remotes/origin/main" in joined:
+            return SimpleNamespace(
+                returncode=0, stdout=f"{target_sha}\n", stderr=""
+            )
 
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
@@ -175,7 +188,7 @@ def test_sibling_cron_restore_precedes_terminal_update_outcome(
     """Sibling recovery runs before either success proof or degraded output."""
     from hermes_cli import backup
 
-    target_sha = "def456"
+    target_sha = UPDATE_TARGET_SHA
     base = _make_head_moved_side_effect(post_sha=target_sha)
 
     def run_side_effect(command, **kwargs):

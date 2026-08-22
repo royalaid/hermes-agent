@@ -167,7 +167,7 @@ class TestCommandBoundaryFinalization:
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["outcome"] == "refused"
         assert payload["exit_code"] == 2
-        assert payload["stop_reason"] == "sys.exit(2)"
+        assert payload["stop_reason"] == "HDU999:command-boundary"
         assert payload["finished_at"] is not None
         assert ur._current is None
 
@@ -280,7 +280,7 @@ class TestCommandBoundaryFinalization:
         assert latest is not None
         assert latest["outcome"] == "refused"
         assert latest["exit_code"] == 2
-        assert latest["stop_reason"] == "sys.exit(2)"
+        assert latest["stop_reason"] == "HDU999:command-boundary"
         assert latest["steps"][0]["name"] == "windows_preflight"
         assert ur._current is None
         # exactly-once: exactly one receipt file
