@@ -176,6 +176,31 @@ class TestEnsureUv:
         assert path == str(uv)
         assert observed == [repair]
 
+    def test_install_without_runtime_cutover_skips_repair(self, tmp_path):
+        uv = _managed_uv_binary(tmp_path)
+
+        def fake_install(target):
+            _make_executable(target)
+
+        with patch(
+            "hermes_cli.managed_uv.get_hermes_home",
+            return_value=tmp_path,
+        ), patch(
+            "hermes_cli.managed_uv._install_uv",
+            side_effect=fake_install,
+        ), patch(
+            "hermes_cli.managed_uv.repair_vulnerable_runtime",
+        ) as mock_repair, patch(
+            "hermes_cli.managed_uv.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="uv 0.1.2"),
+        ):
+            from hermes_cli.managed_uv import ensure_uv_without_runtime_cutover
+
+            path = ensure_uv_without_runtime_cutover()
+
+        assert path == str(uv)
+        mock_repair.assert_not_called()
+
 
 @pytest.mark.skipif(sys.platform == "win32",
                     reason="POSIX-only: the _UvResult dual contract is not offered on Windows")
@@ -367,10 +392,12 @@ class TestManagedPythonStore:
         env = managed_python_env(checkout, base_env=base_env)
 
         assert env["KEEP_ME"] == "yes"
-        assert env["UV_MANAGED_PYTHON"] == "1"
-        assert env["UV_NO_CONFIG"] == "1"
-        assert env["UV_PYTHON_INSTALL_BIN"] == "0"
-        assert env["UV_PYTHON_INSTALL_REGISTRY"] == "0"
+        # uv's clap parser accepts canonical boolean spellings here. Numeric
+        # 1/0 makes current uv reject the environment before provisioning.
+        assert env["UV_MANAGED_PYTHON"] == "true"
+        assert env["UV_NO_CONFIG"] == "true"
+        assert env["UV_PYTHON_INSTALL_BIN"] == "false"
+        assert env["UV_PYTHON_INSTALL_REGISTRY"] == "false"
         assert env["UV_PYTHON_INSTALL_DIR"] == str(
             checkout / ".hermes-runtime" / "python"
         )
@@ -388,6 +415,205 @@ class TestManagedPythonStore:
         ):
             assert key not in env
         assert base_env["PYTHONHOME"] == "/poison/home"
+
+
+def test_stage_candidate_sync_uses_tracked_lock_without_relocking(tmp_path):
+    from hermes_cli.managed_uv import _stage_candidate_venv
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "uv.lock").write_text("# lock\n", encoding="utf-8")
+    generation = root / ".hermes-runtime" / "python" / "gen"
+    python = generation / ("python.exe" if sys.platform == "win32" else "bin/python3")
+    python.parent.mkdir(parents=True)
+    python.write_text("py", encoding="utf-8")
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs.get("env")))
+        return MagicMock(returncode=0)
+
+    with patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run), \
+         patch(
+             "hermes_cli.managed_uv._smoke_candidate_venv",
+             return_value=(True, "", None),
+         ):
+        candidate = _stage_candidate_venv(
+            "uv",
+            project_root=root,
+            generation=generation,
+            python=python,
+        )
+
+    assert candidate is not None
+    assert len(calls) == 2
+    venv_argv, venv_env = calls[0]
+    sync_argv, sync_env = calls[1]
+    assert venv_argv[:2] == ["uv", "venv"]
+    assert "--no-config" in venv_argv
+    assert venv_env.get("UV_NO_CONFIG") == "true"
+    assert sync_argv[:2] == ["uv", "sync"]
+    assert "--frozen" in sync_argv
+    assert "--locked" not in sync_argv
+    assert "--no-config" not in sync_argv
+    assert "UV_NO_CONFIG" not in sync_env
+
+
+def test_stage_update_candidate_reuses_safe_private_base_without_cutover(tmp_path):
+    from dataclasses import replace
+
+    from hermes_cli.managed_uv import (
+        StagedUpdateVenv,
+        managed_python_install_dir,
+        stage_update_candidate_venv,
+    )
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    live = root / ".venv"
+    live_python = live / (
+        "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
+    )
+    live_python.parent.mkdir(parents=True)
+    live_python.write_text("live interpreter", encoding="utf-8")
+    sentinel = live / "sentinel"
+    sentinel.write_text("live", encoding="utf-8")
+
+    python_root = managed_python_install_dir(root).resolve()
+    generation = python_root / "generation-safe"
+    base_python = generation / (
+        "python.exe" if sys.platform == "win32" else "bin/python3"
+    )
+    base_python.parent.mkdir(parents=True)
+    base_python.write_text("safe private base", encoding="utf-8")
+    current = replace(
+        _runtime_info(live_python, (3, 53, 1)),
+        base_prefix=generation,
+    )
+    candidate = root / ".hermes-runtime" / "venv-candidate-test"
+    candidate.mkdir(parents=True)
+
+    with patch(
+        "hermes_cli.managed_uv.probe_sqlite_runtime",
+        return_value=current,
+    ) as mock_probe, patch(
+        "hermes_cli.managed_uv._install_safe_python_generation",
+    ) as mock_install, patch(
+        "hermes_cli.managed_uv._stage_candidate_venv",
+        return_value=candidate,
+    ) as mock_stage, patch(
+        "hermes_cli.managed_uv._cut_over_candidate",
+        side_effect=AssertionError("staging must not cut over the live venv"),
+    ):
+        staged = stage_update_candidate_venv("uv", project_root=root)
+
+    assert staged == StagedUpdateVenv(
+        candidate=candidate,
+        python=base_python,
+        provisioned_generation=None,
+    )
+    mock_probe.assert_called_once_with(live_python)
+    mock_install.assert_not_called()
+    mock_stage.assert_called_once_with(
+        "uv",
+        project_root=root.resolve(),
+        generation=python_root,
+        python=base_python,
+    )
+    assert sentinel.read_text(encoding="utf-8") == "live"
+    assert live.is_dir()
+    assert candidate.is_dir()
+
+
+def test_stage_update_candidate_provisions_unsafe_base_without_cutover(tmp_path):
+    from hermes_cli.managed_uv import StagedUpdateVenv, stage_update_candidate_venv
+
+    windows = sys.platform == "win32"
+    root, live, sentinel = _make_runtime_install(tmp_path, windows=windows)
+    live_python = live / (
+        "Scripts/python.exe" if windows else "bin/python"
+    )
+    current = _runtime_info(live_python, (3, 50, 4))
+    generation = root / ".hermes-runtime" / "python" / "generation-new"
+    python = generation / ("python.exe" if windows else "bin/python3")
+    python.parent.mkdir(parents=True)
+    python.write_text("safe private base", encoding="utf-8")
+    fixed = _runtime_info(python, (3, 53, 1))
+    candidate = root / ".hermes-runtime" / "venv-candidate-test"
+    candidate.mkdir(parents=True)
+
+    with patch(
+        "hermes_cli.managed_uv.probe_sqlite_runtime",
+        return_value=current,
+    ), patch(
+        "hermes_cli.managed_uv._install_safe_python_generation",
+        return_value=(generation, python, fixed),
+    ) as mock_install, patch(
+        "hermes_cli.managed_uv._stage_candidate_venv",
+        return_value=candidate,
+    ) as mock_stage, patch(
+        "hermes_cli.managed_uv._cut_over_candidate",
+        side_effect=AssertionError("staging must not cut over the live venv"),
+    ):
+        staged = stage_update_candidate_venv("uv", project_root=root)
+
+    assert staged == StagedUpdateVenv(
+        candidate=candidate,
+        python=python,
+        provisioned_generation=generation,
+    )
+    mock_install.assert_called_once_with(
+        "uv",
+        project_root=root.resolve(),
+        current=current,
+    )
+    mock_stage.assert_called_once_with(
+        "uv",
+        project_root=root.resolve(),
+        generation=generation,
+        python=python,
+    )
+    assert sentinel.read_text(encoding="utf-8") == "live"
+    assert live.is_dir()
+    assert candidate.is_dir()
+
+
+def test_stage_update_candidate_removes_new_generation_when_staging_fails(tmp_path):
+    from hermes_cli.managed_uv import stage_update_candidate_venv
+
+    windows = sys.platform == "win32"
+    root, live, sentinel = _make_runtime_install(tmp_path, windows=windows)
+    live_python = live / (
+        "Scripts/python.exe" if windows else "bin/python"
+    )
+    current = _runtime_info(live_python, (3, 50, 4))
+    generation = root / ".hermes-runtime" / "python" / "generation-failed"
+    python = generation / ("python.exe" if windows else "bin/python3")
+    python.parent.mkdir(parents=True)
+    python.write_text("safe private base", encoding="utf-8")
+    fixed = _runtime_info(python, (3, 53, 1))
+
+    with patch(
+        "hermes_cli.managed_uv.probe_sqlite_runtime",
+        return_value=current,
+    ), patch(
+        "hermes_cli.managed_uv._install_safe_python_generation",
+        return_value=(generation, python, fixed),
+    ), patch(
+        "hermes_cli.managed_uv._stage_candidate_venv",
+        return_value=None,
+    ), patch(
+        "hermes_cli.managed_uv._cut_over_candidate",
+        side_effect=AssertionError("staging must not cut over the live venv"),
+    ):
+        staged = stage_update_candidate_venv("uv", project_root=root)
+
+    assert staged is None
+    assert not generation.exists()
+    assert sentinel.read_text(encoding="utf-8") == "live"
+    assert live.is_dir()
 
 
 @pytest.mark.skipif(sys.platform == "win32",
@@ -413,47 +639,6 @@ class TestRuntimeRepair:
         assert sentinel.read_text(encoding="utf-8") == "live"
         assert not (root / ".hermes-runtime").exists()
         mock_install.assert_not_called()
-
-    def test_stage_candidate_sync_keeps_uv_project_config(self, tmp_path):
-        from hermes_cli.managed_uv import _stage_candidate_venv
-
-        root = tmp_path / "checkout"
-        root.mkdir()
-        (root / "uv.lock").write_text("# lock\n", encoding="utf-8")
-        generation = root / ".hermes-runtime" / "python" / "gen"
-        python = generation / "bin" / "python"
-        python.parent.mkdir(parents=True)
-        python.write_text("py", encoding="utf-8")
-
-        calls = []
-
-        def fake_run(argv, **kwargs):
-            calls.append((list(argv), kwargs.get("env")))
-            return MagicMock(returncode=0)
-
-        with patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run), \
-             patch(
-                 "hermes_cli.managed_uv._smoke_candidate_venv",
-                 return_value=(True, "", None),
-             ):
-            candidate = _stage_candidate_venv(
-                "uv",
-                project_root=root,
-                generation=generation,
-                python=python,
-            )
-
-        assert candidate is not None
-        assert len(calls) == 2
-        venv_argv, venv_env = calls[0]
-        sync_argv, sync_env = calls[1]
-        assert venv_argv[:2] == ["uv", "venv"]
-        assert "--no-config" in venv_argv
-        assert venv_env.get("UV_NO_CONFIG") == "1"
-        assert sync_argv[:2] == ["uv", "sync"]
-        assert "--locked" in sync_argv
-        assert "--no-config" not in sync_argv
-        assert "UV_NO_CONFIG" not in sync_env
 
     def test_failed_candidate_preserves_live_venv(self, tmp_path):
         from hermes_cli.managed_uv import (
