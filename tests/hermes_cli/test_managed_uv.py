@@ -452,6 +452,7 @@ def test_stage_candidate_sync_uses_tracked_lock_without_relocking(tmp_path):
     sync_argv, sync_env = calls[1]
     assert venv_argv[:2] == ["uv", "venv"]
     assert "--no-config" in venv_argv
+    assert "--allow-existing" in venv_argv
     assert venv_env.get("UV_NO_CONFIG") == "true"
     assert sync_argv[:2] == ["uv", "sync"]
     assert "--frozen" in sync_argv
