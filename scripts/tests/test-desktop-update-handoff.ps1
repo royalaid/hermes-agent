@@ -2042,14 +2042,20 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
         0 '' $crossBranchLeaseId 'normal' $crossBranchDesktop $null `
         @('-Branch', $crossBranchTarget)
     Assert-Equal 0 $code 'clean cross-branch retarget commits only after exact Desktop readiness'
+    if (Test-Path -LiteralPath $crossBranch.PreflightArgsCapture) {
+        $crossBranchPreflight = [System.IO.File]::ReadAllText($crossBranch.PreflightArgsCapture)
+        Assert-True (
+            $crossBranchPreflight -match '--branch\s+disposable/update-target(?:\s|\t)'
+        ) 'cross-branch handoff binds the read-only preflight to the requested target branch'
+    }
     Assert-ManagedPhaseOrder $crossBranch @(
         '^-B -m hermes_cli\.main update --preflight ',
         '^-B -m hermes_cli\.main update --yes ',
         '^-B -m hermes_cli\.desktop_update_activation activate$',
         '^-B -m hermes_cli\.main desktop ',
         '^-B -m hermes_cli\.desktop_update_activation publish-receipt$',
-        '^-B -m hermes_cli\.main update --resume-deferred-gateway ',
-        '^-B -m hermes_cli\.desktop_update_activation commit$'
+        '^-B -m hermes_cli\.desktop_update_activation commit$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway '
     ) 'cross-branch transaction'
     if (Test-Path -LiteralPath $crossBranch.Result) {
         $crossBranchResult = [System.IO.File]::ReadAllText($crossBranch.Result) | ConvertFrom-Json
