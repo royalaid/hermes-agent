@@ -140,23 +140,23 @@ CASES = {
     ),
     "bootstrap updater Rust source → frontend + Windows lane": (
         ["apps/bootstrap-installer/src-tauri/src/update.rs"],
-        _lanes(frontend=True, installer=True),
+        _lanes(frontend=True, installer=True, rust=True),
     ),
     "bootstrap updater Rust dependency → frontend + Windows lane": (
         ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
-        _lanes(frontend=True, installer=True),
+        _lanes(frontend=True, installer=True, rust=True),
     ),
     "bootstrap updater Cargo manifest → frontend + Windows lane": (
         ["apps/bootstrap-installer/src-tauri/Cargo.toml"],
-        _lanes(frontend=True, installer=True),
+        _lanes(frontend=True, installer=True, rust=True),
     ),
     "bootstrap updater Cargo lock → frontend + Windows lane": (
         ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
-        _lanes(frontend=True, installer=True),
+        _lanes(frontend=True, installer=True, rust=True),
     ),
     "bootstrap updater build script → frontend + Windows lane": (
         ["apps/bootstrap-installer/src-tauri/build.rs"],
-        _lanes(frontend=True, installer=True),
+        _lanes(frontend=True, installer=True, rust=True),
     ),
     "updater process source → frontend + Windows lane": (
         ["apps/desktop/electron/updater-process.ts"],
@@ -178,6 +178,30 @@ CASES = {
         ["apps/desktop/electron/windows-process-identity.test.ts"],
         _lanes(frontend=True, installer=True),
     ),
+    "updater preflight boundary → frontend + Windows lane": (
+        ["apps/desktop/electron/update-preflight.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "elevated updater protocol → frontend + Windows lane": (
+        ["apps/desktop/electron/windows-elevated-force-release.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "native termination boundary → frontend + Windows lane": (
+        ["apps/desktop/electron/windows-process-terminate.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "restart manager authority → frontend + Windows lane": (
+        ["apps/desktop/electron/windows-restart-manager.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "force release orchestration → frontend + Windows lane": (
+        ["apps/desktop/electron/windows-update-force-release.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
+    "force release Windows test → frontend + Windows lane": (
+        ["apps/desktop/electron/windows-update-force-release.test.ts"],
+        _lanes(frontend=True, installer=True),
+    ),
     "handoff source → frontend + Windows lane": (
         ["apps/desktop/electron/handoff-result.ts"],
         _lanes(frontend=True, installer=True),
@@ -192,11 +216,11 @@ CASES = {
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
     "rust source → rust": (
         ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
-        _lanes(frontend=True, rust=True),
+        _lanes(frontend=True, installer=True, rust=True),
     ),
     "cargo lockfile → rust": (
         ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
-        _lanes(frontend=True, rust=True),
+        _lanes(frontend=True, installer=True, rust=True),
     ),
     # Non-.rs files in the crate still change what cargo builds.
     "tauri config → rust": (

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { DesktopUpdateStatus } from '@/global'
+import type { DesktopUpdateApplyOptions, DesktopUpdateStatus } from '@/global'
 
 const storage = new Map<string, string>()
 
@@ -691,6 +691,18 @@ describe('applyUpdates terminal state', () => {
 
     expect($updateApply.get().error).toBe('venv-blocked')
     expect($updateApply.get().blockers).toEqual(blockers)
+  })
+
+  it('strips a stale elevated-update flag before crossing the renderer bridge', async () => {
+    applyMock.mockResolvedValue({ ok: false, error: 'venv-unlock-failed', message: 'still blocked' })
+
+    await applyUpdates({
+      dirtyStrategy: 'stash',
+      stopSafeBlockers: true,
+      forceUpdateElevated: true
+    } as DesktopUpdateApplyOptions & { forceUpdateElevated: boolean })
+
+    expect(applyMock).toHaveBeenCalledWith({ dirtyStrategy: 'stash', stopSafeBlockers: true })
   })
 
   it('keeps the manual command state for CLI installs with no staged updater', async () => {

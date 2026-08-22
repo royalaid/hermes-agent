@@ -45,8 +45,6 @@ function totalItems(groups: readonly CommitGroup[]) {
 export function UpdatesOverlay() {
   const open = useStore($updateOverlayOpen)
   const target = useStore($updateOverlayTarget)
-  const { t } = useI18n()
-  const u = t.updates
 
   const clientStatus = useStore($updateStatus)
   const clientChecking = useStore($updateChecking)
@@ -83,11 +81,6 @@ export function UpdatesOverlay() {
             : 'idle'
 
   const updateBlockers = !isBackend && apply.error === 'venv-blocked' && apply.blockers?.length ? apply.blockers : null
-
-  const needsElevation =
-    !isBackend &&
-    (apply.error === 'venv-needs-elevation' || apply.error === 'venv-elevation-cancelled') &&
-    (apply.elevationHolders?.length ?? 0) > 0
 
   const handleClose = (next: boolean) => {
     if (phase === 'applying') {
@@ -134,17 +127,7 @@ export function UpdatesOverlay() {
           />
         ) : null}
 
-        {phase === 'error' && !updateBlockers && needsElevation ? (
-          <ErrorView
-            forceUpdateAdminLabel={u.forceUpdateAdministrator}
-            message={apply.message}
-            onDismiss={() => handleClose(false)}
-            onForceUpdateAdmin={() => void applyUpdates({ forceUpdateElevated: true })}
-            onRetry={handleInstall}
-          />
-        ) : null}
-
-        {phase === 'error' && !updateBlockers && !needsElevation ? (
+        {phase === 'error' && !updateBlockers ? (
           <ErrorView message={apply.message} onDismiss={() => handleClose(false)} onRetry={handleInstall} />
         ) : null}
 
@@ -547,19 +530,7 @@ export function BlockerView({
   )
 }
 
-function ErrorView({
-  forceUpdateAdminLabel,
-  message,
-  onDismiss,
-  onForceUpdateAdmin,
-  onRetry
-}: {
-  forceUpdateAdminLabel?: string
-  message: string
-  onDismiss: () => void
-  onForceUpdateAdmin?: () => void
-  onRetry: () => void
-}) {
+function ErrorView({ message, onDismiss, onRetry }: { message: string; onDismiss: () => void; onRetry: () => void }) {
   const { t } = useI18n()
   const u = t.updates
 
@@ -573,15 +544,9 @@ function ErrorView({
       }
       title={<DialogTitle className="text-center text-xl font-semibold tracking-tight">{u.errorTitle}</DialogTitle>}
     >
-      {onForceUpdateAdmin && forceUpdateAdminLabel ? (
-        <Button className="font-semibold" onClick={onForceUpdateAdmin} size="lg">
-          {forceUpdateAdminLabel}
-        </Button>
-      ) : (
-        <Button className="font-semibold" onClick={onRetry} size="lg">
-          {u.tryAgain}
-        </Button>
-      )}
+      <Button className="font-semibold" onClick={onRetry} size="lg">
+        {u.tryAgain}
+      </Button>
       <Button onClick={onDismiss} variant="text">
         {u.notNow}
       </Button>

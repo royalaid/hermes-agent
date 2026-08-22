@@ -1,13 +1,14 @@
 /**
  * Windows update force-release orchestration.
  *
- * Selecting Update authorizes terminating every process that currently holds or
- * executes files inside the target install. This module:
+ * Selecting Update authorizes terminating only processes that the final native
+ * boundary proves currently own an exact install resource. This module:
  *   1. discovers holders via the existing scanner + Windows Restart Manager;
  *   2. binds each target to PID + create-time (+ resource evidence);
  *   3. terminates leaf-first with a SuperF4-style TerminateProcess path;
  *   4. stays inside a five-second non-elevated budget;
- *   5. escalates to an elevated helper only on access-denied survivors.
+ *   5. reports a fully authenticated permission boundary without exposing an
+ *      Administrator action until a signed elevated helper exists.
  *
  * Behavioral reference (not copied): stefansundin/superf4 @ 6b677d4, superf4.c
  * OpenProcess/TerminateProcess sequence. Implement from Win32 docs only.
@@ -15,11 +16,16 @@
 
 export type ForceReleaseHolder = {
   pid: number
+  /** Approximate Unix seconds used only to correlate independent discovery rows. */
   createdAt: number
+  /** Exact unsigned 64-bit Windows FILETIME. Required for termination authority. */
+  creationFileTime?: string
   name: string
   cmdline: string
   source: 'scanner' | 'restart-manager'
   resource?: string
+  /** Individually authenticated resources. Never concatenate paths into one claim. */
+  resources?: string[]
   parentPid?: number
   wrapperPid?: number
   role?: 'worker' | 'wrapper' | 'other'
@@ -29,6 +35,8 @@ export type ForceReleaseTerminateResult =
   | { kind: 'terminated' }
   | { kind: 'already-gone' }
   | { kind: 'create-time-mismatch' }
+  | { kind: 'permission-required'; win32Error: 5 }
+  /** Generic access failures are not sufficient proof for Administrator UI. */
   | { kind: 'access-denied'; win32Error: number; detail?: string }
   | { kind: 'protected'; win32Error: number }
   | { kind: 'failed'; detail: string; win32Error?: number }
@@ -41,8 +49,12 @@ export type WindowsUpdateForceReleaseDeps = {
    * Discover scanner holders. `budgetMs` is the hard remaining wall-clock
    * budget; implementations must honor it (or the orchestrator races them).
    */
-  listScannerHolders: (budgetMs: number) => Promise<ForceReleaseHolder[]>
-  listRestartManagerHolders: (budgetMs: number) => Promise<ForceReleaseHolder[]>
+  listScannerHolders: (budgetMs: number, signal?: AbortSignal, deadlineAt?: number) => Promise<ForceReleaseHolder[]>
+  listRestartManagerHolders: (
+    budgetMs: number,
+    signal?: AbortSignal,
+    deadlineAt?: number
+  ) => Promise<ForceReleaseHolder[]>
   /**
    * Terminate one holder. Must honor `signal` by cancelling any child work and
    * guaranteeing no process-mutation side effect after abort settles.
@@ -57,6 +69,8 @@ export type WindowsUpdateForceReleaseDeps = {
   excludePids?: ReadonlySet<number>
   /** Non-elevated budget. Spec: five seconds or less. */
   deadlineMs?: number
+  /** Click-wide absolute deadline. Later phases must never reset it. */
+  deadlineAt?: number
   settleMs?: number
 }
 
@@ -68,7 +82,7 @@ export type WindowsUpdateForceReleaseOutcome =
 
 const DEFAULT_DEADLINE_MS = 5_000
 const DEFAULT_SETTLE_MS = 150
-/** RM emits integer-second create times; scanner may be fractional. */
+/** Approximate discovery rows may differ slightly; they never authorize mutation. */
 export const HOLDER_CREATE_TIME_MATCH_SECONDS = 1.5
 
 function wait(delayMs: number): Promise<void> {
@@ -76,15 +90,36 @@ function wait(delayMs: number): Promise<void> {
 }
 
 export function holdersMatchIdentity(
-  left: Pick<ForceReleaseHolder, 'pid' | 'createdAt'>,
-  right: Pick<ForceReleaseHolder, 'pid' | 'createdAt'>,
+  left: Pick<ForceReleaseHolder, 'pid' | 'createdAt' | 'creationFileTime'>,
+  right: Pick<ForceReleaseHolder, 'pid' | 'createdAt' | 'creationFileTime'>,
   toleranceSeconds = HOLDER_CREATE_TIME_MATCH_SECONDS
 ): boolean {
-  if (left.pid !== right.pid) {return false}
+  if (left.pid !== right.pid) {
+    return false
+  }
 
-  if (!Number.isFinite(left.createdAt) || !Number.isFinite(right.createdAt)) {return false}
+  const leftExact = left.creationFileTime
+  const rightExact = right.creationFileTime
+
+  if (leftExact && rightExact) {
+    return leftExact === rightExact
+  }
+
+  if (!Number.isFinite(left.createdAt) || !Number.isFinite(right.createdAt)) {
+    return false
+  }
 
   return Math.abs(left.createdAt - right.createdAt) <= toleranceSeconds
+}
+
+function holderResources(holder: ForceReleaseHolder): string[] {
+  return Array.from(
+    new Set(
+      [...(holder.resources ?? []), ...(holder.resource ? [holder.resource] : [])].filter(
+        value => typeof value === 'string' && value.length > 0
+      )
+    )
+  )
 }
 
 /**
@@ -109,9 +144,7 @@ export function orderHoldersLeafFirst(holders: readonly ForceReleaseHolder[]): F
     stack.add(entry.pid)
 
     const parentRef =
-      (entry.parentPid && byPid.get(entry.parentPid)) ||
-      (entry.wrapperPid && byPid.get(entry.wrapperPid)) ||
-      null
+      (entry.parentPid && byPid.get(entry.parentPid)) || (entry.wrapperPid && byPid.get(entry.wrapperPid)) || null
 
     let depth = 0
 
@@ -136,10 +169,7 @@ export function orderHoldersLeafFirst(holders: readonly ForceReleaseHolder[]): F
       depth: depthOf(entry),
       roleBias: entry.role === 'worker' ? 1 : entry.role === 'wrapper' ? -1 : 0
     }))
-    .sort(
-      (left, right) =>
-        right.depth - left.depth || right.roleBias - left.roleBias || left.index - right.index
-    )
+    .sort((left, right) => right.depth - left.depth || right.roleBias - left.roleBias || left.index - right.index)
     .map(item => item.entry)
 }
 
@@ -147,40 +177,57 @@ export function orderHoldersLeafFirst(holders: readonly ForceReleaseHolder[]): F
  * When holders carry parent/wrapper edges among the set, annotate roles so
  * orderHoldersLeafFirst can drain leaves before roots in production mappings.
  */
-export function attachHolderTreeRelationships(
-  holders: readonly ForceReleaseHolder[]
-): ForceReleaseHolder[] {
-  if (holders.length === 0) {return []}
+export function attachHolderTreeRelationships(holders: readonly ForceReleaseHolder[]): ForceReleaseHolder[] {
+  if (holders.length === 0) {
+    return []
+  }
 
   const byPid = new Map(holders.map(entry => [entry.pid, entry] as const))
   const childCount = new Map<number, number>()
 
-  const withEdges = holders.map(entry => {
-    const parentPid =
-      (entry.parentPid && byPid.has(entry.parentPid) ? entry.parentPid : undefined) ??
-      (entry.wrapperPid && byPid.has(entry.wrapperPid) ? entry.wrapperPid : undefined)
+  const exactParent = (entry: ForceReleaseHolder, candidatePid?: number): number | undefined => {
+    if (!candidatePid || !entry.creationFileTime) {
+      return undefined
+    }
+
+    const candidate = byPid.get(candidatePid)
+
+    if (!candidate?.creationFileTime) {
+      return undefined
+    }
+
+    try {
+      // A PROCESSENTRY32 parent PID is useful only when the RM-authenticated
+      // parent generation existed before the exact child generation. This
+      // rejects the stale ParentProcessId + reused-PID case.
+      if (BigInt(candidate.creationFileTime) > BigInt(entry.creationFileTime)) {
+        return undefined
+      }
+    } catch {
+      return undefined
+    }
+
+    return candidatePid
+  }
+
+  const withEdges: ForceReleaseHolder[] = holders.map(entry => {
+    const parentPid = exactParent(entry, entry.parentPid) ?? exactParent(entry, entry.wrapperPid)
 
     if (parentPid != null) {
       childCount.set(parentPid, (childCount.get(parentPid) ?? 0) + 1)
     }
 
+    const { parentPid: _untrustedParent, wrapperPid: _untrustedWrapper, ...base } = entry
+
     return {
-      ...entry,
-      ...(parentPid != null
-        ? {
-            parentPid: entry.parentPid ?? parentPid,
-            wrapperPid: entry.wrapperPid ?? (entry.wrapperPid === parentPid ? parentPid : entry.wrapperPid)
-          }
-        : {})
+      ...base,
+      ...(parentPid != null ? { parentPid } : {})
     }
   })
 
   return withEdges.map(entry => {
     const isParent = (childCount.get(entry.pid) ?? 0) > 0
-
-    const hasParent =
-      (entry.parentPid != null && byPid.has(entry.parentPid)) ||
-      (entry.wrapperPid != null && byPid.has(entry.wrapperPid))
+    const hasParent = entry.parentPid != null && byPid.has(entry.parentPid)
 
     if (entry.role === 'worker' || entry.role === 'wrapper') {
       return entry
@@ -204,7 +251,10 @@ export function mergeInstallHolders(
 ): ForceReleaseHolder[] {
   const merged: ForceReleaseHolder[] = []
 
-  for (const entry of holders) {
+  // Restart Manager rows are the only termination authority. Scanner rows may
+  // enrich ordering metadata for an already-authoritative RM generation, but
+  // they must never introduce a PID or resource claim of their own.
+  for (const entry of holders.filter(candidate => candidate.source === 'restart-manager')) {
     if (!Number.isInteger(entry.pid) || entry.pid <= 0) {
       continue
     }
@@ -226,89 +276,125 @@ export function mergeInstallHolders(
     }
 
     const existing = merged[existingIndex]!
-    const resources = [existing.resource, entry.resource].filter(Boolean) as string[]
-    const preferredSource = existing.source === 'scanner' || entry.source === 'scanner' ? 'scanner' : entry.source
-
-    // Prefer the more precise (fractional) create-time when both match within tolerance.
-    const createdAt =
-      !Number.isInteger(existing.createdAt) || Number.isInteger(entry.createdAt)
-        ? existing.createdAt
-        : entry.createdAt
-
+    const resources = Array.from(new Set([...holderResources(existing), ...holderResources(entry)]))
     merged[existingIndex] = {
       ...existing,
       ...entry,
-      createdAt,
-      source: preferredSource,
-      resource: resources.length ? Array.from(new Set(resources)).join('; ') : existing.resource,
+      creationFileTime: existing.creationFileTime ?? entry.creationFileTime,
+      source: 'restart-manager',
+      resource: resources[0] ?? existing.resource,
+      resources,
       parentPid: existing.parentPid ?? entry.parentPid,
       wrapperPid: existing.wrapperPid ?? entry.wrapperPid,
-      role: existing.role === 'other' || existing.role == null ? entry.role ?? existing.role : existing.role
+      role: existing.role === 'other' || existing.role == null ? (entry.role ?? existing.role) : existing.role
     }
   }
 
   return attachHolderTreeRelationships(merged)
 }
 
-function formatHolderLine(holder: ForceReleaseHolder): string {
-  const resource = holder.resource ? ` resource=${holder.resource}` : ''
-
-  return `PID ${holder.pid} ${holder.name}${resource}`
-}
-
 function elevationMessage(holders: readonly ForceReleaseHolder[]): string {
-  const sample = holders
-    .slice(0, 5)
-    .map(formatHolderLine)
-    .join('; ')
-
   return (
-    'Update needs Administrator permission to stop processes still locking this Hermes install. ' +
-    `Survivors: ${sample || 'unknown'}. Choose Force update (Administrator) to continue, or close those processes and retry.`
+    'Update verified that a current Hermes install holder requires Administrator permission. ' +
+    `Verified holder count: ${Math.min(holders.length, 64)}. Close it and retry the ordinary update.`
   )
 }
 
 function blockedMessage(holders: readonly ForceReleaseHolder[], detail: string): string {
-  const sample = holders
-    .slice(0, 5)
-    .map(formatHolderLine)
-    .join('; ')
-
   return (
     `Update aborted: ${detail}. ` +
-    `Still holding the install: ${sample || 'unknown'}. ` +
+    `Verified holder count: ${Math.min(holders.length, 64)}. ` +
     'The virtual environment was not modified.'
   )
 }
 
 /**
- * Bounds non-mutating probes against the remaining wall-clock budget. Mutating
- * termination owns and drains its native process/Job boundary and must never be
- * abandoned by this helper.
+ * Race work against the remaining wall-clock budget.
+ *
+ * When `work` is a factory, the orchestrator passes an AbortSignal. Abort fires
+ * early enough that kill-and-reap normally fits inside `budgetMs`. After
+ * abort, a factory is always awaited to terminal settlement: returning while
+ * its child can still write would violate the updater's post-return boundary.
+ * Dependencies therefore must implement abort by closing/reaping their child.
+ * Plain promises remain supported for discovery calls (no drain wait).
  */
-export function raceWithBudget<T>(work: Promise<T>, budgetMs: number, onTimeout: () => T): Promise<T> {
+export function raceWithBudget<T>(
+  work: Promise<T> | ((signal: AbortSignal) => Promise<T>),
+  budgetMs: number,
+  onTimeout: () => T,
+  options?: { drainMs?: number }
+): Promise<T> {
   const budget = Math.trunc(budgetMs)
 
-  if (budget <= 0) {return Promise.resolve(onTimeout())}
+  if (budget <= 0) {
+    return Promise.resolve(onTimeout())
+  }
+
+  const isFactory = typeof work === 'function'
+  const controller = new AbortController()
+  const pending = isFactory ? work(controller.signal) : work
+
+  // Reserve drain room inside the budget so total elapsed stays <= budgetMs.
+  const requestedDrain = Math.max(
+    0,
+    Math.trunc(options?.drainMs ?? (isFactory ? Math.min(750, Math.max(100, Math.floor(budget * 0.2))) : 0))
+  )
+
+  const drainMs = isFactory ? Math.min(requestedDrain, Math.max(0, budget - 1)) : 0
+  const workBudget = Math.max(0, budget - drainMs)
+  let settled = false
+  let timedOut = false
 
   return new Promise<T>((resolve, reject) => {
-    let settled = false
+    const finishTimeout = () => {
+      if (settled) {
+        return
+      }
 
-    const timer = setTimeout(() => {
-      if (settled) {return}
       settled = true
       resolve(onTimeout())
-    }, budget)
+    }
 
-    void work.then(
+    const timer = setTimeout(() => {
+      if (settled) {
+        return
+      }
+
+      timedOut = true
+      controller.abort()
+
+      if (!isFactory || drainMs <= 0) {
+        finishTimeout()
+      }
+    }, workBudget)
+
+    void pending.then(
       value => {
-        if (settled) {return}
+        if (settled) {
+          return
+        }
+
+        if (timedOut) {
+          finishTimeout()
+
+          return
+        }
+
         settled = true
         clearTimeout(timer)
         resolve(value)
       },
       error => {
-        if (settled) {return}
+        if (settled) {
+          return
+        }
+
+        if (timedOut) {
+          finishTimeout()
+
+          return
+        }
+
         settled = true
         clearTimeout(timer)
         reject(error)
@@ -326,55 +412,51 @@ export async function runWindowsUpdateForceRelease(
   const settleMs = Math.max(0, deps.settleMs ?? DEFAULT_SETTLE_MS)
   const excludePids = deps.excludePids ?? new Set<number>()
   const started = now()
-  const deadline = started + deadlineMs
+  const configuredDeadline = started + deadlineMs
+
+  const deadline =
+    typeof deps.deadlineAt === 'number' && Number.isFinite(deps.deadlineAt)
+      ? Math.min(configuredDeadline, Math.trunc(deps.deadlineAt))
+      : configuredDeadline
+
   const remaining = () => Math.max(0, deadline - now())
 
-  const resourceLockedWithinDeadline = async (): Promise<boolean> => {
-    const budget = remaining()
-
-    if (budget <= 0) {return true}
-
-    return await raceWithBudget(deps.isResourceLocked(), budget, () => true)
-  }
-
-  const waitWithinDeadline = async (delayMs: number): Promise<void> => {
-    const budget = Math.min(Math.max(0, delayMs), remaining())
-
-    if (budget <= 0) {return}
-    await raceWithBudget(sleep(budget), budget, () => undefined)
-  }
-
-  if (!(await resourceLockedWithinDeadline())) {
+  if (!(await deps.isResourceLocked())) {
     return { kind: 'clear' }
   }
 
+  let permissionRequired: ForceReleaseHolder[] = []
   let accessDenied: ForceReleaseHolder[] = []
   let protectedHolders: ForceReleaseHolder[] = []
   let mismatchHolders: ForceReleaseHolder[] = []
   let lastHolders: ForceReleaseHolder[] = []
 
   while (remaining() > 0) {
-    if (!(await resourceLockedWithinDeadline())) {
+    if (!(await deps.isResourceLocked())) {
       return { kind: 'clear' }
     }
 
     const passStarted = now()
     const scanBudget = remaining()
 
-    if (scanBudget <= 0) {break}
+    if (scanBudget <= 0) {
+      break
+    }
 
     const scanned = await raceWithBudget(
-      deps.listScannerHolders(scanBudget),
+      signal => deps.listScannerHolders(scanBudget, signal, deadline),
       scanBudget,
       () => [] as ForceReleaseHolder[]
     )
 
-    if (remaining() <= 0) {break}
+    if (remaining() <= 0) {
+      break
+    }
 
     const rmBudget = remaining()
 
     const fromRm = await raceWithBudget(
-      deps.listRestartManagerHolders(rmBudget),
+      signal => deps.listRestartManagerHolders(rmBudget, signal, deadline),
       rmBudget,
       () => [] as ForceReleaseHolder[]
     )
@@ -393,16 +475,17 @@ export async function runWindowsUpdateForceRelease(
       const pause = Math.min(settleMs || 50, remaining())
 
       if (pause > 0) {
-        await waitWithinDeadline(pause)
+        await sleep(pause)
       }
 
-      if (!(await resourceLockedWithinDeadline())) {
+      if (!(await deps.isResourceLocked())) {
         return { kind: 'clear' }
       }
 
       break
     }
 
+    permissionRequired = []
     accessDenied = []
     protectedHolders = []
     mismatchHolders = []
@@ -414,23 +497,30 @@ export async function runWindowsUpdateForceRelease(
         break
       }
 
-      // The native boundary receives the same absolute deadline and does not
-      // resolve until its wrapper, Jobs, helpers, and authenticated descendants
-      // are terminal. Never race/abandon this mutating operation.
-      const controller = new AbortController()
-      const abortTimer = setTimeout(() => controller.abort(), budget)
+      // Mutating termination owns the remaining budget. The controller is
+      // cancelled at the same absolute deadline that is passed to the native
+      // boundary; the boundary must return before this deadline or fail closed.
+      const terminateController = new AbortController()
+
+      const terminateTimer = setTimeout(() => terminateController.abort(), Math.max(1, Math.trunc(budget)))
+
       let result: ForceReleaseTerminateResult
 
       try {
-        result = await deps.terminateHolder(target, budget, controller.signal, deadline)
+        result = await deps.terminateHolder(target, budget, terminateController.signal, deadline)
       } finally {
-        clearTimeout(abortTimer)
+        clearTimeout(terminateTimer)
       }
 
       switch (result.kind) {
         case 'terminated':
 
         case 'already-gone':
+          break
+
+        case 'permission-required':
+          permissionRequired.push(target)
+
           break
 
         case 'access-denied':
@@ -457,30 +547,29 @@ export async function runWindowsUpdateForceRelease(
     const settle = Math.min(Math.max(settleMs, 1), remaining())
 
     if (settle > 0) {
-      await waitWithinDeadline(settle)
+      await sleep(settle)
     }
 
-    if (!(await resourceLockedWithinDeadline())) {
+    if (!(await deps.isResourceLocked())) {
       return { kind: 'clear' }
     }
 
-    // Access-denied survivors need elevation — stop the quick path promptly.
-    if (accessDenied.length > 0) {
+    // A dedicated native permission result stops the ordinary path promptly.
+    if (permissionRequired.length > 0) {
       return {
         kind: 'needs-elevation',
-        holders: accessDenied,
-        message: elevationMessage(accessDenied)
+        holders: permissionRequired,
+        message: elevationMessage(permissionRequired)
       }
     }
 
-    if (protectedHolders.length > 0) {
+    if (protectedHolders.length > 0 || accessDenied.length > 0) {
+      const blocked = [...protectedHolders, ...accessDenied]
+
       return {
         kind: 'blocked',
-        holders: protectedHolders,
-        message: blockedMessage(
-          protectedHolders,
-          'a protected or unkillable process still holds install files (Win32 access denied / protected process)'
-        )
+        holders: blocked,
+        message: blockedMessage(blocked, 'the exact holder identity or permission boundary could not be authenticated')
       }
     }
 
@@ -502,26 +591,25 @@ export async function runWindowsUpdateForceRelease(
     }
   }
 
-  if (!(await resourceLockedWithinDeadline())) {
+  if (!(await deps.isResourceLocked())) {
     return { kind: 'clear' }
   }
 
-  if (accessDenied.length > 0) {
+  if (permissionRequired.length > 0) {
     return {
       kind: 'needs-elevation',
-      holders: accessDenied,
-      message: elevationMessage(accessDenied)
+      holders: permissionRequired,
+      message: elevationMessage(permissionRequired)
     }
   }
 
-  if (protectedHolders.length > 0) {
+  if (protectedHolders.length > 0 || accessDenied.length > 0) {
+    const blocked = [...protectedHolders, ...accessDenied]
+
     return {
       kind: 'blocked',
-      holders: protectedHolders,
-      message: blockedMessage(
-        protectedHolders,
-        'a protected or unkillable process still holds install files (Win32 access denied / protected process)'
-      )
+      holders: blocked,
+      message: blockedMessage(blocked, 'the exact holder identity or permission boundary could not be authenticated')
     }
   }
 
@@ -539,9 +627,6 @@ export async function runWindowsUpdateForceRelease(
   return {
     kind: 'timeout',
     holders: lastHolders,
-    message: blockedMessage(
-      lastHolders,
-      'install file locks could not be cleared within five seconds'
-    )
+    message: blockedMessage(lastHolders, 'install file locks could not be cleared within five seconds')
   }
 }

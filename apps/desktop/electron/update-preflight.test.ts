@@ -5,6 +5,7 @@ import { describe, it } from 'vitest'
 import type { McpBridgeQuiesceLease } from './mcp-bridge-quiesce'
 import {
   authorizeUpdateMutation,
+  createNormalUpdateBlockerDeadline,
   runAuthorizedUpdateMutation,
   runWindowsUpdatePreflight,
   type UpdatePreflightDeps,
@@ -18,6 +19,72 @@ import type {
 } from './venv-blocker-scan'
 
 const PURPOSES: UpdatePreflightPurpose[] = ['normal-update', 'bootstrap-recovery']
+
+describe('normal update request deadline', () => {
+  it('creates one absolute five-second deadline at the request boundary', () => {
+    const deadline = createNormalUpdateBlockerDeadline(() => 12_345)
+
+    assert.deepEqual(deadline, { deadlineAt: 17_345 })
+    assert.ok(Object.isFrozen(deadline))
+  })
+
+  it('passes the same absolute deadline through tracked preparation and force release', async () => {
+    const seen: Array<[string, number]> = []
+    let currentTime = 10_000
+    const deadline = createNormalUpdateBlockerDeadline(() => currentTime)
+
+    const { deps } = makeDeps([], {
+      now: () => currentTime,
+      releaseTrackedBackendTrees: async current => {
+        seen.push(['release', current.deadlineAt])
+        currentTime += 1_750
+
+        return { unlocked: false }
+      },
+      forceReleaseInstallHolders: async current => {
+        seen.push(['force-release', current.deadlineAt])
+
+        return { kind: 'timeout', holders: [], message: 'deadline elapsed' }
+      }
+    })
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {}, deadline)
+
+    assert.equal(outcome.kind, 'blocked')
+    assert.equal(outcome.reason, 'unlock-failed')
+    assert.deepEqual(seen, [
+      ['release', 15_000],
+      ['force-release', 15_000]
+    ])
+  })
+
+  it('does not start a fresh force-release window after preparation exhausts the request deadline', async () => {
+    let currentTime = 20_000
+    let forceReleaseCalled = false
+    const deadline = createNormalUpdateBlockerDeadline(() => currentTime)
+
+    const { deps } = makeDeps([], {
+      now: () => currentTime,
+      releaseTrackedBackendTrees: async () => {
+        currentTime = deadline.deadlineAt
+
+        return { unlocked: false }
+      },
+      forceReleaseInstallHolders: async () => {
+        forceReleaseCalled = true
+
+        return { kind: 'needs-elevation', holders: [], message: 'should not run' }
+      }
+    })
+
+    const outcome = await runWindowsUpdatePreflight('normal-update', deps, {}, deadline)
+
+    assert.equal(outcome.kind, 'blocked')
+    assert.equal(outcome.reason, 'unlock-failed')
+    assert.equal(forceReleaseCalled, false)
+    assert.equal('elevationHolders' in outcome, false)
+  })
+})
 
 const lease: McpBridgeQuiesceLease = {
   schemaVersion: 1,
@@ -42,9 +109,7 @@ const bridge = (overrides: Partial<McpBridgeProcess> = {}): McpBridgeProcess => 
   ...overrides
 })
 
-const desktopPluginService = (
-  overrides: Partial<DesktopPluginServiceProcess> = {}
-): DesktopPluginServiceProcess => ({
+const desktopPluginService = (overrides: Partial<DesktopPluginServiceProcess> = {}): DesktopPluginServiceProcess => ({
   pid: 301,
   name: 'python.exe',
   cmdline: 'python.exe C:\\Users\\u\\AppData\\Local\\hermes\\desktop-plugins\\tracker\\service.py',
@@ -123,8 +188,7 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
     },
     terminateVenvHolder: async current => {
       const isMcpBridge =
-        'role' in current &&
-        (current.role === 'mcp_bridge_worker' || current.role === 'mcp_bridge_wrapper')
+        'role' in current && (current.role === 'mcp_bridge_worker' || current.role === 'mcp_bridge_wrapper')
 
       calls.push(`${isMcpBridge ? 'terminate' : 'terminate-holder'}:${current.pid}:${current.createdAt}`)
 
@@ -191,9 +255,12 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
           {
             pid: 901,
             createdAt: 1,
+            creationFileTime: '133000000000000000',
             name: 'python.exe',
             cmdline: 'python.exe',
-            source: 'scanner'
+            source: 'scanner',
+            resource: String.raw`C:\Hermes\venv\Scripts\hermes.exe`,
+            resources: [String.raw`C:\Hermes\venv\Scripts\hermes.exe`]
           }
         ],
         message: 'needs Administrator'
@@ -206,6 +273,63 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     if (outcome.kind === 'blocked') {
       assert.equal(outcome.reason, 'needs-elevation')
       assert.equal(outcome.elevationHolders?.[0]?.pid, 901)
+    }
+  })
+
+  it('does not expose Administrator action for an unauthenticated permission-shaped result', async () => {
+    const { deps } = makeDeps([], {
+      releaseTrackedBackendTrees: async () => ({ unlocked: false }),
+      forceReleaseInstallHolders: async () => ({
+        kind: 'needs-elevation',
+        holders: [
+          {
+            pid: 901,
+            createdAt: Number.NaN,
+            name: 'python.exe',
+            cmdline: 'python.exe',
+            source: 'scanner'
+          }
+        ],
+        message: 'generic access failure'
+      })
+    })
+
+    const outcome = await runWindowsUpdatePreflight(purpose, deps)
+
+    assert.equal(outcome.kind, 'blocked')
+
+    if (outcome.kind === 'blocked') {
+      assert.equal(outcome.reason, 'unlock-failed')
+      assert.equal(outcome.elevationHolders, undefined)
+    }
+  })
+
+  it('does not preserve a permission claim without exact create-time and per-resource evidence', async () => {
+    const { deps } = makeDeps([], {
+      releaseTrackedBackendTrees: async () => ({ unlocked: false }),
+      forceReleaseInstallHolders: async () => ({
+        kind: 'needs-elevation',
+        holders: [
+          {
+            pid: 901,
+            createdAt: 1,
+            name: 'python.exe',
+            cmdline: 'python.exe',
+            source: 'restart-manager',
+            resource: String.raw`C:\Hermes\venv\Scripts\hermes.exe`
+          }
+        ],
+        message: 'permission required'
+      })
+    })
+
+    const outcome = await runWindowsUpdatePreflight(purpose, deps)
+
+    assert.equal(outcome.kind, 'blocked')
+
+    if (outcome.kind === 'blocked') {
+      assert.equal(outcome.reason, 'unlock-failed')
+      assert.equal(outcome.elevationHolders, undefined)
     }
   })
 
@@ -248,10 +372,11 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     let updaterLaunched = false
     let desktopShutdown = false
     assert.throws(
-      () => runAuthorizedUpdateMutation(permit as never, () => {
-        updaterLaunched = true
-        desktopShutdown = true
-      }),
+      () =>
+        runAuthorizedUpdateMutation(permit as never, () => {
+          updaterLaunched = true
+          desktopShutdown = true
+        }),
       /clear-preflight permit/
     )
     assert.equal(updaterLaunched, false)
@@ -284,9 +409,10 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     assert.equal(permit, null)
     let mutated = false
     assert.throws(
-      () => runAuthorizedUpdateMutation(permit as never, () => {
-        mutated = true
-      }),
+      () =>
+        runAuthorizedUpdateMutation(permit as never, () => {
+          mutated = true
+        }),
       /clear-preflight permit/
     )
     assert.equal(mutated, false)
@@ -382,10 +508,48 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     assert.equal(outcome.kind, 'clear')
     assert.ok(calls.includes('terminate:101:123.5'))
   })
-
 })
 
 describe('MCP bridge drain', () => {
+  it('routes a normal-update newcomer through the native force-release boundary, never legacy termination', async () => {
+    let currentTime = 1_000
+    const deadline = createNormalUpdateBlockerDeadline(() => currentTime)
+
+    const { calls, deps } = makeDeps([clear(), blockedByBridges(), clear(), clear()], {
+      now: () => currentTime,
+      forceReleaseInstallHolders: async current => {
+        calls.push(`native-force:${current?.deadlineAt}`)
+
+        return { kind: 'clear' }
+      },
+      wait: async delay => {
+        calls.push(`wait:${delay}`)
+        currentTime += Math.max(0, delay)
+      }
+    })
+
+    const outcome = await runWindowsUpdatePreflight(
+      'normal-update',
+      deps,
+      { cooperativeExitMs: 0, respawnIntervalMs: 0, terminationSettleMs: 0 },
+      deadline
+    )
+
+    assert.equal(outcome.kind, 'clear')
+    assert.deepEqual(calls, [
+      'release',
+      'scan',
+      'lease',
+      'wait:0',
+      'scan',
+      'native-force:6000',
+      'scan',
+      'wait:0',
+      'scan'
+    ])
+    assert.ok(!calls.some(call => call.startsWith('terminate:')))
+  })
+
   it('gets consent before activating the lease, then lets cooperative exit win', async () => {
     const { calls, deps } = makeDeps([blockedByBridges(), clear(), clear()])
 
@@ -518,18 +682,11 @@ describe('MCP bridge drain', () => {
     })
 
     assert.equal(outcome.kind, 'clear')
-    assert.equal(calls.some(call => call.startsWith('terminate:')), false)
-    assert.deepEqual(calls, [
-      'release',
-      'scan',
-      'lease',
-      'wait:0',
-      'scan',
-      'wait:5',
-      'scan',
-      'wait:0',
-      'scan'
-    ])
+    assert.equal(
+      calls.some(call => call.startsWith('terminate:')),
+      false
+    )
+    assert.deepEqual(calls, ['release', 'scan', 'lease', 'wait:0', 'scan', 'wait:5', 'scan', 'wait:0', 'scan'])
   })
 
   it('drains an exact bridge from a mixed late scan while a transient generic holder exits naturally', async () => {
@@ -745,8 +902,14 @@ describe('MCP bridge drain', () => {
 
     assert.equal(outcome.kind, 'clear')
     assert.equal(terminated.length, 64)
-    assert.equal(terminated.slice(0, 32).every(current => current.role === 'mcp_bridge_worker'), true)
-    assert.equal(terminated.slice(32).every(current => current.role === 'mcp_bridge_wrapper'), true)
+    assert.equal(
+      terminated.slice(0, 32).every(current => current.role === 'mcp_bridge_worker'),
+      true
+    )
+    assert.equal(
+      terminated.slice(32).every(current => current.role === 'mcp_bridge_wrapper'),
+      true
+    )
     assert.equal(new Set(terminated.map(current => current.wrapperPid ?? current.pid)).size, 32)
   })
 
@@ -1007,6 +1170,100 @@ describe('MCP bridge drain', () => {
 })
 
 describe('production update mutation permit wiring', () => {
+  it('threads one request-bound deadline through every ordinary preflight attempt', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
+
+    assert.match(
+      main,
+      /async function applyUpdates\([^)]*\)\s*{\s*const blockerDeadline = createNormalUpdateBlockerDeadline\(\)/
+    )
+    assert.match(main, /applyUpdatesTransaction\(opts, blockerDeadline\)/)
+    assert.equal(
+      (main.match(/runWindowsHandoffPreflight\(updateRoot, 'normal-update', blockerDeadline\)/g) ?? []).length,
+      2,
+      'the initial attempt and same-request safe-blocker continuation share one absolute deadline'
+    )
+  })
+
+  it('does not broad-tree-kill tracked backends before native holder authentication', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
+
+    const body = main.slice(
+      main.indexOf('async function releaseBackendLockForUpdate'),
+      main.indexOf('function windowsPreflightErrorCode')
+    )
+
+    assert.doesNotMatch(body, /stopBackendTreesForUpdate|forceKillProcessTree|releaseBackendLock\(/)
+    assert.match(body, /isAnyInstallResourceLocked/)
+
+    const transactionBody = main.slice(
+      main.indexOf('async function applyUpdatesTransaction'),
+      main.indexOf('async function handOffWindowsBootstrapRecovery')
+    )
+
+    assert.doesNotMatch(transactionBody, /forceKillProcessTree|releaseBackendLock\(|stopBackendTreesForUpdate/)
+  })
+
+  it('propagates abort and the absolute deadline into both discovery helpers', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
+
+    const body = main.slice(
+      main.indexOf('async function forceReleaseInstallHoldersForUpdate'),
+      main.indexOf('function runWindowsHandoffPreflight')
+    )
+
+    assert.match(body, /deadlineAt:\s*deadline\.deadlineAt/)
+    assert.match(body, /listScannerHolders:\s*async \(budgetMs, signal, deadlineAt\)/)
+    assert.match(body, /scanVenvBlockersWithinDeadline\([\s\S]{0,300}signal/)
+    assert.match(body, /listRestartManagerHolders:\s*async \(budgetMs, signal, deadlineAt\)/)
+    assert.match(body, /listRestartManagerHoldersForResources\([\s\S]{0,300}\{ timeoutMs, signal \}/)
+  })
+
+  it('does not launch the legacy elevated helper from an unbound renderer retry flag', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
+
+    const body = main.slice(
+      main.indexOf('async function applyUpdatesTransaction'),
+      main.indexOf('const mutationPermit')
+    )
+
+    assert.doesNotMatch(body, /runElevatedForceReleaseForUpdate/)
+    assert.match(body, /if \(IS_WINDOWS && opts\.forceUpdateElevated\)[\s\S]{0,700}error: 'elevation-claim-required'/)
+    assert.match(main, /case 'needs-elevation':[\s\S]{0,500}return 'venv-permission-required'/)
+    assert.doesNotMatch(body, /elevationHolders:\s*preflight\.elevationHolders/)
+  })
+
+  it('authenticates and observes the actual hidden writer generation before Desktop quit', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
+
+    const body = main.slice(
+      main.indexOf('const launch = runAuthorizedUpdateMutation'),
+      main.indexOf('return { ok: true, handedOff: true')
+    )
+
+    assert.match(body, /const handoffOwner = await waitForWindowsHandoffOwnerIdentity\(child\)/)
+    assert.match(body, /requiredOwnerPid:\s*handoffOwner\.pid/)
+    assert.match(
+      body,
+      /observeUpdaterGeneration\(\s*handoffOwner\.pid,\s*handoffOwner\.creationFileTime,\s*[\s\S]{0,500}if \(!handoffOutcome\.ok \|\| !writerGenerationActive\)/
+    )
+    assert.ok(
+      body.indexOf('const handoffOwner = await waitForWindowsHandoffOwnerIdentity(child)') <
+        body.indexOf('isQuittingForHandoff = true'),
+      'actual writer identity must be proven before the Desktop quit boundary'
+    )
+  })
+
   it('gates normal and bootstrap-recovery updater launch and Desktop shutdown sites', async () => {
     const fs = await import('node:fs')
     const path = await import('node:path')

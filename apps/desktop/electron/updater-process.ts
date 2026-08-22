@@ -1,9 +1,10 @@
 import { spawn, type SpawnOptions } from 'node:child_process'
 import { statSync } from 'node:fs'
 import path from 'node:path'
+import type { Readable } from 'node:stream'
 
 import { hiddenWindowsChildOptions } from './windows-child-options'
-import { queryWindowsProcessCreatedAt } from './windows-process-identity'
+import { queryWindowsProcessCreatedAt, queryWindowsProcessCreationFileTime } from './windows-process-identity'
 
 export const STAGED_UPDATER_BRIDGE_LEASE_ENV = 'HERMES_UPDATE_BRIDGE_LEASE_ID'
 
@@ -18,12 +19,34 @@ const WINDOWS_HANDOFF_ENV = {
 
 const BRIDGE_LEASE_ID_PATTERN = /^[A-Za-z0-9._-]{16,128}$/
 
-// cmd.exe parses every token after `start`, even when Node spawns it without a
-// shell. Keep that surface byte-stable: all dynamic values travel in the
-// private child environment and this fixed PowerShell program reads them back
-// as values, never source text. Windows PowerShell expects UTF-16LE for
+const INHERITED_UPDATE_CONTROL_ENV = [
+  /^HERMES_DESKTOP_UPDATE_TEST$/i,
+  /^HERMES_INTERNAL_UPDATE_STAGE_TIMEOUT_SECONDS$/i,
+  /^HERMES_SELFTEST_/i,
+  /^HERMES_TEST_/i,
+  /^HERMES_FORCE_RELEASE_(?:FORCE_|TEST_)/i,
+  /^HERMES_TERMINATE_/i,
+  /^HERMES_DEFERRED_GATEWAY_STARTUP_GATE$/i,
+  /^HERMES_UPDATE_HANDOFF_/i,
+  /^HERMES_UPDATE_BRIDGE_LEASE_ID$/i
+]
+
+/** Prevent ambient controls from changing a production handoff. */
+function sanitizeWindowsUpdateEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(env).filter(([name]) => !INHERITED_UPDATE_CONTROL_ENV.some(pattern => pattern.test(name)))
+  )
+}
+
+function windowsPowerShellExecutable(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+}
+
+// Keep the native argument surface byte-stable: all dynamic values travel in
+// the private child environment and this fixed PowerShell program reads them
+// back as values, never source text. Windows PowerShell expects UTF-16LE for
 // -EncodedCommand.
-const WINDOWS_HANDOFF_LAUNCHER = String.raw`
+const WINDOWS_HANDOFF_RUNNER = String.raw`
 $ErrorActionPreference = 'Stop'
 $required = @(
   'HERMES_UPDATE_HANDOFF_SCRIPT',
@@ -65,11 +88,44 @@ if ($null -eq $LASTEXITCODE) { exit 1 }
 exit $LASTEXITCODE
 `.trim()
 
+const WINDOWS_HANDOFF_RUNNER_ENCODED_COMMAND = Buffer.from(WINDOWS_HANDOFF_RUNNER, 'utf16le').toString('base64')
+
+// The directly tracked bridge is short-lived. It starts the actual writer with
+// an explicit hidden window style, publishes only that process's exact PID and
+// creation FILETIME, then exits. Neither the bridge PID nor untrusted output is
+// allowed to become update ownership authority.
+const WINDOWS_HANDOFF_LAUNCHER = String.raw`
+$ErrorActionPreference = 'Stop'
+try {
+  $powerShell = Join-Path $PSHOME 'powershell.exe'
+  if (-not (Test-Path -LiteralPath $powerShell -PathType Leaf)) { exit 20 }
+  $child = Start-Process -FilePath $powerShell -ArgumentList @(
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-EncodedCommand',
+    '${WINDOWS_HANDOFF_RUNNER_ENCODED_COMMAND}'
+  ) -WorkingDirectory (Get-Location).Path -WindowStyle Hidden -PassThru
+  if ($null -eq $child -or $child.Id -le 0) { exit 21 }
+  $created = $child.StartTime.ToUniversalTime().ToFileTimeUtc()
+  [Console]::Out.WriteLine("HERMES_UPDATE_HANDOFF_PID=$($child.Id);FILETIME=$created")
+  [Console]::Out.Flush()
+  exit 0
+} catch {
+  exit 22
+}
+`.trim()
+
 const WINDOWS_HANDOFF_ENCODED_COMMAND = Buffer.from(WINDOWS_HANDOFF_LAUNCHER, 'utf16le').toString('base64')
 
 export interface UpdaterChild {
   pid?: number
   kill: (signal?: NodeJS.Signals | number) => boolean
+  stdout?: Readable | null
+  once?: (event: string, listener: (...args: any[]) => void) => unknown
+  removeListener?: (event: string, listener: (...args: any[]) => void) => unknown
   unref: () => void
 }
 
@@ -102,8 +158,7 @@ export interface DetachedWindowsHandoff {
 }
 
 export type WindowsUpdateLaunchResult =
-  | { kind: 'manual' }
-  | { kind: 'spawned'; child: UpdaterChild; handoff: UpdateScriptHandoff }
+  { kind: 'manual' } | { kind: 'spawned'; child: UpdaterChild; handoff: UpdateScriptHandoff }
 
 /**
  * Repo-owned Windows update hand-off (frozen-binary escape hatch).
@@ -198,24 +253,9 @@ export function resolvePosixScriptHandoff(
 }
 
 /**
- * Wrap a PowerShell hand-off invocation so it survives a detached, hidden
- * spawn from Electron.
- *
- * Verified empirically (2026-08-09, Windows 11): `spawn('powershell', [...,
- * '-File', script], { detached: true, stdio: 'ignore', windowsHide: true })`
- * exits 0 WITHOUT executing a single line of the script. powershell.exe is a
- * console-subsystem binary; detached+windowsHide gives it no console to
- * attach to, and Windows PowerShell 5.1 dies during console init before
- * -File processing (the same class of failure as #54220's conhost work, on
- * the launch side). The same spawn with a visible console, or non-detached,
- * runs fine — so unit tests and foreground use hide the bug.
- *
- * `cmd /c start "" /min powershell ...` was the variant that survived the
- * full detached+hidden production shape in testing: `start` allocates the
- * child its own (minimized) console and fully detaches it from cmd.exe,
- * which exits immediately. The spawned pid is therefore the WRAPPER's —
- * callers must not use it as a marker owner (the script claims the marker
- * itself with its own $PID).
+ * Compose a fixed hidden PowerShell bridge. It starts the actual hidden writer
+ * and emits only that process's PID plus exact creation FILETIME. Dynamic
+ * values remain outside argv and windowsHide prevents console allocation.
  */
 export function wrapHandoffForDetachedConsole(
   handoff: UpdateScriptHandoff,
@@ -242,15 +282,9 @@ export function wrapHandoffForDetachedConsole(
   }
 
   return {
-    command: 'cmd.exe',
+    command: windowsPowerShellExecutable(),
     args: [
-      '/d',
-      '/s',
-      '/c',
-      'start',
-      '',
-      '/min',
-      'powershell',
+      '-NoLogo',
       '-NoProfile',
       '-NonInteractive',
       '-ExecutionPolicy',
@@ -272,12 +306,13 @@ export function wrapHandoffForDetachedConsole(
 
 /** Dev Electron starts `electron.exe <app-entry>`; preserve that entry for a
  * detached updater relaunch. Packaged Hermes.exe takes no app argument. */
-export function resolveWindowsDevRelaunchAppPath(
-  defaultApp: boolean,
-  argv: readonly string[]
-): string | undefined {
+export function resolveWindowsDevRelaunchAppPath(defaultApp: boolean, argv: readonly string[]): string | undefined {
   const appEntry = argv[1]
-  if (!defaultApp || !appEntry || appEntry.startsWith('-')) return undefined
+
+  if (!defaultApp || !appEntry || appEntry.startsWith('-')) {
+    return undefined
+  }
+
   return path.win32.resolve(appEntry)
 }
 
@@ -285,9 +320,7 @@ export function resolveWindowsDevRelaunchAppPath(
  * executable source from unquoted values. Single quotes are literal in
  * PowerShell; an embedded quote is represented by two single quotes. */
 export function formatPowerShellArgvForDisplay(argv: string[]): string {
-  return argv
-    .map(value => (/^[A-Za-z0-9._/:-]+$/.test(value) ? value : `'${value.replaceAll("'", "''")}'`))
-    .join(' ')
+  return argv.map(value => (/^[A-Za-z0-9._/:-]+$/.test(value) ? value : `'${value.replaceAll("'", "''")}'`)).join(' ')
 }
 
 /** Apply the resolved ordinary-update policy and compose the exact production
@@ -308,7 +341,12 @@ export function launchWindowsUpdateTransport(
   const child = spawnUpdaterProcess(
     wrapped.command,
     wrapped.args,
-    { ...options, env: { ...options.env, ...wrapped.env } },
+    {
+      ...options,
+      detached: false,
+      env: { ...sanitizeWindowsUpdateEnvironment(options.env ?? {}), ...wrapped.env },
+      stdio: ['ignore', 'pipe', 'ignore']
+    },
     deps
   )
 
@@ -425,10 +463,128 @@ export interface SpawnUpdaterProcessDeps {
 
 interface ExactUpdaterProcessDeps {
   queryCreatedAt?: (pid: number) => Promise<number | null>
+  queryCreationFileTime?: (pid: number) => Promise<string | null>
+}
+
+interface WindowsHandoffOwnerIdentityDeps extends ExactUpdaterProcessDeps {
+  clearTimeoutFn?: (timer: unknown) => void
+  setTimeoutFn?: (callback: () => void, ms: number) => unknown
+  timeoutMs?: number
+}
+
+export interface WindowsHandoffOwnerIdentity {
+  pid: number
+  createdAt: number
+  creationFileTime: string
 }
 
 export function stagedUpdaterEnvironment(baseEnv: NodeJS.ProcessEnv, bridgeLeaseId: string): NodeJS.ProcessEnv {
-  return { ...baseEnv, [STAGED_UPDATER_BRIDGE_LEASE_ENV]: bridgeLeaseId }
+  return {
+    ...sanitizeWindowsUpdateEnvironment(baseEnv),
+    [STAGED_UPDATER_BRIDGE_LEASE_ENV]: bridgeLeaseId
+  }
+}
+
+/**
+ * Resolve the actual writer started by the short-lived hidden bridge. The
+ * bridge receipt is bounded and the exact creation generation is queried
+ * independently from Windows before the PID can authorize adoption.
+ */
+export async function waitForWindowsHandoffOwnerIdentity(
+  child: UpdaterChild,
+  deps: WindowsHandoffOwnerIdentityDeps = {}
+): Promise<WindowsHandoffOwnerIdentity | null> {
+  const stdout = child.stdout
+
+  if (!stdout || typeof stdout.on !== 'function') {
+    return null
+  }
+
+  const setTimeoutFn = deps.setTimeoutFn ?? setTimeout
+
+  const clearTimeoutFn =
+    deps.clearTimeoutFn ?? ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>))
+
+  const timeoutMs = deps.timeoutMs ?? 5_000
+
+  const receipt = await new Promise<{ pid: number; creationFileTime: string } | null>(resolve => {
+    let settled = false
+    let buffer = ''
+
+    const finish = (value: { pid: number; creationFileTime: string } | null) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      clearTimeoutFn(timer)
+      stdout.removeListener('data', onData)
+      stdout.removeListener('end', onEnd)
+      stdout.removeListener('error', onStreamError)
+      child.removeListener?.('error', onChildError)
+      child.removeListener?.('exit', onChildExit)
+      resolve(value)
+    }
+
+    const parse = (): { pid: number; creationFileTime: string } | null | undefined => {
+      const match = /^HERMES_UPDATE_HANDOFF_PID=([1-9][0-9]{0,9});FILETIME=([1-9][0-9]{0,19})\r?\n?$/.exec(buffer)
+
+      if (!match) {
+        return undefined
+      }
+
+      const pid = Number(match[1])
+
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, creationFileTime: match[2] } : null
+    }
+
+    const onData = (chunk: Buffer | string) => {
+      buffer += String(chunk)
+
+      if (buffer.length > 128) {
+        finish(null)
+
+        return
+      }
+
+      const parsed = parse()
+
+      if (parsed !== undefined) {
+        finish(parsed)
+      }
+    }
+
+    const onEnd = () => finish(parse() ?? null)
+    const onStreamError = () => finish(null)
+    const onChildError = () => finish(null)
+
+    const onChildExit = (code: number | null, signal: string | null) => {
+      if (signal || (typeof code === 'number' && code !== 0)) {
+        finish(null)
+      }
+    }
+
+    const timer = setTimeoutFn(() => finish(null), timeoutMs)
+
+    stdout.on('data', onData)
+    stdout.once('end', onEnd)
+    stdout.once('error', onStreamError)
+    child.once?.('error', onChildError)
+    child.once?.('exit', onChildExit)
+  })
+
+  if (!receipt) {
+    return null
+  }
+
+  const [createdAt, observedFileTime] = await Promise.all([
+    captureSpawnedUpdaterCreatedAt(receipt.pid, deps),
+    (deps.queryCreationFileTime ?? queryWindowsProcessCreationFileTime)(receipt.pid)
+  ])
+
+  return createdAt && observedFileTime === receipt.creationFileTime
+    ? { pid: receipt.pid, createdAt, creationFileTime: receipt.creationFileTime }
+    : null
 }
 
 /**
@@ -483,9 +639,10 @@ export interface ObserveUpdaterHandoffDeps {
  * event on the detached child would crash the Electron main process outright.
  *
  * Success is: no `error` event AND either the child survives the settle
- * window or it exits 0 inside it (the Windows `cmd start` wrapper exits 0
- * immediately by design — see wrapHandoffForDetachedConsole). Failure is a
- * spawn `error`, a non-zero exit, or a signal death inside the window.
+ * window or it exits 0 inside it. Failure is a spawn `error`, a non-zero exit,
+ * or a signal death inside the window. For the Windows bridge, this observes
+ * only bridge health; callers must adopt and then observe the exact writer
+ * generation with waitForWindowsHandoffOwnerIdentity/observeUpdaterGeneration.
  *
  * Children that expose no event interface (bare test doubles) settle as ok
  * after the window — the observation is a best-effort hardening, never a new
@@ -555,9 +712,8 @@ export function observeUpdaterHandoff(
         return
       }
 
-      // Clean exit 0 inside the window is expected for wrapper shapes
-      // (cmd.exe `start` on Windows exits immediately after launching the
-      // real script in its own console).
+      // A fixed launcher may exit cleanly after publishing its child receipt.
+      // The child receipt still requires independent generation observation.
       finish({ ok: true, code: code ?? 0, signal: null })
     }
 
@@ -566,6 +722,40 @@ export function observeUpdaterHandoff(
     observable.once('error', onError)
     observable.once('exit', onExit)
   })
+}
+
+interface ObserveUpdaterGenerationDeps extends ExactUpdaterProcessDeps {
+  wait?: (delayMs: number) => Promise<void>
+}
+
+/** Hold the quit boundary until the exact adopted writer generation survives. */
+export async function observeUpdaterGeneration(
+  pid: number,
+  expectedCreationFileTime: string,
+  settleMs: number,
+  deps: ObserveUpdaterGenerationDeps = {}
+): Promise<boolean> {
+  if (
+    !Number.isSafeInteger(pid) ||
+    pid <= 0 ||
+    !/^[1-9][0-9]{0,19}$/.test(expectedCreationFileTime) ||
+    !Number.isFinite(settleMs) ||
+    settleMs < 0
+  ) {
+    return false
+  }
+
+  const wait = deps.wait ?? (delayMs => new Promise(resolve => setTimeout(resolve, delayMs)))
+
+  if (settleMs > 0) {
+    await wait(settleMs)
+  }
+
+  try {
+    return (await (deps.queryCreationFileTime ?? queryWindowsProcessCreationFileTime)(pid)) === expectedCreationFileTime
+  } catch {
+    return false
+  }
 }
 
 /** Capture the OS creation identity immediately after an updater spawn. */

@@ -445,7 +445,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   },
   updates: {
     check: () => ipcRenderer.invoke('hermes:updates:check'),
-    apply: opts => ipcRenderer.invoke('hermes:updates:apply', opts),
+    apply: opts =>
+      ipcRenderer.invoke('hermes:updates:apply', {
+        ...(opts?.dirtyStrategy !== undefined ? { dirtyStrategy: opts.dirtyStrategy } : {}),
+        ...(opts?.stopSafeBlockers !== undefined ? { stopSafeBlockers: opts.stopSafeBlockers } : {})
+      }),
     getBranch: () => ipcRenderer.invoke('hermes:updates:branch:get'),
     setBranch: name => ipcRenderer.invoke('hermes:updates:branch:set', name),
     onProgress: callback => {

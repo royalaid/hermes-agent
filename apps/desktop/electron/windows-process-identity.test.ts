@@ -4,7 +4,8 @@ import { describe, it } from 'vitest'
 
 import {
   createCachedWindowsProcessCreateTimeProbe,
-  queryWindowsProcessCreatedAt
+  queryWindowsProcessCreatedAt,
+  queryWindowsProcessCreationFileTime
 } from './windows-process-identity'
 
 describe('queryWindowsProcessCreatedAt', () => {
@@ -49,6 +50,48 @@ describe('queryWindowsProcessCreatedAt', () => {
       }),
       null
     )
+  })
+})
+
+describe('queryWindowsProcessCreationFileTime', () => {
+  it('returns the exact unsigned 64-bit decimal from the bounded hidden query', async () => {
+    const calls: Array<{ args: string[]; timeoutMs: number }> = []
+
+    const result = await queryWindowsProcessCreationFileTime(42, {
+      platform: 'win32',
+      run: async (_command, args, timeoutMs) => {
+        calls.push({ args, timeoutMs })
+
+        return '133456736000000123\r\n'
+      }
+    })
+
+    assert.equal(result, '133456736000000123')
+    assert.equal(calls.length, 1)
+    assert.match(calls[0].args.at(-1) ?? '', /Get-Process -Id 42/)
+    assert.match(calls[0].args.at(-1) ?? '', /ToFileTimeUtc/)
+    assert.ok(calls[0].timeoutMs > 0)
+  })
+
+  it('fails closed outside the unsigned 64-bit decimal boundary', async () => {
+    for (const output of [
+      '',
+      '0',
+      '-1',
+      '0133456736000000123',
+      '18446744073709551616',
+      '133456736000000123suffix',
+      '9'.repeat(4_096)
+    ]) {
+      assert.equal(
+        await queryWindowsProcessCreationFileTime(42, {
+          platform: 'win32',
+          run: async () => output
+        }),
+        null,
+        `accepted invalid FILETIME ${output.slice(0, 32)}`
+      )
+    }
   })
 })
 
