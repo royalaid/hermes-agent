@@ -201,7 +201,9 @@ def finalize_update_receipt(
     try:
         receipt.finalize(outcome)
         if stop_reason:
-            receipt.data["stop_reason"] = stop_reason
+            from hermes_cli.update_diagnostics import sanitize_receipt_reason
+
+            receipt.data["stop_reason"] = sanitize_receipt_reason(stop_reason)
         if fleet is not None:
             receipt.data["fleet"] = fleet
         directory = _receipt_dir()

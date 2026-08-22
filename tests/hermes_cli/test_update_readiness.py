@@ -601,7 +601,8 @@ def test_heartbeat_probe_exception_fail_stops_before_renewal(
 
     assert not heartbeat._renew_once()
     assert heartbeat.lost
-    assert events and events[0].startswith("fail-stop:bridge quiesce lease probe failed")
+    assert events == ["fail-stop:HDU401:heartbeat-probe"]
+    assert heartbeat.loss_reason == "HDU401:heartbeat-probe"
     assert "renewed" not in events
 
 
@@ -2136,6 +2137,129 @@ def test_atomic_prepare_releases_initial_lease_when_post_drain_renewal_fails(
 
 
 @pytest.mark.windows_only
+def test_atomic_prepare_recovers_stale_journals_under_the_renewed_live_lease(
+    tmp_path: Path, monkeypatch
+):
+    from hermes_cli import desktop_update_activation as activation
+
+    root = tmp_path / "install"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    initial = {
+        "schema_version": 1,
+        "lease_id": "lease-prepare-recovery-123456",
+        "owner_pid": os.getpid(),
+        "created_at": 100,
+        "expires_at": 220,
+        "handoff_grace_until": 160,
+        "install_root": str(root.resolve()),
+    }
+    renewed = {
+        **initial,
+        "created_at": 300,
+        "expires_at": 1500,
+        "handoff_grace_until": 300,
+    }
+    recovered = []
+    monkeypatch.setattr(
+        update_cmd, "_claim_update_quiesce_lease", lambda *_args, **_kwargs: initial
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_drain_under_update_lease",
+        lambda *_args, **_kwargs: {"ok": True, "ready": True},
+    )
+    monkeypatch.setattr(gate, "write_quiesce_lease", lambda *_args, **_kwargs: renewed)
+    monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+    monkeypatch.setattr(
+        activation,
+        "recover_stale_transaction_journals",
+        lambda recovery_root, **kwargs: recovered.append(
+            (recovery_root, kwargs["home"], kwargs["current_lease"])
+        ),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_release_update_quiesce_lease",
+        lambda *_args, **_kwargs: pytest.fail("successful prepare must retain its lease"),
+    )
+    args = SimpleNamespace(
+        yes=True,
+        bridge_lease_id=None,
+        timeout_seconds=1.0,
+        invocation_id="invocation-prepare-recovery-123456",
+        branch="main",
+        force_venv=False,
+    )
+    transaction = update_transaction._UpdateTransaction()
+
+    update_cmd._prepare_atomic_windows_update(
+        args, root=root, transaction=transaction
+    )
+
+    assert recovered == [(root, home, renewed)]
+    assert transaction.lease == renewed
+    assert transaction.invocation_id == args.invocation_id
+
+
+@pytest.mark.windows_only
+def test_atomic_prepare_refuses_coordinator_only_and_releases_renewed_lease(
+    tmp_path: Path, monkeypatch
+):
+    from hermes_cli import desktop_update_activation as activation
+
+    root = tmp_path / "install"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    coordinator = home / activation._COMMIT_COORDINATOR_NAME
+    opaque = b"opaque-native-commit-authority"
+    coordinator.write_bytes(opaque)
+    initial = {
+        **_lease(root),
+        "lease_id": "lease-coordinator-prepare-123456",
+    }
+    renewed = {**initial, "expires_at": initial["expires_at"] + 60}
+    released = []
+    monkeypatch.setattr(
+        update_cmd, "_claim_update_quiesce_lease", lambda *_args, **_kwargs: initial
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_drain_under_update_lease",
+        lambda *_args, **_kwargs: {"ok": True, "ready": True},
+    )
+    monkeypatch.setattr(gate, "write_quiesce_lease", lambda *_args, **_kwargs: renewed)
+    monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+    monkeypatch.setattr(
+        update_cmd,
+        "_release_update_quiesce_lease",
+        lambda _root, value: released.append(value) or True,
+    )
+    args = SimpleNamespace(
+        yes=True,
+        bridge_lease_id=None,
+        timeout_seconds=1.0,
+        invocation_id="invocation-coordinator-prepare-123456",
+        branch="main",
+        force_venv=False,
+    )
+    transaction = update_transaction._UpdateTransaction()
+
+    with pytest.raises(activation.ActivationError, match="commit coordinator"):
+        update_cmd._prepare_atomic_windows_update(
+            args, root=root, transaction=transaction
+        )
+
+    assert released == [renewed]
+    assert transaction.lease is None
+    assert transaction.invocation_id is None
+    assert coordinator.read_bytes() == opaque
+    assert sorted(path.name for path in home.iterdir()) == [coordinator.name]
+
+
+@pytest.mark.windows_only
 def test_deferred_update_does_not_kill_gateway_missing_from_frozen_plan(
     monkeypatch,
 ):
@@ -2638,12 +2762,10 @@ def test_windows_cmd_update_orders_all_transaction_cleanup(
         defer_gateway_resume=False,
     )
 
-    if outcome == "body-failure":
-        with pytest.raises(BodyFailure, match="injected update body failure"):
+    if outcome in {"body-failure", "heartbeat-loss"}:
+        with pytest.raises(SystemExit) as failure:
             cli_main.cmd_update(args)
-    elif outcome == "heartbeat-loss":
-        with pytest.raises(RuntimeError, match="injected update quiesce lease loss"):
-            cli_main.cmd_update(args)
+        assert failure.value.code == 1
     else:
         cli_main.cmd_update(args)
 
@@ -2664,3 +2786,288 @@ def test_windows_cmd_update_orders_all_transaction_cleanup(
         "lock-release",
         "output-finalize",
     ]
+
+
+def _stage_scope(tmp_path, monkeypatch):
+    from hermes_cli import desktop_update_activation as activation
+    from hermes_cli import main as cli_main
+    from hermes_cli import managed_uv
+
+    root = tmp_path / "hermes-agent"
+    candidate = root / ".hermes-runtime" / "venv-candidate-12345678"
+    generation = root / ".hermes-runtime" / "python" / "generation-12345678"
+    candidate.mkdir(parents=True)
+    generation.mkdir(parents=True)
+    for relative in update_cmd._UPDATE_CRITICAL_FILES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# valid critical entrypoint\n", encoding="utf-8")
+    target_sha = "b" * 40
+    transaction = update_transaction._UpdateTransaction(
+        invocation_id="invocation-stage-test-123456",
+        lease={
+            "schema_version": 1,
+            "lease_id": "lease-stage-test-123456",
+            "owner_pid": os.getpid(),
+            "created_at": 100,
+            "expires_at": 220,
+            "handoff_grace_until": 160,
+            "install_root": str(root.resolve()),
+        },
+    )
+    target = update_cmd._UpdateTarget(
+        branch="codex/disposable",
+        remote="origin",
+        tracking_ref="refs/remotes/origin/codex/disposable",
+        refspec="refs/heads/codex/disposable:refs/remotes/origin/codex/disposable",
+    )
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *_args: target_sha)
+    monkeypatch.setattr(update_cmd, "_git_worktree_is_clean", lambda *_args: True)
+    monkeypatch.setattr(managed_uv, "ensure_uv_without_runtime_cutover", lambda: "uv")
+    monkeypatch.setattr(
+        managed_uv,
+        "stage_update_candidate_venv",
+        lambda *_args, **_kwargs: managed_uv.StagedUpdateVenv(
+            candidate=candidate,
+            python=generation / "python.exe",
+            provisioned_generation=generation,
+        ),
+    )
+    monkeypatch.setattr(
+        managed_uv, "_smoke_candidate_venv", lambda _path: (True, "", None)
+    )
+    monkeypatch.setattr(activation, "_smoke_live", lambda *_args: True)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+    activation.write_staging_journal(
+        root,
+        home=home,
+        invocation_id=transaction.invocation_id,
+        lease=transaction.lease,
+        pre_update_head="a" * 40,
+        pre_update_branch=target.branch,
+        branch=target.branch,
+        selected_pre_head="a" * 40,
+        target_head=target_sha,
+    )
+    activation.update_staging_journal(
+        root,
+        home=home,
+        invocation_id=transaction.invocation_id,
+        lease_id=transaction.lease["lease_id"],
+        phase="candidate-staging",
+        candidate=candidate,
+        provisioned_generation=generation,
+    )
+    return root, candidate, generation, target_sha, transaction, target
+
+
+def test_candidate_install_env_removes_mixed_case_ambient_uv_controls(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import main as cli_main
+
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path / "root")
+    for key in (
+        "uV_tArGeT",
+        "Uv_CoNfIg_FiLe",
+        "uv_system_python",
+        "UV_PROJECT_ENVIRONMENT",
+        "pYtHoNhOmE",
+        "virtual_env",
+    ):
+        monkeypatch.setenv(key, "ambient-must-not-survive")
+    candidate = tmp_path / "root" / ".hermes-runtime" / "venv-candidate-12345678"
+
+    env = update_cmd._candidate_install_env(candidate)
+
+    canonical_uv = {
+        "UV_MANAGED_PYTHON",
+        "UV_NO_CONFIG",
+        "UV_PYTHON_INSTALL_BIN",
+        "UV_PYTHON_INSTALL_DIR",
+        "UV_PYTHON_INSTALL_REGISTRY",
+        "UV_PROJECT_ENVIRONMENT",
+    }
+    assert {
+        key for key in env if key.upper().startswith("UV_")
+    } == canonical_uv
+    assert env["UV_PROJECT_ENVIRONMENT"] == str(candidate)
+    assert env["VIRTUAL_ENV"] == str(candidate)
+    assert all(value != "ambient-must-not-survive" for value in env.values())
+
+
+def test_transactional_stage_publishes_recovery_before_activation(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import desktop_update_activation as activation
+    from hermes_cli import managed_uv
+
+    root, candidate, _generation, target_sha, transaction, target = _stage_scope(
+        tmp_path, monkeypatch
+    )
+    events = []
+    monkeypatch.setattr(
+        gate,
+        "live_quiesce_lease",
+        lambda *_args, **_kwargs: dict(transaction.lease),
+    )
+    monkeypatch.setattr(gate, "marker_path", lambda: root / ".lease")
+    monkeypatch.setattr(
+        update_cmd,
+        "_install_candidate_optional_dependencies",
+        lambda *_args, **_kwargs: events.append("optional-dependencies"),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_deferred_gateway_plan",
+        lambda *_args, **_kwargs: events.append("recovery-plan"),
+    )
+    monkeypatch.setattr(
+        activation,
+        "write_activation_manifest",
+        lambda *_args, **_kwargs: events.append("activation-manifest"),
+    )
+    monkeypatch.setattr(
+        managed_uv,
+        "_remove_tree",
+        lambda *_args, **_kwargs: pytest.fail("healthy candidate was removed"),
+    )
+
+    update_cmd._stage_transactional_desktop_environment(
+        transaction=transaction,
+        source_identity=update_cmd._TransactionalSourceIdentity(
+            pre_update_head="a" * 40,
+            pre_update_branch=target.branch,
+            selected_pre_head="a" * 40,
+            target_head=target_sha,
+        ),
+        update_target=target,
+        active_lazy_features=[],
+        active_tool_dependencies=[],
+    )
+
+    assert candidate.exists()
+    assert events == [
+        "optional-dependencies",
+        "recovery-plan",
+        "activation-manifest",
+    ]
+
+
+def test_transactional_stage_refuses_nonimported_critical_syntax_error(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import desktop_update_activation as activation
+
+    root, _candidate, _generation, target_sha, transaction, target = _stage_scope(
+        tmp_path, monkeypatch
+    )
+    for relative in update_cmd._UPDATE_CRITICAL_FILES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# valid critical entrypoint\n", encoding="utf-8")
+    (root / "cli.py").write_text("def broken(:\n", encoding="utf-8")
+    monkeypatch.setattr(
+        gate,
+        "live_quiesce_lease",
+        lambda *_args, **_kwargs: dict(transaction.lease),
+    )
+    monkeypatch.setattr(gate, "marker_path", lambda: root / ".lease")
+    monkeypatch.setattr(
+        update_cmd, "_install_candidate_optional_dependencies", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_deferred_gateway_plan",
+        lambda *_a, **_k: pytest.fail("invalid syntax published recovery"),
+    )
+    monkeypatch.setattr(
+        activation,
+        "write_activation_manifest",
+        lambda *_a, **_k: pytest.fail("invalid syntax published activation"),
+    )
+
+    with pytest.raises(RuntimeError, match="critical syntax"):
+        update_cmd._stage_transactional_desktop_environment(
+            transaction=transaction,
+            source_identity=update_cmd._TransactionalSourceIdentity(
+                pre_update_head="a" * 40,
+                pre_update_branch=target.branch,
+                selected_pre_head="a" * 40,
+                target_head=target_sha,
+            ),
+            update_target=target,
+            active_lazy_features=[],
+            active_tool_dependencies=[],
+        )
+
+
+@pytest.mark.parametrize("drift", ["lease", "source"])
+def test_transactional_stage_removes_exact_candidate_when_authority_drifts(
+    tmp_path, monkeypatch, drift
+):
+    from hermes_cli import desktop_update_activation as activation
+    from hermes_cli import managed_uv
+
+    root, candidate, generation, target_sha, transaction, target = _stage_scope(
+        tmp_path, monkeypatch
+    )
+    lease_reads = 0
+    head_reads = 0
+
+    def live_lease(*_args, **_kwargs):
+        nonlocal lease_reads
+        lease_reads += 1
+        if drift == "lease" and lease_reads > 1:
+            return {**transaction.lease, "lease_id": "lease-replaced-123456"}
+        return dict(transaction.lease)
+
+    def live_head(*_args):
+        nonlocal head_reads
+        head_reads += 1
+        if drift == "source" and head_reads > 1:
+            return "c" * 40
+        return target_sha
+
+    monkeypatch.setattr(gate, "live_quiesce_lease", live_lease)
+    monkeypatch.setattr(gate, "marker_path", lambda: root / ".lease")
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", live_head)
+    monkeypatch.setattr(
+        update_cmd, "_install_candidate_optional_dependencies", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_deferred_gateway_plan",
+        lambda *_a, **_k: pytest.fail("drifted authority published recovery"),
+    )
+    monkeypatch.setattr(
+        activation,
+        "write_activation_manifest",
+        lambda *_a, **_k: pytest.fail("drifted authority published activation"),
+    )
+    with pytest.raises(RuntimeError, match="authority changed"):
+        update_cmd._stage_transactional_desktop_environment(
+            transaction=transaction,
+            source_identity=update_cmd._TransactionalSourceIdentity(
+                pre_update_head="a" * 40,
+                pre_update_branch=target.branch,
+                selected_pre_head="a" * 40,
+                target_head=target_sha,
+            ),
+            update_target=target,
+            active_lazy_features=[],
+            active_tool_dependencies=[],
+        )
+
+    monkeypatch.setattr(activation, "_restore_source", lambda *_a, **_k: None)
+    activation.recover_staging_journal(
+        root,
+        tmp_path / "home",
+        transaction.invocation_id,
+        transaction.lease["lease_id"],
+    )
+    assert not candidate.exists()
+    assert not generation.exists()

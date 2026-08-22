@@ -521,6 +521,8 @@ def test_stage_update_candidate_reuses_safe_private_base_without_cutover(tmp_pat
         project_root=root.resolve(),
         generation=python_root,
         python=base_python,
+        staging_observer=None,
+        provisioned_generation=None,
     )
     assert sentinel.read_text(encoding="utf-8") == "live"
     assert live.is_dir()
@@ -568,12 +570,15 @@ def test_stage_update_candidate_provisions_unsafe_base_without_cutover(tmp_path)
         "uv",
         project_root=root.resolve(),
         current=current,
+        staging_observer=None,
     )
     mock_stage.assert_called_once_with(
         "uv",
         project_root=root.resolve(),
         generation=generation,
         python=python,
+        staging_observer=None,
+        provisioned_generation=generation,
     )
     assert sentinel.read_text(encoding="utf-8") == "live"
     assert live.is_dir()
