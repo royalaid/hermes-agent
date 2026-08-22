@@ -1,1 +1,1 @@
-disposable-updater-canary-2
+disposable-updater-canary-3
