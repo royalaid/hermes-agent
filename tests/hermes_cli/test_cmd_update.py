@@ -14,9 +14,11 @@ from hermes_cli.main import cmd_update, PROJECT_ROOT
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 
-    installed_sha = "a" * 40
+    target_sha = "a" * 40
+    head_sha = "0" * 40 if int(commit_count) > 0 else target_sha
 
     def side_effect(cmd, **kwargs):
+        nonlocal head_sha
         joined = " ".join(str(c) for c in cmd)
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
@@ -26,14 +28,18 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
         # git rev-parse --verify origin/{branch}  (check remote branch exists)
         if "rev-parse" in joined and "--verify" in joined:
             rc = 0 if verify_ok else 128
-            stdout = f"{installed_sha}\n" if verify_ok else ""
+            stdout = f"{target_sha}\n" if verify_ok else ""
             return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr="")
 
         # Receipt proof resolves the installed HEAD after fork sync/update.
         if "rev-parse" in joined and "HEAD" in joined:
             return subprocess.CompletedProcess(
-                cmd, 0, stdout=f"{installed_sha}\n", stderr=""
+                cmd, 0, stdout=f"{head_sha}\n", stderr=""
             )
+
+        if "merge" in [str(value) for value in cmd] and "merge-base" not in joined:
+            head_sha = target_sha
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         # git rev-list HEAD..origin/{branch} --count
         if "rev-list" in joined:
@@ -699,9 +705,11 @@ class TestCmdUpdateBranchFlag:
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
         """
 
-        installed_sha = "a" * 40
+        target_sha = "a" * 40
+        head_sha = "0" * 40 if int(commit_count) > 0 else target_sha
 
         def side_effect(cmd, **kwargs):
+            nonlocal head_sha
             joined = " ".join(str(c) for c in cmd)
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
@@ -709,13 +717,17 @@ class TestCmdUpdateBranchFlag:
 
             if "rev-parse" in joined and "--verify" in joined:
                 return subprocess.CompletedProcess(
-                    cmd, 0, stdout=f"{installed_sha}\n", stderr=""
+                    cmd, 0, stdout=f"{target_sha}\n", stderr=""
                 )
 
             if "rev-parse" in joined and "HEAD" in joined:
                 return subprocess.CompletedProcess(
-                    cmd, 0, stdout=f"{installed_sha}\n", stderr=""
+                    cmd, 0, stdout=f"{head_sha}\n", stderr=""
                 )
+
+            if "merge" in [str(value) for value in cmd] and "merge-base" not in joined:
+                head_sha = target_sha
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
             if "checkout" in joined and "-B" in joined:
                 rc = 128 if track_fails else 0
@@ -843,6 +855,10 @@ class TestCmdUpdateBranchFlag:
 
         def side_effect(command, **kwargs):
             joined = " ".join(str(value) for value in command)
+            if " cherry " in f" {joined} ":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=f"+ {'c' * 40}\n", stderr=""
+                )
             if "checkout work" in joined:
                 return subprocess.CompletedProcess(
                     command, 1, stdout="", stderr="injected checkout failure"
@@ -856,7 +872,15 @@ class TestCmdUpdateBranchFlag:
         mock_run.side_effect = side_effect
         args = SimpleNamespace(branch="main")
 
-        with patch.object(update_cmd, "_record_update_success") as record:
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "updates": {"parked_branch_strategy": "update_in_place"}
+                },
+            ),
+            patch.object(update_cmd, "_record_update_success") as record,
+        ):
             with pytest.raises(SystemExit) as exit_info:
                 cmd_update(args)
 
@@ -877,6 +901,10 @@ class TestCmdUpdateBranchFlag:
 
         def side_effect(command, **kwargs):
             joined = " ".join(str(value) for value in command)
+            if " cherry " in f" {joined} ":
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=f"+ {'c' * 40}\n", stderr=""
+                )
             if "checkout work" in joined:
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
             if "symbolic-ref --quiet --short HEAD" in joined:
@@ -888,7 +916,15 @@ class TestCmdUpdateBranchFlag:
         mock_run.side_effect = side_effect
         args = SimpleNamespace(branch="main")
 
-        with patch.object(update_cmd, "_record_update_success") as record:
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "updates": {"parked_branch_strategy": "update_in_place"}
+                },
+            ),
+            patch.object(update_cmd, "_record_update_success") as record,
+        ):
             with pytest.raises(SystemExit) as exit_info:
                 cmd_update(args)
 
@@ -1192,7 +1228,9 @@ class TestCmdUpdateBranchFlag:
                 update_cmd, "_node_dependencies_healthy_read_only", return_value=True
             ),
             patch.object(
-                update_cmd, "_capture_head_sha", return_value=installed_sha
+                update_cmd,
+                "_capture_head_sha",
+                side_effect=["0" * 40, installed_sha, installed_sha],
             ),
             patch.object(update_cmd, "_record_update_success") as record,
             pytest.raises(SystemExit) as exit_info,
@@ -1619,7 +1657,11 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setattr(hm, "PROJECT_ROOT", project_root)
         monkeypatch.setattr(hm, "_is_windows", lambda: True)
         monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
-        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+        monkeypatch.setattr(
+            hm,
+            "_pause_windows_gateways_for_update",
+            lambda **_kwargs: None,
+        )
         monkeypatch.setattr(hm, "_get_origin_url", lambda *_args: "")
         monkeypatch.setattr(
             hm,
@@ -1642,8 +1684,23 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
         monkeypatch.setattr(
             update_cmd,
+            "_validate_critical_files_syntax",
+            lambda *_args: (True, None, None),
+        )
+        monkeypatch.setattr(
+            update_cmd,
             "_validate_critical_modules_import",
             lambda *_args: (True, None, None),
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_venv_core_imports_healthy",
+            lambda: (True, ""),
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_node_dependencies_healthy_read_only",
+            lambda: True,
         )
         monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
         monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
@@ -1698,11 +1755,17 @@ class TestUpdateNodeDependencies:
     """
 
     @pytest.fixture(autouse=True)
-    def _stub_npx_warmup(self):
+    def _stub_npx_warmup(self, monkeypatch):
         """The npx cache warm-up is covered by its own dedicated test below;
         stub it out everywhere else so it doesn't add a spurious npm/npx
         call to the workspace-install assertions in this class."""
-        with patch("tools.browser_tool.warm_agent_browser_npx_cache", return_value=True):
+        from hermes_cli import main as hm
+
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+
+        with patch(
+            "tools.browser_tool.warm_agent_browser_npx_cache", return_value=True
+        ):
             yield
 
     def _npm_calls(self, mock_run):
@@ -1740,8 +1803,7 @@ class TestUpdateNodeDependencies:
         return [c["cmd"] for c in calls if c["cmd"] and "npm" in str(c["cmd"][0])]
 
     @patch("subprocess.Popen")
-    @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_install_names_ui_tui_and_web_workspaces(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_install_names_ui_tui_and_web_workspaces(self, mock_popen, tmp_path, monkeypatch):
         """Regression for #43564: install ui-tui + web directly. apps/desktop
         must never appear, so its Electron postinstall is never triggered.
         """
@@ -1770,9 +1832,8 @@ class TestUpdateNodeDependencies:
         )
 
     @patch("subprocess.Popen")
-    @patch("shutil.which", return_value="/usr/bin/npm")
     def test_install_includes_workspace_root_to_protect_root_devdependencies(
-        self, _which, mock_popen, tmp_path, monkeypatch
+        self, mock_popen, tmp_path, monkeypatch
     ):
         """Root package.json still owns devDependencies (the shared ESLint
         flat config every workspace's own eslint.config.mjs imports) even
@@ -1800,8 +1861,7 @@ class TestUpdateNodeDependencies:
         assert "desktop" not in joined
 
     @patch("subprocess.Popen")
-    @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_install_preserves_standard_flags(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_install_preserves_standard_flags(self, mock_popen, tmp_path, monkeypatch):
         """--no-fund, --no-audit, --progress=false must survive."""
         from hermes_cli import main as hm
 
@@ -1821,25 +1881,23 @@ class TestUpdateNodeDependencies:
             assert flag in joined, f"{flag} missing from npm call; actual: {calls[0]}"
 
     @patch("subprocess.run")
-    @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_skips_install_when_deps_up_to_date(self, _which, mock_run, tmp_path, monkeypatch):
+    def test_skips_install_when_deps_up_to_date(self, mock_run, tmp_path, monkeypatch):
         """When _npm_lockfile_changed reports no change, npm must not be called."""
         from hermes_cli import main as hm
 
         (tmp_path / "package.json").write_text("{}")
         (tmp_path / "package-lock.json").write_text("{}")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
-        monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: False)
+        with patch.object(hm, "_npm_lockfile_changed", return_value=False) as lock_changed:
+            hm._update_node_dependencies()
 
-        hm._update_node_dependencies()
-
+        lock_changed.assert_called_once()
         assert not self._npm_calls(mock_run), (
             "npm must not run when _npm_lockfile_changed reports no change"
         )
 
     @patch("subprocess.Popen")
-    @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_runs_install_when_lockfile_changed(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_runs_install_when_lockfile_changed(self, mock_popen, tmp_path, monkeypatch):
         """When _npm_lockfile_changed reports a change, npm must run."""
         from hermes_cli import main as hm
 
@@ -1856,8 +1914,7 @@ class TestUpdateNodeDependencies:
         assert len(calls) == 1, f"expected npm to run when lockfile changed; got: {calls}"
 
     @patch("subprocess.Popen")
-    @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_records_lockfile_hash_only_on_success(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_records_lockfile_hash_only_on_success(self, mock_popen, tmp_path, monkeypatch):
         """A failed install must not record the lockfile hash (so the next
         run retries instead of wrongly believing deps are up to date)."""
         from hermes_cli import main as hm
@@ -1868,16 +1925,21 @@ class TestUpdateNodeDependencies:
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
         recorded = []
         monkeypatch.setattr(hm, "_record_npm_lockfile_hash", lambda root: recorded.append(root))
-        mock_popen.side_effect = self._make_popen([], returncode=1, stderr_lines=["npm ERR!\n"])
+        popen_calls = []
+        mock_popen.side_effect = self._make_popen(
+            popen_calls, returncode=1, stderr_lines=["npm ERR!\n"]
+        )
 
         hm._update_node_dependencies()
 
+        assert self._popen_npm_calls(popen_calls), (
+            "expected npm install to be attempted before checking failed-install cache behavior"
+        )
         assert not recorded, "lockfile hash must not be recorded when npm install fails"
 
     @patch("subprocess.Popen")
-    @patch("shutil.which", return_value="/usr/bin/npm")
     def test_warms_npx_agent_browser_cache_regardless_of_install_result(
-        self, _which, mock_popen, tmp_path, monkeypatch
+        self, mock_popen, tmp_path, monkeypatch
     ):
         """The npx warm-up must fire even when the workspace install fails —
         it's independent of ui-tui/web dependency state (#43564)."""
@@ -1887,31 +1949,36 @@ class TestUpdateNodeDependencies:
         (tmp_path / "package-lock.json").write_text("{}")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
-        mock_popen.side_effect = self._make_popen([], returncode=1, stderr_lines=["npm ERR!\n"])
+        popen_calls = []
+        mock_popen.side_effect = self._make_popen(
+            popen_calls, returncode=1, stderr_lines=["npm ERR!\n"]
+        )
 
         with patch(
             "tools.browser_tool.warm_agent_browser_npx_cache", return_value=True
         ) as mock_warm:
             hm._update_node_dependencies()
 
+        assert self._popen_npm_calls(popen_calls), (
+            "expected a failed npm install attempt while verifying cache warm-up"
+        )
         mock_warm.assert_called_once()
 
     @patch("subprocess.run")
-    @patch("shutil.which", return_value=None)
-    def test_returns_silently_when_npm_not_found(self, _which, mock_run, tmp_path, monkeypatch):
+    def test_returns_silently_when_npm_not_found(self, mock_run, tmp_path, monkeypatch):
         """No npm on PATH → return without calling subprocess."""
         from hermes_cli import main as hm
 
         (tmp_path / "package.json").write_text("{}")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: None)
 
         hm._update_node_dependencies()
 
         mock_run.assert_not_called()
 
     @patch("subprocess.run")
-    @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_returns_silently_when_package_json_absent(self, _which, mock_run, tmp_path, monkeypatch):
+    def test_returns_silently_when_package_json_absent(self, mock_run, tmp_path, monkeypatch):
         """No package.json → return without calling npm."""
         from hermes_cli import main as hm
 
@@ -1922,8 +1989,7 @@ class TestUpdateNodeDependencies:
         mock_run.assert_not_called()
 
     @patch("subprocess.Popen")
-    @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_install_runs_from_project_root(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_install_runs_from_project_root(self, mock_popen, tmp_path, monkeypatch):
         """npm install must execute from PROJECT_ROOT, not a workspace subdir."""
         from hermes_cli import main as hm
 

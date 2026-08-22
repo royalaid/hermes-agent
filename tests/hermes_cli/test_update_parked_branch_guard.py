@@ -60,7 +60,8 @@ def repo_pair(tmp_path):
     _git(origin, "commit", "-qm", "c1")
 
     clone = tmp_path / "clone"
-    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _git(tmp_path, "-c", "core.autocrlf=false", "clone", "-q", str(origin), str(clone))
+    _git(clone, "config", "core.autocrlf", "false")
     _git(clone, "config", "user.email", "test@example.com")
     _git(clone, "config", "user.name", "Test")
     # Park the clone on a feature branch cut at c1.
@@ -277,14 +278,18 @@ def _patch_update_flow(monkeypatch, repo, run_real_git=True):
         hermes_main, "_get_origin_url",
         lambda *a, **k: "https://github.com/NousResearch/hermes-agent.git",
     )
-    monkeypatch.setattr(hermes_main, "_is_fork", lambda *a, **k: False)
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda *a, **k: False)
     monkeypatch.setattr(hermes_main, "_discard_lockfile_churn", lambda *a, **k: None)
     monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *a, **k: None)
     monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *a, **k: None)
     monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a, **k: 0)
     monkeypatch.setattr(hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None)
     monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda *a, **k: None)
-    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_pause_windows_gateways_for_update",
+        lambda **_kwargs: None,
+    )
     monkeypatch.setattr(
         hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
     )
@@ -348,7 +353,7 @@ def test_update_switches_unmerged_parked_branch_with_kept_notice(
         hermes_main.cmd_update(args)
 
     out = capsys.readouterr().out
-    assert "1 commit(s) not merged into origin/main" in out
+    assert "1 commit(s) not merged into refs/remotes/origin/main" in out
     assert "safe on 'old-feature'" in out
     assert "CODE UPDATE SKIPPED" not in out
     assert "updating it in place" not in out
@@ -460,7 +465,7 @@ def test_switch_branch_flag_overrides_in_place_strategy(
         hermes_main.cmd_update(args)
 
     out = capsys.readouterr().out
-    assert "1 commit(s) not merged into origin/main" in out
+    assert "1 commit(s) not merged into refs/remotes/origin/main" in out
     assert "updating it in place" not in out
     assert "CODE UPDATE SKIPPED" not in out
     # Checkout moved to the target and picked up its code...
@@ -573,7 +578,8 @@ def test_update_up_to_date_path_does_not_repark_merged_branch(
     _git(origin, "commit", "-qm", "c1")
 
     clone = tmp_path / "clone"
-    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _git(tmp_path, "-c", "core.autocrlf=false", "clone", "-q", str(origin), str(clone))
+    _git(clone, "config", "core.autocrlf", "false")
     _git(clone, "config", "user.email", "test@example.com")
     _git(clone, "config", "user.name", "Test")
     _git(clone, "checkout", "-qb", "old-feature")

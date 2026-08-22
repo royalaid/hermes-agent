@@ -59,6 +59,22 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     """Common setup for cmd_update tests."""
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._validate_critical_files_syntax",
+        lambda *_args: (True, None, None),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._validate_critical_modules_import",
+        lambda *_args: (True, None, None),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._venv_core_imports_healthy",
+        lambda: (True, ""),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._node_dependencies_healthy_read_only",
+        lambda: True,
+    )
     monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *a, **kw: True)
     monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
@@ -121,8 +137,11 @@ def _make_update_side_effect(
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
+    target_sha = "a" * 40
+    head_sha = "0" * 40 if int(commit_count) > 0 else target_sha
 
     def side_effect(cmd, **kwargs):
+        nonlocal head_sha
         recorded.append(cmd)
         joined = " ".join(str(c) for c in cmd)
         if "fetch" in joined and "origin" in joined:
@@ -131,6 +150,10 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "--verify" in joined:
+            return SimpleNamespace(stdout=f"{target_sha}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "HEAD" in joined:
+            return SimpleNamespace(stdout=f"{head_sha}\n", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
@@ -142,10 +165,12 @@ def _make_update_side_effect(
                     stderr="fatal: Not possible to fast-forward, aborting.\n",
                     returncode=128,
                 )
+            head_sha = target_sha
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
         if "reset" in joined and "--hard" in joined:
             if reset_fails:
                 return SimpleNamespace(stdout="", stderr="error: unable to write\n", returncode=1)
+            head_sha = target_sha
             return SimpleNamespace(stdout="HEAD is now at abc123\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 

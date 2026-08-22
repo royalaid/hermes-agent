@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.update_cmd import _normalize_managed_eol
+from hermes_cli.update_cmd import _GitRoutingEnvironmentGuard, _normalize_managed_eol
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
@@ -122,6 +122,22 @@ def test_churn_is_cleared_and_the_pin_is_persisted(tmp_path: Path) -> None:
     repo = _managed_repo(tmp_path, {"a.py": b"x = 1\n", "b.md": b"# Title\n\nbody\n"})
 
     _normalize_managed_eol(GIT_CMD, repo)
+
+    assert _dirty(repo) == set()
+    assert b"\r\n" not in (repo / "a.py").read_bytes()
+    assert _autocrlf(repo) == "false"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="legacy system autocrlf is Windows-specific")
+def test_legacy_unpinned_checkout_is_repaired_under_routing_guard(tmp_path: Path) -> None:
+    """The safe Git environment must not hide a legacy checkout's repair need."""
+    repo = _managed_repo(tmp_path, {"a.py": b"x = 1\n"})
+    _git(repo, "config", "--local", "--unset", "core.autocrlf")
+    assert _autocrlf(repo) == ""
+    assert b"\r\n" in (repo / "a.py").read_bytes()
+
+    with _GitRoutingEnvironmentGuard():
+        _normalize_managed_eol(GIT_CMD, repo)
 
     assert _dirty(repo) == set()
     assert b"\r\n" not in (repo / "a.py").read_bytes()

@@ -8605,15 +8605,23 @@ def _normalize_managed_eol(git_cmd, repo_root):
         return all_dirty - real_dirty
 
     try:
-        effective = subprocess.run(
-            git_cmd + ["config", "--get", "core.autocrlf"],
+        local_setting = subprocess.run(
+            git_cmd + ["config", "--local", "--get", "core.autocrlf"],
             cwd=repo_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
-        # Only "true" rewrites LF to CRLF on checkout. Unset, false, and input
-        # all leave the working tree alone, so there is nothing to repair.
-        if effective.stdout.strip().lower() != "true":
+        if local_setting.returncode not in (0, 1):
+            return
+        configured = local_setting.stdout.strip().lower()
+        # New managed checkouts pin false. A missing local value on Windows is
+        # the legacy state that inherited system autocrlf=true. The mutation
+        # pipeline intentionally hides system/global Git config, so inspect the
+        # local value directly and still repair that legacy state. Never revive
+        # inherited routing merely to discover it.
+        if configured not in ("", "true"):
+            return
+        if not configured and sys.platform != "win32":
             return
 
         eol_only = _eol_only()
@@ -9464,6 +9472,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if (
                 is_fork
                 and branch == "main"
+                and not fork_sync_performed
             ):
                 # A failed fork push leaves local HEAD ahead of the selected
                 # remote target. Refresh the exact refspec and keep the two
@@ -10021,12 +10030,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     _m().PROJECT_ROOT,
                     fork_remote=update_target.remote,
                 )
-            target_sha = _refresh_update_target_sha(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                update_target,
-                env=git_env,
-            )
+                target_sha = _refresh_update_target_sha(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    update_target,
+                    env=git_env,
+                )
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -10645,6 +10654,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         "⚠ Installed Git identity could not be proven; "
                         "no success receipt was written."
                     )
+                    sys.exit(1)
                 else:
                     _record_update_success(
                         args,

@@ -32,15 +32,27 @@ def _make_run_side_effect(
 ):
     """Minimal subprocess.run side_effect for the update flow."""
 
+    target_sha = "a" * 40
+    head_sha = "0" * 40 if int(commit_count) > 0 else target_sha
+
     def side_effect(cmd, **kwargs):
+        nonlocal head_sha
         joined = " ".join(str(c) for c in cmd)
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
         if "rev-parse" in joined and "--verify" in joined:
+            stdout = f"{target_sha}\n" if verify_ok else ""
             return subprocess.CompletedProcess(
-                cmd, 0 if verify_ok else 128, stdout="", stderr=""
+                cmd, 0 if verify_ok else 128, stdout=stdout, stderr=""
             )
+        if "rev-parse" in joined and "HEAD" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{head_sha}\n", stderr=""
+            )
+        if "merge" in [str(value) for value in cmd] and "merge-base" not in joined:
+            head_sha = target_sha
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if "rev-list" in joined:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=f"{commit_count}\n", stderr=""

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd
 
 
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
@@ -26,6 +27,10 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+
+        # git rev-parse --verify refs/remotes/origin/main  (receipt target)
+        if "rev-parse --verify refs/remotes/origin/main" in joined:
+            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
 
         # git rev-list HEAD..origin/main --count  (behind count)
         if "rev-list" in joined:
@@ -99,7 +104,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_main, "_run_pre_update_backup", lambda *a, **k: None
     )
     monkeypatch.setattr(
-        hermes_main, "_pause_windows_gateways_for_update", lambda: None
+        hermes_main, "_pause_windows_gateways_for_update", lambda **_kwargs: None
     )
     monkeypatch.setattr(
         hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
@@ -107,6 +112,28 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     # Short-circuit the long tail: dependency install + desktop build.
     monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_critical_files_syntax",
+        lambda _root: (True, None, None),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_critical_modules_import",
+        lambda _root: (True, None, None),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_venv_core_imports_healthy", lambda: (True, "")
+    )
+    monkeypatch.setattr(
+        update_cmd, "_node_dependencies_healthy_read_only", lambda: True
+    )
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(
+        update_cmd,
+        "_rebuild_desktop_after_update",
+        lambda *_args, **_kwargs: True,
+    )
     # Gateway restart path (called after a successful update).
     monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a: None)
     # Keep the (now surfaced — #78574) gateway auto-restart phase away from
@@ -138,15 +165,15 @@ def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
 
 
 @pytest.mark.parametrize(
-    ("node_failures", "terminal_event"),
-    [([], "receipt"), (["ui-tui"], "summary")],
+    ("node_failures", "terminal_event", "expected_exit_code"),
+    [([], "receipt", None), (["ui-tui"], "summary", 1)],
     ids=["proven-success", "degraded-node-refresh"],
 )
 def test_sibling_cron_restore_precedes_terminal_update_outcome(
-    monkeypatch, tmp_path, node_failures, terminal_event
+    monkeypatch, tmp_path, node_failures, terminal_event, expected_exit_code
 ):
     """Sibling recovery runs before either success proof or degraded output."""
-    from hermes_cli import backup, update_cmd
+    from hermes_cli import backup
 
     target_sha = "def456"
     base = _make_head_moved_side_effect(post_sha=target_sha)
@@ -165,9 +192,6 @@ def test_sibling_cron_restore_precedes_terminal_update_outcome(
         backup,
         "restore_cron_jobs_all_profiles",
         lambda value: events.append("restore") or ([] if value is snapshots else None),
-    )
-    monkeypatch.setattr(
-        update_cmd, "_validate_critical_modules_import", lambda _root: (True, None, None)
     )
     monkeypatch.setattr(
         update_cmd, "_update_node_dependencies", lambda: list(node_failures)
@@ -191,9 +215,13 @@ def test_sibling_cron_restore_precedes_terminal_update_outcome(
         lambda _message: events.append("completion"),
     )
 
-    hermes_main.cmd_update(
-        SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
-    )
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+    if expected_exit_code is None:
+        hermes_main.cmd_update(args)
+    else:
+        with pytest.raises(SystemExit) as exc_info:
+            hermes_main.cmd_update(args)
+        assert exc_info.value.code == expected_exit_code
 
     assert events[0] == "restore"
     assert terminal_event in events[1:]
