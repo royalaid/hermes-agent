@@ -9,7 +9,8 @@ import {
   $updateOverlayOpen,
   $updateOverlayTarget,
   $updateStatus,
-  resetUpdateApplyState
+  resetUpdateApplyState,
+  type UpdateApplyState
 } from '@/store/updates'
 
 import { BlockerView, formatBlockerCommandLine, UpdatesOverlay } from './updates-overlay'
@@ -211,7 +212,19 @@ describe('BlockerView', () => {
     expect(onStopAndUpdate).toHaveBeenCalledTimes(1)
   })
 
-  it('offers Force update (Administrator) only for elevation errors and sends forceUpdateElevated', async () => {
+  it.each([
+    ['permission-required result', 'venv-needs-elevation', 'Administrator permission is required.'],
+    ['UAC cancellation', 'venv-elevation-cancelled', 'Administrator permission was not granted.'],
+    ['generic helper failure', 'venv-unlock-failed', 'Elevated helper failed.'],
+    ['helper launch failure', 'venv-unlock-failed', 'Elevated helper failed to launch.'],
+    ['helper response failure', 'venv-unlock-failed', 'Elevated helper produced no response.'],
+    ['helper preparation failure', 'venv-unlock-failed', 'Could not prepare the elevated request.'],
+    ['helper watcher failure', 'venv-unlock-failed', 'Elevated helper watcher failed.'],
+    ['stale helper response', 'venv-unlock-failed', 'Elevated helper response was stale.'],
+    ['nonce mismatch', 'venv-unlock-failed', 'Elevated helper nonce did not match.'],
+    ['scope mismatch', 'venv-unlock-failed', 'Elevated helper scope did not match.'],
+    ['ownership mismatch', 'venv-unlock-failed', 'Elevated helper ownership changed.']
+  ])('keeps Administrator hidden for a %s', async (_case, error, message) => {
     const applyMock = vi.fn().mockResolvedValue({ ok: false, error: 'still-blocked' })
     const originalDesktop = window.hermesDesktop
 
@@ -234,12 +247,15 @@ describe('BlockerView', () => {
         behind: 1,
         commits: []
       } as DesktopUpdateStatus)
+      // Simulate a stale main/preload pair that still leaked the removed
+      // elevation-holder payload. Renderer behavior must not depend on those
+      // details or revive the unsafe Administrator path.
       $updateApply.set({
         applying: false,
         stage: 'error',
-        message: 'Update needs Administrator permission to stop locked processes.',
+        message,
         percent: null,
-        error: 'venv-needs-elevation',
+        error,
         command: null,
         elevationHolders: [
           {
@@ -251,22 +267,23 @@ describe('BlockerView', () => {
           }
         ],
         log: []
-      })
+      } as unknown as UpdateApplyState)
 
       await renderUpdatesOverlay()
 
-      const adminButton = screen.getByRole('button', { name: 'Force update (Administrator)' })
-      expect(adminButton).toBeTruthy()
-      expect(screen.queryByRole('button', { name: /try again/i })).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Force update (Administrator)' })).toBeNull()
 
-      fireEvent.click(adminButton)
-      expect(applyMock).toHaveBeenCalledWith({ forceUpdateElevated: true })
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /try again/i }))
+        await Promise.resolve()
+      })
+      expect(applyMock).toHaveBeenCalledWith({})
     } finally {
       window.hermesDesktop = originalDesktop
     }
   })
 
-  it('keeps the generic retry path when elevation holders are absent', async () => {
+  it('keeps the generic retry path for ordinary update failures', async () => {
     $updateOverlayTarget.set('client')
     $updateOverlayOpen.set(true)
     $updateStatus.set({
@@ -282,41 +299,6 @@ describe('BlockerView', () => {
       percent: null,
       error: 'venv-unlock-failed',
       command: null,
-      elevationHolders: null,
-      log: []
-    })
-
-    await renderUpdatesOverlay()
-
-    expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Force update (Administrator)' })).toBeNull()
-  })
-
-  it('does not offer Administrator retry for a generic helper failure even when holder details remain', async () => {
-    $updateOverlayTarget.set('client')
-    $updateOverlayOpen.set(true)
-    $updateStatus.set({
-      supported: true,
-      updateAvailable: true,
-      behind: 1,
-      commits: []
-    } as DesktopUpdateStatus)
-    $updateApply.set({
-      applying: false,
-      stage: 'error',
-      message: 'Elevated helper failed to launch.',
-      percent: null,
-      error: 'venv-unlock-failed',
-      command: null,
-      elevationHolders: [
-        {
-          pid: 902,
-          name: 'python.exe',
-          cmdline: 'python.exe tools',
-          createdAt: 124,
-          resource: 'venv\\Scripts\\hermes.exe'
-        }
-      ],
       log: []
     })
 

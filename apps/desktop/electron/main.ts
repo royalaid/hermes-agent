@@ -329,8 +329,10 @@ import { UpdateInFlightTransaction, waitForLocalBackendClearance } from './updat
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import {
   authorizeUpdateMutation,
+  createNormalUpdateBlockerDeadline,
   runAuthorizedUpdateMutation,
   runWindowsUpdatePreflight,
+  type UpdateBlockerDeadline,
   type UpdatePreflightOutcome,
   type UpdatePreflightPurpose
 } from './update-preflight'
@@ -341,6 +343,7 @@ import {
   formatPowerShellArgvForDisplay,
   isSpawnedUpdaterGenerationActive,
   launchWindowsUpdateTransport,
+  observeUpdaterGeneration,
   observeUpdaterHandoff,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
@@ -349,7 +352,8 @@ import {
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
   stagedUpdaterEnvironment,
-  terminateSpawnedUpdaterIfExact
+  terminateSpawnedUpdaterIfExact,
+  waitForWindowsHandoffOwnerIdentity
 } from './updater-process'
 import {
   isExactVenvHolder,
@@ -373,13 +377,6 @@ import {
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
 import { hiddenWindowsChildOptions } from './windows-child-options'
-import {
-  cleanupForceReleaseArtifacts,
-  formatElevatedForceReleaseFailure,
-  launchElevatedForceReleaseHelper,
-  parseForceReleaseResponse,
-  writeForceReleaseRequestFiles
-} from './windows-elevated-force-release'
 import {
   buildPathExtCandidates,
   chooseUpdaterArgs,
@@ -413,7 +410,6 @@ import {
 import {
   attachHolderTreeRelationships,
   type ForceReleaseHolder,
-  mergeInstallHolders,
   runWindowsUpdateForceRelease
 } from './windows-update-force-release'
 import { readWindowsHostPath, readWindowsUserEnvVar } from './windows-user-env'
@@ -3794,8 +3790,28 @@ function reapOrphanedBackendsOnce() {
 // SIGTERM + app.quit() teardown already works (the macOS path is flawless), and
 // aggressively SIGKILL-ing the backend here would be an untested behavior change
 // for no benefit. So we no-op off Windows and leave that path exactly as it was.
-async function releaseBackendLockForUpdate(updateRoot, tag = 'updates') {
-  return releaseBackendLock(updateRoot, tag)
+async function releaseBackendLockForUpdate(updateRoot: string, tag = 'updates', deadline?: UpdateBlockerDeadline) {
+  if (!IS_WINDOWS) {
+    return { unlocked: true }
+  }
+
+  if (deadline && Date.now() >= deadline.deadlineAt) {
+    return { unlocked: false }
+  }
+
+  // Ordinary update preparation must not use taskkill /T /F. Broadly killing
+  // a captured root before the native holder worker authenticates its current
+  // PID generation, executable scope, and live resource ownership recreates
+  // the rejected "kill all the things" race. The in-flight gate already
+  // prevents a new Desktop backend from being started; leave current holders
+  // alive for the exact native force-release boundary below.
+  const unlocked = !isAnyInstallResourceLocked(updateRoot) && !isShimLocked(venvHermesShimPath(updateRoot))
+
+  if (!unlocked) {
+    rememberLog(`[${tag}] tracked install holder release deferred to authenticated native force-release`)
+  }
+
+  return { unlocked }
 }
 
 function windowsPreflightErrorCode(outcome: Exclude<UpdatePreflightOutcome, { kind: 'clear' }>): string {
@@ -3814,7 +3830,11 @@ function windowsPreflightErrorCode(outcome: Exclude<UpdatePreflightOutcome, { ki
       return 'mcp-bridge-quiesce-incomplete'
 
     case 'needs-elevation':
-      return 'venv-needs-elevation'
+      // The old UAC path was a user-writable PowerShell helper and did not
+      // carry a request-bound native capability. Preserve the typed permission
+      // result without exposing an Administrator action until that boundary
+      // exists.
+      return 'venv-permission-required'
 
     default:
       return 'venv-unlock-failed'
@@ -3825,22 +3845,26 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
   const holders: ForceReleaseHolder[] = []
 
   for (const process of result.processes) {
-      if (!isExactVenvHolder(process)) {continue}
-      holders.push({
-        pid: process.pid,
-        createdAt: process.createdAt,
-        name: process.name,
-        cmdline: process.cmdline,
-        source: 'scanner',
-        ...(typeof process.parentPid === 'number' && process.parentPid > 0
-          ? { parentPid: process.parentPid }
-          : {}),
-        role: 'other'
-      })
+    if (!isExactVenvHolder(process)) {
+      continue
     }
 
+    holders.push({
+      pid: process.pid,
+      createdAt: process.createdAt,
+      name: process.name,
+      cmdline: process.cmdline,
+      source: 'scanner',
+      ...(typeof process.parentPid === 'number' && process.parentPid > 0 ? { parentPid: process.parentPid } : {}),
+      role: 'other'
+    })
+  }
+
   for (const bridge of result.mcpBridges) {
-    if (!isExactVenvHolder(bridge)) {continue}
+    if (!isExactVenvHolder(bridge)) {
+      continue
+    }
+
     holders.push({
       pid: bridge.pid,
       createdAt: bridge.createdAt,
@@ -3853,7 +3877,10 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
   }
 
   for (const service of result.desktopPluginServices) {
-    if (!isExactVenvHolder(service)) {continue}
+    if (!isExactVenvHolder(service)) {
+      continue
+    }
+
     holders.push({
       pid: service.pid,
       createdAt: service.createdAt,
@@ -3868,40 +3895,110 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
   return attachHolderTreeRelationships(holders)
 }
 
-function forceReleaseHoldersFromScan(updateRoot: string, result: VenvBlockerScanResult): ForceReleaseHolder[] {
-  const resources = installLockResources(updateRoot)
-  const defaultResource = resources[0] ?? venvHermesShimPath(updateRoot)
-
-  return scanResultToForceReleaseHolders(result).map(holder => ({
-    ...holder,
-    resource: holder.resource ?? defaultResource
-  }))
+function forceReleaseHoldersFromScan(result: VenvBlockerScanResult): ForceReleaseHolder[] {
+  // Scanner rows are identity/order hints only. They do not prove current
+  // ownership of a particular lock resource, so never manufacture a resource
+  // claim for them. Restart Manager must supply that evidence before the
+  // native boundary can authorize termination or elevation.
+  return scanResultToForceReleaseHolders(result)
 }
 
-async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
+const UPDATE_DISCOVERY_REAP_MARGIN_MS = 100
+
+function helperBudgetWithinDeadline(requestedMs: number, deadline?: UpdateBlockerDeadline): number {
+  if (!deadline) {
+    return Math.max(0, Math.trunc(requestedMs))
+  }
+
+  return Math.max(
+    0,
+    Math.min(Math.trunc(requestedMs), Math.trunc(deadline.deadlineAt - Date.now() - UPDATE_DISCOVERY_REAP_MARGIN_MS))
+  )
+}
+
+function scanVenvBlockersWithinDeadline(
+  updateRoot: string,
+  deadline?: UpdateBlockerDeadline,
+  requestedBudgetMs = Number.MAX_SAFE_INTEGER,
+  signal?: AbortSignal
+) {
+  if (!deadline) {
+    return scanVenvBlockers(updateRoot)
+  }
+
+  const budgetMs = helperBudgetWithinDeadline(requestedBudgetMs, deadline)
+
+  if (budgetMs <= 0) {
+    return Promise.resolve({ kind: 'probe-failure' as const, error: 'shared update blocker deadline elapsed' })
+  }
+
+  // venv-blocker-scan accepts an exec seam. Bound the actual child process,
+  // rather than abandoning its Promise: execFile's callback runs only after
+  // timeout termination has been observed and stdio has been drained.
+  const boundedExec = ((file: string, args: readonly string[], options: any) =>
+    new Promise((resolve, reject) => {
+      const timeout = Math.max(1, Math.min(Number(options?.timeout) || budgetMs, budgetMs))
+
+      execFile(file, [...args], { ...options, timeout, killSignal: 'SIGKILL', signal }, (error, stdout, stderr) => {
+        if (error) {
+          ;(error as any).stdout = stdout
+          ;(error as any).stderr = stderr
+          reject(error)
+
+          return
+        }
+
+        resolve({ stdout, stderr })
+      })
+    })) as any
+
+  return scanVenvBlockers(updateRoot, boundedExec)
+}
+
+async function forceReleaseInstallHoldersForUpdate(updateRoot: string, deadline?: UpdateBlockerDeadline) {
   const resources = installLockResources(updateRoot)
   const exclude = new Set<number>([process.pid].filter(pid => Number.isInteger(pid) && pid > 0))
+  const remainingMs = deadline ? Math.max(0, deadline.deadlineAt - Date.now()) : 5_000
+
+  if (remainingMs <= 0) {
+    return {
+      kind: 'timeout' as const,
+      holders: [],
+      message: 'Update aborted: the shared five-second blocker deadline elapsed before holder discovery.'
+    }
+  }
 
   return runWindowsUpdateForceRelease({
-    deadlineMs: 5_000,
+    deadlineMs: remainingMs,
+    ...(deadline ? { deadlineAt: deadline.deadlineAt } : {}),
     settleMs: 150,
     excludePids: exclude,
     isResourceLocked: async () => isAnyInstallResourceLocked(updateRoot),
-    listScannerHolders: async (_budgetMs) => {
-      // Orchestrator races this call against the remaining <=5s budget.
-      const outcome = await scanVenvBlockers(updateRoot)
+    listScannerHolders: async (budgetMs, signal, deadlineAt) => {
+      const absoluteDeadline = deadlineAt != null ? { deadlineAt } : deadline
+      const helperBudgetMs = helperBudgetWithinDeadline(budgetMs, absoluteDeadline)
 
-      if (outcome.kind !== 'blocked') {return []}
+      if (helperBudgetMs <= 0) {return []}
 
-      return forceReleaseHoldersFromScan(updateRoot, outcome.result)
+      const outcome = await scanVenvBlockersWithinDeadline(
+        updateRoot,
+        absoluteDeadline,
+        helperBudgetMs,
+        signal
+      )
+
+      return outcome.kind === 'blocked' ? forceReleaseHoldersFromScan(outcome.result) : []
     },
-    listRestartManagerHolders: async (budgetMs) => {
-      const rmResources = resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
-      const timeoutMs = Math.max(0, Math.min(3_500, Math.trunc(budgetMs)))
+    listRestartManagerHolders: async (budgetMs, signal, deadlineAt) => {
+      const absoluteDeadline = deadlineAt != null ? { deadlineAt } : deadline
+      const timeoutMs = helperBudgetWithinDeadline(Math.min(3_500, budgetMs), absoluteDeadline)
 
       if (timeoutMs <= 0) {return []}
 
-      return listRestartManagerHoldersForResources(rmResources, { timeoutMs })
+      return listRestartManagerHoldersForResources(
+        resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)],
+        { timeoutMs, signal }
+      )
     },
     terminateHolder: (holder, budgetMs, signal, deadlineAt) =>
       terminateWindowsHolderWithinDeadline(holder, {
@@ -3913,161 +4010,28 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
   })
 }
 
-async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
-  ok: boolean
-  error?: string
-  message: string
-  elevationHolders?: ForceReleaseHolder[]
-}> {
-  if (!isAnyInstallResourceLocked(updateRoot)) {
-    return { ok: true, message: 'already clear' }
-  }
-
-  const resources = installLockResources(updateRoot)
-  const excludePids = [process.pid].filter(pid => Number.isInteger(pid) && pid > 0)
-  const scanOutcome = await scanVenvBlockers(updateRoot)
-
-  const scannerHolders =
-    scanOutcome.kind === 'blocked' ? forceReleaseHoldersFromScan(updateRoot, scanOutcome.result) : []
-
-  const rmHolders = await listRestartManagerHoldersForResources(
-    resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
-  )
-
-  const holders = mergeInstallHolders([...scannerHolders, ...rmHolders], new Set(excludePids)).filter(
-    holder => Number.isInteger(holder.pid) && holder.pid > 0
-  )
-
-  if (holders.length === 0) {
-    return {
-      ok: false,
-      error: 'venv-unlock-failed',
-      message:
-        'Update aborted: the install is still locked but no exact holder identity is available for elevation.'
-    }
-  }
-
-  const helperScriptPath = path.join(
-    updateRoot,
-    'scripts',
-    'desktop-update',
-    'windows-force-release.ps1'
-  )
-
-  if (!fs.existsSync(helperScriptPath)) {
-    return {
-      ok: false,
-      error: 'venv-unlock-failed',
-      message: 'Update aborted: elevated force-release helper is missing from this checkout.'
-    }
-  }
-
-  let written: Awaited<ReturnType<typeof writeForceReleaseRequestFiles>> | null = null
-
-  try {
-    written = await writeForceReleaseRequestFiles({
-      installRoot: updateRoot,
-      holders,
-      excludePids
-    })
-
-    const launch = await launchElevatedForceReleaseHelper({
-      helperScriptPath,
-      requestPath: written.requestPath,
-      responsePath: written.responsePath
-    })
-
-    if (launch.responseTempPath) {
-      written.responseTempPath = launch.responseTempPath
-    }
-
-    if (launch.kind === 'cancelled') {
-      return {
-        ok: false,
-        error: 'venv-elevation-cancelled',
-        message: 'Update cancelled: Administrator permission was not granted.',
-        elevationHolders: holders
-      }
-    }
-
-    if (launch.kind === 'failed') {
-      return {
-        ok: false,
-        error: 'venv-unlock-failed',
-        message: `Update aborted: elevated force-release failed (${launch.detail}).`
-      }
-    }
-
-    let responseRaw = ''
-
-    try {
-      responseRaw = fs.readFileSync(written.responsePath, 'utf8')
-    } catch {
-      return {
-        ok: false,
-        error: 'venv-unlock-failed',
-        message: 'Update aborted: elevated helper produced no response.'
-      }
-    }
-
-    const response = parseForceReleaseResponse(responseRaw, written.request.nonce)
-
-    if (!response || !response.ok || !response.cleared) {
-      const failure = formatElevatedForceReleaseFailure(response)
-
-      return {
-        ok: false,
-        error: 'venv-unlock-failed',
-        message: failure.message,
-        elevationHolders: holders
-      }
-    }
-
-    if (isAnyInstallResourceLocked(updateRoot)) {
-      const survivorDetail = (response.survivors ?? [])
-        .map(entry => `PID ${entry.pid}${entry.resource ? ` resource=${entry.resource}` : ''} ${entry.detail || 'locked'}`.trim())
-        .join('; ')
-
-      return {
-        ok: false,
-        error: 'venv-unlock-failed',
-        message:
-          survivorDetail
-            ? `Update aborted: install files remain locked after elevated force-release (${survivorDetail}). The virtual environment was not modified.`
-            : 'Update aborted: install files remain locked after elevated force-release. The virtual environment was not modified.',
-        elevationHolders: holders
-      }
-    }
-
-    return { ok: true, message: 'cleared' }
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-
-    return {
-      ok: false,
-      error: 'venv-unlock-failed',
-      message: `Update aborted: could not prepare the elevated force-release request (${detail}).`
-    }
-  } finally {
-    if (written) {
-      cleanupForceReleaseArtifacts(written)
-    }
-  }
-}
-
-function runWindowsHandoffPreflight(updateRoot: string, purpose: UpdatePreflightPurpose) {
-  return runWindowsUpdatePreflight(purpose, {
-    releaseTrackedBackendTrees: () =>
-      releaseBackendLockForUpdate(updateRoot, purpose === 'bootstrap-recovery' ? 'bootstrap' : 'updates'),
-    forceReleaseInstallHolders: () => forceReleaseInstallHoldersForUpdate(updateRoot),
-    scan: () => scanVenvBlockers(updateRoot),
-    acquireMcpBridgeLease: () => acquireMcpBridgeQuiesceLease(HERMES_HOME, updateRoot),
-    clearMcpBridgeLease: lease => {
-      clearMcpBridgeQuiesceLease(HERMES_HOME, lease)
+function runWindowsHandoffPreflight(
+  updateRoot: string,
+  purpose: UpdatePreflightPurpose,
+  deadline?: UpdateBlockerDeadline
+) {
+  return runWindowsUpdatePreflight(
+    purpose,
+    {
+      releaseTrackedBackendTrees: () =>
+        releaseBackendLockForUpdate(updateRoot, purpose === 'bootstrap-recovery' ? 'bootstrap' : 'updates', deadline),
+      forceReleaseInstallHolders: () => forceReleaseInstallHoldersForUpdate(updateRoot, deadline),
+      scan: () => scanVenvBlockersWithinDeadline(updateRoot, deadline),
+      acquireMcpBridgeLease: () => acquireMcpBridgeQuiesceLease(HERMES_HOME, updateRoot),
+      clearMcpBridgeLease: lease => {
+        clearMcpBridgeQuiesceLease(HERMES_HOME, lease)
+      },
+      terminateDesktopPluginService: service => terminateDesktopPluginService(updateRoot, service),
+      terminateVenvHolder: holder => terminateVenvHolder(updateRoot, holder)
     },
-    terminateDesktopPluginService: service => terminateDesktopPluginService(updateRoot, service),
-    terminateVenvHolder: holder => terminateVenvHolder(updateRoot, holder)
-  })
+    {},
+    deadline
+  )
 }
 
 // Shared backend teardown + venv-shim unlock wait. Used by BOTH the self-update
@@ -4160,10 +4124,15 @@ async function releaseBackendLock(updateRoot, tag, options: { settleMs?: number 
 // UpdateInFlightTransaction: it refuses a concurrent run and releases on both
 // success and failure, so the update can never latch "in progress" forever.
 async function applyUpdates(opts: { stopSafeBlockers?: boolean; forceUpdateElevated?: boolean } = {}) {
-  return updateInFlightTransaction.run(() => applyUpdatesTransaction(opts))
+  const blockerDeadline = createNormalUpdateBlockerDeadline()
+
+  return updateInFlightTransaction.run(() => applyUpdatesTransaction(opts, blockerDeadline))
 }
 
-async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; forceUpdateElevated?: boolean } = {}) {
+async function applyUpdatesTransaction(
+  opts: { stopSafeBlockers?: boolean; forceUpdateElevated?: boolean } = {},
+  blockerDeadline: UpdateBlockerDeadline
+) {
   let bridgeLease: McpBridgeQuiesceLease | null = null
   let bridgeLeaseHandedOff = false
 
@@ -4246,25 +4215,17 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     // the two-clear-scan respawn guard. The bootstrap recovery path calls the
     // same helper; neither path may spawn an updater on an unknown state.
     if (IS_WINDOWS && opts.forceUpdateElevated) {
-      const elevated = await runElevatedForceReleaseForUpdate(updateRoot)
+      const message =
+        'Update aborted: Administrator retry requires a fresh authenticated permission claim from the native holder worker.'
 
-      if (!elevated.ok) {
-        rememberLog(`[updates] elevated force-release failed: ${elevated.error}`)
-        emitUpdateProgress({ stage: 'error', message: elevated.message, percent: null })
-        startHermes().catch(() => {})
+      rememberLog('[updates] refused unbound elevated retry request')
+      emitUpdateProgress({ stage: 'error', message, percent: null })
+      startHermes().catch(() => {})
 
-        return {
-          ok: false,
-          error: elevated.error,
-          message: elevated.message,
-          ...(elevated.elevationHolders ? { elevationHolders: elevated.elevationHolders } : {})
-        }
-      }
-
-      rememberLog('[updates] elevated force-release cleared install holders')
+      return { ok: false, error: 'elevation-claim-required', message }
     }
 
-    let preflight = await runWindowsHandoffPreflight(updateRoot, 'normal-update')
+    let preflight = await runWindowsHandoffPreflight(updateRoot, 'normal-update', blockerDeadline)
 
     // The preflight refuses on ANY holder, including the Python static-file
     // preview servers Hermes itself started. When the user approved stopping
@@ -4279,8 +4240,10 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       )
       // Let verified process-tree termination finish unwinding wrapper shells,
       // then make the scanner — not the stale renderer payload — authoritative.
-      await new Promise(resolve => setTimeout(resolve, 300))
-      preflight = await runWindowsHandoffPreflight(updateRoot, 'normal-update')
+      await new Promise(resolve =>
+        setTimeout(resolve, Math.max(0, Math.min(300, blockerDeadline.deadlineAt - Date.now())))
+      )
+      preflight = await runWindowsHandoffPreflight(updateRoot, 'normal-update', blockerDeadline)
     }
 
     if (preflight.kind !== 'clear') {
@@ -4291,26 +4254,15 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       emitUpdateProgress({ stage: 'error', message: preflight.message, percent: null })
       startHermes().catch(() => {})
 
-      // Hand the classified blockers back so the renderer can offer to stop the
-      // safe local previews among them and retry. Elevation holders drive the
-      // Force update (Administrator) action on the same error card.
+      // Hand only classified safe local previews back to the renderer. Exact
+      // native holder claims remain inside the main process; they are not a
+      // renderer capability and cannot authorize an elevated retry.
       return {
         ok: false,
         error,
         message: preflight.message,
         ...(preflight.kind === 'blocked' && preflight.result
           ? { blockers: preflight.result.processes }
-          : {}),
-        ...(preflight.kind === 'blocked' && preflight.elevationHolders
-          ? {
-              elevationHolders: preflight.elevationHolders.map(holder => ({
-                pid: holder.pid,
-                name: holder.name,
-                cmdline: holder.cmdline,
-                createdAt: holder.createdAt,
-                resource: holder.resource
-              }))
-            }
           : {})
       }
     }
@@ -4347,17 +4299,12 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
 
     const updateStartedAt = Math.floor(Date.now() / 1000)
 
-    // A bare detached+hidden powershell spawn silently dies before -File
-    // processing (console-subsystem init failure — see
-    // wrapHandoffForDetachedConsole). The production composer routes through
-    // `cmd start` with a constant encoded launcher so the script gets its own
-    // minimized console and survives our exit; script path, branch, install
-    // root, relaunch path, and the one-shot lease travel only through the
-    // child environment. The wrapper cmd.exe exits immediately, so child.pid
-    // is NOT the script's pid — the script claims the update marker itself
-    // with its own $PID as its first action, and a relaunched Desktop parks
-    // on that. The clear-preflight mutation permit is required at the exact
-    // transport launch boundary.
+    // A bare detached PowerShell spawn can die before -File processing. The
+    // production composer uses a hidden, pipe-backed bridge that returns the
+    // actual PowerShell writer PID and exact creation FILETIME. No terminal
+    // window is created, and the bridge PID never becomes update authority.
+    // The clear-preflight mutation permit is required at the exact transport
+    // launch boundary.
     const launch = runAuthorizedUpdateMutation(mutationPermit, () =>
       launchWindowsUpdateTransport(
         windowsTransport,
@@ -4390,23 +4337,19 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     const child = launch.child
     const scriptHandoff = launch.handoff
 
-    // child.pid is the short-lived cmd.exe WRAPPER, not the script (see
-    // wrapHandoffForDetachedConsole). Earlier revisions pre-wrote the update
-    // marker with that wrapper pid to cover the first moments of the
-    // hand-off; that gap is now closed by waiting here instead, so nothing
-    // ever publishes a claim the updater does not own.
-    //
-    // cmd.exe is only a transient wrapper and must never own either marker.
-    // The script receives the unguessable lease ID, adopts that exact lease
-    // with its own PID, and writes the shared update marker with the same PID
-    // before mutation. Wait for both proofs; a successful wrapper spawn alone
-    // is not a successful updater handoff.
+    // child.pid is the short-lived hidden bridge, not the writer. Authenticate
+    // the receipt against Windows before that PID can be used for marker/lease
+    // adoption. A bridge spawn alone is never a successful updater handoff.
     const wrapperPid = Number.isInteger(child.pid) ? Number(child.pid) : null
+    const handoffOwner = await waitForWindowsHandoffOwnerIdentity(child)
 
-    const adoptedLease = await waitForMcpBridgeQuiesceLeaseAdoption(HERMES_HOME, bridgeLease, {
-      excludedOwnerPids: wrapperPid ? [wrapperPid] : [],
-      readUpdateOwner: readProvenUpdateOwnerClaim
-    })
+    const adoptedLease = handoffOwner
+      ? await waitForMcpBridgeQuiesceLeaseAdoption(HERMES_HOME, bridgeLease, {
+          excludedOwnerPids: wrapperPid && wrapperPid !== handoffOwner.pid ? [wrapperPid] : [],
+          readUpdateOwner: readProvenUpdateOwnerClaim,
+          requiredOwnerPid: handoffOwner.pid
+        })
+      : null
 
     if (!adoptedLease) {
       updateHandoffRevocationPending = true
@@ -4451,19 +4394,29 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     // relaunches us when it's done. (#50419 — a 600ms quit looked like a crash
     // and lured users into the #50238 relaunch loop.)
     //
-    // The dwell doubles as the hand-off settle window (#66753): watch the
-    // detached child for an async spawn `error` (ENOENT/EACCES) or an early
-    // non-zero/signal exit. On failure, DON'T quit — the user would be left
-    // with no app, no updater, and no evidence. Restart our backend and
-    // surface the error instead. The pre-written marker names the dead child
-    // pid, so readLiveUpdateMarker self-heals it; no cleanup needed.
+    // The dwell doubles as the hand-off settle window (#66753): observe both
+    // the hidden bridge and the exact independently authenticated writer
+    // generation. On either failure, DON'T quit — the user would be left with
+    // no app, no updater, and no evidence.
     const dwellStartedAt = Date.now()
-    const handoffOutcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
 
-    if (!handoffOutcome.ok) {
-      const message = `Update failed to start: ${handoffOutcome.message}. Hermes will keep running — try again, or run \`hermes update\` from a terminal.`
+    const [handoffOutcome, writerGenerationActive] = await Promise.all([
+      observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS),
+      observeUpdaterGeneration(
+        handoffOwner.pid,
+        handoffOwner.creationFileTime,
+        UPDATE_HANDOFF_DWELL_MS
+      )
+    ])
 
-      rememberLog(`[updates] hand-off not viable, aborting quit: ${handoffOutcome.message}`)
+    if (!handoffOutcome.ok || !writerGenerationActive) {
+      const failure = handoffOutcome.ok
+        ? 'the authenticated updater writer exited or changed generation before Desktop shutdown'
+        : handoffOutcome.message
+
+      const message = `Update failed to start: ${failure}. Hermes will keep running — try again, or run \`hermes update\` from a terminal.`
+
+      rememberLog(`[updates] hand-off not viable, aborting quit: ${failure}`)
       emitUpdateProgress({ stage: 'error', message, percent: null })
       startHermes().catch(() => {})
 

@@ -9,7 +9,6 @@ import type {
   DesktopUpdateApplyOptions,
   DesktopUpdateApplyResult,
   DesktopUpdateBlocker,
-  DesktopUpdateElevationHolder,
   DesktopUpdateProgress,
   DesktopUpdateStage,
   DesktopUpdateStatus,
@@ -34,8 +33,6 @@ export interface UpdateApplyState {
   command: string | null
   /** Structured update blockers used by the safe close-and-update confirmation. */
   blockers?: readonly DesktopUpdateBlocker[] | null
-  /** Exact holders requiring the Force update (Administrator) action. */
-  elevationHolders?: readonly DesktopUpdateElevationHolder[] | null
   log: readonly { stage: DesktopUpdateStage; message: string; at: number }[]
 }
 
@@ -440,7 +437,14 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
   $updateApply.set({ ...IDLE, applying: true, stage: 'prepare', message: 'Starting update…' })
 
   try {
-    const result = await bridge.apply(opts)
+    // Whitelist the ordinary update controls so a stale renderer cannot carry
+    // the removed elevated-update flag across IPC.
+    const ordinaryOptions: DesktopUpdateApplyOptions = {
+      ...(opts.dirtyStrategy !== undefined ? { dirtyStrategy: opts.dirtyStrategy } : {}),
+      ...(opts.stopSafeBlockers !== undefined ? { stopSafeBlockers: opts.stopSafeBlockers } : {})
+    }
+
+    const result = await bridge.apply(ordinaryOptions)
 
     // CLI install with no staged updater: not an error — the user just runs
     // `hermes update` themselves. Land on a dedicated manual state so the
@@ -519,8 +523,7 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
           stage: 'error',
           error: result?.error ?? 'apply-failed',
           message: result?.message ?? translateNow('updates.errorBody'),
-          blockers: result?.blockers ?? null,
-          elevationHolders: result?.elevationHolders ?? null
+          blockers: result?.blockers ?? null
         })
       }
     }

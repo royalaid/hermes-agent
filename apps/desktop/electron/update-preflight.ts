@@ -12,18 +12,28 @@ import type { ForceReleaseHolder, WindowsUpdateForceReleaseOutcome } from './win
 
 export type UpdatePreflightPurpose = 'normal-update' | 'bootstrap-recovery'
 
+export interface UpdateBlockerDeadline {
+  readonly deadlineAt: number
+}
+
+export const NORMAL_UPDATE_BLOCKER_TIMEOUT_MS = 5_000
+
+export function createNormalUpdateBlockerDeadline(now: () => number = Date.now): UpdateBlockerDeadline {
+  return Object.freeze({ deadlineAt: now() + NORMAL_UPDATE_BLOCKER_TIMEOUT_MS })
+}
+
 export interface UpdatePreflightDeps {
   acquireMcpBridgeLease: () => McpBridgeQuiesceLease | null
   clearMcpBridgeLease: (lease: McpBridgeQuiesceLease) => void
   now?: () => number
-  releaseTrackedBackendTrees: () => Promise<{ unlocked: boolean }>
+  releaseTrackedBackendTrees: (deadline?: UpdateBlockerDeadline) => Promise<{ unlocked: boolean }>
   /**
    * Non-elevated ≤5s force-release of exact install holders when tracked
    * backends alone did not unlock the install. Optional only for unit tests
    * that intentionally exercise the legacy unlock-failed path.
    */
-  forceReleaseInstallHolders?: () => Promise<WindowsUpdateForceReleaseOutcome>
-  scan: () => Promise<ScanOutcome>
+  forceReleaseInstallHolders?: (deadline?: UpdateBlockerDeadline) => Promise<WindowsUpdateForceReleaseOutcome>
+  scan: (deadline?: UpdateBlockerDeadline) => Promise<ScanOutcome>
   terminateDesktopPluginService: (service: DesktopPluginServiceProcess) => Promise<boolean>
   terminateVenvHolder: (holder: VenvBlockerProcess) => Promise<boolean>
   wait?: (delayMs: number) => Promise<void>
@@ -58,7 +68,10 @@ const updateMutationPermits = new WeakSet<object>()
 export function authorizeUpdateMutation(preflight: UpdatePreflightOutcome): UpdateMutationPermit | null {
   const permit = successfulPreflightPermits.get(preflight) ?? null
 
-  if (!permit) {return null}
+  if (!permit) {
+    return null
+  }
+
   successfulPreflightPermits.delete(preflight)
 
   return permit
@@ -112,10 +125,31 @@ function quiesceIncompleteMessage(): string {
   )
 }
 
+function isAuthenticatedPermissionHolder(holder: ForceReleaseHolder): boolean {
+  const resources = holder.resources ?? []
+
+  return (
+    Number.isInteger(holder.pid) &&
+    holder.pid > 0 &&
+    Number.isFinite(holder.createdAt) &&
+    holder.createdAt > 0 &&
+    typeof holder.creationFileTime === 'string' &&
+    /^\d+$/.test(holder.creationFileTime) &&
+    BigInt(holder.creationFileTime) > 0n &&
+    (holder.source === 'scanner' || holder.source === 'restart-manager') &&
+    typeof holder.resource === 'string' &&
+    holder.resource.trim().length > 0 &&
+    resources.length > 0 &&
+    resources.every(resource => typeof resource === 'string' && resource.trim().length > 0) &&
+    resources.includes(holder.resource)
+  )
+}
+
 export async function runWindowsUpdatePreflight(
-  _purpose: UpdatePreflightPurpose,
+  purpose: UpdatePreflightPurpose,
   deps: UpdatePreflightDeps,
-  timing: UpdatePreflightTiming = {}
+  timing: UpdatePreflightTiming = {},
+  blockerDeadline?: UpdateBlockerDeadline
 ): Promise<UpdatePreflightOutcome> {
   const sleep = deps.wait ?? wait
   const now = deps.now ?? Date.now
@@ -125,10 +159,13 @@ export async function runWindowsUpdatePreflight(
   const respawnIntervalMs = timing.respawnIntervalMs ?? DEFAULT_RESPAWN_INTERVAL_MS
   const terminationSettleMs = timing.terminationSettleMs ?? DEFAULT_TERMINATION_SETTLE_MS
 
+  const remainingBlockerMs = () =>
+    blockerDeadline ? Math.max(0, blockerDeadline.deadlineAt - now()) : Number.POSITIVE_INFINITY
+
   let lock: { unlocked: boolean }
 
   try {
-    lock = await deps.releaseTrackedBackendTrees()
+    lock = await deps.releaseTrackedBackendTrees(blockerDeadline)
   } catch {
     lock = { unlocked: false }
   }
@@ -137,11 +174,19 @@ export async function runWindowsUpdatePreflight(
   // holders. Do not dead-end on the tracked-backend unlock wait alone — that
   // is how a stale `hermes tools | head` tree blocked the scanner forever.
   if (lock?.unlocked !== true) {
+    if (remainingBlockerMs() <= 0) {
+      return {
+        kind: 'blocked',
+        reason: 'unlock-failed',
+        message: 'Update aborted: Hermes could not prepare the install within the shared five-second deadline.'
+      }
+    }
+
     if (typeof deps.forceReleaseInstallHolders === 'function') {
       let forceOutcome: WindowsUpdateForceReleaseOutcome
 
       try {
-        forceOutcome = await deps.forceReleaseInstallHolders()
+        forceOutcome = await deps.forceReleaseInstallHolders(blockerDeadline)
       } catch (error) {
         return {
           kind: 'probe-failure',
@@ -152,7 +197,11 @@ export async function runWindowsUpdatePreflight(
 
       if (forceOutcome.kind === 'clear') {
         lock = { unlocked: true }
-      } else if (forceOutcome.kind === 'needs-elevation') {
+      } else if (
+        forceOutcome.kind === 'needs-elevation' &&
+        forceOutcome.holders.length > 0 &&
+        forceOutcome.holders.every(isAuthenticatedPermissionHolder)
+      ) {
         return {
           kind: 'blocked',
           reason: 'needs-elevation',
@@ -181,8 +230,12 @@ export async function runWindowsUpdatePreflight(
   // exit when they see that lease, while this first scan defines the exact
   // current holder set authorized by the user's Update action.
   const scanFailClosed = async (): Promise<ScanOutcome> => {
+    if (remainingBlockerMs() <= 0) {
+      return { kind: 'probe-failure', error: 'shared update blocker deadline elapsed' }
+    }
+
     try {
-      return await deps.scan()
+      return await deps.scan(blockerDeadline)
     } catch (error) {
       return { kind: 'probe-failure', error: `scanner threw: ${errorText(error)}` }
     }
@@ -198,7 +251,7 @@ export async function runWindowsUpdatePreflight(
         break
       }
 
-      await sleep(Math.min(genericHolderPollMs, remainingMs))
+      await sleep(Math.min(genericHolderPollMs, remainingMs, remainingBlockerMs()))
       outcome = await scanFailClosed()
     }
 
@@ -241,7 +294,7 @@ export async function runWindowsUpdatePreflight(
   let returnLease = false
 
   try {
-    await sleep(cooperativeExitMs)
+    await sleep(Math.min(cooperativeExitMs, remainingBlockerMs()))
     let firstClear = await scanFailClosed()
     let genericHolderDeadline: number | null = null
 
@@ -249,8 +302,67 @@ export async function runWindowsUpdatePreflight(
       return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
     }
 
-    if (firstClear.kind === 'blocked' && genericHoldersOnly(firstClear.result) && !exactDrainableOnly(firstClear.result)) {
-      genericHolderDeadline = now() + genericHolderTimeoutMs
+    // Ordinary updates must cross the same native authentication boundary for
+    // a holder that appears after the first observation. The legacy Python
+    // per-PID terminators remain only as a bootstrap-compatibility fallback;
+    // production ordinary updates always wire this native force-release seam.
+    if (
+      purpose === 'normal-update' &&
+      firstClear.kind === 'blocked' &&
+      typeof deps.forceReleaseInstallHolders === 'function'
+    ) {
+      if (remainingBlockerMs() <= 0) {
+        return {
+          kind: 'blocked',
+          reason: 'unlock-failed',
+          message: 'Update aborted: exact holder handling did not finish within five seconds.'
+        }
+      }
+
+      let forceOutcome: WindowsUpdateForceReleaseOutcome
+
+      try {
+        forceOutcome = await deps.forceReleaseInstallHolders(blockerDeadline)
+      } catch (error) {
+        return {
+          kind: 'probe-failure',
+          error: `force-release threw: ${errorText(error)}`,
+          message: formatProbeFailedMessage()
+        }
+      }
+
+      if (forceOutcome.kind === 'clear') {
+        firstClear = await scanFailClosed()
+
+        if (firstClear.kind === 'probe-failure') {
+          return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
+        }
+      } else if (
+        forceOutcome.kind === 'needs-elevation' &&
+        forceOutcome.holders.length > 0 &&
+        forceOutcome.holders.every(isAuthenticatedPermissionHolder)
+      ) {
+        return {
+          kind: 'blocked',
+          reason: 'needs-elevation',
+          message: forceOutcome.message,
+          elevationHolders: forceOutcome.holders
+        }
+      } else {
+        return {
+          kind: 'blocked',
+          reason: 'unlock-failed',
+          message: forceOutcome.message
+        }
+      }
+    }
+
+    if (
+      firstClear.kind === 'blocked' &&
+      genericHoldersOnly(firstClear.result) &&
+      !exactDrainableOnly(firstClear.result)
+    ) {
+      genericHolderDeadline = Math.min(now() + genericHolderTimeoutMs, blockerDeadline?.deadlineAt ?? Infinity)
       firstClear = await pollGenericHoldersUntil(firstClear, genericHolderDeadline)
 
       if (firstClear.kind === 'probe-failure') {
@@ -277,8 +389,7 @@ export async function runWindowsUpdatePreflight(
         firstClear.result.processes.every(holder => !isExactVenvHolder(holder))
 
       const exactCurrentHolders =
-        exactDrainableOnly(firstClear.result) ||
-        (forceableMcpAndDesktopServices && naturallyExitingGenericHolders)
+        exactDrainableOnly(firstClear.result) || (forceableMcpAndDesktopServices && naturallyExitingGenericHolders)
 
       const logicalDrainGroups =
         logicalDrainGroupCount(firstClear.result.mcpBridges) +
@@ -325,8 +436,7 @@ export async function runWindowsUpdatePreflight(
       }
 
       const desktopPluginTerminationOrder = [...firstClear.result.desktopPluginServices].sort(
-        (left, right) =>
-          Number(right.role === 'desktop_plugin_worker') - Number(left.role === 'desktop_plugin_worker')
+        (left, right) => Number(right.role === 'desktop_plugin_worker') - Number(left.role === 'desktop_plugin_worker')
       )
 
       // A plugin's managed-runtime worker must stop before its venv wrapper.
@@ -357,9 +467,9 @@ export async function runWindowsUpdatePreflight(
       // holder without an identity timestamp cannot be force-stopped, so give
       // it one bounded chance to exit before refusing. The deadline includes
       // the first post-termination settle scan.
-      genericHolderDeadline ??= now() + genericHolderTimeoutMs
+      genericHolderDeadline ??= Math.min(now() + genericHolderTimeoutMs, blockerDeadline?.deadlineAt ?? Infinity)
 
-      await sleep(terminationSettleMs)
+      await sleep(Math.min(terminationSettleMs, remainingBlockerMs()))
       firstClear = await scanFailClosed()
 
       if (firstClear.kind === 'probe-failure') {
@@ -386,7 +496,7 @@ export async function runWindowsUpdatePreflight(
     }
 
     while (true) {
-      await sleep(respawnIntervalMs)
+      await sleep(Math.min(respawnIntervalMs, remainingBlockerMs()))
       let secondClear = await scanFailClosed()
 
       if (secondClear.kind === 'probe-failure') {
@@ -394,7 +504,7 @@ export async function runWindowsUpdatePreflight(
       }
 
       if (secondClear.kind === 'blocked' && genericHoldersOnly(secondClear.result)) {
-        genericHolderDeadline ??= now() + genericHolderTimeoutMs
+        genericHolderDeadline ??= Math.min(now() + genericHolderTimeoutMs, blockerDeadline?.deadlineAt ?? Infinity)
         secondClear = await pollGenericHoldersUntil(secondClear, genericHolderDeadline)
 
         if (secondClear.kind === 'probe-failure') {

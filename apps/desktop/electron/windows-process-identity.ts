@@ -7,6 +7,8 @@ const DEFAULT_PROBE_TIMEOUT_MS = 3_000
 // still bypasses this cache and performs a fresh awaited OS query.
 const DEFAULT_CACHE_MS = 2_000
 const INTEGER_EPOCH_PATTERN = /^[1-9][0-9]{8,11}$/
+const FILETIME_PATTERN = /^[1-9][0-9]{0,19}$/
+const MAX_UNSIGNED_64_BIT = (1n << 64n) - 1n
 
 type RunProbe = (command: string, args: string[], timeoutMs: number) => Promise<string>
 
@@ -30,11 +32,8 @@ function powershellExecutable(): string {
 
 function runProbe(command: string, args: string[], timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(
-      command,
-      args,
-      { encoding: 'utf8', timeout: timeoutMs, windowsHide: true },
-      (error, stdout) => (error ? reject(error) : resolve(String(stdout)))
+    execFile(command, args, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true }, (error, stdout) =>
+      error ? reject(error) : resolve(String(stdout))
     )
   })
 }
@@ -48,7 +47,9 @@ export async function queryWindowsProcessCreatedAt(
   pid: number,
   { platform = process.platform, run = runProbe, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS }: QueryOptions = {}
 ): Promise<number | null> {
-  if (platform !== 'win32' || !Number.isInteger(pid) || pid <= 0) {return null}
+  if (platform !== 'win32' || !Number.isInteger(pid) || pid <= 0) {
+    return null
+  }
 
   const script =
     `$p=Get-Process -Id ${pid} -ErrorAction Stop;` +
@@ -57,19 +58,56 @@ export async function queryWindowsProcessCreatedAt(
   let raw: string
 
   try {
-    raw = (await run(
-      powershellExecutable(),
-      ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-      timeoutMs
-    )).trim()
+    raw = (
+      await run(powershellExecutable(), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], timeoutMs)
+    ).trim()
   } catch {
     return null
   }
 
-  if (!INTEGER_EPOCH_PATTERN.test(raw)) {return null}
+  if (!INTEGER_EPOCH_PATTERN.test(raw)) {
+    return null
+  }
+
   const createdAt = Number(raw)
 
   return Number.isSafeInteger(createdAt) && createdAt > 0 ? createdAt : null
+}
+
+/** Query one live process's exact unsigned Windows creation FILETIME. */
+export async function queryWindowsProcessCreationFileTime(
+  pid: number,
+  { platform = process.platform, run = runProbe, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS }: QueryOptions = {}
+): Promise<string | null> {
+  if (platform !== 'win32' || !Number.isInteger(pid) || pid <= 0) {
+    return null
+  }
+
+  const script =
+    `$p=Get-Process -Id ${pid} -ErrorAction Stop;` +
+    '$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString([Globalization.CultureInfo]::InvariantCulture)'
+
+  let raw: string
+
+  try {
+    raw = (
+      await run(powershellExecutable(), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], timeoutMs)
+    ).trim()
+  } catch {
+    return null
+  }
+
+  if (!FILETIME_PATTERN.test(raw)) {
+    return null
+  }
+
+  try {
+    const parsed = BigInt(raw)
+
+    return parsed <= MAX_UNSIGNED_64_BIT ? raw : null
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -86,11 +124,16 @@ export function createCachedWindowsProcessCreateTimeProbe({
   const entries = new Map<number, { pending: boolean; validUntil: number; value: number | null }>()
 
   return (pid: number): number | null => {
-    if (!Number.isInteger(pid) || pid <= 0) {return null}
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return null
+    }
+
     const at = now()
     const existing = entries.get(pid)
 
-    if (existing && !existing.pending && at <= existing.validUntil) {return existing.value}
+    if (existing && !existing.pending && at <= existing.validUntil) {
+      return existing.value
+    }
 
     if (!existing?.pending) {
       entries.set(pid, { pending: true, validUntil: at, value: null })

@@ -42,14 +42,8 @@ describe('elevated force-release request contract', () => {
     })
 
     assert.equal(request.nonce, 'abc123')
-    assert.equal(
-      verifyForceReleaseRequest(request, secret, 'C:\\Users\\gwmai\\AppData\\Local\\hermes', 1_500).ok,
-      true
-    )
-    assert.equal(
-      verifyForceReleaseRequest(request, secret, 'C:\\Users\\gwmai\\AppData\\Local\\other', 1_500).ok,
-      false
-    )
+    assert.equal(verifyForceReleaseRequest(request, secret, 'C:\\Users\\gwmai\\AppData\\Local\\hermes', 1_500).ok, true)
+    assert.equal(verifyForceReleaseRequest(request, secret, 'C:\\Users\\gwmai\\AppData\\Local\\other', 1_500).ok, false)
     assert.equal(verifyForceReleaseRequest(request, 'wrong', request.installRoot, 1_500).ok, false)
     assert.equal(verifyForceReleaseRequest(request, secret, request.installRoot, 100_000).ok, false)
   })
@@ -84,8 +78,17 @@ describe('elevated force-release request contract', () => {
     const canonical = canonicalForceReleasePayload(body)
     assert.match(canonical, new RegExp(`1\\t${canonicalNumericToken(createdAt)}\\tx\\ty`))
 
-    if (process.platform !== 'win32') {return}
-    const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    if (process.platform !== 'win32') {
+      return
+    }
+
+    const ps = path.join(
+      process.env.SystemRoot || 'C:\\Windows',
+      'System32',
+      'WindowsPowerShell',
+      'v1.0',
+      'powershell.exe'
+    )
 
     const script = `
 function Format-CanonicalNumber([double]$Value) {
@@ -140,28 +143,34 @@ exit 0
 })
 
 describe('terminate script output parser', () => {
-  it('classifies create-time mismatch, access denied, and protected', () => {
-    assert.deepEqual(parseTerminateScriptOutput('CREATE_TIME_MISMATCH actual=1 expected=2', 3), {
+  it('accepts only fixed exact-boundary results and rejects raw diagnostics', () => {
+    assert.deepEqual(parseTerminateScriptOutput('RESULT:GENERATION_MISMATCH', 3), {
       kind: 'create-time-mismatch'
     })
-    assert.deepEqual(parseTerminateScriptOutput('ACCESS_DENIED', 5), {
-      kind: 'access-denied',
+    assert.deepEqual(parseTerminateScriptOutput('RESULT:PERMISSION_REQUIRED', 5), {
+      kind: 'permission-required',
       win32Error: 5
     })
-    assert.deepEqual(parseTerminateScriptOutput('PROTECTED win32=5', 5), {
-      kind: 'protected',
-      win32Error: 5
+    assert.deepEqual(parseTerminateScriptOutput('ACCESS_DENIED path=C:\\private', 5), {
+      kind: 'failed',
+      detail: 'boundary-failed'
     })
-    assert.deepEqual(parseTerminateScriptOutput('TERMINATED', 0), { kind: 'terminated' })
-    assert.deepEqual(parseTerminateScriptOutput('ALREADY_GONE', 0), { kind: 'already-gone' })
-    assert.equal(parseTerminateScriptOutput('FAILED win32=87', 1).kind, 'failed')
+    assert.deepEqual(parseTerminateScriptOutput('RESULT:TERMINATED', 0), { kind: 'terminated' })
+    assert.deepEqual(parseTerminateScriptOutput('RESULT:ALREADY_GONE', 0), { kind: 'already-gone' })
   })
 })
 
 describe('restart manager output parser', () => {
   it('maps RM rows into force-release holders and emits safe split expression', () => {
     const holders = parseRestartManagerOutput(
-      JSON.stringify([{ pid: 12, createdAt: 34, name: 'python.exe' }]),
+      JSON.stringify([
+        {
+          pid: 12,
+          createdAt: 34,
+          creationFileTime: '133456736000000012',
+          name: 'python.exe'
+        }
+      ]),
       ['C:\\h\\venv\\Scripts\\hermes.exe']
     )
 
@@ -169,15 +178,27 @@ describe('restart manager output parser', () => {
     assert.equal(holders[0]?.source, 'restart-manager')
     assert.equal(holders[0]?.pid, 12)
     assert.match(String(holders[0]?.resource), /hermes\.exe/)
-    assert.equal(RESTART_MANAGER_ROW_SPLIT_EXPRESSION, "$part.Split([char]'|', 4)")
-    assert.match(buildRestartManagerScript(['C:\\a']), /\$part\.Split\(\[char\]'\|', 4\)/)
+    assert.equal(RESTART_MANAGER_ROW_SPLIT_EXPRESSION, "$part.Split([char]'|', 5)")
+    assert.match(buildRestartManagerScript(['C:\\a']), /\$part\.Split\(\[char\]'\|', 5\)/)
   })
 
   it('preserves per-resource RM evidence instead of collapsing to resources[0]', () => {
     const holders = parseRestartManagerOutput(
       JSON.stringify([
-        { pid: 1, createdAt: 10, name: 'a', resource: 'C:\\h\\venv\\Scripts\\hermes.exe' },
-        { pid: 2, createdAt: 11, name: 'b', resource: 'C:\\h\\venv\\Scripts\\python.exe' }
+        {
+          pid: 1,
+          createdAt: 10,
+          creationFileTime: '133456736000000001',
+          name: 'a',
+          resource: 'C:\\h\\venv\\Scripts\\hermes.exe'
+        },
+        {
+          pid: 2,
+          createdAt: 11,
+          creationFileTime: '133456736000000002',
+          name: 'b',
+          resource: 'C:\\h\\venv\\Scripts\\python.exe'
+        }
       ]),
       ['C:\\h\\venv\\Scripts\\hermes.exe', 'C:\\h\\venv\\Scripts\\python.exe']
     )
@@ -195,15 +216,14 @@ describe('elevated UAC launch argv safety', () => {
       ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER,
       ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND,
       launchElevatedForceReleaseHelper
-    } =
-      await import('./windows-elevated-force-release')
+    } = await import('./windows-elevated-force-release')
 
     const adversarial = {
       helperScriptPath: "C:\\Users\\gwmai\\AppData\\Local\\tmp\\evil$()`payload (1)\\u4e2d\\u6587'file.ps1".replace(
         '\\u4e2d\\u6587',
         '\u4e2d\u6587'
       ),
-      requestPath: "C:\\tmp\\req $HOME $(Get-Process) path.json",
+      requestPath: 'C:\\tmp\\req $HOME $(Get-Process) path.json',
       responsePath: "C:\\tmp\\resp backtick` and 'quotes'.json"
     }
 
@@ -241,7 +261,10 @@ describe('elevated UAC launch argv safety', () => {
     assert.equal(captured!.args[4], ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND)
 
     for (const value of Object.values(adversarial)) {
-      assert.ok(!captured!.args.some(arg => arg.includes(value)), 'adversarial path must not appear in outer argv source text')
+      assert.ok(
+        !captured!.args.some(arg => arg.includes(value)),
+        'adversarial path must not appear in outer argv source text'
+      )
     }
 
     assert.equal(captured!.env?.HERMES_FORCE_RELEASE_HELPER, adversarial.helperScriptPath)
@@ -250,11 +273,11 @@ describe('elevated UAC launch argv safety', () => {
   })
 
   it('preserves adversarial paths through the real non-UAC Start-Process boundary', async () => {
-    if (process.platform !== 'win32') {return}
+    if (process.platform !== 'win32') {
+      return
+    }
 
-    const {
-      ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER
-    } = await import('./windows-elevated-force-release')
+    const { ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER } = await import('./windows-elevated-force-release')
 
     const temp = fsNative.mkdtempSync(path.join(osNative.tmpdir(), 'hermes force-args '))
     const captureScript = path.join(temp, 'capture arguments.ps1')
@@ -263,14 +286,14 @@ describe('elevated UAC launch argv safety', () => {
     const expected = [
       path.join(temp, "helper $() `tick (1) '中文'.ps1"),
       path.join(temp, "request $HOME (2) 'quoted'.json"),
-      path.join(temp, "response backtick` $() 中文.json")
+      path.join(temp, 'response backtick` $() 中文.json')
     ]
 
     fsNative.writeFileSync(
       captureScript,
       [
         'param([string]$A, [string]$B, [string]$C)',
-        "[IO.File]::WriteAllText($env:PROBE_OUTPUT, (ConvertTo-Json @($A, $B, $C) -Compress), [Text.UTF8Encoding]::new($false))"
+        '[IO.File]::WriteAllText($env:PROBE_OUTPUT, (ConvertTo-Json @($A, $B, $C) -Compress), [Text.UTF8Encoding]::new($false))'
       ].join('\n'),
       'utf8'
     )
@@ -279,7 +302,7 @@ describe('elevated UAC launch argv safety', () => {
       ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER,
       "$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
       "$argList = @('-NoLogo','-NoProfile','-NonInteractive','-File',(ConvertTo-WindowsArgument $env:CAPTURE_SCRIPT),(ConvertTo-WindowsArgument $env:PROBE_A),(ConvertTo-WindowsArgument $env:PROBE_B),(ConvertTo-WindowsArgument $env:PROBE_C))",
-      "$p = Start-Process -FilePath $ps -Wait -PassThru -WindowStyle Hidden -ArgumentList $argList",
+      '$p = Start-Process -FilePath $ps -Wait -PassThru -WindowStyle Hidden -ArgumentList $argList',
       'exit $p.ExitCode'
     ].join('; ')
 
@@ -309,11 +332,8 @@ describe('elevated UAC launch argv safety', () => {
   })
 
   it('retains the early elevated PID for exact response-temp cleanup after interruption', async () => {
-    const {
-      cleanupForceReleaseArtifacts,
-      forceReleasePaths,
-      launchElevatedForceReleaseHelper
-    } = await import('./windows-elevated-force-release')
+    const { cleanupForceReleaseArtifacts, forceReleasePaths, launchElevatedForceReleaseHelper } =
+      await import('./windows-elevated-force-release')
 
     const directory = fsNative.mkdtempSync(path.join(osNative.tmpdir(), 'hermes-force-response-temp-'))
     const responsePath = forceReleasePaths(directory, 'interrupted').responsePath
@@ -373,116 +393,122 @@ describe('elevated UAC launch argv safety', () => {
 
     assert.equal(result.kind, 'failed')
 
-    if (result.kind === 'failed') {assert.equal(result.detail, 'elevated helper survived terminal boundary')}
+    if (result.kind === 'failed') {
+      assert.equal(result.detail, 'elevated helper survived terminal boundary')
+    }
   })
 
-  it(
-    'kills the job-assigned bootstrap before it can write after launcher death',
-    { timeout: 20_000 },
-    async () => {
-      if (process.platform !== 'win32') {return}
-
-      const { ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE, ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND } =
-        await import('./windows-elevated-force-release')
-
-      const temp = fsNative.mkdtempSync(path.join(osNative.tmpdir(), 'hermes-elevated-job-'))
-      const helper = path.join(temp, 'delayed-helper.ps1')
-      const bootstrap = `${ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE}\n[IO.File]::WriteAllText($env:HERMES_JOB_READY, 'ready')\nStart-Sleep -Seconds 30\n[IO.File]::WriteAllText($env:HERMES_JOB_LATE, 'late')`
-      const ready = path.join(temp, 'ready.txt')
-      const late = path.join(temp, 'late.txt')
-      fsNative.writeFileSync(
-        helper,
-        [
-          'param([string]$RequestPath,[string]$ResponsePath)',
-          '[IO.File]::WriteAllText($env:HERMES_JOB_READY, "ready")',
-          'Start-Sleep -Seconds 30',
-          '[IO.File]::WriteAllText($env:HERMES_JOB_LATE, "late")'
-        ].join('\n'),
-        'utf8'
-      )
-
-      const ps = path.join(
-        process.env.SystemRoot || 'C:\\Windows',
-        'System32',
-        'WindowsPowerShell',
-        'v1.0',
-        'powershell.exe'
-      )
-
-      const nonElevatedLauncher = ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND.replace(' -Verb RunAs', '')
-
-      const child = spawn(
-        ps,
-        ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', nonElevatedLauncher],
-        {
-          windowsHide: true,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: {
-            ...process.env,
-            HERMES_FORCE_RELEASE_HELPER: helper,
-            HERMES_FORCE_RELEASE_REQUEST: path.join(temp, 'request.json'),
-            HERMES_FORCE_RELEASE_RESPONSE: path.join(temp, 'response.json'),
-            HERMES_FORCE_RELEASE_BOOTSTRAP: bootstrap,
-            HERMES_JOB_READY: ready,
-            HERMES_JOB_LATE: late
-          }
-        }
-      )
-
-      let stdout = ''
-      let stderr = ''
-      child.stdout?.on('data', chunk => {
-        stdout += String(chunk)
-      })
-      child.stderr?.on('data', chunk => {
-        stderr += String(chunk)
-      })
-
-      try {
-        const readyDeadline = Date.now() + 10_000
-
-        while (!fsNative.existsSync(ready) && Date.now() < readyDeadline && child.exitCode == null) {
-          await new Promise(resolve => setTimeout(resolve, 25))
-        }
-
-        assert.equal(
-          fsNative.existsSync(ready),
-          true,
-          `bootstrap did not start code=${child.exitCode} stdout=${stdout} stderr=${stderr}`
-        )
-        const helperPid = Number(stdout.match(/HERMES_ELEVATED_PID=(\d+)/)?.[1])
-        assert.ok(Number.isInteger(helperPid) && helperPid > 0, `missing helper PID: ${stdout}`)
-
-        child.kill()
-        await new Promise<void>(resolve => {
-          if (child.exitCode != null) {return resolve()}
-          child.once('close', () => resolve())
-        })
-        const absenceDeadline = Date.now() + 5_000
-        let alive = true
-
-        while (Date.now() < absenceDeadline) {
-          try {
-            process.kill(helperPid, 0)
-          } catch {
-            alive = false
-
-            break
-          }
-
-          await new Promise(resolve => setTimeout(resolve, 25))
-        }
-
-        assert.equal(alive, false, `job-assigned helper ${helperPid} survived launcher death`)
-        await new Promise(resolve => setTimeout(resolve, 250))
-        assert.equal(fsNative.existsSync(late), false, 'helper performed a delayed write after launcher death')
-      } finally {
-        if (child.exitCode == null) {child.kill()}
-        fsNative.rmSync(temp, { recursive: true, force: true })
-      }
+  it('kills the job-assigned bootstrap before it can write after launcher death', { timeout: 20_000 }, async () => {
+    if (process.platform !== 'win32') {
+      return
     }
-  )
 
+    const { ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE, ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND } =
+      await import('./windows-elevated-force-release')
+
+    const temp = fsNative.mkdtempSync(path.join(osNative.tmpdir(), 'hermes-elevated-job-'))
+    const helper = path.join(temp, 'delayed-helper.ps1')
+    const bootstrap = `${ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE}\n[IO.File]::WriteAllText($env:HERMES_JOB_READY, 'ready')\nStart-Sleep -Seconds 30\n[IO.File]::WriteAllText($env:HERMES_JOB_LATE, 'late')`
+    const ready = path.join(temp, 'ready.txt')
+    const late = path.join(temp, 'late.txt')
+    fsNative.writeFileSync(
+      helper,
+      [
+        'param([string]$RequestPath,[string]$ResponsePath)',
+        '[IO.File]::WriteAllText($env:HERMES_JOB_READY, "ready")',
+        'Start-Sleep -Seconds 30',
+        '[IO.File]::WriteAllText($env:HERMES_JOB_LATE, "late")'
+      ].join('\n'),
+      'utf8'
+    )
+
+    const ps = path.join(
+      process.env.SystemRoot || 'C:\\Windows',
+      'System32',
+      'WindowsPowerShell',
+      'v1.0',
+      'powershell.exe'
+    )
+
+    const nonElevatedLauncher = ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND.replace(' -Verb RunAs', '')
+
+    const child = spawn(
+      ps,
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', nonElevatedLauncher],
+      {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          HERMES_FORCE_RELEASE_HELPER: helper,
+          HERMES_FORCE_RELEASE_REQUEST: path.join(temp, 'request.json'),
+          HERMES_FORCE_RELEASE_RESPONSE: path.join(temp, 'response.json'),
+          HERMES_FORCE_RELEASE_BOOTSTRAP: bootstrap,
+          HERMES_JOB_READY: ready,
+          HERMES_JOB_LATE: late
+        }
+      }
+    )
+
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', chunk => {
+      stdout += String(chunk)
+    })
+    child.stderr?.on('data', chunk => {
+      stderr += String(chunk)
+    })
+
+    try {
+      const readyDeadline = Date.now() + 10_000
+
+      while (!fsNative.existsSync(ready) && Date.now() < readyDeadline && child.exitCode == null) {
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+
+      assert.equal(
+        fsNative.existsSync(ready),
+        true,
+        `bootstrap did not start code=${child.exitCode} stdout=${stdout} stderr=${stderr}`
+      )
+      const helperPid = Number(stdout.match(/HERMES_ELEVATED_PID=(\d+)/)?.[1])
+      assert.ok(Number.isInteger(helperPid) && helperPid > 0, `missing helper PID: ${stdout}`)
+
+      child.kill()
+      await new Promise<void>(resolve => {
+        if (child.exitCode != null) {
+          return resolve()
+        }
+
+        child.once('close', () => resolve())
+      })
+
+      const absenceDeadline = Date.now() + 5_000
+      let alive = true
+
+      while (Date.now() < absenceDeadline) {
+        try {
+          process.kill(helperPid, 0)
+        } catch {
+          alive = false
+
+          break
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+
+      assert.equal(alive, false, `job-assigned helper ${helperPid} survived launcher death`)
+      await new Promise(resolve => setTimeout(resolve, 250))
+      assert.equal(fsNative.existsSync(late), false, 'helper performed a delayed write after launcher death')
+    } finally {
+      if (child.exitCode == null) {
+        child.kill()
+      }
+
+      fsNative.rmSync(temp, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('force-release artifact cleanup', () => {
@@ -491,11 +517,8 @@ describe('force-release artifact cleanup', () => {
     const os = await import('node:os')
     const path = await import('node:path')
 
-    const {
-      cleanupForceReleaseArtifacts,
-      forceReleasePaths,
-      writeForceReleaseRequestFiles
-    } = await import('./windows-elevated-force-release')
+    const { cleanupForceReleaseArtifacts, forceReleasePaths, writeForceReleaseRequestFiles } =
+      await import('./windows-elevated-force-release')
 
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-cleanup-'))
 
@@ -530,9 +553,8 @@ describe('force-release artifact cleanup', () => {
     const os = await import('node:os')
     const path = await import('node:path')
 
-    const { cleanupForceReleaseArtifacts, writeForceReleaseRequestFiles } = await import(
-      './windows-elevated-force-release'
-    )
+    const { cleanupForceReleaseArtifacts, writeForceReleaseRequestFiles } =
+      await import('./windows-elevated-force-release')
 
     const written = await writeForceReleaseRequestFiles({
       installRoot: 'C:\\h',
@@ -557,7 +579,9 @@ describe('force-release artifact cleanup', () => {
     writeSpy.mockImplementation(((filePath: any, data: any, options?: any) => {
       writes += 1
 
-      if (writes === 2) {throw new Error('injected request write failure')}
+      if (writes === 2) {
+        throw new Error('injected request write failure')
+      }
 
       return originalWrite(filePath, data, options)
     }) as typeof fsNative.writeFileSync)
@@ -592,7 +616,10 @@ describe('elevated helper script shape', () => {
     const digest = createHash('sha256').update(Buffer.from(helperText, 'utf8')).digest('hex')
     assert.equal(digest, ELEVATED_FORCE_RELEASE_HELPER_SHA256)
     assert.ok(ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE.startsWith(ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE))
-    const beforeAssignment = ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE.split('$native::AssignProcessToJobObject')[0] ?? ''
+
+    const beforeAssignment =
+      ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE.split('$native::AssignProcessToJobObject')[0] ?? ''
+
     assert.doesNotMatch(beforeAssignment, /Add-Type|Start-Process|WriteAllText|WriteAllBytes|CreateText|OpenWrite/)
     assert.match(ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE, /ScriptBlock\]::Create\(\$helperText\)/)
   })
