@@ -74,6 +74,34 @@ class TestReceiptLifecycle:
         assert latest is not None
         assert latest["outcome"] == "partial"
 
+    def test_receipt_omits_raw_command_line_capabilities(
+        self, receipt_home, monkeypatch
+    ):
+        lease_capability = "synthetic-bridge-lease-capability-123456"
+        invocation_capability = "synthetic-invocation-capability-123456"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "hermes",
+                "update",
+                "--gateway",
+                "--defer-gateway-resume",
+                "--bridge-lease-id",
+                lease_capability,
+                f"--invocation-id={invocation_capability}",
+            ],
+        )
+
+        ur.begin_update_receipt()
+        path = _finalize("partial")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        serialized = json.dumps(payload, sort_keys=True)
+        assert "argv" not in payload
+        assert lease_capability not in serialized
+        assert invocation_capability not in serialized
+
     def test_phase_error_shape(self, receipt_home):
         ur.begin_update_receipt()
         ur.record_gateway_restart(
@@ -164,6 +192,37 @@ class TestCommandBoundaryFinalization:
         assert ur.finalize_pending_update_receipt(2, "sys.exit(2)") is None
         assert ur.read_latest_receipt() is None
 
+    def test_deferred_staging_child_cannot_finalize_terminal_success(
+        self, receipt_home, monkeypatch
+    ):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "hermes",
+                "update",
+                "--gateway",
+                "--defer-gateway-resume",
+                "--bridge-lease-id",
+                "synthetic-bridge-lease-capability-123456",
+                "--invocation-id",
+                "synthetic-invocation-capability-123456",
+            ],
+        )
+
+        ur.begin_update_receipt()
+        inner = ur.finalize_update_receipt("success")
+        boundary = ur.finalize_pending_update_receipt(
+            0, "completed at command boundary"
+        )
+
+        assert inner is not None
+        assert boundary is None
+        payload = ur.read_latest_receipt()
+        assert payload is not None
+        assert payload["gateway_resume_deferred"] is True
+        assert payload["outcome"] == "partial"
+
     def test_cmd_update_boundary_finalizes_on_early_exit(
         self, receipt_home, monkeypatch, platform_neutral_update_lifecycle
     ):
@@ -175,7 +234,7 @@ class TestCommandBoundaryFinalization:
 
         from hermes_cli import main as hermes_main
 
-        def _fake_impl(args, gateway_mode):
+        def _fake_impl(args, gateway_mode, *, transaction):
             ur.begin_update_receipt()
             ur.record_step("windows_preflight", False, "hermes.exe holds venv")
             sys.exit(2)

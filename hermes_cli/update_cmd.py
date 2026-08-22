@@ -52,6 +52,7 @@ from hermes_constants import get_default_hermes_root, venv_bin_dir, venv_python_
 # handoff-receipt validator is taken from its split-out home, so the exact
 # 40-/64-hex SHA hardening applies to the live receipt path.
 from hermes_cli.update_receipt import _sanitize_update_receipt
+from hermes_cli.update_transaction import _UpdateTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -501,16 +502,20 @@ def _sanitize_deferred_gateway_plan(
     }
 
 
-def _write_deferred_gateway_plan(args, root: Path) -> Path:
-    invocation_id = getattr(args, "_update_invocation_id", None)
-    lease = getattr(args, "_update_quiesce_lease", None)
-    token = getattr(args, "_windows_gateway_resume_plan", None) or {}
+def _write_deferred_gateway_plan(
+    root: Path,
+    *,
+    transaction: _UpdateTransaction,
+) -> Path:
+    invocation_id = transaction.invocation_id
+    lease = transaction.lease
+    token = transaction.gateway_resume_plan or {}
     if not isinstance(invocation_id, str) or not isinstance(lease, dict):
         raise RuntimeError("deferred gateway plan lacks update correlation")
     lease_id = lease.get("lease_id")
     if not isinstance(lease_id, str):
         raise RuntimeError("deferred gateway plan lacks lease correlation")
-    existing_path = getattr(args, "_deferred_gateway_plan_written", None)
+    existing_path = transaction.deferred_gateway_plan_path
     if isinstance(existing_path, Path):
         try:
             existing = json.loads(existing_path.read_text(encoding="utf-8"))
@@ -572,7 +577,7 @@ def _write_deferred_gateway_plan(args, root: Path) -> Path:
     _write_private_exclusive(
         path, json.dumps(sanitized, sort_keys=True, separators=(",", ":"))
     )
-    setattr(args, "_deferred_gateway_plan_written", path)
+    transaction.deferred_gateway_plan_path = path
     return path
 
 
@@ -1011,6 +1016,7 @@ def _write_update_receipt(
 def _record_update_success(
     args,
     *,
+    transaction: _UpdateTransaction,
     mode: str,
     branch: str,
     remote: str | None,
@@ -1021,8 +1027,8 @@ def _record_update_success(
     health: dict[str, bool],
 ) -> dict | None:
     """Write a receipt only for an atomic invocation that owns a lease."""
-    invocation_id = getattr(args, "_update_invocation_id", None)
-    lease = getattr(args, "_update_quiesce_lease", None)
+    invocation_id = transaction.invocation_id
+    lease = transaction.lease
     lease_id = lease.get("lease_id") if isinstance(lease, dict) else None
     if not isinstance(invocation_id, str) or not isinstance(lease_id, str):
         return None
@@ -1058,7 +1064,7 @@ def _record_update_success(
         # Publish the authenticated, no-argv fleet state first.  The receipt
         # is the terminal mutation proof and must never claim a resumable
         # update when the private plan was not durably published.
-        _write_deferred_gateway_plan(args, root)
+        _write_deferred_gateway_plan(root, transaction=transaction)
     receipt = _write_update_receipt(
         root,
         invocation_id=invocation_id,
@@ -2189,7 +2195,12 @@ class _WindowsMutationJob:
         self._close_handle(handle)
 
 
-def _prepare_atomic_windows_update(args, *, root: Path) -> tuple[dict, str]:
+def _prepare_atomic_windows_update(
+    args,
+    *,
+    root: Path,
+    transaction: _UpdateTransaction,
+) -> None:
     """Acquire consent+lease, then drain before any update mutation occurs."""
     handoff_id = getattr(args, "bridge_lease_id", None)
     handoff_owner_pid: int | None = None
@@ -2287,10 +2298,9 @@ def _prepare_atomic_windows_update(args, *, root: Path) -> tuple[dict, str]:
         ):
             raise RuntimeError("invalid update invocation identity")
         invocation_id = requested_invocation or secrets.token_urlsafe(24)
-        setattr(args, "_update_quiesce_lease", lease)
-        setattr(args, "_update_invocation_id", invocation_id)
-        setattr(args, "_update_handoff_owner_pid", handoff_owner_pid)
-        return lease, invocation_id
+        transaction.lease = lease
+        transaction.invocation_id = invocation_id
+        transaction.handoff_owner_pid = handoff_owner_pid
     except BaseException:
         _return_or_release_on_failure(lease)
         raise
@@ -3749,7 +3759,12 @@ def _write_gateway_update_exit_code(ok: bool) -> None:
         pass
 
 
-def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
+def _update_via_zip(
+    args,
+    *,
+    transaction: _UpdateTransaction,
+    had_desktop_app_before_update: bool = False,
+) -> bool:
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
@@ -4209,6 +4224,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         print()
         _record_update_success(
             args,
+            transaction=transaction,
             mode="archive",
             branch=branch,
             remote=None,
@@ -8800,7 +8816,12 @@ def _rebuild_desktop_after_update(
 
 
 @_with_sanitized_git_routing
-def _cmd_update_impl(args, gateway_mode: bool):
+def _cmd_update_impl(
+    args,
+    gateway_mode: bool,
+    *,
+    transaction: _UpdateTransaction,
+):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
     # A managed-runtime refresh can replace site-packages before the normal
@@ -8908,12 +8929,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # The outer command's finally block is the rollback owner. Publish the
         # in-memory token before the first ordinary or deferred stop so even a
         # later identity refusal resumes gateways already drained in this call.
-        # ``args`` is the resume-plan carrier here (there is no transaction
-        # object in this tree), and it is what _write_deferred_gateway_plan
-        # reads the token back out of.
-        setattr(args, "_windows_gateway_resume_plan", token)
+        transaction.gateway_resume_plan = token
         if deferred_gateway_resume:
-            _write_deferred_gateway_plan(args, Path(_m().PROJECT_ROOT))
+            _write_deferred_gateway_plan(
+                Path(_m().PROJECT_ROOT), transaction=transaction
+            )
 
     if deferred_gateway_resume:
         # Prove the prior fleet is losslessly representable before the first
@@ -8929,7 +8949,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # gateway plan only after the Job proves every mutating descendant exited
     # and disarms kill-on-close, while both update coordination markers remain
     # held. Starting it here would make the gateway inherit the mutation Job.
-    setattr(args, "_windows_gateway_resume_plan", _windows_gateway_resume)
+    transaction.gateway_resume_plan = _windows_gateway_resume
 
     # Pre-update backup — runs before any git/file mutation so users can
     # always roll back to the exact state they had before this update.
@@ -8956,7 +8976,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # proven every descendant exited and disarmed kill-on-close. An atexit
         # hook would both double-resume that plan and start the gateway while
         # the Job still owns this process tree.
-        setattr(args, "_windows_gateway_resume_plan", _windows_gateway_resume)
+        transaction.gateway_resume_plan = _windows_gateway_resume
 
     # With gateways paused, anything still running from the venv interpreter
     # (most commonly the Desktop app's `hermes serve` backend) will keep .pyd
@@ -9199,6 +9219,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         try:
             desktop_build_ok = _update_via_zip(
                 args,
+                transaction=transaction,
                 had_desktop_app_before_update=had_desktop_app_before_update,
             )
         finally:
@@ -9783,6 +9804,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             else:
                 _record_update_success(
                     args,
+                    transaction=transaction,
                     mode="git",
                     branch=branch,
                     remote=update_target.remote,
@@ -10718,6 +10740,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     _record_update_success(
                         args,
+                        transaction=transaction,
                         mode="git",
                         branch=branch,
                         remote=update_target.remote,
@@ -11753,6 +11776,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print()
             desktop_build_ok = _update_via_zip(
                 args,
+                transaction=transaction,
                 had_desktop_app_before_update=had_desktop_app_before_update,
             )
             if gateway_mode:

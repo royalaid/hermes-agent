@@ -9,6 +9,7 @@ from unittest.mock import ANY, patch
 import pytest
 
 from hermes_cli.main import cmd_update, PROJECT_ROOT
+from hermes_cli.update_transaction import _UpdateTransaction
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -1475,7 +1476,7 @@ class TestCmdUpdateZipBranchRefusal:
 
         args = SimpleNamespace(branch="bb/gui")
         with pytest.raises(SystemExit) as exc_info:
-            _update_via_zip(args)
+            _update_via_zip(args, transaction=_UpdateTransaction())
         assert exc_info.value.code == 1
 
         out = capsys.readouterr().out
@@ -1729,6 +1730,7 @@ class TestNodeRuntimeNpmResolution:
             update_cmd._cmd_update_impl(
                 SimpleNamespace(yes=True, force=True, force_venv=True, branch=None),
                 gateway_mode=False,
+                transaction=_UpdateTransaction(),
             )
 
         # Release-dir graft (#70337): the packaged exe SURVIVES the swap, so
