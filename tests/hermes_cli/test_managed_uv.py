@@ -447,18 +447,24 @@ def test_stage_candidate_sync_uses_tracked_lock_without_relocking(tmp_path):
         )
 
     assert candidate is not None
-    assert len(calls) == 2
+    assert len(calls) == 3
     venv_argv, venv_env = calls[0]
     sync_argv, sync_env = calls[1]
+    relocate_argv, relocate_env = calls[2]
     assert venv_argv[:2] == ["uv", "venv"]
     assert "--no-config" in venv_argv
     assert "--allow-existing" in venv_argv
+    assert "--relocatable" not in venv_argv
     assert venv_env.get("UV_NO_CONFIG") == "true"
     assert sync_argv[:2] == ["uv", "sync"]
     assert "--frozen" in sync_argv
     assert "--locked" not in sync_argv
     assert "--no-config" not in sync_argv
     assert "UV_NO_CONFIG" not in sync_env
+    assert relocate_argv[:2] == ["uv", "venv"]
+    assert "--relocatable" in relocate_argv
+    assert "--allow-existing" in relocate_argv
+    assert relocate_env.get("UV_NO_CONFIG") == "true"
 
 
 def test_stage_update_candidate_reuses_safe_private_base_without_cutover(tmp_path):
