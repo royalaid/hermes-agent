@@ -8802,7 +8802,7 @@ def _capture_target_venv_gateway_ancestor(
         except psutil.NoSuchProcess:
             return None
         except Exception as exc:
-            raise RuntimeError(
+            raise _GatewayOutsideInstall(
                 f"gateway process {process_pid} ancestry is unreadable"
             ) from exc
         if current is None:
@@ -8820,7 +8820,7 @@ def _capture_target_venv_gateway_ancestor(
         except psutil.NoSuchProcess:
             return None
         except Exception as exc:
-            raise RuntimeError(
+            raise _GatewayOutsideInstall(
                 f"gateway process {process_pid} ancestry is unreadable"
             ) from exc
         if not math.isfinite(created_at) or created_at <= 0:
