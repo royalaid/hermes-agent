@@ -70,6 +70,7 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{16,128}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_DEFERRED_GATEWAY_STARTUP_GATE_ENV = "HERMES_DEFERRED_GATEWAY_STARTUP_GATE"
 _EXECUTABLE_GIT_CONFIG_RE = (
     r"^(filter\..*\.(clean|smudge|process)|merge\..*\.driver|"
     r"core\.(sshcommand|gitproxy)|credential(\..*)?\.helper|"
@@ -94,6 +95,25 @@ _READINESS_KEYS = {
     "actions",
     "error",
 }
+
+
+@dataclass(frozen=True)
+class _GatewayRuntimeIdentity:
+    pid: int
+    created_at: float
+
+
+@dataclass(frozen=True)
+class _GatewayReadinessResult:
+    ready: bool
+    runtime: _GatewayRuntimeIdentity | None
+
+
+@dataclass(frozen=True)
+class _GatewayStartupAttempt:
+    profile: str
+    process: subprocess.Popen
+    runtime: _GatewayRuntimeIdentity
 
 
 @dataclass(frozen=True)
@@ -649,8 +669,8 @@ def _load_deferred_gateway_plan(
 
 
 def _consume_deferred_gateway_plan(path: Path, expected_raw: str) -> bool:
-    """Consume exact pending bytes into an idempotent completed record."""
-    completed = path.with_suffix(".completed")
+    """Consume exact pending bytes into a native-commit prepared record."""
+    prepared = path.with_suffix(".prepared")
     tombstone = path.with_name(
         f"{path.name}.consume-{os.getpid()}-{secrets.token_hex(8)}"
     )
@@ -678,7 +698,7 @@ def _consume_deferred_gateway_plan(path: Path, expected_raw: str) -> bool:
             pass
         return False
     try:
-        os.link(tombstone, completed)
+        os.link(tombstone, prepared)
     except (FileExistsError, OSError):
         try:
             os.link(tombstone, path)
@@ -688,11 +708,11 @@ def _consume_deferred_gateway_plan(path: Path, expected_raw: str) -> bool:
     try:
         tombstone.unlink()
     except OSError:
-        # A completed record is terminal authority only after the pending
-        # tombstone is retired. Roll it back and restore the exact pending
-        # bytes so replay cannot skip lease cleanup after a partial consume.
+        # A prepared record is usable only after the pending tombstone is
+        # retired. Roll it back and restore the exact pending bytes so the
+        # native parent never sees an ambiguous commit candidate.
         try:
-            completed.unlink()
+            prepared.unlink()
         except OSError:
             pass
         try:
@@ -701,6 +721,212 @@ def _consume_deferred_gateway_plan(path: Path, expected_raw: str) -> bool:
             pass
         return False
     return True
+
+
+def _restore_consumed_deferred_gateway_plan(path: Path, expected_raw: str) -> bool:
+    """Restore exact prepared authority without overwriting a pending claim."""
+    prepared = path.with_suffix(".prepared")
+    try:
+        prepared_raw = prepared.read_text(encoding="utf-8")
+        prepared_stat = prepared.stat()
+    except OSError:
+        return False
+    if prepared_raw != expected_raw:
+        return False
+    prepared_identity = (prepared_stat.st_dev, prepared_stat.st_ino)
+    try:
+        os.link(prepared, path)
+    except OSError:
+        return False
+
+    prepared_unlinked = False
+    restored = False
+    try:
+        pending_stat = path.stat()
+        if (pending_stat.st_dev, pending_stat.st_ino) != prepared_identity:
+            return False
+        if path.read_text(encoding="utf-8") != expected_raw:
+            return False
+        current_prepared_stat = prepared.stat()
+        if (
+            current_prepared_stat.st_dev,
+            current_prepared_stat.st_ino,
+        ) != prepared_identity:
+            return False
+        prepared.unlink()
+        prepared_unlinked = True
+        final_pending_stat = path.stat()
+        restored = (
+            (final_pending_stat.st_dev, final_pending_stat.st_ino)
+            == prepared_identity
+            and path.read_text(encoding="utf-8") == expected_raw
+        )
+        return restored
+    except OSError:
+        return False
+    finally:
+        if not restored and not prepared_unlinked:
+            try:
+                pending_stat = path.stat()
+                if (pending_stat.st_dev, pending_stat.st_ino) == prepared_identity:
+                    path.unlink()
+            except OSError:
+                pass
+
+
+def _remove_private_exact(path: Path, expected_raw: str) -> bool:
+    """Remove only the exact private inode and bytes published by this process."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        first = path.stat()
+        if raw != expected_raw:
+            return False
+        second = path.stat()
+        if (first.st_dev, first.st_ino) != (second.st_dev, second.st_ino):
+            return False
+        path.unlink()
+    except OSError:
+        return False
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _windows_process_creation_file_time(pid: int) -> str:
+    """Return one process generation as an exact unsigned Windows FILETIME."""
+    if sys.platform != "win32":
+        raise RuntimeError("Windows process identity is unavailable")
+    if type(pid) is not int or pid <= 0 or pid > (1 << 32) - 1:
+        raise RuntimeError("invalid Windows process identity")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [
+            ("low", wintypes.DWORD),
+            ("high", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        raise RuntimeError("Windows process identity could not be opened")
+    try:
+        creation = _FileTime()
+        exit_time = _FileTime()
+        kernel_time = _FileTime()
+        user_time = _FileTime()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            raise RuntimeError("Windows process generation could not be read")
+        value = (int(creation.high) << 32) | int(creation.low)
+        if value <= 0:
+            raise RuntimeError("Windows process generation is invalid")
+        return str(value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _write_prepared_gateway_runtime_manifest(
+    root: Path,
+    pending_path: Path,
+    *,
+    invocation_id: str,
+    lease_id: str,
+    plan_raw: str,
+    attempts: list[_GatewayStartupAttempt],
+) -> tuple[Path, str]:
+    """Publish a bounded authenticated survivor manifest for native commit."""
+    if len(attempts) > 64:
+        raise RuntimeError("deferred gateway runtime manifest is too large")
+    from hermes_constants import get_default_hermes_root
+
+    canonical_root = os.path.normcase(os.path.realpath(root))
+    default_home = get_default_hermes_root()
+    runtimes: list[dict] = []
+    seen_profiles: set[str] = set()
+    for attempt in sorted(attempts, key=lambda item: (item.profile, item.runtime.pid)):
+        profile = str(attempt.profile)
+        if profile in seen_profiles:
+            raise RuntimeError("deferred gateway runtime manifest has duplicate profiles")
+        seen_profiles.add(profile)
+        identity = attempt.runtime
+        try:
+            import psutil  # type: ignore
+
+            process = psutil.Process(int(identity.pid))
+            live_created_at = float(process.create_time())
+            executable_path = os.path.normcase(os.path.realpath(process.exe()))
+            creation_file_time = _windows_process_creation_file_time(int(identity.pid))
+        except Exception as exc:
+            raise RuntimeError(
+                "deferred gateway runtime identity could not be captured"
+            ) from exc
+        if (
+            int(identity.pid) <= 0
+            or not math.isfinite(live_created_at)
+            or abs(live_created_at - float(identity.created_at)) > 0.001
+            or not executable_path
+            or re.fullmatch(r"[1-9][0-9]{0,19}", creation_file_time) is None
+            or int(creation_file_time) > (1 << 64) - 1
+        ):
+            raise RuntimeError("deferred gateway runtime identity changed")
+        try:
+            if os.path.commonpath([executable_path, canonical_root]) != canonical_root:
+                raise RuntimeError("deferred gateway executable escaped install root")
+        except ValueError as exc:
+            raise RuntimeError("deferred gateway executable scope is invalid") from exc
+        profile_home = (
+            default_home if profile == "default" else default_home / "profiles" / profile
+        )
+        canonical_profile_home = os.path.normcase(os.path.realpath(profile_home))
+        if not _gateway_runtime_ready_record_matches(profile_home, identity):
+            raise RuntimeError("deferred gateway runtime is no longer ready")
+        runtimes.append(
+            {
+                "profile": profile,
+                "pid": int(identity.pid),
+                "created_at": round(live_created_at, 2),
+                "creation_file_time": creation_file_time,
+                "executable_path": executable_path,
+                "profile_home": canonical_profile_home,
+            }
+        )
+    unsigned = {
+        "schema_version": 1,
+        "invocation_id": invocation_id,
+        "install_root": canonical_root,
+        "plan_sha256": hashlib.sha256(plan_raw.encode("utf-8")).hexdigest(),
+        "runtimes": runtimes,
+    }
+    payload = {**unsigned, "auth": _gateway_plan_auth(unsigned, lease_id)}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    path = pending_path.with_suffix(".prepared-runtime.json")
+    _write_private_exclusive(path, raw)
+    return path, raw
 
 
 def _validate_deferred_update_request(args) -> None:
@@ -763,8 +989,134 @@ def _running_gateway_profiles() -> dict[str, int]:
     }
 
 
-def _spawn_deferred_gateway_profile(profile: str) -> int:
-    """Start one derived Hermes profile without accepting caller argv."""
+def _spawned_gateway_created_at(process: subprocess.Popen) -> float:
+    """Capture the exact newly spawned process generation."""
+    try:
+        import psutil  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("psutil is required to verify gateway identity") from exc
+    try:
+        created_at = float(psutil.Process(int(process.pid)).create_time())
+    except Exception as exc:
+        raise RuntimeError("could not capture spawned gateway identity") from exc
+    if not math.isfinite(created_at) or created_at <= 0:
+        raise RuntimeError("spawned gateway creation time is invalid")
+    return created_at
+
+
+def _authenticated_gateway_writer_created_at(
+    writer_pid: int,
+    wrapper_pid: int,
+    wrapper_created_at: float,
+) -> float | None:
+    """Authenticate a gateway writer beneath the retained venv wrapper."""
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return None
+    try:
+        current = psutil.Process(int(writer_pid))
+        writer_created_at = float(current.create_time())
+        if not math.isfinite(writer_created_at) or writer_created_at <= 0:
+            return None
+        seen: set[int] = set()
+        for _ in range(32):
+            current_pid = int(current.pid)
+            if current_pid in seen:
+                return None
+            seen.add(current_pid)
+            if current_pid == int(wrapper_pid):
+                current_created_at = float(current.create_time())
+                if (
+                    math.isfinite(current_created_at)
+                    and abs(current_created_at - float(wrapper_created_at)) <= 0.001
+                ):
+                    return writer_created_at
+                return None
+            current = current.parent()
+            if current is None:
+                return None
+    except Exception:
+        return None
+    return None
+
+
+def _gateway_runtime_ready_record_matches(
+    profile_home: Path,
+    identity: _GatewayRuntimeIdentity,
+) -> bool:
+    """Bind gateway readiness to the exact live generation's running record."""
+    try:
+        from gateway.status import read_runtime_status
+
+        profile_home = Path(profile_home)
+        payload = read_runtime_status(profile_home / "gateway_state.json")
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("kind") != "hermes-gateway":
+            return False
+        if payload.get("gateway_state") != "running":
+            return False
+        if type(payload.get("pid")) is not int or payload["pid"] != identity.pid:
+            return False
+        expected_start = int(round(float(identity.created_at) * 100))
+        if (
+            type(payload.get("start_time")) is not int
+            or payload["start_time"] != expected_start
+        ):
+            return False
+        recorded_home = payload.get("hermes_home")
+        if not isinstance(recorded_home, str) or not recorded_home:
+            return False
+        return os.path.normcase(os.path.realpath(recorded_home)) == os.path.normcase(
+            os.path.realpath(profile_home)
+        )
+    except Exception:
+        return False
+
+
+def _exact_gateway_profile_identity(
+    profile: str,
+    process: subprocess.Popen,
+    created_at: float,
+) -> _GatewayRuntimeIdentity | None:
+    """Return the exact ready runtime descended from the retained launcher."""
+    if process.poll() is not None:
+        return None
+    from hermes_cli.gateway import find_profile_gateway_processes
+
+    identity: _GatewayRuntimeIdentity | None = None
+    for candidate in find_profile_gateway_processes():
+        if str(candidate.profile) != profile:
+            continue
+        candidate_pid = int(candidate.pid)
+        if candidate_pid == int(process.pid):
+            candidate_created_at = float(created_at)
+        else:
+            candidate_created_at = _authenticated_gateway_writer_created_at(
+                candidate_pid,
+                int(process.pid),
+                float(created_at),
+            )
+            if candidate_created_at is None:
+                raise RuntimeError("unrecognized gateway runtime")
+        if not _profile_process_still_matches(candidate_pid, candidate_created_at):
+            raise RuntimeError("gateway runtime identity changed")
+        candidate_identity = _GatewayRuntimeIdentity(
+            candidate_pid, candidate_created_at
+        )
+        if not _gateway_runtime_ready_record_matches(
+            Path(candidate.path), candidate_identity
+        ):
+            continue
+        if identity is not None and identity != candidate_identity:
+            raise RuntimeError("multiple gateway runtimes were reported")
+        identity = candidate_identity
+    return identity
+
+
+def _spawn_deferred_gateway_profile(profile: str) -> subprocess.Popen:
+    """Start one derived profile and retain its exact Windows process handle."""
     from hermes_constants import get_default_hermes_root
     from hermes_cli import gateway_windows
 
@@ -772,67 +1124,293 @@ def _spawn_deferred_gateway_profile(profile: str) -> int:
     profile_home = default_root if profile == "default" else default_root / "profiles" / profile
     if profile != "default" and not profile_home.is_dir():
         raise RuntimeError(f"gateway profile {profile!r} no longer exists")
-    previous = os.environ.get("HERMES_HOME")
-    os.environ["HERMES_HOME"] = str(profile_home)
-    try:
-        return int(gateway_windows._spawn_detached())
-    finally:
-        if previous is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = previous
+    return gateway_windows._spawn_detached_process(
+        hermes_home=profile_home,
+        allow_breakaway=False,
+    )
 
 
-def _wait_for_deferred_gateway_profile(profile: str, *, timeout: float = 20.0) -> bool:
+def _wait_for_deferred_gateway_profile(
+    profile: str,
+    process: subprocess.Popen,
+    created_at: float,
+    *,
+    timeout: float = 20.0,
+) -> _GatewayReadinessResult:
     deadline = _time.monotonic() + max(0.1, float(timeout))
+    consecutive = 0
+    last_runtime: _GatewayRuntimeIdentity | None = None
+    last_authenticated_runtime: _GatewayRuntimeIdentity | None = None
     while _time.monotonic() < deadline:
-        try:
-            if profile in _running_gateway_profiles():
-                return True
-        except Exception:
-            pass
+        runtime = _exact_gateway_profile_identity(profile, process, created_at)
+        if runtime is not None:
+            last_authenticated_runtime = runtime
+        if runtime is not None and runtime == last_runtime:
+            consecutive += 1
+            if consecutive >= 2:
+                final_runtime = _exact_gateway_profile_identity(
+                    profile, process, created_at
+                )
+                if final_runtime is not None:
+                    last_authenticated_runtime = final_runtime
+                if final_runtime == runtime:
+                    return _GatewayReadinessResult(True, final_runtime)
+                consecutive = 0
+                last_runtime = final_runtime
+        elif runtime is not None:
+            consecutive = 1
+            last_runtime = runtime
+        else:
+            consecutive = 0
+            last_runtime = None
         _time.sleep(0.2)
-    return False
+    last_runtime = _exact_gateway_profile_identity(profile, process, created_at)
+    if last_runtime is not None:
+        last_authenticated_runtime = last_runtime
+    return _GatewayReadinessResult(False, last_authenticated_runtime)
 
 
-def _resume_deferred_gateway_fleet(plan: dict) -> None:
+def _gateway_runtime_is_still_alive(identity: _GatewayRuntimeIdentity) -> bool:
+    """Revalidate one exact runtime generation without trusting PID existence."""
+    try:
+        import psutil  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("psutil is required to verify gateway identity") from exc
+    try:
+        process = psutil.Process(int(identity.pid))
+        live_created_at = float(process.create_time())
+    except psutil.NoSuchProcess:
+        return False
+    except Exception as exc:
+        raise RuntimeError("could not revalidate spawned gateway runtime") from exc
+    if not math.isfinite(live_created_at) or live_created_at <= 0:
+        raise RuntimeError("spawned gateway runtime creation time is invalid")
+    return abs(live_created_at - float(identity.created_at)) <= 0.001
+
+
+def _terminate_exact_gateway_runtime(identity: _GatewayRuntimeIdentity) -> None:
+    """Terminate and drain one authenticated runtime generation leaf-first."""
+    try:
+        import psutil  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("psutil is required to terminate gateway runtime") from exc
+    try:
+        process = psutil.Process(int(identity.pid))
+        live_created_at = float(process.create_time())
+    except psutil.NoSuchProcess:
+        return
+    except Exception as exc:
+        raise RuntimeError("could not open spawned gateway runtime") from exc
+    if (
+        not math.isfinite(live_created_at)
+        or abs(live_created_at - float(identity.created_at)) > 0.001
+    ):
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=10.0)
+    except psutil.NoSuchProcess:
+        return
+    except psutil.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait()
+        except psutil.NoSuchProcess:
+            return
+    except Exception as exc:
+        raise RuntimeError("could not terminate spawned gateway runtime") from exc
+    if _gateway_runtime_is_still_alive(identity):
+        raise RuntimeError("spawned gateway runtime remained alive after termination")
+
+
+def _terminate_unready_gateway_generation(
+    process: subprocess.Popen,
+    runtime: _GatewayRuntimeIdentity | None = None,
+) -> None:
+    """Drain the authenticated runtime child, then the retained launcher."""
+    runtime_error: Exception | None = None
+    if runtime is not None:
+        try:
+            _terminate_exact_gateway_runtime(runtime)
+        except Exception as exc:
+            runtime_error = exc
+    try:
+        if process.poll() is not None:
+            process.wait()
+        else:
+            try:
+                process.terminate()
+            except Exception:
+                if process.poll() is None:
+                    process.kill()
+            process.wait()
+    finally:
+        if runtime is not None and _gateway_runtime_is_still_alive(runtime):
+            raise RuntimeError("spawned gateway runtime survived launcher cleanup")
+    if runtime_error is not None:
+        raise RuntimeError("spawned gateway runtime cleanup failed") from runtime_error
+
+
+def _spawn_and_verify_deferred_gateway_profile(
+    profile: str,
+) -> _GatewayStartupAttempt:
+    process = _spawn_deferred_gateway_profile(profile)
+    if int(process.pid) <= 0:
+        raise RuntimeError(f"gateway profile {profile!r} did not start")
+    try:
+        created_at = _spawned_gateway_created_at(process)
+    except Exception:
+        _terminate_unready_gateway_generation(process)
+        raise
+    try:
+        readiness = _wait_for_deferred_gateway_profile(profile, process, created_at)
+    except BaseException:
+        _terminate_unready_gateway_generation(process)
+        raise
+    if readiness.ready and readiness.runtime is not None:
+        return _GatewayStartupAttempt(profile, process, readiness.runtime)
+    _terminate_unready_gateway_generation(process, readiness.runtime)
+    raise RuntimeError(f"gateway profile {profile!r} did not become ready")
+
+
+def _drain_gateway_startup_attempts(
+    attempts: list[_GatewayStartupAttempt],
+) -> None:
+    """Drain every uncommitted profile attempt in reverse start order."""
+    cleanup_error: Exception | None = None
+    for attempt in reversed(attempts):
+        try:
+            _terminate_unready_gateway_generation(attempt.process, attempt.runtime)
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+    if cleanup_error is not None:
+        raise RuntimeError("gateway fleet cleanup could not be proven") from cleanup_error
+
+
+def _resume_deferred_gateway_fleet(plan: dict) -> list[_GatewayStartupAttempt]:
     """Resume only the authenticated structured fleet, idempotently."""
+    attempts: list[_GatewayStartupAttempt] = []
     running = _running_gateway_profiles()
-    for entry in plan["profiles"]:
-        profile = str(entry["name"])
-        running_pid = running.get(profile)
-        if running_pid is not None:
-            if int(running_pid) == int(entry["old_pid"]) and _profile_process_still_matches(
+    try:
+        for entry in plan["profiles"]:
+            profile = str(entry["name"])
+            if _profile_process_still_matches(
                 int(entry["old_pid"]), float(entry["created_at"])
             ):
                 raise RuntimeError(
                     f"prior gateway profile {profile!r} is still running"
                 )
-            # A different verified profile PID (or a recycled numeric PID
-            # whose creation identity does not match) is a prior successful
-            # partial-resume result. Do not start a duplicate.
-            continue
-        if _profile_process_still_matches(
-            int(entry["old_pid"]), float(entry["created_at"])
-        ):
-            raise RuntimeError(
-                f"prior gateway profile {profile!r} is still running"
-            )
-        if _spawn_deferred_gateway_profile(profile) <= 0:
-            raise RuntimeError(f"gateway profile {profile!r} did not start")
-        if not _wait_for_deferred_gateway_profile(profile):
-            raise RuntimeError(f"gateway profile {profile!r} did not become ready")
-        running = _running_gateway_profiles()
+            if profile in running:
+                raise RuntimeError(f"unrecognized running gateway profile {profile!r}")
+            attempts.append(_spawn_and_verify_deferred_gateway_profile(profile))
+            running = _running_gateway_profiles()
 
-    if plan["cold_start_if_installed"] and not plan["profiles"]:
-        if "default" not in running:
+        if plan["cold_start_if_installed"] and not plan["profiles"]:
+            if "default" in running:
+                raise RuntimeError("unrecognized running gateway profile 'default'")
             from hermes_cli import gateway_windows
 
             if gateway_windows.is_installed():
-                if _spawn_deferred_gateway_profile("default") <= 0:
-                    raise RuntimeError("default gateway did not start")
-                if not _wait_for_deferred_gateway_profile("default"):
-                    raise RuntimeError("default gateway did not become ready")
+                attempts.append(
+                    _spawn_and_verify_deferred_gateway_profile("default")
+                )
+        return attempts
+    except Exception:
+        _drain_gateway_startup_attempts(attempts)
+        raise
+
+
+def _current_operational_gateway_identity(
+    profile: str,
+) -> _GatewayRuntimeIdentity | None:
+    """Return one exact current running generation for a completed-plan replay."""
+    from hermes_cli.gateway import find_profile_gateway_processes
+
+    candidates = [
+        candidate
+        for candidate in find_profile_gateway_processes()
+        if str(candidate.profile) == profile
+    ]
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    try:
+        import psutil  # type: ignore
+
+        pid = int(candidate.pid)
+        created_at = float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
+    if (
+        pid <= 0
+        or not math.isfinite(created_at)
+        or created_at <= 0
+        or not _profile_process_still_matches(pid, created_at)
+    ):
+        return None
+    identity = _GatewayRuntimeIdentity(pid, created_at)
+    if not _gateway_runtime_ready_record_matches(Path(candidate.path), identity):
+        return None
+    return identity
+
+
+def _completed_deferred_gateway_fleet_is_operational(plan: dict) -> bool:
+    """Require stable exact running identities before accepting completed replay."""
+    expected_profiles = [str(entry["name"]) for entry in plan.get("profiles", [])]
+    if plan.get("cold_start_if_installed") and not expected_profiles:
+        try:
+            from hermes_cli import gateway_windows
+
+            if gateway_windows.is_installed():
+                expected_profiles.append("default")
+        except Exception:
+            return False
+    first: dict[str, _GatewayRuntimeIdentity] = {}
+    for profile in expected_profiles:
+        identity = _current_operational_gateway_identity(profile)
+        if identity is None:
+            return False
+        first[profile] = identity
+    for profile, identity in first.items():
+        if _current_operational_gateway_identity(profile) != identity:
+            return False
+    return True
+
+
+def _await_parent_gateway_containment() -> None:
+    """Require an explicit native-parent signal before recovery can mutate."""
+    raw_path = os.environ.pop(_DEFERRED_GATEWAY_STARTUP_GATE_ENV, None)
+    if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 32767:
+        raise RuntimeError("deferred gateway containment gate is missing")
+    gate = Path(raw_path)
+    if not gate.is_absolute():
+        raise RuntimeError("deferred gateway containment gate is invalid")
+    deadline = _time.monotonic() + 10.0
+    unreadable_since: float | None = None
+    while True:
+        try:
+            with gate.open("rb") as stream:
+                state = stream.read(6)
+                trailing = stream.read(1)
+        except OSError as exc:
+            now = _time.monotonic()
+            if unreadable_since is None:
+                unreadable_since = now
+            if now >= min(deadline, unreadable_since + 2.25):
+                raise RuntimeError(
+                    "deferred gateway containment gate is unreadable"
+                ) from exc
+            _time.sleep(0.05)
+            continue
+        unreadable_since = None
+        if not trailing and state == b"armed":
+            return
+        if trailing or state != b"wait":
+            raise RuntimeError("deferred gateway containment gate has invalid state")
+        if _time.monotonic() >= deadline:
+            raise RuntimeError("deferred gateway containment gate was not armed")
+        _time.sleep(0.05)
 
 
 def _cmd_update_resume_deferred_gateway(args, *, root: Path) -> NoReturn:
@@ -852,6 +1430,8 @@ def _cmd_update_resume_deferred_gateway(args, *, root: Path) -> NoReturn:
         print("✗ Invalid deferred gateway resume request.")
         raise SystemExit(1)
 
+    _await_parent_gateway_containment()
+
     pending_path = _deferred_gateway_plan_path(root, invocation_id)
     completed_path = _deferred_gateway_plan_path(root, invocation_id, completed=True)
     completed = _load_deferred_gateway_plan(
@@ -865,12 +1445,19 @@ def _cmd_update_resume_deferred_gateway(args, *, root: Path) -> NoReturn:
     from hermes_mcp_update_gate import marker_path, read_quiesce_lease
 
     if completed is not None and read_quiesce_lease(marker_path()) is None:
-        print("✓ Deferred gateway fleet was already resumed.")
-        raise SystemExit(0)
+        if _completed_deferred_gateway_fleet_is_operational(completed[1]):
+            print("✓ Deferred gateway fleet was already resumed.")
+            raise SystemExit(0)
+        print("✗ Deferred gateway completed state is not operational.")
+        raise SystemExit(1)
 
     update_lock = UpdateLock()
     lease: dict | None = None
     prior_owner_pid: int | None = None
+    startup_attempts: list[_GatewayStartupAttempt] = []
+    consumed_plan_raw: str | None = None
+    prepared_manifest_path: Path | None = None
+    prepared_manifest_raw: str | None = None
     success = False
     try:
         if not update_lock.acquire() or not update_lock.prove_claim():
@@ -909,7 +1496,12 @@ def _cmd_update_resume_deferred_gateway(args, *, root: Path) -> NoReturn:
                 and receipt.get("gateway_resume_deferred") is True
             ):
                 raise RuntimeError("deferred gateway receipt correlation failed")
-        if completed is None:
+        if completed is not None:
+            if not _completed_deferred_gateway_fleet_is_operational(completed[1]):
+                raise RuntimeError(
+                    "deferred gateway completed state is not operational"
+                )
+        else:
             loaded = _load_deferred_gateway_plan(
                 pending_path,
                 root=root,
@@ -919,9 +1511,20 @@ def _cmd_update_resume_deferred_gateway(args, *, root: Path) -> NoReturn:
             if loaded is None:
                 raise RuntimeError("deferred gateway plan is missing")
             raw, plan = loaded
-            _resume_deferred_gateway_fleet(plan)
+            startup_attempts = _resume_deferred_gateway_fleet(plan) or []
             if not _consume_deferred_gateway_plan(pending_path, raw):
                 raise RuntimeError("deferred gateway plan changed before consume")
+            consumed_plan_raw = raw
+            prepared_manifest_path, prepared_manifest_raw = (
+                _write_prepared_gateway_runtime_manifest(
+                    root,
+                    pending_path,
+                    invocation_id=invocation_id,
+                    lease_id=lease_id,
+                    plan_raw=raw,
+                    attempts=startup_attempts,
+                )
+            )
         success = True
     except Exception as exc:
         print(f"✗ Deferred gateway resume failed: {exc}")
@@ -936,6 +1539,35 @@ def _cmd_update_resume_deferred_gateway(args, *, root: Path) -> NoReturn:
                     if not released:
                         success = False
                         print("✗ Deferred gateway lease cleanup could not be proven.")
+                if not success and consumed_plan_raw is not None:
+                    manifest_removed = True
+                    if (
+                        prepared_manifest_path is not None
+                        and prepared_manifest_raw is not None
+                    ):
+                        try:
+                            manifest_removed = _remove_private_exact(
+                                prepared_manifest_path, prepared_manifest_raw
+                            )
+                        except Exception:
+                            manifest_removed = False
+                    restored = False
+                    if manifest_removed:
+                        try:
+                            restored = _restore_consumed_deferred_gateway_plan(
+                                pending_path, consumed_plan_raw
+                            )
+                        except Exception:
+                            restored = False
+                    if not restored:
+                        print(
+                            "✗ Deferred gateway plan restoration could not be proven."
+                        )
+                if not success and startup_attempts:
+                    try:
+                        _drain_gateway_startup_attempts(startup_attempts)
+                    except Exception:
+                        print("✗ Deferred gateway fleet cleanup could not be proven.")
                 if not success and prior_owner_pid is not None and prior_owner_pid > 0:
                     try:
                         _transfer_update_quiesce_lease(
@@ -952,7 +1584,7 @@ def _cmd_update_resume_deferred_gateway(args, *, root: Path) -> NoReturn:
         print(
             "✓ Deferred gateway fleet was already resumed."
             if completed is not None
-            else "✓ Deferred gateway fleet resumed."
+            else "✓ Deferred gateway fleet prepared for native commit."
         )
     raise SystemExit(0 if success else 1)
 

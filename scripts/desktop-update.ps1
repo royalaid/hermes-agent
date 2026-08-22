@@ -50,10 +50,40 @@ param(
     [string]$RelaunchAppPath = "",
     [string]$BridgeLeaseId = "",
     [switch]$NoUi,
-    [switch]$NoMarkerCleanup
+    [switch]$NoMarkerCleanup,
+    [switch]$TestMode,
+    [ValidateRange(0, 5000)][int]$TestDeferredGatewayPreAssignHoldMilliseconds = 0,
+    [switch]$TestDeferredGatewayAssignFailure,
+    [switch]$TestDeferredGatewayInitialKillFailure,
+    [switch]$TestDeferredGatewayNativeBoundaryFailure,
+    [ValidateRange(0, 5000)][int]$TestDeferredGatewayTargetRetentionHoldMilliseconds = 0,
+    [ValidateRange(0, 5000)][int]$TestDeferredGatewayPostTargetGateHoldMilliseconds = 0,
+    [ValidateRange(0, 5000)][int]$TestDeferredGatewayWrapperExitHoldMilliseconds = 0,
+    [ValidateSet('none', 'malformed', 'duplicate', 'wrong-path', 'wrong-filetime', 'stall')]
+    [string]$TestDeferredGatewayTargetStartFault = 'none'
 )
 
 $ErrorActionPreference = "Continue"
+if (($TestDeferredGatewayPreAssignHoldMilliseconds -gt 0 -or
+    $TestDeferredGatewayAssignFailure -or
+    $TestDeferredGatewayInitialKillFailure -or
+    $TestDeferredGatewayNativeBoundaryFailure -or
+    $TestDeferredGatewayTargetRetentionHoldMilliseconds -gt 0 -or
+    $TestDeferredGatewayPostTargetGateHoldMilliseconds -gt 0 -or
+    $TestDeferredGatewayWrapperExitHoldMilliseconds -gt 0 -or
+    $TestDeferredGatewayTargetStartFault -ne 'none') -and (-not $TestMode -or -not $NoUi)) {
+    throw 'deferred gateway containment fault controls require -TestMode and -NoUi'
+}
+# `-TestMode -NoUi` is the explicit repo test-harness boundary. Production
+# headless launches also use `-NoUi`, so that switch alone must never enable
+# inherited fault controls from an older Desktop, test runner, or parent.
+if (-not $TestMode) {
+    Get-ChildItem Env: | Where-Object {
+        $_.Name -match '^(?i:HERMES_(?:DESKTOP_UPDATE_TEST$|TEST_|SELFTEST_|FORCE_RELEASE_(?:FORCE|TEST)_|TERMINATE_|DEFERRED_GATEWAY_STARTUP_GATE$|INTERNAL_UPDATE_STAGE_TIMEOUT_SECONDS$|INTERNAL_TEST_|UPDATE_HANDOFF_))'
+    } | ForEach-Object {
+        Remove-Item -LiteralPath ("Env:{0}" -f $_.Name) -ErrorAction SilentlyContinue
+    }
+}
 # Foreground helpers: the script is spawned via `cmd start /min`, so its
 # WinForms window comes up backgrounded unless we explicitly claim focus --
 # and after the update we must hand focus TO the relaunched Desktop (a
@@ -116,6 +146,14 @@ namespace HermesHandoff {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint GetProcessId(IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool CreateHardLink(string newName, string existingName, IntPtr securityAttributes);
@@ -132,6 +170,13 @@ namespace HermesHandoff {
             }
             return job;
         }
+        public static void DisarmKillOnClose(IntPtr job) {
+            if (job == IntPtr.Zero) return;
+            var limits = new ExtendedLimits();
+            limits.BasicLimitInformation.LimitFlags = 0;
+            if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedLimits))))
+                throw new Win32Exception();
+        }
         public static void Assign(IntPtr job, IntPtr process) {
             if (!AssignProcessToJobObject(job, process)) throw new Win32Exception();
         }
@@ -143,6 +188,43 @@ namespace HermesHandoff {
                 if (!IsProcessInJob(process, job, out contained)) throw new Win32Exception();
                 return contained;
             } finally { CloseHandle(process); }
+        }
+        public static IntPtr OpenRuntimeProcess(int pid) {
+            IntPtr process = OpenProcess(0x00101000, false, (uint)pid);
+            if (process == IntPtr.Zero) throw new Win32Exception();
+            return process;
+        }
+        public static bool RuntimeProcessIsLive(IntPtr process) {
+            uint result = WaitForSingleObject(process, 0);
+            if (result == 0x00000102) return true;
+            if (result == 0x00000000) return false;
+            throw new Win32Exception();
+        }
+        public static int RuntimeProcessId(IntPtr process) {
+            uint pid = GetProcessId(process);
+            if (pid == 0 || pid > Int32.MaxValue) throw new Win32Exception();
+            return (int)pid;
+        }
+        public static bool ContainsProcessHandle(IntPtr job, IntPtr process) {
+            bool contained;
+            if (!IsProcessInJob(process, job, out contained)) throw new Win32Exception();
+            return contained;
+        }
+        public static string RuntimeCreationFileTime(IntPtr process) {
+            long creation, exit, kernel, user;
+            if (!GetProcessTimes(process, out creation, out exit, out kernel, out user))
+                throw new Win32Exception();
+            return ((ulong)creation).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+        public static string RuntimeExecutablePath(IntPtr process) {
+            uint size = 32768;
+            var path = new StringBuilder((int)size);
+            if (!QueryFullProcessImageName(process, 0, path, ref size))
+                throw new Win32Exception();
+            return path.ToString();
+        }
+        public static void CloseRuntimeProcess(IntPtr process) {
+            if (process != IntPtr.Zero) CloseHandle(process);
         }
         public static void Terminate(IntPtr job) {
             if (job != IntPtr.Zero && !TerminateJobObject(job, 8)) throw new Win32Exception();
@@ -235,6 +317,20 @@ $script:CanonicalRelaunchExe = $null
 $script:CanonicalRelaunchAppPath = $null
 $script:AttemptId = "attempt-$([Guid]::NewGuid().ToString('N'))"
 $script:InvocationId = "invocation-$([Guid]::NewGuid().ToString('N'))"
+$handoffFallbackHasher = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $handoffFallbackHash = [System.BitConverter]::ToString(
+        $handoffFallbackHasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($script:AttemptId))
+    ).Replace('-', '').ToLowerInvariant().Substring(0, 16)
+} finally {
+    $handoffFallbackHasher.Dispose()
+}
+$script:HandoffFallbackPath = Join-Path $LogDir ("desktop-update-handoff-fallback-{0}.log" -f $handoffFallbackHash)
+$script:HandoffPrimaryLogUnavailable = $false
+$script:HandoffFallbackHeaderWritten = $false
+$script:HandoffFallbackSuppressionWritten = $false
+$script:HandoffFallbackPersistenceWarningWritten = $false
+$script:HandoffFallbackMaxBytes = 131072
 $script:AckPath = Join-Path $HermesHome (".hermes-update-ack-{0}.json" -f $script:AttemptId)
 $script:RelaunchRequestPath = Join-Path $HermesHome (".hermes-update-relaunch-request-{0}.json" -f $script:AttemptId)
 $script:RelaunchRequestRaw = $null
@@ -242,6 +338,8 @@ $script:RelaunchRequestPublished = $false
 $script:RelaunchSuppressed = $false
 $script:GatewayPlanPath = Join-Path $HermesHome (".hermes-gateway-resume-{0}.json" -f $script:InvocationId)
 $script:GatewayPlanCompletedPath = Join-Path $HermesHome (".hermes-gateway-resume-{0}.completed" -f $script:InvocationId)
+$script:GatewayPlanPreparedPath = Join-Path $HermesHome (".hermes-gateway-resume-{0}.prepared" -f $script:InvocationId)
+$script:GatewayRuntimeManifestPath = Join-Path $HermesHome (".hermes-gateway-resume-{0}.prepared-runtime.json" -f $script:InvocationId)
 $script:BridgeLeaseMaxLifetimeSeconds = 1200
 $script:BridgeLeaseHandoffGraceSeconds = 90
 $script:GatewayPlanMaxLifetimeSeconds = 3960
@@ -262,9 +360,73 @@ function Get-ManagedStageTimeoutSeconds([string]$Tag) {
     }
 }
 
+function Add-HandoffLogLineWithRetry([string]$Path, [string]$Line) {
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Line + [Environment]::NewLine)
+    foreach ($delay in @(0, 25, 75, 150)) {
+        if ($delay -gt 0) { Start-Sleep -Milliseconds $delay }
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            [void]$stream.Seek(0, [System.IO.SeekOrigin]::End)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+            return $true
+        } catch {
+            # Retry only this bounded append. Raw native/PowerShell errors are
+            # not diagnostics and must never escape into the handoff surface.
+        } finally {
+            if ($stream) { $stream.Dispose() }
+        }
+    }
+    return $false
+}
+
+function Add-HandoffFallbackLine([string]$Line) {
+    try {
+        $currentLength = if (Test-Path -LiteralPath $script:HandoffFallbackPath -PathType Leaf) {
+            (Get-Item -LiteralPath $script:HandoffFallbackPath -ErrorAction Stop).Length
+        } else { 0L }
+        $lineBytes = (New-Object System.Text.UTF8Encoding($false)).GetByteCount($Line + [Environment]::NewLine)
+        if (($currentLength + $lineBytes) -le $script:HandoffFallbackMaxBytes) {
+            return Add-HandoffLogLineWithRetry $script:HandoffFallbackPath $Line
+        }
+        if (-not $script:HandoffFallbackSuppressionWritten) {
+            $script:HandoffFallbackSuppressionWritten = $true
+            [void](Add-HandoffLogLineWithRetry $script:HandoffFallbackPath (
+                "{0:yyyy-MM-ddTHH:mm:ssK} further handoff diagnostics omitted after the bounded fallback limit" -f (Get-Date)
+            ))
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Write-HandoffLog([string]$Message) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
-    try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
+    $persisted = $false
+    if (-not $script:HandoffPrimaryLogUnavailable) {
+        $persisted = Add-HandoffLogLineWithRetry $LogPath $line
+        if (-not $persisted) { $script:HandoffPrimaryLogUnavailable = $true }
+    }
+    if ($script:HandoffPrimaryLogUnavailable) {
+        if (-not $script:HandoffFallbackHeaderWritten) {
+            $script:HandoffFallbackHeaderWritten = $true
+            $persisted = Add-HandoffFallbackLine (
+                "{0:yyyy-MM-ddTHH:mm:ssK} primary handoff log unavailable; using bounded per-attempt fallback" -f (Get-Date)
+            )
+        }
+        if (-not (Add-HandoffFallbackLine $line)) { $persisted = $false }
+    }
+    if (-not $persisted -and -not $script:HandoffFallbackPersistenceWarningWritten) {
+        $script:HandoffFallbackPersistenceWarningWritten = $true
+        Write-Host 'Hermes update diagnostics could not be persisted; the updater result is unchanged.'
+    }
     Write-Host $line
     if ($script:Ui) {
         try {
@@ -688,7 +850,21 @@ function Stop-ExactSpawnedProcessTree(
             # invocation. Termination therefore reaches a shim's exact Python
             # descendants without any image-wide process matching.
             [HermesHandoff.UpdaterJob]::Terminate($JobHandle)
-            return
+            # TerminateJobObject initiates termination, but return is not the
+            # postcondition. Keep the exact private Job handle open until the
+            # kernel reports that every associated process has drained. A
+            # caller must never observe failure while a contained descendant
+            # can still mutate updater state.
+            while ($true) {
+                try {
+                    if ([HermesHandoff.UpdaterJob]::ActiveProcesses($JobHandle) -eq 0) {
+                        return
+                    }
+                } catch {
+                    # Unknown is not absence. Retain containment and retry.
+                }
+                Start-Sleep -Milliseconds 25
+            }
         } catch {
             # Fall through to the exact launcher PID only when Job Object
             # termination itself failed.
@@ -705,6 +881,192 @@ function Stop-ExactSpawnedProcessTree(
         if (-not $Process.HasExited) { $Process.Kill() }
     } catch {
         try { if (-not $Process.HasExited) { $Process.Kill() } } catch {}
+    }
+    while ($true) {
+        try {
+            if ($Process.HasExited -or
+                $Process.StartTime.ToUniversalTime().Ticks -ne $StartedAtTicks) {
+                return
+            }
+            $Process.Kill()
+        } catch {
+            # Unknown is not absence. Retain the exact Process handle and retry.
+        }
+        Start-Sleep -Milliseconds 25
+    }
+}
+
+function Get-RetainedTargetBridgeLeaseOwnerState(
+    [int]$TargetPid,
+    [System.IntPtr]$TargetHandle,
+    [string]$TargetCreationFileTime,
+    [System.IntPtr]$JobHandle
+) {
+    if (-not $script:BridgeLeaseRequired) { return 'not-required' }
+    if (@(Get-HandoffCasArtifacts $BridgeLeasePath).Count -gt 0) { return 'unreadable' }
+    if (-not (Test-Path -LiteralPath $BridgeLeasePath)) { return 'missing' }
+    $stream = $null
+    $targetExitedAfterSnapshot = $false
+    try {
+        $stream = Open-BridgeLeaseSnapshot
+        $snapshot = Read-BridgeLeaseSnapshotFromStream $stream
+        $now = Get-UnixTimeSeconds
+        if (-not $snapshot -or -not (Test-BridgeLeaseForAdoption $snapshot.Lease $now)) {
+            return 'foreign-or-invalid'
+        }
+        $ownerPid = [int64]$snapshot.Lease.owner_pid
+        if ($ownerPid -eq $PID) { return 'script' }
+        if ($TargetPid -le 0 -or $ownerPid -ne $TargetPid -or
+            $TargetHandle -eq [System.IntPtr]::Zero -or
+            $JobHandle -eq [System.IntPtr]::Zero -or
+            [string]::IsNullOrWhiteSpace($TargetCreationFileTime)) {
+            return 'foreign-or-invalid'
+        }
+        try {
+            if ([HermesHandoff.UpdaterJob]::RuntimeProcessId($TargetHandle) -ne $TargetPid -or
+                -not [HermesHandoff.UpdaterJob]::ContainsProcessHandle($JobHandle, $TargetHandle) -or
+                -not [string]::Equals(
+                    [HermesHandoff.UpdaterJob]::RuntimeCreationFileTime($TargetHandle),
+                    $TargetCreationFileTime,
+                    [StringComparison]::Ordinal
+                )) {
+                return 'foreign-or-invalid'
+            }
+            if (-not [HermesHandoff.UpdaterJob]::RuntimeProcessIsLive($TargetHandle)) {
+                $targetExitedAfterSnapshot = $true
+            }
+        } catch {
+            return 'unreadable'
+        }
+        if (-not $targetExitedAfterSnapshot) {
+            $script:BridgeLeaseTransferredPid = $TargetPid
+            return 'child'
+        }
+    } catch {
+        return 'unreadable'
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+    # The exact retained target may atomically delete its lease and exit after
+    # this function opens the delete-sharing snapshot. Reconcile only a fresh,
+    # exact namespace absence after closing that stale snapshot. Any surviving
+    # path, CAS sibling, or unreadable namespace remains fail-closed.
+    try {
+        if (@(Get-HandoffCasArtifacts $BridgeLeasePath).Count -gt 0) { return 'unreadable' }
+        if (Test-Path -LiteralPath $BridgeLeasePath -ErrorAction Stop) {
+            return 'foreign-or-invalid'
+        }
+        return 'missing'
+    } catch {
+        return 'unreadable'
+    }
+}
+
+$script:DeferredGatewayDiagnosticMaxLines = 8
+$script:DeferredGatewayDiagnosticMaxMessageChars = 480
+$script:DeferredGatewayDiagnosticMaxOutputChars = 2048
+
+function Protect-DeferredGatewayDiagnosticDetail(
+    [string]$Value,
+    [string]$StartupGate
+) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return 'no detail' }
+    $sanitized = $Value.Trim()
+    $substitutions = @(
+        [pscustomobject]@{ Value = $StartupGate; Replacement = '[STARTUP_GATE]' },
+        [pscustomobject]@{ Value = $HermesHome; Replacement = '[HERMES_HOME]' },
+        [pscustomobject]@{ Value = $InstallRoot; Replacement = '[INSTALL_ROOT]' },
+        [pscustomobject]@{ Value = $env:TEMP; Replacement = '[TEMP]' },
+        [pscustomobject]@{ Value = $script:InvocationId; Replacement = '[INVOCATION]' },
+        [pscustomobject]@{ Value = $BridgeLeaseId; Replacement = '[LEASE]' },
+        [pscustomobject]@{ Value = $script:AttemptId; Replacement = '[ATTEMPT]' }
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Value) } |
+        Sort-Object { ([string]$_.Value).Length } -Descending
+    foreach ($substitution in $substitutions) {
+        $sanitized = [regex]::Replace(
+            $sanitized,
+            [regex]::Escape([string]$substitution.Value),
+            [string]$substitution.Replacement,
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    }
+    $sanitized = [regex]::Replace(
+        $sanitized,
+        '(?i)\b(api[_-]?key|authorization|cookie|invocation(?:[_-]?id)?|lease(?:[_-]?id)?|nonce|password|secret|token)\s*([:=])\s*("[^"]*"|''[^'']*''|[^\s,;]+)',
+        '$1$2[redacted]'
+    )
+    # Any absolute path not already recognized above is machine-specific and
+    # not useful enough to justify exposing it in the user-visible handoff log.
+    $sanitized = [regex]::Replace(
+        $sanitized,
+        '(?i)(?:[a-z]:\\|\\\\)[^,;|\r\n]*',
+        '[LOCAL_PATH]'
+    )
+    $sanitized = [regex]::Replace($sanitized, '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '')
+    if ($sanitized.Length -gt $script:DeferredGatewayDiagnosticMaxMessageChars) {
+        $sanitized = $sanitized.Substring(0, $script:DeferredGatewayDiagnosticMaxMessageChars - 3) + '...'
+    }
+    return $sanitized
+}
+
+function ConvertTo-DeferredGatewayDiagnostic(
+    [string]$Line,
+    [string]$StartupGate,
+    [ValidateSet('stdout', 'stderr')][string]$Source
+) {
+    $trimmed = if ($null -eq $Line) { '' } else { $Line.Trim() }
+    $allowlist = @(
+        [pscustomobject]@{ Raw = '✓ Deferred gateway fleet was already resumed.'; Safe = 'fleet already resumed' },
+        [pscustomobject]@{ Raw = '✓ Deferred gateway fleet resumed.'; Safe = 'fleet resumed' },
+        [pscustomobject]@{ Raw = '✗ Invalid deferred gateway resume request.'; Safe = 'invalid recovery request' },
+        [pscustomobject]@{ Raw = '✗ Deferred gateway lease cleanup could not be proven.'; Safe = 'lease cleanup not proved' },
+        [pscustomobject]@{ Raw = '✗ Deferred gateway fleet cleanup could not be proven.'; Safe = 'fleet cleanup not proved' },
+        [pscustomobject]@{ Raw = 'deferred wrapper rejected its startup gate'; Safe = 'wrapper rejected startup gate' },
+        [pscustomobject]@{ Raw = 'deferred wrapper could not read its startup gate'; Safe = 'wrapper could not read startup gate' },
+        [pscustomobject]@{ Raw = 'deferred wrapper timed out before authorization'; Safe = 'wrapper authorization timed out' },
+        [pscustomobject]@{ Raw = 'deferred wrapper rejected its target request'; Safe = 'wrapper rejected target request' },
+        [pscustomobject]@{ Raw = 'deferred wrapper could not execute its target'; Safe = 'wrapper target execution failed' }
+    )
+    foreach ($entry in $allowlist) {
+        if ([string]::Equals($trimmed, $entry.Raw, [StringComparison]::Ordinal)) {
+            return [string]$entry.Safe
+        }
+    }
+    foreach ($failurePrefix in @('✗ Deferred gateway resume failed:', 'Deferred gateway resume failed:')) {
+        if ($trimmed.StartsWith($failurePrefix, [StringComparison]::Ordinal)) {
+            $detail = $trimmed.Substring($failurePrefix.Length)
+            return 'recovery failed: ' + (Protect-DeferredGatewayDiagnosticDetail $detail $StartupGate)
+        }
+    }
+    return "$Source diagnostic omitted"
+}
+
+function Add-BoundedDeferredGatewayOutput(
+    [System.Text.StringBuilder]$Builder,
+    [string]$Message
+) {
+    $remaining = $script:DeferredGatewayDiagnosticMaxOutputChars - $Builder.Length
+    if ($remaining -le 0) { return }
+    $value = $Message + [Environment]::NewLine
+    if ($value.Length -gt $remaining) { $value = $value.Substring(0, $remaining) }
+    [void]$Builder.Append($value)
+}
+
+function Write-BoundedDeferredGatewayDiagnostic(
+    [string]$Prefix,
+    [string]$Message,
+    [ref]$Count,
+    [ref]$SuppressionLogged
+) {
+    if ($Count.Value -lt ($script:DeferredGatewayDiagnosticMaxLines - 1)) {
+        Write-HandoffLog ("{0} {1}" -f $Prefix, $Message)
+        $Count.Value++
+        return
+    }
+    if (-not $SuppressionLogged.Value) {
+        Write-HandoffLog 'gateway-resume| further child diagnostics suppressed'
+        $Count.Value++
+        $SuppressionLogged.Value = $true
     }
 }
 
@@ -1469,7 +1831,7 @@ function Retire-LateRelaunchExitAcks {
 }
 
 function Focus-RelaunchedDesktop {
-    if (-not $script:RelaunchStarted -or -not $script:Win32) { return }
+    if ($NoUi -or -not $script:RelaunchStarted -or -not $script:Win32) { return }
     # Result publication MUST precede this optional 20-second window poll. The
     # relaunched Desktop starts consuming the result immediately; focus is not
     # part of the transaction proof and must never delay that durable record.
@@ -1508,6 +1870,7 @@ function Invoke-StreamedHermes(
     if (-not (Refresh-BridgeQuiesceLeaseIfOwned -Force)) {
         return @{
             Code = 8
+            ChildExitCode = $null
             Output = 'Update aborted: the bridge-quiesce lease could not be refreshed before mutation.'
             Stdout = ''
             Stderr = 'Update aborted: the bridge-quiesce lease could not be refreshed before mutation.'
@@ -1516,6 +1879,7 @@ function Invoke-StreamedHermes(
     if (-not $script:JobContainmentAvailable) {
         return @{
             Code = 8
+            ChildExitCode = $null
             Output = 'Update aborted: exact updater process containment is unavailable.'
             Stdout = ''
             Stderr = 'Update aborted: exact updater process containment is unavailable.'
@@ -1603,6 +1967,7 @@ exit $LASTEXITCODE
         Close-UpdaterContainment $jobHandle $startupGate
         return @{
             Code = 8
+            ChildExitCode = $null
             Output = 'Update aborted: the spawned Hermes updater could not be contained before execution.'
             Stdout = ''
             Stderr = 'Update aborted: the spawned Hermes updater could not be contained before execution.'
@@ -1729,7 +2094,8 @@ exit $LASTEXITCODE
     }
     $outWriter.Close(); $errWriter.Close()
     $proc.WaitForExit()
-    $code = $proc.ExitCode
+    $childExitCode = [int]$proc.ExitCode
+    $code = $childExitCode
     $drainDeadline = (Get-Date).AddSeconds($script:OuterJobDrainSeconds)
     $activeProcesses = [uint32]::MaxValue
     while ((Get-Date) -lt $drainDeadline) {
@@ -1777,11 +2143,18 @@ exit $LASTEXITCODE
         $all += "`nUpdate aborted: the contained $Tag stage did not reach a bounded, drained terminal state."
     }
     $containmentFinished = $true
-    return @{ Code = $code; Output = $all; Stdout = $stdoutText; Stderr = $errText }
+    return @{
+        Code = $code
+        ChildExitCode = $childExitCode
+        Output = $all
+        Stdout = $stdoutText
+        Stderr = $errText
+    }
     } catch {
         Write-HandoffLog "the contained $Tag process failed before a verified terminal state"
         return @{
             Code = 8
+            ChildExitCode = $null
             Output = "Update aborted: the contained $Tag process could not be monitored safely."
             Stdout = ''
             Stderr = "Update aborted: the contained $Tag process could not be monitored safely."
@@ -1892,10 +2265,699 @@ function Read-DeferredGatewayPlanProof {
     }
 }
 
+function ConvertTo-CanonicalAsciiJsonString([string]$Value) {
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int][char]$character
+        # `continue` inside a PowerShell switch advances the switch, not this
+        # foreach, which previously appended the original character again.
+        if ($code -eq 8) { [void]$builder.Append('\b'); continue }
+        if ($code -eq 9) { [void]$builder.Append('\t'); continue }
+        if ($code -eq 10) { [void]$builder.Append('\n'); continue }
+        if ($code -eq 12) { [void]$builder.Append('\f'); continue }
+        if ($code -eq 13) { [void]$builder.Append('\r'); continue }
+        if ($code -eq 34) { [void]$builder.Append('\"'); continue }
+        if ($code -eq 92) { [void]$builder.Append('\\'); continue }
+        if ($code -lt 32 -or $code -gt 126) {
+            [void]$builder.Append(('\u{0:x4}' -f $code))
+        } else {
+            [void]$builder.Append($character)
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-HmacSha256Hex([string]$Value, [string]$Key) {
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256(
+        ,([System.Text.Encoding]::UTF8.GetBytes($Key))
+    )
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+        return ([BitConverter]::ToString($hmac.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $hmac.Dispose()
+    }
+}
+
+function Read-PreparedGatewayNativeProofCore(
+    [string]$ExpectedPlanRaw,
+    [System.IntPtr]$JobHandle,
+    [bool]$RequireLiveRuntimes
+) {
+    $script:PreparedGatewayProofState = 'unreadable'
+    $runtimeHandles = New-Object 'System.Collections.Generic.List[System.IntPtr]'
+    $proofSucceeded = $false
+    try {
+        if (($RequireLiveRuntimes -and $JobHandle -eq [System.IntPtr]::Zero) -or
+            (Test-Path -LiteralPath $script:GatewayPlanPath) -or
+            (Test-Path -LiteralPath $script:GatewayPlanCompletedPath) -or
+            -not (Test-Path -LiteralPath $script:GatewayPlanPreparedPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $script:GatewayRuntimeManifestPath -PathType Leaf) -or
+            @(Get-DeferredGatewayConsumeArtifacts).Count -gt 0) {
+            $script:PreparedGatewayProofState = 'artifact-state'
+            return $null
+        }
+        $preparedRaw = [System.IO.File]::ReadAllText($script:GatewayPlanPreparedPath)
+        if (-not [string]::Equals($preparedRaw, $ExpectedPlanRaw, [StringComparison]::Ordinal)) {
+            $script:PreparedGatewayProofState = 'plan-bytes'
+            return $null
+        }
+        $manifestInfo = Get-Item -LiteralPath $script:GatewayRuntimeManifestPath -ErrorAction Stop
+        if ($manifestInfo.Length -le 0 -or $manifestInfo.Length -gt 65536) {
+            $script:PreparedGatewayProofState = 'manifest-size'
+            return $null
+        }
+        $manifestRaw = [System.IO.File]::ReadAllText($script:GatewayRuntimeManifestPath)
+        $manifest = $manifestRaw | ConvertFrom-Json -ErrorAction Stop
+        if ($manifest -isnot [pscustomobject]) {
+            $script:PreparedGatewayProofState = 'manifest-shape'
+            return $null
+        }
+        $expectedFields = @('schema_version', 'invocation_id', 'install_root', 'plan_sha256', 'runtimes', 'auth')
+        $manifestFields = @($manifest.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($manifestFields.Count -ne $expectedFields.Count) {
+            $script:PreparedGatewayProofState = 'manifest-fields'
+            return $null
+        }
+        foreach ($field in $expectedFields) {
+            if ($manifestFields -notcontains $field) {
+                $script:PreparedGatewayProofState = 'manifest-fields'
+                return $null
+            }
+        }
+        if (-not (Test-JsonInteger $manifest.schema_version) -or [int64]$manifest.schema_version -ne 1 -or
+            $manifest.invocation_id -isnot [string] -or
+            -not [string]::Equals($manifest.invocation_id, $script:InvocationId, [StringComparison]::Ordinal) -or
+            $manifest.install_root -isnot [string] -or
+            $manifest.plan_sha256 -isnot [string] -or $manifest.plan_sha256 -notmatch '^[0-9a-f]{64}$' -or
+            -not [string]::Equals($manifest.plan_sha256, (Get-Sha256Hex $ExpectedPlanRaw), [StringComparison]::Ordinal) -or
+            $manifest.auth -isnot [string] -or $manifest.auth -notmatch '^[0-9a-f]{64}$' -or
+            $manifest.runtimes -isnot [System.Array]) {
+            $script:PreparedGatewayProofState = 'manifest-core'
+            return $null
+        }
+        $manifestRoot = Get-CanonicalInstallRoot $manifest.install_root
+        if (-not $manifestRoot -or
+            -not [string]::Equals($manifestRoot, $InstallRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            $script:PreparedGatewayProofState = 'install-root'
+            return $null
+        }
+        $runtimeValues = @($manifest.runtimes)
+        if ($runtimeValues.Count -gt 64) {
+            $script:PreparedGatewayProofState = 'runtime-count'
+            return $null
+        }
+        $runtimeJson = New-Object System.Collections.Generic.List[string]
+        $lastProfile = $null
+        $lastPid = 0
+        foreach ($runtime in $runtimeValues) {
+            if ($runtime -isnot [pscustomobject]) {
+                $script:PreparedGatewayProofState = 'runtime-shape'
+                return $null
+            }
+            $runtimeFields = @($runtime.PSObject.Properties | ForEach-Object { $_.Name })
+            $expectedRuntimeFields = @(
+                'profile', 'pid', 'created_at', 'creation_file_time',
+                'executable_path', 'profile_home'
+            )
+            if ($runtimeFields.Count -ne $expectedRuntimeFields.Count) {
+                $script:PreparedGatewayProofState = 'runtime-fields'
+                return $null
+            }
+            foreach ($field in $expectedRuntimeFields) {
+                if ($runtimeFields -notcontains $field) {
+                    $script:PreparedGatewayProofState = 'runtime-fields'
+                    return $null
+                }
+            }
+            if ($runtime.profile -isnot [string] -or $runtime.profile -notmatch '^[A-Za-z0-9._-]{1,128}$' -or
+                -not (Test-JsonInteger $runtime.pid) -or [int64]$runtime.pid -le 0 -or [int64]$runtime.pid -gt [int]::MaxValue -or
+                $runtime.creation_file_time -isnot [string] -or
+                $runtime.creation_file_time -notmatch '^[1-9][0-9]{0,19}$' -or
+                $runtime.executable_path -isnot [string] -or $runtime.profile_home -isnot [string]) {
+                $script:PreparedGatewayProofState = 'runtime-core'
+                return $null
+            }
+            $createdAt = 0.0
+            try { $createdAt = [double]$runtime.created_at } catch {
+                $script:PreparedGatewayProofState = 'runtime-created'
+                return $null
+            }
+            if ([double]::IsNaN($createdAt) -or [double]::IsInfinity($createdAt) -or $createdAt -le 0) {
+                $script:PreparedGatewayProofState = 'runtime-created'
+                return $null
+            }
+            $creationFileTime = [uint64]0
+            if (-not [uint64]::TryParse(
+                [string]$runtime.creation_file_time,
+                [System.Globalization.NumberStyles]::None,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$creationFileTime
+            ) -or $creationFileTime -le 0) {
+                $script:PreparedGatewayProofState = 'runtime-filetime'
+                return $null
+            }
+            $profileCompare = if ($null -eq $lastProfile) { 1 } else {
+                [string]::CompareOrdinal([string]$runtime.profile, [string]$lastProfile)
+            }
+            if ($profileCompare -lt 0 -or ($profileCompare -eq 0 -and [int]$runtime.pid -le $lastPid)) {
+                $script:PreparedGatewayProofState = 'runtime-order'
+                return $null
+            }
+            $lastProfile = [string]$runtime.profile
+            $lastPid = [int]$runtime.pid
+            $expectedProfileHome = if ($runtime.profile -eq 'default') {
+                $HermesHome
+            } else {
+                Join-Path (Join-Path $HermesHome 'profiles') $runtime.profile
+            }
+            $profileHome = (Resolve-Path -LiteralPath $runtime.profile_home -ErrorAction Stop).ProviderPath
+            $profileHome = [System.IO.Path]::GetFullPath($profileHome).TrimEnd([char[]]@('\', '/'))
+            $expectedProfileHome = [System.IO.Path]::GetFullPath($expectedProfileHome).TrimEnd([char[]]@('\', '/'))
+            if (-not [string]::Equals($profileHome, $expectedProfileHome, [StringComparison]::OrdinalIgnoreCase)) {
+                $script:PreparedGatewayProofState = 'profile-home'
+                return $null
+            }
+            $executablePath = (Resolve-Path -LiteralPath $runtime.executable_path -ErrorAction Stop).ProviderPath
+            $executablePath = [System.IO.Path]::GetFullPath($executablePath)
+            $installPrefix = $InstallRoot.TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
+            if (-not $executablePath.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                $script:PreparedGatewayProofState = 'executable-scope'
+                return $null
+            }
+            if ($RequireLiveRuntimes) {
+                $runtimeHandle = [HermesHandoff.UpdaterJob]::OpenRuntimeProcess([int]$runtime.pid)
+                $runtimeHandles.Add($runtimeHandle)
+                if (-not [HermesHandoff.UpdaterJob]::RuntimeProcessIsLive($runtimeHandle) -or
+                    -not [HermesHandoff.UpdaterJob]::ContainsProcessHandle($JobHandle, $runtimeHandle)) {
+                    $script:PreparedGatewayProofState = 'job-membership'
+                    return $null
+                }
+                $liveCreationFileTime = [HermesHandoff.UpdaterJob]::RuntimeCreationFileTime($runtimeHandle)
+                if (-not [string]::Equals(
+                    $liveCreationFileTime,
+                    [string]$runtime.creation_file_time,
+                    [StringComparison]::Ordinal
+                )) {
+                    $script:PreparedGatewayProofState = 'runtime-generation'
+                    return $null
+                }
+                $liveExecutablePath = [System.IO.Path]::GetFullPath(
+                    [HermesHandoff.UpdaterJob]::RuntimeExecutablePath($runtimeHandle)
+                )
+                if (-not [string]::Equals(
+                    $liveExecutablePath,
+                    $executablePath,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $script:PreparedGatewayProofState = 'runtime-executable'
+                    return $null
+                }
+                $liveCreatedAt = [Math]::Round(($creationFileTime / 10000000.0) - 11644473600.0, 2)
+                if ([Math]::Abs($liveCreatedAt - $createdAt) -gt 0.001) {
+                    $script:PreparedGatewayProofState = 'runtime-generation'
+                    return $null
+                }
+                $runtimeStatusPath = Join-Path $profileHome 'gateway_state.json'
+                $runtimeStatus = [System.IO.File]::ReadAllText($runtimeStatusPath) | ConvertFrom-Json -ErrorAction Stop
+                if ($runtimeStatus -isnot [pscustomobject] -or
+                    $runtimeStatus.kind -ne 'hermes-gateway' -or $runtimeStatus.gateway_state -ne 'running' -or
+                    -not (Test-JsonInteger $runtimeStatus.pid) -or [int64]$runtimeStatus.pid -ne [int64]$runtime.pid -or
+                    -not (Test-JsonInteger $runtimeStatus.start_time) -or
+                    [int64]$runtimeStatus.start_time -ne [int64][Math]::Round($createdAt * 100) -or
+                    $runtimeStatus.hermes_home -isnot [string]) {
+                    $script:PreparedGatewayProofState = 'runtime-status'
+                    return $null
+                }
+                $statusHome = (Resolve-Path -LiteralPath $runtimeStatus.hermes_home -ErrorAction Stop).ProviderPath
+                $statusHome = [System.IO.Path]::GetFullPath($statusHome).TrimEnd([char[]]@('\', '/'))
+                if (-not [string]::Equals($statusHome, $profileHome, [StringComparison]::OrdinalIgnoreCase)) {
+                    $script:PreparedGatewayProofState = 'runtime-status-home'
+                    return $null
+                }
+            }
+            $createdText = $createdAt.ToString('0.0#', [System.Globalization.CultureInfo]::InvariantCulture)
+            $runtimeJson.Add(
+                '{"created_at":' + $createdText +
+                ',"creation_file_time":' + (ConvertTo-CanonicalAsciiJsonString ([string]$runtime.creation_file_time)) +
+                ',"executable_path":' + (ConvertTo-CanonicalAsciiJsonString ([string]$runtime.executable_path)) +
+                ',"pid":' + ([int]$runtime.pid).ToString([System.Globalization.CultureInfo]::InvariantCulture) +
+                ',"profile":' + (ConvertTo-CanonicalAsciiJsonString ([string]$runtime.profile)) +
+                ',"profile_home":' + (ConvertTo-CanonicalAsciiJsonString ([string]$runtime.profile_home)) + '}'
+            )
+        }
+        if ($RequireLiveRuntimes) {
+            # The terminated wrapper can remain in Job accounting for a short
+            # native teardown edge after WaitForExit. Wait only for that bounded
+            # decrement; an unauthorized live member keeps the proof failed.
+            $memberCountDeadline = (Get-Date).AddMilliseconds(750)
+            do {
+                $activeRuntimeCount = [HermesHandoff.UpdaterJob]::ActiveProcesses($JobHandle)
+                if ($activeRuntimeCount -eq [uint32]$runtimeValues.Count) { break }
+                Start-Sleep -Milliseconds 25
+            } while ((Get-Date) -lt $memberCountDeadline)
+            if ($activeRuntimeCount -ne [uint32]$runtimeValues.Count) {
+                $script:PreparedGatewayProofState = 'job-member-count'
+                return $null
+            }
+        }
+        $unsigned = '{"install_root":' + (ConvertTo-CanonicalAsciiJsonString ([string]$manifest.install_root)) +
+            ',"invocation_id":' + (ConvertTo-CanonicalAsciiJsonString ([string]$manifest.invocation_id)) +
+            ',"plan_sha256":' + (ConvertTo-CanonicalAsciiJsonString ([string]$manifest.plan_sha256)) +
+            ',"runtimes":[' + ([string]::Join(',', $runtimeJson.ToArray())) + '],"schema_version":1}'
+        if ($TestMode -and
+            [System.IO.Path]::IsPathRooted($env:HERMES_TEST_MANIFEST_UNSIGNED_CAPTURE)) {
+            [System.IO.File]::WriteAllText(
+                ($env:HERMES_TEST_MANIFEST_UNSIGNED_CAPTURE + '.native'),
+                $unsigned,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+        $expectedAuth = Get-HmacSha256Hex $unsigned $BridgeLeaseId
+        if (-not [string]::Equals($expectedAuth, [string]$manifest.auth, [StringComparison]::Ordinal)) {
+            $script:PreparedGatewayProofState = 'manifest-auth'
+            return $null
+        }
+        $script:PreparedGatewayProofState = 'valid'
+        $proof = [pscustomobject]@{
+            PreparedRaw = $preparedRaw
+            ManifestRaw = $manifestRaw
+            Runtimes = $runtimeValues
+            RuntimeHandles = @($runtimeHandles.ToArray())
+        }
+        $proofSucceeded = $true
+        return $proof
+    } catch {
+        return $null
+    } finally {
+        if (-not $proofSucceeded) {
+            foreach ($runtimeHandle in $runtimeHandles) {
+                [HermesHandoff.UpdaterJob]::CloseRuntimeProcess($runtimeHandle)
+            }
+        }
+    }
+}
+
+function Read-AuthenticatedPreparedGatewayState([string]$ExpectedPlanRaw) {
+    # This proof authenticates durable bytes and canonical scope only. It is
+    # intentionally independent of runtime liveness so a failed, already-
+    # drained attempt can still restore its exact pending plan safely.
+    return Read-PreparedGatewayNativeProofCore `
+        $ExpectedPlanRaw ([System.IntPtr]::Zero) $false
+}
+
+function Read-PreparedGatewayNativeCommitProof(
+    [string]$ExpectedPlanRaw,
+    [System.IntPtr]$JobHandle
+) {
+    # Commit authority additionally requires every authenticated runtime to be
+    # live, exact-generation, in the private Job, and the complete Job member
+    # set at this final native boundary.
+    return Read-PreparedGatewayNativeProofCore $ExpectedPlanRaw $JobHandle $true
+}
+
+function Restore-PreparedGatewayPlanExact([string]$ExpectedPlanRaw) {
+    try {
+        if ((Test-Path -LiteralPath $script:GatewayPlanPath) -or
+            (Test-Path -LiteralPath $script:GatewayPlanCompletedPath) -or
+            -not (Test-Path -LiteralPath $script:GatewayPlanPreparedPath -PathType Leaf) -or
+            -not [string]::Equals(
+                [System.IO.File]::ReadAllText($script:GatewayPlanPreparedPath),
+                $ExpectedPlanRaw,
+                [StringComparison]::Ordinal
+            )) {
+            return $false
+        }
+        [HermesHandoff.UpdaterJob]::HardLink($script:GatewayPlanPath, $script:GatewayPlanPreparedPath)
+        if (-not [string]::Equals(
+            [System.IO.File]::ReadAllText($script:GatewayPlanPath),
+            $ExpectedPlanRaw,
+            [StringComparison]::Ordinal
+        )) { return $false }
+        Remove-Item -LiteralPath $script:GatewayPlanPreparedPath -Force -ErrorAction Stop
+        return -not (Test-Path -LiteralPath $script:GatewayPlanPreparedPath) -and
+            [string]::Equals([System.IO.File]::ReadAllText($script:GatewayPlanPath), $ExpectedPlanRaw, [StringComparison]::Ordinal)
+    } catch {
+        return $false
+    }
+}
+
+function Commit-PreparedGatewayPlanExact([string]$ExpectedPlanRaw, [string]$ExpectedManifestRaw) {
+    $moved = $false
+    try {
+        if ((Test-Path -LiteralPath $script:GatewayPlanPath) -or
+            (Test-Path -LiteralPath $script:GatewayPlanCompletedPath) -or
+            -not [string]::Equals([System.IO.File]::ReadAllText($script:GatewayPlanPreparedPath), $ExpectedPlanRaw, [StringComparison]::Ordinal) -or
+            -not [string]::Equals([System.IO.File]::ReadAllText($script:GatewayRuntimeManifestPath), $ExpectedManifestRaw, [StringComparison]::Ordinal)) {
+            return $false
+        }
+        [System.IO.File]::Move($script:GatewayPlanPreparedPath, $script:GatewayPlanCompletedPath)
+        $moved = $true
+        if (-not [string]::Equals([System.IO.File]::ReadAllText($script:GatewayPlanCompletedPath), $ExpectedPlanRaw, [StringComparison]::Ordinal)) {
+            throw 'prepared gateway plan changed during native commit'
+        }
+        Remove-Item -LiteralPath $script:GatewayRuntimeManifestPath -Force -ErrorAction Stop
+        if ((Test-Path -LiteralPath $script:GatewayRuntimeManifestPath) -or
+            -not [string]::Equals([System.IO.File]::ReadAllText($script:GatewayPlanCompletedPath), $ExpectedPlanRaw, [StringComparison]::Ordinal)) {
+            throw 'prepared gateway runtime manifest could not be retired'
+        }
+        return $true
+    } catch {
+        if ($moved -and (Test-Path -LiteralPath $script:GatewayPlanCompletedPath -PathType Leaf)) {
+            try {
+                if ([string]::Equals([System.IO.File]::ReadAllText($script:GatewayPlanCompletedPath), $ExpectedPlanRaw, [StringComparison]::Ordinal)) {
+                    if (-not (Test-Path -LiteralPath $script:GatewayPlanPreparedPath)) {
+                        [System.IO.File]::Move($script:GatewayPlanCompletedPath, $script:GatewayPlanPreparedPath)
+                    } else {
+                        Remove-Item -LiteralPath $script:GatewayPlanCompletedPath -Force -ErrorAction Stop
+                    }
+                }
+            } catch {}
+        }
+        return $false
+    }
+}
+
+function Restore-PreparedGatewayAttemptAfterNativeFailure(
+    [string]$ExpectedPlanRaw,
+    [AllowEmptyString()][string]$ExpectedManifestRaw
+) {
+    $restoredPending = Restore-PreparedGatewayPlanExact $ExpectedPlanRaw
+    $manifestRetired = -not (Test-Path -LiteralPath $script:GatewayRuntimeManifestPath)
+    if (-not $manifestRetired -and -not [string]::IsNullOrEmpty($ExpectedManifestRaw)) {
+        try {
+            $manifestStillExact = [string]::Equals(
+                [System.IO.File]::ReadAllText($script:GatewayRuntimeManifestPath),
+                $ExpectedManifestRaw,
+                [StringComparison]::Ordinal
+            )
+            if ($manifestStillExact) {
+                Remove-Item -LiteralPath $script:GatewayRuntimeManifestPath -Force -ErrorAction Stop
+                $manifestRetired = -not (Test-Path -LiteralPath $script:GatewayRuntimeManifestPath)
+            }
+        } catch {
+            $manifestRetired = $false
+        }
+    }
+    return $restoredPending -and $manifestRetired -and
+        -not (Test-Path -LiteralPath $script:GatewayPlanPreparedPath) -and
+        @(Get-DeferredGatewayConsumeArtifacts).Count -eq 0
+}
+
+function Restore-AuthenticatedPreparedGatewayAttemptAfterNativeFailure(
+    [string]$ExpectedPlanRaw
+) {
+    # A child can fail before consuming the pending plan or can restore it
+    # itself. Treat only the exact original pending bytes with no remaining
+    # prepared protocol artifacts as already restored.
+    try {
+        if ((Test-Path -LiteralPath $script:GatewayPlanPath -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $script:GatewayPlanPreparedPath) -and
+            -not (Test-Path -LiteralPath $script:GatewayRuntimeManifestPath) -and
+            -not (Test-Path -LiteralPath $script:GatewayPlanCompletedPath) -and
+            @(Get-DeferredGatewayConsumeArtifacts).Count -eq 0 -and
+            [string]::Equals(
+                [System.IO.File]::ReadAllText($script:GatewayPlanPath),
+                $ExpectedPlanRaw,
+                [StringComparison]::Ordinal
+            )) {
+            return $true
+        }
+    } catch {}
+
+    # Once the Job is drained, runtime liveness is expected to be false. Use
+    # only authenticated durable bytes as rollback authority; never infer
+    # authority from a dead PID, a path, or an unauthenticated manifest.
+    $authenticatedState = Read-AuthenticatedPreparedGatewayState $ExpectedPlanRaw
+    if (-not $authenticatedState) { return $false }
+    return Restore-PreparedGatewayAttemptAfterNativeFailure `
+        $ExpectedPlanRaw ([string]$authenticatedState.ManifestRaw)
+}
+
+function Remove-DeferredGatewayStartupGateExact([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $true }
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+        $parent = Split-Path -Parent $Path
+        $leaf = Split-Path -Leaf $Path
+        $artifacts = @(
+            [System.IO.Directory]::EnumerateFiles($parent, "$leaf.next-*")
+            [System.IO.Directory]::EnumerateFiles($parent, "$leaf.previous-*")
+        )
+        return -not (Test-Path -LiteralPath $Path) -and $artifacts.Count -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function New-DeferredGatewayStartupGate {
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+        $path = Join-Path ([System.IO.Path]::GetTempPath()) (
+            "hermes-deferred-gateway-start-{0}-{1}.gate" -f $PID, [Guid]::NewGuid().ToString('N')
+        )
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $path,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                ([System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete)
+            )
+            $bytes = $encoding.GetBytes('wait')
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+            return $path
+        } catch [System.IO.IOException] {
+            if ($attempt -ge 3) { throw }
+        } finally {
+            if ($stream) { $stream.Dispose() }
+        }
+    }
+    throw 'the deferred gateway startup gate could not be created exclusively'
+}
+
+function Set-DeferredGatewayStartupGateStateExact(
+    [string]$Path,
+    [string]$Expected,
+    [ValidateSet('armed', 'abort')][string]$State
+) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        ($Expected -ne 'wait' -and $Expected -ne 'armed')) {
+        throw 'the deferred gateway startup gate transition is invalid'
+    }
+    $snapshot = $null
+    $shadow = "$Path.next-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $previous = "$Path.previous-$PID-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        $snapshot = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete)
+        )
+        if ($snapshot.Length -le 0 -or $snapshot.Length -gt 16) {
+            throw 'the deferred gateway startup gate is malformed'
+        }
+        $bytes = New-Object byte[] ([int]$snapshot.Length)
+        $count = $snapshot.Read($bytes, 0, $bytes.Length)
+        if ($count -ne $bytes.Length) {
+            throw 'the deferred gateway startup gate is unreadable'
+        }
+        $raw = [System.Text.Encoding]::UTF8.GetString($bytes)
+        if (-not [string]::Equals($raw, $Expected, [StringComparison]::Ordinal)) {
+            throw 'the deferred gateway startup gate changed before transition'
+        }
+
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        $writer = [System.IO.File]::Open(
+            $shadow,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            $nextBytes = $encoding.GetBytes($State)
+            $writer.Write($nextBytes, 0, $nextBytes.Length)
+            $writer.Flush($true)
+        } finally {
+            $writer.Dispose()
+        }
+
+        # The child polls with a short-lived read handle. Retry only sharing
+        # collisions; every other native failure remains fail-closed.
+        $snapshot.Dispose()
+        $snapshot = $null
+        $replaceDeadline = (Get-Date).AddSeconds(2)
+        while ($true) {
+            try {
+                [System.IO.File]::Replace($shadow, $Path, $previous, $true)
+                break
+            } catch [System.IO.IOException] {
+                if ((Get-Date) -ge $replaceDeadline) { throw }
+                Start-Sleep -Milliseconds 25
+            }
+        }
+        if (-not [string]::Equals(
+            [System.IO.File]::ReadAllText($previous, [System.Text.Encoding]::UTF8),
+            $Expected,
+            [StringComparison]::Ordinal
+        ) -or -not [string]::Equals(
+            [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8),
+            $State,
+            [StringComparison]::Ordinal
+        )) {
+            throw 'the deferred gateway startup gate transition could not be proved'
+        }
+        Remove-Item -LiteralPath $previous -Force -ErrorAction Stop
+    } finally {
+        if ($snapshot) { $snapshot.Dispose() }
+        if (Test-Path -LiteralPath $shadow) {
+            Remove-Item -LiteralPath $shadow -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $previous) {
+            Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Stop-UnassignedDeferredGatewayResumeAndProve(
+    [System.Diagnostics.Process]$Process,
+    [int64]$StartedAtTicks,
+    [string]$StartupGate,
+    [switch]$SkipInitialKill
+) {
+    if (-not $Process) { return $true }
+    try {
+        if ($Process.HasExited -or
+            $Process.StartTime.ToUniversalTime().Ticks -ne $StartedAtTicks) {
+            return $true
+        }
+    } catch {
+        return $false
+    }
+
+    try {
+        Set-DeferredGatewayStartupGateStateExact $StartupGate 'wait' 'abort'
+    } catch {
+        # Keep the exact wait file in place. Missing/malformed/inaccessible
+        # state is never converted into authorization to spawn a writer.
+    }
+
+    if (-not $SkipInitialKill) {
+        try {
+            $Process.Kill()
+            $Process.WaitForExit()
+        } catch {}
+    }
+
+    $deadline = (Get-Date).AddSeconds(11)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            if ($Process.HasExited) { return $true }
+            if ($Process.StartTime.ToUniversalTime().Ticks -ne $StartedAtTicks) { return $true }
+        } catch {
+            return $false
+        }
+        Start-Sleep -Milliseconds 25
+    }
+
+    try {
+        if (-not $Process.HasExited -and
+            $Process.StartTime.ToUniversalTime().Ticks -eq $StartedAtTicks) {
+            $Process.Kill()
+            $Process.WaitForExit()
+        }
+        return $Process.HasExited
+    } catch {
+        return $false
+    }
+}
+
+function Open-DeferredGatewayTargetStartFrame(
+    [string]$Line,
+    [string]$ExpectedExecutable,
+    [System.IntPtr]$JobHandle
+) {
+    $targetHandle = [System.IntPtr]::Zero
+    try {
+        $frame = $Line | ConvertFrom-Json -ErrorAction Stop
+        if ($frame -isnot [pscustomobject]) { return $false }
+        $expected = @(
+            'schema_version', 'event', 'target_pid',
+            'creation_file_time', 'executable_path'
+        )
+        $names = @($frame.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($names.Count -ne $expected.Count) { return $false }
+        foreach ($name in $expected) { if ($names -notcontains $name) { return $false } }
+        if (-not (Test-JsonInteger $frame.schema_version) -or [int64]$frame.schema_version -ne 1 -or
+            $frame.event -isnot [string] -or $frame.event -ne 'deferred-gateway-target-started' -or
+            -not (Test-JsonInteger $frame.target_pid) -or [int64]$frame.target_pid -le 0 -or
+            [int64]$frame.target_pid -gt [int]::MaxValue -or
+            $frame.creation_file_time -isnot [string] -or
+            $frame.creation_file_time -notmatch '^[1-9][0-9]{0,19}$' -or
+            $frame.executable_path -isnot [string] -or
+            $JobHandle -eq [System.IntPtr]::Zero) {
+            return $null
+        }
+        $expectedPath = [System.IO.Path]::GetFullPath(
+            (Resolve-Path -LiteralPath $ExpectedExecutable -ErrorAction Stop).ProviderPath
+        )
+        $framePath = [System.IO.Path]::GetFullPath(
+            (Resolve-Path -LiteralPath ([string]$frame.executable_path) -ErrorAction Stop).ProviderPath
+        )
+        if (-not [string]::Equals($framePath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            return $null
+        }
+        $targetPid = [int]$frame.target_pid
+        # The wrapper retains its Process handle until this parent responds on
+        # the target gate. That pins the process object while this exact handle
+        # is opened, preventing PID reuse between the frame and native proof.
+        $targetHandle = [HermesHandoff.UpdaterJob]::OpenRuntimeProcess($targetPid)
+        if ([HermesHandoff.UpdaterJob]::RuntimeProcessId($targetHandle) -ne $targetPid -or
+            -not [HermesHandoff.UpdaterJob]::RuntimeProcessIsLive($targetHandle) -or
+            -not [HermesHandoff.UpdaterJob]::ContainsProcessHandle($JobHandle, $targetHandle) -or
+            -not [string]::Equals(
+                [HermesHandoff.UpdaterJob]::RuntimeCreationFileTime($targetHandle),
+                [string]$frame.creation_file_time,
+                [StringComparison]::Ordinal
+            )) {
+            return $null
+        }
+        $livePath = [System.IO.Path]::GetFullPath(
+            [HermesHandoff.UpdaterJob]::RuntimeExecutablePath($targetHandle)
+        )
+        if (-not [string]::Equals($livePath, $expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($livePath, $framePath, [StringComparison]::OrdinalIgnoreCase)) {
+            return $null
+        }
+        $retainedHandle = $targetHandle
+        $targetHandle = [System.IntPtr]::Zero
+        return [pscustomobject]@{
+            Pid = $targetPid
+            Handle = $retainedHandle
+            CreationFileTime = [string]$frame.creation_file_time
+            ExecutablePath = $livePath
+        }
+    } catch {
+        return $null
+    } finally {
+        if ($targetHandle -ne [System.IntPtr]::Zero) {
+            [HermesHandoff.UpdaterJob]::CloseRuntimeProcess($targetHandle)
+        }
+    }
+}
+
 function Test-DeferredGatewayAdoptionFrame(
     [string]$Line,
-    [System.Diagnostics.Process]$Process,
-    [int64]$StartedAtTicks
+    [int]$ExpectedTargetPid,
+    [System.IntPtr]$TargetHandle,
+    [string]$TargetCreationFileTime,
+    [System.IntPtr]$JobHandle
 ) {
     try {
         $frame = $Line | ConvertFrom-Json -ErrorAction Stop
@@ -1908,13 +2970,18 @@ function Test-DeferredGatewayAdoptionFrame(
             $frame.event -isnot [string] -or $frame.event -ne 'deferred-gateway-lease-adopted' -or
             $frame.invocation_id -isnot [string] -or
             -not [string]::Equals($frame.invocation_id, $script:InvocationId, [StringComparison]::Ordinal) -or
-            -not (Test-JsonInteger $frame.owner_pid) -or [int64]$frame.owner_pid -ne $Process.Id) {
+            -not (Test-JsonInteger $frame.owner_pid) -or [int64]$frame.owner_pid -ne $ExpectedTargetPid -or
+            $TargetHandle -eq [System.IntPtr]::Zero -or $JobHandle -eq [System.IntPtr]::Zero -or
+            [HermesHandoff.UpdaterJob]::RuntimeProcessId($TargetHandle) -ne $ExpectedTargetPid -or
+            -not [HermesHandoff.UpdaterJob]::ContainsProcessHandle($JobHandle, $TargetHandle) -or
+            -not [string]::Equals(
+                [HermesHandoff.UpdaterJob]::RuntimeCreationFileTime($TargetHandle),
+                $TargetCreationFileTime,
+                [StringComparison]::Ordinal
+            )) {
             return $false
         }
-        # The process can adopt, clear, and exit before ReadLineAsync delivers
-        # this flushed frame. The Process object still owns the exact kernel
-        # handle; its captured creation ticks remain authoritative after exit.
-        return $Process.StartTime.ToUniversalTime().Ticks -eq $StartedAtTicks
+        return $true
     } catch {
         return $false
     }
@@ -1936,6 +3003,7 @@ function Invoke-DeferredGatewayResume(
             Output = 'Gateway recovery was not started because its authenticated fleet plan is missing, expired, or malformed.'
             Stdout = ''
             Stderr = 'Gateway recovery was not started because its authenticated fleet plan is missing, expired, or malformed.'
+            PendingPlanVerified = $false
         }
     }
     if (-not $script:BridgeLeaseOwned -or
@@ -1945,6 +3013,7 @@ function Invoke-DeferredGatewayResume(
             Output = 'Gateway recovery was not started because the returned bridge-quiesce lease could not be proved.'
             Stdout = ''
             Stderr = 'Gateway recovery was not started because the returned bridge-quiesce lease could not be proved.'
+            PendingPlanVerified = [bool]($initialPlan.Source -eq 'pending')
         }
     }
 
@@ -1957,21 +3026,300 @@ function Invoke-DeferredGatewayResume(
     $cleanupObserved = $false
     $adoptionFrameObserved = $false
     $adoptionFrameInvalid = $false
-    $meaningfulStdoutSeen = $false
+    $targetStartFrameObserved = $false
+    $targetStartFrameInvalid = $false
+    $stdoutProtocolPhase = 'target-start'
     $leaseLost = $false
     $timedOut = $false
+    $jobHandle = [System.IntPtr]::Zero
+    $jobAssigned = $false
+    $jobMembershipProved = $false
+    $containedTreeDrained = $false
+    $startupGate = ''
+    $targetGate = ''
+    $retainedTargetHandle = [System.IntPtr]::Zero
+    $retainedTargetPid = 0
+    $retainedTargetCreationFileTime = ''
+    $recoveryCommitted = $false
+    $retainedRuntimeHandles = @()
+    $unassignedChildDeathProved = $false
+    $diagnosticLinesLogged = 0
+    $diagnosticSuppressionLogged = $false
     try {
         # Windows venv python.exe can be a redirector process whose child runs
         # Python. Launch the canonical base interpreter exactly as CPython's
         # multiprocessing module does, so the retained Process handle, adoption
         # frame PID, and lease owner all identify one generation.
         $pythonLaunch = Resolve-ManagedVenvPythonLaunch $Exe
+        $wrapperScript = @'
+$ErrorActionPreference = 'Stop'
+$gate = $env:HERMES_DEFERRED_GATEWAY_STARTUP_GATE
+if ([string]::IsNullOrWhiteSpace($gate) -or -not [System.IO.Path]::IsPathRooted($gate)) {
+    [Console]::Error.WriteLine('deferred wrapper rejected its startup gate')
+    exit 13
+}
+$testCapture = $env:HERMES_INTERNAL_TEST_DEFERRED_GATEWAY_CONTAINMENT_CAPTURE
+if (-not [string]::IsNullOrWhiteSpace($testCapture)) {
+    try {
+        [System.IO.File]::AppendAllText(
+            $testCapture,
+            "waiting:${PID}:$([System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks)" + [Environment]::NewLine
+        )
+    } catch {}
+}
+$deadline = (Get-Date).AddSeconds(15)
+$unreadableSince = $null
+while ((Get-Date) -lt $deadline) {
+    try {
+        $stream = [System.IO.File]::Open(
+            $gate,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+        )
+        try {
+            if ($stream.Length -le 0 -or $stream.Length -gt 16) {
+                [Console]::Error.WriteLine('deferred wrapper rejected its startup gate')
+                exit 13
+            }
+            $bytes = New-Object byte[] ([int]$stream.Length)
+            if ($stream.Read($bytes, 0, $bytes.Length) -ne $bytes.Length) {
+                [Console]::Error.WriteLine('deferred wrapper could not read its startup gate')
+                exit 13
+            }
+            $state = [System.Text.Encoding]::UTF8.GetString($bytes)
+        } finally {
+            $stream.Dispose()
+        }
+        $unreadableSince = $null
+    } catch [System.IO.IOException] {
+        if (-not $unreadableSince) { $unreadableSince = Get-Date }
+        if ((Get-Date) -ge $deadline -or
+            (Get-Date) -ge $unreadableSince.AddMilliseconds(2250)) {
+            [Console]::Error.WriteLine('deferred wrapper could not read its startup gate')
+            exit 13
+        }
+        Start-Sleep -Milliseconds 25
+        continue
+    } catch [System.UnauthorizedAccessException] {
+        if (-not $unreadableSince) { $unreadableSince = Get-Date }
+        if ((Get-Date) -ge $deadline -or
+            (Get-Date) -ge $unreadableSince.AddMilliseconds(2250)) {
+            [Console]::Error.WriteLine('deferred wrapper could not read its startup gate')
+            exit 13
+        }
+        Start-Sleep -Milliseconds 25
+        continue
+    } catch {
+        [Console]::Error.WriteLine('deferred wrapper rejected its startup gate')
+        exit 13
+    }
+    if ([string]::Equals($state, 'armed', [StringComparison]::Ordinal)) { break }
+    if ([string]::Equals($state, 'abort', [StringComparison]::Ordinal) -and
+        $env:HERMES_INTERNAL_TEST_DEFERRED_GATEWAY_IGNORE_ABORT -eq '1') {
+        Start-Sleep -Milliseconds 25
+        continue
+    }
+    if (-not [string]::Equals($state, 'wait', [StringComparison]::Ordinal)) {
+        [Console]::Error.WriteLine('deferred wrapper rejected its startup gate')
+        exit 13
+    }
+    Start-Sleep -Milliseconds 25
+}
+if (-not [string]::Equals($state, 'armed', [StringComparison]::Ordinal)) {
+    [Console]::Error.WriteLine('deferred wrapper timed out before authorization')
+    exit 13
+}
+try {
+    $request = $env:HERMES_INTERNAL_DEFERRED_GATEWAY_REQUEST | ConvertFrom-Json -ErrorAction Stop
+    $program = [string]$request.program
+    $argumentLine = [string]$request.argument_line
+    $targetGate = [string]$request.target_gate
+    $targetStartFault = [string]$request.target_start_fault
+    $wrapperExitHoldMilliseconds = [int]$request.wrapper_exit_hold_ms
+    $requestFields = @($request.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($requestFields.Count -ne 5 -or $requestFields -notcontains 'program' -or
+        $requestFields -notcontains 'argument_line' -or
+        $requestFields -notcontains 'target_gate' -or
+        $requestFields -notcontains 'target_start_fault' -or
+        $requestFields -notcontains 'wrapper_exit_hold_ms' -or
+        [string]::IsNullOrWhiteSpace($program) -or
+        -not [System.IO.Path]::IsPathRooted($program) -or
+        [string]::IsNullOrWhiteSpace($targetGate) -or
+        -not [System.IO.Path]::IsPathRooted($targetGate) -or
+        $wrapperExitHoldMilliseconds -lt 0 -or $wrapperExitHoldMilliseconds -gt 5000 -or
+        $targetStartFault -notin @('none', 'malformed', 'duplicate', 'wrong-path', 'wrong-filetime', 'stall')) {
+        [Console]::Error.WriteLine('deferred wrapper rejected its target request')
+        exit 13
+    }
+    Remove-Item Env:HERMES_INTERNAL_DEFERRED_GATEWAY_REQUEST -ErrorAction SilentlyContinue
+    $targetInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $targetInfo.FileName = $program
+    $targetInfo.Arguments = $argumentLine
+    $targetInfo.WorkingDirectory = [Environment]::CurrentDirectory
+    $targetInfo.UseShellExecute = $false
+    $targetInfo.CreateNoWindow = $true
+    $targetInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $targetInfo.RedirectStandardOutput = $true
+    $targetInfo.RedirectStandardError = $true
+    $targetInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $targetInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $targetInfo.EnvironmentVariables['HERMES_DEFERRED_GATEWAY_STARTUP_GATE'] = $targetGate
+    $targetInfo.EnvironmentVariables.Remove('HERMES_INTERNAL_DEFERRED_GATEWAY_REQUEST')
+    $targetInfo.EnvironmentVariables.Remove('HERMES_INTERNAL_TEST_DEFERRED_GATEWAY_IGNORE_ABORT')
+    $target = [System.Diagnostics.Process]::Start($targetInfo)
+    if (-not $target) { exit 13 }
+    try {
+        $creationFileTime = $target.StartTime.ToUniversalTime().ToFileTimeUtc().ToString(
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+        $targetExecutable = [System.IO.Path]::GetFullPath($program)
+        if ($targetStartFault -eq 'wrong-path') {
+            $targetExecutable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        } elseif ($targetStartFault -eq 'wrong-filetime') {
+            $creationFileTime = (([uint64]$creationFileTime) + [uint64]1).ToString(
+                [System.Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        $targetStartFrame = if ($targetStartFault -eq 'malformed') {
+            '{}'
+        } else {
+            [ordered]@{
+                schema_version = 1
+                event = 'deferred-gateway-target-started'
+                target_pid = [int]$target.Id
+                creation_file_time = $creationFileTime
+                executable_path = $targetExecutable
+            } | ConvertTo-Json -Compress
+        }
+        if ($targetStartFault -ne 'stall') {
+            [Console]::Out.WriteLine($targetStartFrame)
+            if ($targetStartFault -eq 'duplicate') {
+                [Console]::Out.WriteLine($targetStartFrame)
+            }
+            [Console]::Out.Flush()
+        }
+
+        $targetGateDeadline = (Get-Date).AddSeconds(15)
+        $targetGateState = ''
+        $targetGateUnreadableSince = $null
+        while ((Get-Date) -lt $targetGateDeadline) {
+            try {
+                $targetGateStream = [System.IO.File]::Open(
+                    $targetGate,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+                )
+                try {
+                    if ($targetGateStream.Length -le 0 -or $targetGateStream.Length -gt 16) {
+                        throw 'invalid target gate length'
+                    }
+                    $targetGateBytes = New-Object byte[] ([int]$targetGateStream.Length)
+                    if ($targetGateStream.Read($targetGateBytes, 0, $targetGateBytes.Length) -ne
+                        $targetGateBytes.Length) {
+                        throw 'incomplete target gate read'
+                    }
+                    $targetGateState = [System.Text.Encoding]::UTF8.GetString($targetGateBytes)
+                } finally {
+                    $targetGateStream.Dispose()
+                }
+                $targetGateUnreadableSince = $null
+            } catch [System.IO.IOException] {
+                if (-not $targetGateUnreadableSince) { $targetGateUnreadableSince = Get-Date }
+                if ((Get-Date) -ge $targetGateDeadline -or
+                    (Get-Date) -ge $targetGateUnreadableSince.AddMilliseconds(2250)) {
+                    $targetGateState = 'invalid'
+                } else {
+                    Start-Sleep -Milliseconds 25
+                    continue
+                }
+            } catch [System.UnauthorizedAccessException] {
+                if (-not $targetGateUnreadableSince) { $targetGateUnreadableSince = Get-Date }
+                if ((Get-Date) -ge $targetGateDeadline -or
+                    (Get-Date) -ge $targetGateUnreadableSince.AddMilliseconds(2250)) {
+                    $targetGateState = 'invalid'
+                } else {
+                    Start-Sleep -Milliseconds 25
+                    continue
+                }
+            } catch {
+                $targetGateState = 'invalid'
+            }
+            if ([string]::Equals($targetGateState, 'armed', [StringComparison]::Ordinal)) { break }
+            if ([string]::Equals($targetGateState, 'abort', [StringComparison]::Ordinal)) {
+                try {
+                    if (-not $target.HasExited) {
+                        $target.Kill()
+                        $target.WaitForExit()
+                    }
+                } catch {}
+                exit 13
+            }
+            if (-not [string]::Equals($targetGateState, 'wait', [StringComparison]::Ordinal)) {
+                [Console]::Error.WriteLine('deferred wrapper rejected its target gate')
+                exit 13
+            }
+            Start-Sleep -Milliseconds 25
+        }
+        if (-not [string]::Equals($targetGateState, 'armed', [StringComparison]::Ordinal)) {
+            try {
+                if (-not $target.HasExited) {
+                    $target.Kill()
+                    $target.WaitForExit()
+                }
+            } catch {}
+            [Console]::Error.WriteLine('deferred wrapper timed out before target authorization')
+            exit 13
+        }
+
+        $targetOutTask = $target.StandardOutput.ReadLineAsync()
+        $targetErrTask = $target.StandardError.ReadLineAsync()
+        $targetOutClosed = $false
+        $targetErrClosed = $false
+        while (-not $target.HasExited -or -not $targetOutClosed -or -not $targetErrClosed) {
+            if (-not $targetOutClosed -and $targetOutTask.Wait(10)) {
+                $line = $targetOutTask.Result
+                if ($null -eq $line) {
+                    $targetOutClosed = $true
+                } else {
+                    [Console]::Out.WriteLine($line)
+                    [Console]::Out.Flush()
+                    $targetOutTask = $target.StandardOutput.ReadLineAsync()
+                }
+            }
+            if (-not $targetErrClosed -and $targetErrTask.Wait(10)) {
+                $line = $targetErrTask.Result
+                if ($null -eq $line) {
+                    $targetErrClosed = $true
+                } else {
+                    [Console]::Error.WriteLine($line)
+                    [Console]::Error.Flush()
+                    $targetErrTask = $target.StandardError.ReadLineAsync()
+                }
+            }
+        }
+        $target.WaitForExit()
+        if ($wrapperExitHoldMilliseconds -gt 0) {
+            Start-Sleep -Milliseconds $wrapperExitHoldMilliseconds
+        }
+        exit [int]$target.ExitCode
+    } finally {
+        $target.Dispose()
+    }
+} catch {
+    [Console]::Error.WriteLine('deferred wrapper could not execute its target')
+    exit 13
+}
+'@
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $pythonLaunch.Executable
-        $quoted = @($HermesArgs | ForEach-Object {
-            [HermesHandoff.UpdaterJob]::QuoteArgument([string]$_)
-        })
-        $psi.Arguments = [string]::Join(' ', [string[]]$quoted)
+        $powershellPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        if ([string]::IsNullOrWhiteSpace($powershellPath)) {
+            throw 'the trusted deferred gateway wrapper executable could not be resolved'
+        }
+        $encodedWrapper = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapperScript))
+        $psi.FileName = $powershellPath
+        $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedWrapper"
         $psi.WorkingDirectory = $InstallRoot
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
@@ -1984,9 +3332,51 @@ function Invoke-DeferredGatewayResume(
         $psi.EnvironmentVariables['__PYVENV_LAUNCHER__'] = $pythonLaunch.Launcher
         $psi.EnvironmentVariables['HERMES_HOME'] = $HermesHome
         $psi.EnvironmentVariables['HERMES_UPDATE_HANDOFF_PID'] = "$PID"
+        $startupGate = New-DeferredGatewayStartupGate
+        $targetGate = New-DeferredGatewayStartupGate
+        $psi.EnvironmentVariables['HERMES_DEFERRED_GATEWAY_STARTUP_GATE'] = $startupGate
+        if ($NoUi -and -not [string]::IsNullOrWhiteSpace($env:HERMES_TEST_RESUME_CONTAINMENT_CAPTURE)) {
+            $psi.EnvironmentVariables['HERMES_INTERNAL_TEST_DEFERRED_GATEWAY_CONTAINMENT_CAPTURE'] =
+                $env:HERMES_TEST_RESUME_CONTAINMENT_CAPTURE
+        }
+        if ($NoUi -and $TestDeferredGatewayInitialKillFailure) {
+            $psi.EnvironmentVariables['HERMES_INTERNAL_TEST_DEFERRED_GATEWAY_IGNORE_ABORT'] = '1'
+        }
+        if ($NoUi -and -not [string]::IsNullOrWhiteSpace($env:HERMES_TEST_RESUME_GATE_CAPTURE)) {
+            [System.IO.File]::WriteAllText(
+                $env:HERMES_TEST_RESUME_GATE_CAPTURE,
+                $startupGate,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+        $quotedHermesArgs = @($HermesArgs | ForEach-Object {
+            [HermesHandoff.UpdaterJob]::QuoteArgument([string]$_)
+        })
+        $request = [ordered]@{
+            program = $pythonLaunch.Executable
+            argument_line = [string]::Join(' ', $quotedHermesArgs)
+            target_gate = $targetGate
+            target_start_fault = $TestDeferredGatewayTargetStartFault
+            wrapper_exit_hold_ms = $TestDeferredGatewayWrapperExitHoldMilliseconds
+        } | ConvertTo-Json -Compress -Depth 2
+        $psi.EnvironmentVariables['HERMES_INTERNAL_DEFERRED_GATEWAY_REQUEST'] = $request
+        $jobHandle = [HermesHandoff.UpdaterJob]::CreateKillOnClose()
         $proc = [System.Diagnostics.Process]::Start($psi)
         if (-not $proc) { throw 'the trusted deferred gateway resume child did not start' }
         $startedAtTicks = $proc.StartTime.ToUniversalTime().Ticks
+        if ($TestDeferredGatewayPreAssignHoldMilliseconds -gt 0) {
+            Start-Sleep -Milliseconds $TestDeferredGatewayPreAssignHoldMilliseconds
+        }
+        if ($TestDeferredGatewayAssignFailure) {
+            throw 'the deferred gateway resume child could not be assigned to containment'
+        }
+        [HermesHandoff.UpdaterJob]::Assign($jobHandle, $proc.Handle)
+        $jobAssigned = $true
+        if (-not [HermesHandoff.UpdaterJob]::ContainsPid($jobHandle, $proc.Id)) {
+            throw 'the deferred gateway resume child Job membership could not be proved'
+        }
+        $jobMembershipProved = $true
+        Set-DeferredGatewayStartupGateStateExact $startupGate 'wait' 'armed'
 
         $outTask = $proc.StandardOutput.ReadLineAsync()
         $errTask = $proc.StandardError.ReadLineAsync()
@@ -1995,13 +3385,13 @@ function Invoke-DeferredGatewayResume(
         $nextLeaseRefresh = (Get-Date).AddSeconds(30)
         $deadline = (Get-Date).AddSeconds((Get-ManagedStageTimeoutSeconds 'gateway-resume'))
         $missingSince = $null
-        $unreadablePolls = 0
+        $leaseProofGap = $null
         $rootExitedAt = $null
         while (-not $proc.HasExited -or -not $outClosed -or -not $errClosed) {
             if ((Get-Date) -ge $deadline) {
                 $timedOut = $true
                 Write-HandoffLog 'trusted gateway recovery exceeded its bounded deadline; stopping its exact process tree'
-                Stop-ExactSpawnedProcessTree $proc $startedAtTicks
+                Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
             }
             if ($proc.HasExited) {
                 if (-not $rootExitedAt) { $rootExitedAt = Get-Date }
@@ -2030,27 +3420,101 @@ function Invoke-DeferredGatewayResume(
                         $line = $outTask.Result
                         if ($null -eq $line) { $outClosed = $true }
                         else {
-                            [void]$out.AppendLine($line)
                             if ($line.Trim()) {
-                                if (-not $meaningfulStdoutSeen) {
-                                    if (Test-DeferredGatewayAdoptionFrame $line $proc $startedAtTicks) {
-                                        $adoptionFrameObserved = $true
-                                        $transferObserved = $true
-                                        $script:BridgeLeaseOwned = $false
-                                        $script:BridgeLeaseTransferredPid = $proc.Id
-                                    } elseif ($initialPlan.Source -eq 'pending' -or
-                                        $line -match 'deferred-gateway-lease-adopted') {
-                                        # A pending plan must announce adoption
-                                        # in the first nonempty stdout line. An
-                                        # already-completed replay may emit an
-                                        # ordinary status without a frame.
-                                        $adoptionFrameInvalid = $true
+                                $acceptedProtocolFrame = ''
+                                $isTargetStartFrame = $line -match 'deferred-gateway-target-started'
+                                $isAdoptionFrame = $line -match 'deferred-gateway-lease-adopted'
+                                if ($stdoutProtocolPhase -eq 'target-start') {
+                                    if ($TestDeferredGatewayTargetRetentionHoldMilliseconds -gt 0) {
+                                        Start-Sleep -Milliseconds $TestDeferredGatewayTargetRetentionHoldMilliseconds
                                     }
-                                    $meaningfulStdoutSeen = $true
-                                } elseif ($line -match 'deferred-gateway-lease-adopted') {
-                                    $adoptionFrameInvalid = $true
+                                    $targetIdentity = Open-DeferredGatewayTargetStartFrame `
+                                        $line $pythonLaunch.Executable $jobHandle
+                                    if ($targetIdentity) {
+                                        $retainedTargetHandle = $targetIdentity.Handle
+                                        $retainedTargetPid = [int]$targetIdentity.Pid
+                                        $retainedTargetCreationFileTime = [string]$targetIdentity.CreationFileTime
+                                        try {
+                                            Set-DeferredGatewayStartupGateStateExact $targetGate 'wait' 'armed'
+                                            if ($TestDeferredGatewayPostTargetGateHoldMilliseconds -gt 0) {
+                                                Start-Sleep -Milliseconds $TestDeferredGatewayPostTargetGateHoldMilliseconds
+                                            }
+                                            $targetStartFrameObserved = $true
+                                            $stdoutProtocolPhase = 'adoption'
+                                            $acceptedProtocolFrame = 'target-start'
+                                        } catch {
+                                            [HermesHandoff.UpdaterJob]::CloseRuntimeProcess($retainedTargetHandle)
+                                            $retainedTargetHandle = [System.IntPtr]::Zero
+                                            $retainedTargetPid = 0
+                                            $retainedTargetCreationFileTime = ''
+                                            $targetStartFrameInvalid = $true
+                                            $stdoutProtocolPhase = 'failed'
+                                        }
+                                    } else {
+                                        $targetStartFrameInvalid = $true
+                                        $stdoutProtocolPhase = 'failed'
+                                    }
+                                    if ($targetStartFrameInvalid) {
+                                        try {
+                                            Set-DeferredGatewayStartupGateStateExact $targetGate 'wait' 'abort'
+                                        } catch {}
+                                    }
+                                } elseif ($stdoutProtocolPhase -eq 'adoption') {
+                                    if ($isTargetStartFrame) {
+                                        $targetStartFrameInvalid = $true
+                                        $adoptionFrameInvalid = $true
+                                        $stdoutProtocolPhase = 'failed'
+                                    } elseif ($isAdoptionFrame) {
+                                        if (Test-DeferredGatewayAdoptionFrame `
+                                            $line $retainedTargetPid $retainedTargetHandle `
+                                            $retainedTargetCreationFileTime $jobHandle) {
+                                            $adoptionFrameObserved = $true
+                                            $transferObserved = $true
+                                            $script:BridgeLeaseOwned = $false
+                                            $script:BridgeLeaseTransferredPid = $retainedTargetPid
+                                            $stdoutProtocolPhase = 'diagnostic'
+                                            $acceptedProtocolFrame = 'adoption'
+                                        } else {
+                                            $adoptionFrameInvalid = $true
+                                            $stdoutProtocolPhase = 'failed'
+                                        }
+                                    } else {
+                                        if ($initialPlan.Source -eq 'pending') {
+                                            $adoptionFrameInvalid = $true
+                                            $stdoutProtocolPhase = 'failed'
+                                        } else {
+                                            # A completed replay can legitimately
+                                            # produce no adoption frame because it
+                                            # no longer owns a transferable lease.
+                                            $stdoutProtocolPhase = 'diagnostic'
+                                        }
+                                    }
+                                } elseif ($isTargetStartFrame -or $isAdoptionFrame) {
+                                    if ($isTargetStartFrame) { $targetStartFrameInvalid = $true }
+                                    if ($isAdoptionFrame) { $adoptionFrameInvalid = $true }
+                                    $stdoutProtocolPhase = 'failed'
                                 }
-                                Write-HandoffLog ("gateway-resume| {0}" -f $line)
+                                $safeDiagnostic = if ($acceptedProtocolFrame -eq 'target-start') {
+                                    'target start frame accepted'
+                                } elseif ($acceptedProtocolFrame -eq 'adoption') {
+                                    'adoption frame accepted'
+                                } elseif ($isTargetStartFrame -or $isAdoptionFrame -or
+                                    $targetStartFrameInvalid -or $adoptionFrameInvalid) {
+                                    'unexpected recovery protocol frame rejected'
+                                } else {
+                                    $diagnostic = ConvertTo-DeferredGatewayDiagnostic $line $startupGate 'stdout'
+                                    Protect-DeferredGatewayDiagnosticDetail $diagnostic $targetGate
+                                }
+                                Add-BoundedDeferredGatewayOutput $out $safeDiagnostic
+                                Write-BoundedDeferredGatewayDiagnostic 'gateway-resume|' $safeDiagnostic `
+                                    ([ref]$diagnosticLinesLogged) ([ref]$diagnosticSuppressionLogged)
+                                if ($targetStartFrameInvalid -or $adoptionFrameInvalid) {
+                                    $leaseLost = $true
+                                    if ($adoptionFrameInvalid -and $jobAssigned) {
+                                        Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
+                                        $containedTreeDrained = $true
+                                    }
+                                }
                             }
                             $outTask = $proc.StandardOutput.ReadLineAsync()
                         }
@@ -2058,14 +3522,17 @@ function Invoke-DeferredGatewayResume(
                         $line = $errTask.Result
                         if ($null -eq $line) { $errClosed = $true }
                         else {
-                            [void]$err.AppendLine($line)
                             if ($line.Trim()) {
                                 # stdout and stderr are independent OS pipes;
                                 # WaitAny cannot infer write order between them.
                                 # Authorization still requires the exact first
                                 # nonempty stdout frame, so stderr is diagnostic
                                 # only and cannot authorize adoption.
-                                Write-HandoffLog ("gateway-resume!| {0}" -f $line)
+                                $safeDiagnostic = ConvertTo-DeferredGatewayDiagnostic $line $startupGate 'stderr'
+                                $safeDiagnostic = Protect-DeferredGatewayDiagnosticDetail $safeDiagnostic $targetGate
+                                Add-BoundedDeferredGatewayOutput $err $safeDiagnostic
+                                Write-BoundedDeferredGatewayDiagnostic 'gateway-resume!|' $safeDiagnostic `
+                                    ([ref]$diagnosticLinesLogged) ([ref]$diagnosticSuppressionLogged)
                             }
                             $errTask = $proc.StandardError.ReadLineAsync()
                         }
@@ -2075,13 +3542,25 @@ function Invoke-DeferredGatewayResume(
                 Start-Sleep -Milliseconds 100
             }
 
-            if (-not $leaseLost) {
-                $leaseState = Get-BridgeLeaseOwnerState $proc.Id ([System.IntPtr]::Zero) $startedAtTicks
+            if (-not $leaseLost -and $targetStartFrameObserved) {
+                $leaseState = Get-RetainedTargetBridgeLeaseOwnerState `
+                    $retainedTargetPid $retainedTargetHandle `
+                    $retainedTargetCreationFileTime $jobHandle
+                $targetStillLive = $true
+                try {
+                    $targetStillLive = [HermesHandoff.UpdaterJob]::RuntimeProcessIsLive(
+                        $retainedTargetHandle
+                    )
+                } catch {
+                    # Unknown is not absence. Keep the exact target classified
+                    # as live so the bounded failure path retains containment.
+                    $targetStillLive = $true
+                }
                 if ($leaseState -eq 'child') {
                     $transferObserved = $true
                     $script:BridgeLeaseOwned = $false
                     $missingSince = $null
-                    $unreadablePolls = 0
+                    $leaseProofGap = $null
                 } elseif ($leaseState -eq 'script') {
                     if ($transferObserved) {
                         $returnedToScript = $true
@@ -2091,26 +3570,42 @@ function Invoke-DeferredGatewayResume(
                         $nextLeaseRefresh = (Get-Date).AddSeconds(30)
                     }
                     $missingSince = $null
-                    $unreadablePolls = 0
+                    $leaseProofGap = $null
                 } elseif ($leaseState -eq 'missing' -and $transferObserved) {
                     $cleanupObserved = $true
+                    $leaseProofGap = $null
                     if (-not $missingSince) { $missingSince = Get-Date }
                     # Successful resume clears its exact lease immediately
                     # before exit. A still-running child without the lease for
                     # more than the bounded edge is no longer authorized.
-                    if (-not $proc.HasExited -and
+                    if ($targetStillLive -and
                         (Get-Date) -ge $missingSince.AddMilliseconds(750)) {
                         $leaseLost = $true
                     }
-                } elseif ($leaseState -eq 'unreadable' -and -not $proc.HasExited) {
-                    $unreadablePolls++
-                    if ($unreadablePolls -ge 3) { $leaseLost = $true }
+                } elseif (($leaseState -eq 'missing' -or $leaseState -eq 'unreadable') -and
+                    -not $transferObserved) {
+                    # After the exact target is retained and armed, it can adopt
+                    # and clear the lease before this parent consumes the already-
+                    # buffered adoption frame. Unknown state is never success, but
+                    # give that frame one bounded monotonic proof window. Engine
+                    # scheduling must not turn three fast polls into a false loss.
+                    if (-not $leaseProofGap) {
+                        $leaseProofGap = [System.Diagnostics.Stopwatch]::StartNew()
+                    }
+                    if ($targetStillLive -and $leaseProofGap.ElapsedMilliseconds -ge 750) {
+                        $leaseLost = $true
+                    }
+                } elseif ($leaseState -eq 'unreadable' -and $targetStillLive) {
+                    if (-not $leaseProofGap) {
+                        $leaseProofGap = [System.Diagnostics.Stopwatch]::StartNew()
+                    }
+                    if ($leaseProofGap.ElapsedMilliseconds -ge 750) { $leaseLost = $true }
                 } else {
                     $leaseLost = $true
                 }
                 if ($leaseLost) {
                     Write-HandoffLog 'trusted gateway recovery lost its bridge-quiesce lease; stopping its exact process tree'
-                    Stop-ExactSpawnedProcessTree $proc $startedAtTicks
+                    Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
                 }
             }
             if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
@@ -2118,35 +3613,136 @@ function Invoke-DeferredGatewayResume(
 
         $proc.WaitForExit()
         $code = [int]$proc.ExitCode
-        $finalLeaseState = Get-BridgeLeaseOwnerState $proc.Id ([System.IntPtr]::Zero) $startedAtTicks
+        $finalLeaseState = if ($targetStartFrameObserved) {
+            Get-RetainedTargetBridgeLeaseOwnerState `
+                $retainedTargetPid $retainedTargetHandle `
+                $retainedTargetCreationFileTime $jobHandle
+        } else { 'unreadable' }
         if ($code -eq 0) {
-            $terminalPlan = Read-DeferredGatewayPlanProof
-            $planConsumed = $terminalPlan -and
-                $terminalPlan.Source -eq 'completed' -and
-                [string]::Equals($terminalPlan.Raw, $initialPlan.Raw, [StringComparison]::Ordinal) -and
-                -not (Test-Path -LiteralPath $script:GatewayPlanPath) -and
-                @(Get-DeferredGatewayConsumeArtifacts).Count -eq 0
+            $nativeCommitProof = $null
+            if ($initialPlan.Source -eq 'completed') {
+                $terminalPlan = Read-DeferredGatewayPlanProof
+                $planStateProved = $terminalPlan -and
+                    $terminalPlan.Source -eq 'completed' -and
+                    [string]::Equals($terminalPlan.Raw, $initialPlan.Raw, [StringComparison]::Ordinal) -and
+                    -not (Test-Path -LiteralPath $script:GatewayPlanPath) -and
+                    -not (Test-Path -LiteralPath $script:GatewayPlanPreparedPath) -and
+                    -not (Test-Path -LiteralPath $script:GatewayRuntimeManifestPath) -and
+                    @(Get-DeferredGatewayConsumeArtifacts).Count -eq 0 -and
+                    [HermesHandoff.UpdaterJob]::ActiveProcesses($jobHandle) -eq 0
+            } else {
+                $nativeCommitProof = Read-PreparedGatewayNativeCommitProof $initialPlan.Raw $jobHandle
+                $planStateProved = $null -ne $nativeCommitProof
+                if ($planStateProved) {
+                    $retainedRuntimeHandles = @($nativeCommitProof.RuntimeHandles)
+                }
+                if (-not $planStateProved) {
+                    $proofState = if ($script:PreparedGatewayProofState -match '^[a-z-]{1,40}$') {
+                        $script:PreparedGatewayProofState
+                    } else { 'invalid' }
+                    Write-HandoffLog ("gateway-resume!|state=prepared-proof-{0}" -f $proofState)
+                }
+            }
             $adoptionProved = if ($initialPlan.Source -eq 'completed') {
                 # Idempotent replay starts with the exact authenticated
                 # completed bytes. With an active returned lease Python emits
                 # the frame; a fully completed replay with no lease does not.
-                -not $adoptionFrameInvalid
+                $targetStartFrameObserved -and -not $targetStartFrameInvalid -and
+                    -not $adoptionFrameInvalid
             } else {
-                $adoptionFrameObserved -and -not $adoptionFrameInvalid
+                $targetStartFrameObserved -and -not $targetStartFrameInvalid -and
+                    $adoptionFrameObserved -and -not $adoptionFrameInvalid
             }
-            $cleanupProved = $adoptionProved -and $planConsumed -and
+            $cleanupProved = $adoptionProved -and $planStateProved -and
                 ($cleanupObserved -or $finalLeaseState -eq 'missing') -and
                 -not (Test-Path -LiteralPath $BridgeLeasePath) -and
                 @(Get-HandoffCasArtifacts $BridgeLeasePath).Count -eq 0
             if (-not $cleanupProved) {
                 $code = 8
                 $leaseLost = $true
+                if ($initialPlan.Source -ne 'completed' -and $jobAssigned) {
+                    Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
+                    $containedTreeDrained = $true
+                    if (-not (Restore-AuthenticatedPreparedGatewayAttemptAfterNativeFailure `
+                        $initialPlan.Raw)) {
+                        Write-HandoffLog 'gateway-resume!|state=prepared-recovery-artifact-retained'
+                    }
+                }
             } else {
-                $script:BridgeLeaseOwned = $false
-                $script:BridgeLeaseRequired = $false
-                $script:BridgeLeaseTransferredPid = 0
+                $nativeBoundaryProved = $true
+                if ($initialPlan.Source -ne 'completed') {
+                    if ($retainedRuntimeHandles.Count -ne @($nativeCommitProof.Runtimes).Count) {
+                        $nativeBoundaryProved = $false
+                    }
+                    foreach ($runtimeHandle in $retainedRuntimeHandles) {
+                        if (-not $nativeBoundaryProved) { break }
+                        try {
+                            if (-not [HermesHandoff.UpdaterJob]::RuntimeProcessIsLive($runtimeHandle) -or
+                                -not [HermesHandoff.UpdaterJob]::ContainsProcessHandle($jobHandle, $runtimeHandle)) {
+                                $nativeBoundaryProved = $false
+                            }
+                        } catch {
+                            $nativeBoundaryProved = $false
+                        }
+                    }
+                    try {
+                        if ([HermesHandoff.UpdaterJob]::ActiveProcesses($jobHandle) -ne
+                            [uint32]$retainedRuntimeHandles.Count) {
+                            $nativeBoundaryProved = $false
+                        }
+                    } catch {
+                        $nativeBoundaryProved = $false
+                    }
+                    if ($TestDeferredGatewayNativeBoundaryFailure) {
+                        $nativeBoundaryProved = $false
+                    }
+                }
+                if (-not $nativeBoundaryProved) {
+                    Write-HandoffLog 'gateway-resume!|state=native-boundary-changed'
+                    $code = 8
+                    $leaseLost = $true
+                    Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
+                    $containedTreeDrained = $true
+                    if (-not (Restore-AuthenticatedPreparedGatewayAttemptAfterNativeFailure `
+                        $initialPlan.Raw)) {
+                        Write-HandoffLog 'gateway-resume!|state=prepared-recovery-artifact-retained'
+                    }
+                } else {
+                # The trusted Python child may only prepare the durable plan.
+                # Validate every surviving Job member first, then disarm the
+                # private Job, and only then publish the exact completed plan.
+                # If publication fails after disarm, the still-open Job handle
+                # retains explicit TerminateJob authority and the attempt is
+                # drained before this function can return.
+                [HermesHandoff.UpdaterJob]::DisarmKillOnClose($jobHandle)
+                if ($initialPlan.Source -eq 'completed' -or
+                    (Commit-PreparedGatewayPlanExact `
+                        $nativeCommitProof.PreparedRaw $nativeCommitProof.ManifestRaw)) {
+                    $script:BridgeLeaseOwned = $false
+                    $script:BridgeLeaseRequired = $false
+                    $script:BridgeLeaseTransferredPid = 0
+                    $recoveryCommitted = $true
+                } else {
+                    $code = 8
+                    $leaseLost = $true
+                    Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
+                    $containedTreeDrained = $true
+                    if (-not (Restore-AuthenticatedPreparedGatewayAttemptAfterNativeFailure `
+                        $initialPlan.Raw)) {
+                        Write-HandoffLog 'gateway-resume!|state=prepared-recovery-artifact-retained'
+                    }
+                }
+                }
             }
         } else {
+            if ($initialPlan.Source -ne 'completed' -and $jobAssigned) {
+                Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
+                $containedTreeDrained = $true
+                if (-not (Restore-AuthenticatedPreparedGatewayAttemptAfterNativeFailure `
+                    $initialPlan.Raw)) {
+                    Write-HandoffLog 'gateway-resume!|state=prepared-recovery-artifact-retained'
+                }
+            }
             # A failed recovery command must return the same lease to this live
             # parent. This preserves continuous quiesce while the original
             # update failure is surfaced and terminal cleanup runs.
@@ -2169,16 +3765,87 @@ function Invoke-DeferredGatewayResume(
             Output = $stdoutText + $stderrText
             Stdout = $stdoutText
             Stderr = $stderrText
+            PendingPlanVerified = [bool]($initialPlan.Source -eq 'pending')
         }
     } catch {
-        if ($proc) { Stop-ExactSpawnedProcessTree $proc $startedAtTicks }
+        Write-HandoffLog ("trusted gateway recovery containment failed closed ({0})" -f $_.Exception.GetType().Name)
+        if ($proc) {
+            if ($jobAssigned) {
+                Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
+                $containedTreeDrained = $true
+            } else {
+                $unassignedChildDeathProved = Stop-UnassignedDeferredGatewayResumeAndProve `
+                    $proc $startedAtTicks $startupGate -SkipInitialKill:$TestDeferredGatewayInitialKillFailure
+                if (-not $unassignedChildDeathProved) {
+                    # Never release the startup gate while this exact
+                    # uncontained generation may still execute.
+                    while ($true) {
+                        try {
+                            if ($proc.HasExited) {
+                                $unassignedChildDeathProved = $true
+                                break
+                            }
+                        } catch {}
+                        Start-Sleep -Milliseconds 50
+                    }
+                }
+            }
+        } else {
+            $unassignedChildDeathProved = $true
+        }
+        if ($initialPlan.Source -ne 'completed' -and $jobAssigned) {
+            if (-not (Restore-AuthenticatedPreparedGatewayAttemptAfterNativeFailure `
+                $initialPlan.Raw)) {
+                Write-HandoffLog 'gateway-resume!|state=prepared-recovery-artifact-retained'
+            }
+        }
         return @{
             Code = 8
             Output = 'The trusted deferred gateway recovery process could not be monitored safely.'
             Stdout = ''
-            Stderr = $_.Exception.Message
+            Stderr = 'The trusted deferred gateway recovery process could not be monitored safely.'
+            PendingPlanVerified = [bool]($initialPlan.Source -eq 'pending')
         }
     } finally {
+        if ($targetGate -and -not $recoveryCommitted) {
+            try {
+                $expectedTargetGateState = if ($targetStartFrameObserved) { 'armed' } else { 'wait' }
+                Set-DeferredGatewayStartupGateStateExact `
+                    $targetGate $expectedTargetGateState 'abort'
+            } catch {}
+        }
+        if ($jobHandle -ne [System.IntPtr]::Zero) {
+            try {
+                if ($recoveryCommitted) {
+                    # Survivor validation, disarm, and exact prepared-to-
+                    # completed publication already succeeded above.
+                } elseif ($jobAssigned -and
+                    [HermesHandoff.UpdaterJob]::ActiveProcesses($jobHandle) -ne 0) {
+                    Stop-ExactSpawnedProcessTree $proc $startedAtTicks $jobHandle
+                    $containedTreeDrained = $true
+                } elseif ($jobAssigned) {
+                    $containedTreeDrained = $true
+                }
+            } finally {
+                foreach ($runtimeHandle in $retainedRuntimeHandles) {
+                    [HermesHandoff.UpdaterJob]::CloseRuntimeProcess($runtimeHandle)
+                }
+                $retainedRuntimeHandles = @()
+                if ($retainedTargetHandle -ne [System.IntPtr]::Zero) {
+                    [HermesHandoff.UpdaterJob]::CloseRuntimeProcess($retainedTargetHandle)
+                    $retainedTargetHandle = [System.IntPtr]::Zero
+                }
+                [HermesHandoff.UpdaterJob]::Close($jobHandle)
+            }
+        }
+        $gateCleanupSafe = $jobMembershipProved -or $containedTreeDrained -or
+            $unassignedChildDeathProved -or -not $proc
+        if ($startupGate -and $gateCleanupSafe) {
+            Remove-DeferredGatewayStartupGateExact $startupGate | Out-Null
+        }
+        if ($targetGate -and $gateCleanupSafe) {
+            Remove-DeferredGatewayStartupGateExact $targetGate | Out-Null
+        }
         if ($proc) { try { $proc.Dispose() } catch {} }
     }
 }
@@ -2564,7 +4231,23 @@ try {
 
     if ($resume.Code -ne 0) {
         $finalCode = 13
-        $finalMsg = 'The update attempt ended without restoring the verified Hermes gateway fleet.'
+        $recoveryFailure = if ($resume.PendingPlanVerified) {
+            'The update attempt ended without restoring the verified Hermes gateway fleet.'
+        } else {
+            'Hermes could not verify whether gateway recovery was required or completed.'
+        }
+        if ($res.Code -ne 0) {
+            $reportedUpdateCode = if ($null -ne $res.ChildExitCode) {
+                [int]$res.ChildExitCode
+            } else {
+                [int]$res.Code
+            }
+            $finalMsg = "Hermes update failed (exit $reportedUpdateCode). See logs\desktop-update-handoff.log. $recoveryFailure"
+        } elseif ($desktopBuildFailed) {
+            $finalMsg = "Code and dependencies updated, but the Desktop app rebuild failed. $recoveryFailure"
+        } else {
+            $finalMsg = $recoveryFailure
+        }
     } elseif ($res.Code -eq 0 -and -not $desktopBuildFailed) {
         $finalCode = 0
         $finalMsg = "Update complete."

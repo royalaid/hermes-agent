@@ -84,6 +84,7 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
             stdout=output,
             stderr=subprocess.STDOUT,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
     try:

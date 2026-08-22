@@ -1665,7 +1665,7 @@ def test_deferred_gateway_plan_refuses_unmapped_or_foreign_bytes(
     ) is None
 
 
-def test_deferred_fleet_partial_retry_does_not_duplicate_started_profile(monkeypatch):
+def test_deferred_fleet_partial_failure_drains_before_clean_retry(monkeypatch):
     plan = {
         "profiles": [
             {"name": "default", "old_pid": 101, "created_at": 10.0},
@@ -1681,27 +1681,37 @@ def test_deferred_fleet_partial_retry_does_not_duplicate_started_profile(monkeyp
         update_cmd, "_profile_process_still_matches", lambda _pid, _created: False
     )
 
-    def spawn(profile: str) -> int:
+    def spawn_and_verify(profile: str):
         nonlocal fail_work
         starts.append(profile)
         if profile == "work" and fail_work:
             fail_work = False
             raise RuntimeError("injected partial resume")
-        running[profile] = 900 + len(starts)
-        return running[profile]
+        pid = 900 + len(starts)
+        running[profile] = pid
+        return update_cmd._GatewayStartupAttempt(
+            profile,
+            SimpleNamespace(pid=pid, profile=profile),
+            update_cmd._GatewayRuntimeIdentity(pid, float(pid)),
+        )
 
-    monkeypatch.setattr(update_cmd, "_spawn_deferred_gateway_profile", spawn)
     monkeypatch.setattr(
         update_cmd,
-        "_wait_for_deferred_gateway_profile",
-        lambda profile, **_kwargs: profile in running,
+        "_spawn_and_verify_deferred_gateway_profile",
+        spawn_and_verify,
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_terminate_unready_gateway_generation",
+        lambda process, _runtime: running.pop(process.profile, None),
     )
 
     with pytest.raises(RuntimeError, match="partial"):
         update_cmd._resume_deferred_gateway_fleet(plan)
     update_cmd._resume_deferred_gateway_fleet(plan)
 
-    assert starts == ["default", "work", "work"]
+    assert starts == ["default", "work", "default", "work"]
+    assert set(running) == {"default", "work"}
 
 
 def test_deferred_fleet_pid_reuse_is_not_treated_as_old_live_gateway(monkeypatch):
@@ -1716,13 +1726,8 @@ def test_deferred_fleet_pid_reuse_is_not_treated_as_old_live_gateway(monkeypatch
     )
     monkeypatch.setattr(
         update_cmd,
-        "_spawn_deferred_gateway_profile",
+        "_spawn_and_verify_deferred_gateway_profile",
         lambda profile: running.setdefault(profile, 404),
-    )
-    monkeypatch.setattr(
-        update_cmd,
-        "_wait_for_deferred_gateway_profile",
-        lambda profile, **_kwargs: profile in running,
     )
 
     update_cmd._resume_deferred_gateway_fleet(plan)
@@ -1754,7 +1759,7 @@ def test_deferred_fleet_refuses_exact_old_process_even_if_profile_is_running(
         update_cmd._resume_deferred_gateway_fleet(plan)
 
 
-def test_deferred_plan_consume_is_exact_and_completed_replay_is_idempotent(
+def test_deferred_plan_consume_publishes_prepared_without_completed_authority(
     tmp_path: Path, monkeypatch
 ):
     home = tmp_path / ".hermes"
@@ -1776,19 +1781,21 @@ def test_deferred_plan_consume_is_exact_and_completed_replay_is_idempotent(
 
     assert update_cmd._consume_deferred_gateway_plan(pending, raw) is True
     assert not pending.exists()
+    prepared = pending.with_suffix(".prepared")
     completed = update_cmd._deferred_gateway_plan_path(
         root, transaction.invocation_id, completed=True
     )
-    assert completed.read_text(encoding="utf-8") == raw
+    assert prepared.read_text(encoding="utf-8") == raw
+    assert not completed.exists()
     assert update_cmd._load_deferred_gateway_plan(
-        completed,
+        prepared,
         root=root,
         invocation_id=transaction.invocation_id,
         lease_id=transaction.lease["lease_id"],
     ) is not None
 
 
-def test_deferred_plan_consume_unlink_failure_rolls_back_completed_authority(
+def test_deferred_plan_restore_is_exact_and_never_overwrites_pending(
     tmp_path: Path, monkeypatch
 ):
     home = tmp_path / ".hermes"
@@ -1807,9 +1814,76 @@ def test_deferred_plan_consume_unlink_failure_rolls_back_completed_authority(
     )
     pending = update_cmd._write_deferred_gateway_plan(root, transaction=transaction)
     raw = pending.read_text(encoding="utf-8")
-    completed = update_cmd._deferred_gateway_plan_path(
-        root, transaction.invocation_id, completed=True
+
+    assert update_cmd._consume_deferred_gateway_plan(pending, raw) is True
+    prepared = pending.with_suffix(".prepared")
+    assert update_cmd._restore_consumed_deferred_gateway_plan(pending, raw) is True
+    assert pending.read_text(encoding="utf-8") == raw
+    assert not prepared.exists()
+
+    assert update_cmd._consume_deferred_gateway_plan(pending, raw) is True
+    pending.write_text("foreign-pending-bytes", encoding="utf-8")
+
+    assert update_cmd._restore_consumed_deferred_gateway_plan(pending, raw) is False
+    assert pending.read_text(encoding="utf-8") == "foreign-pending-bytes"
+    assert prepared.read_text(encoding="utf-8") == raw
+
+
+def test_deferred_plan_restore_unlink_failure_rolls_back_pending_alias(
+    tmp_path: Path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    root = home / "hermes-agent"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    transaction = _deferred_transaction(
+        token={
+            "resume_needed": True,
+            "profiles": {},
+            "profile_identities": {},
+            "unmapped_pids": [],
+            "unmapped": [],
+            "cold_start_if_installed": False,
+        },
     )
+    pending = update_cmd._write_deferred_gateway_plan(root, transaction=transaction)
+    raw = pending.read_text(encoding="utf-8")
+    assert update_cmd._consume_deferred_gateway_plan(pending, raw) is True
+    prepared = pending.with_suffix(".prepared")
+    original_unlink = Path.unlink
+
+    def fail_prepared_unlink(path: Path, *args, **kwargs):
+        if path == prepared:
+            raise OSError("injected prepared retention")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_prepared_unlink)
+
+    assert update_cmd._restore_consumed_deferred_gateway_plan(pending, raw) is False
+    assert not pending.exists()
+    assert prepared.read_text(encoding="utf-8") == raw
+
+
+def test_deferred_plan_consume_unlink_failure_rolls_back_prepared_authority(
+    tmp_path: Path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    root = home / "hermes-agent"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    transaction = _deferred_transaction(
+        token={
+            "resume_needed": True,
+            "profiles": {},
+            "profile_identities": {},
+            "unmapped_pids": [],
+            "unmapped": [],
+            "cold_start_if_installed": False,
+        },
+    )
+    pending = update_cmd._write_deferred_gateway_plan(root, transaction=transaction)
+    raw = pending.read_text(encoding="utf-8")
+    prepared = pending.with_suffix(".prepared")
     original_unlink = Path.unlink
 
     def fail_consume_tombstone_unlink(path: Path, *positional, **keywords):
@@ -1821,7 +1895,94 @@ def test_deferred_plan_consume_unlink_failure_rolls_back_completed_authority(
 
     assert update_cmd._consume_deferred_gateway_plan(pending, raw) is False
     assert pending.read_text(encoding="utf-8") == raw
-    assert not completed.exists()
+    assert not prepared.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows process handles")
+def test_windows_process_creation_file_time_is_exact_and_stable():
+    first = update_cmd._windows_process_creation_file_time(os.getpid())
+    second = update_cmd._windows_process_creation_file_time(os.getpid())
+
+    assert first == second
+    assert first.isascii() and first.isdecimal()
+    assert 0 < int(first) <= (1 << 64) - 1
+
+
+def test_prepared_runtime_manifest_is_bounded_scoped_and_authenticated(
+    tmp_path: Path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    root = home / "hermes-agent"
+    executable = root / "venv" / "Scripts" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    pending = root / ".hermes-gateway-resume-invocation-manifest-123456.json"
+    plan_raw = "authenticated-plan-bytes"
+    lease_id = "lease-manifest-123456"
+    attempt = update_cmd._GatewayStartupAttempt(
+        "default",
+        SimpleNamespace(pid=404),
+        update_cmd._GatewayRuntimeIdentity(405, 60.0),
+    )
+
+    class Process:
+        def __init__(self, pid):
+            assert pid == 405
+
+        def create_time(self):
+            return 60.0
+
+        def exe(self):
+            return str(executable)
+
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=Process))
+    monkeypatch.setattr(
+        update_cmd, "_profile_process_still_matches", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        update_cmd, "_gateway_runtime_ready_record_matches", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_windows_process_creation_file_time",
+        lambda pid: "133801632600000000" if pid == 405 else "",
+    )
+
+    manifest_path, manifest_raw = update_cmd._write_prepared_gateway_runtime_manifest(
+        root,
+        pending,
+        invocation_id="invocation-manifest-123456",
+        lease_id=lease_id,
+        plan_raw=plan_raw,
+        attempts=[attempt],
+    )
+
+    assert manifest_path == pending.with_suffix(".prepared-runtime.json")
+    assert manifest_path.read_text(encoding="utf-8") == manifest_raw
+    payload = json.loads(manifest_raw)
+    assert set(payload) == {
+        "schema_version",
+        "invocation_id",
+        "install_root",
+        "plan_sha256",
+        "runtimes",
+        "auth",
+    }
+    assert "lease_id" not in payload
+    assert payload["plan_sha256"] == hashlib.sha256(plan_raw.encode()).hexdigest()
+    assert payload["runtimes"] == [
+        {
+            "profile": "default",
+            "pid": 405,
+            "created_at": 60.0,
+            "creation_file_time": "133801632600000000",
+            "executable_path": os.path.normcase(os.path.realpath(executable)),
+            "profile_home": os.path.normcase(os.path.realpath(home)),
+        }
+    ]
+    unsigned = {name: value for name, value in payload.items() if name != "auth"}
+    assert payload["auth"] == update_cmd._gateway_plan_auth(unsigned, lease_id)
 
 
 def test_deferred_plan_loader_recovers_authenticated_consume_tombstone(
@@ -2047,6 +2208,11 @@ def test_hidden_deferred_resume_emits_exact_first_adoption_frame(
         bridge_lease_id=lease_id,
         resume_root=str(root),
     )
+    startup_gate = tmp_path / "startup.gate"
+    startup_gate.write_text("armed", encoding="utf-8")
+    monkeypatch.setenv(
+        "HERMES_DEFERRED_GATEWAY_STARTUP_GATE", str(startup_gate)
+    )
     prior = {
         "schema_version": 1,
         "lease_id": lease_id,
@@ -2114,6 +2280,11 @@ def test_completed_deferred_resume_without_lease_emits_no_adoption_frame(
         bridge_lease_id="lease-resume-123456",
         resume_root=str(root),
     )
+    startup_gate = tmp_path / "startup.gate"
+    startup_gate.write_text("armed", encoding="utf-8")
+    monkeypatch.setenv(
+        "HERMES_DEFERRED_GATEWAY_STARTUP_GATE", str(startup_gate)
+    )
     monkeypatch.setattr(
         update_cmd,
         "_load_deferred_gateway_plan",
@@ -2129,6 +2300,46 @@ def test_completed_deferred_resume_without_lease_emits_no_adoption_frame(
     assert lines == ["✓ Deferred gateway fleet was already resumed."]
 
 
+def test_completed_deferred_resume_without_operational_fleet_fails_closed(
+    tmp_path: Path, monkeypatch, capsys
+):
+    root = tmp_path / "install"
+    root.mkdir()
+    args = SimpleNamespace(
+        invocation_id="invocation-resume-123456",
+        bridge_lease_id="lease-resume-123456",
+        resume_root=str(root),
+    )
+    startup_gate = tmp_path / "startup.gate"
+    startup_gate.write_text("armed", encoding="utf-8")
+    monkeypatch.setenv(
+        "HERMES_DEFERRED_GATEWAY_STARTUP_GATE", str(startup_gate)
+    )
+    completed_plan = {
+        "profiles": [{"name": "work", "old_pid": 202, "created_at": 20.0}],
+        "cold_start_if_installed": False,
+    }
+    monkeypatch.setattr(
+        update_cmd,
+        "_load_deferred_gateway_plan",
+        lambda *_args, **_kwargs: ("completed", completed_plan),
+    )
+    monkeypatch.setattr(gate, "read_quiesce_lease", lambda _path: None)
+    monkeypatch.setattr(
+        update_cmd,
+        "_completed_deferred_gateway_fleet_is_operational",
+        lambda _plan: False,
+        raising=False,
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        update_cmd._cmd_update_resume_deferred_gateway(args, root=root)
+
+    assert exit_info.value.code == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["✗ Deferred gateway completed state is not operational."]
+
+
 def test_deferred_resume_cleanup_failure_returns_lease_and_releases_lock(
     tmp_path: Path, monkeypatch
 ):
@@ -2142,6 +2353,11 @@ def test_deferred_resume_cleanup_failure_returns_lease_and_releases_lock(
         invocation_id=invocation_id,
         bridge_lease_id=lease_id,
         resume_root=str(root),
+    )
+    startup_gate = tmp_path / "startup.gate"
+    startup_gate.write_text("armed", encoding="utf-8")
+    monkeypatch.setenv(
+        "HERMES_DEFERRED_GATEWAY_STARTUP_GATE", str(startup_gate)
     )
     prior = {"schema_version": 1, "lease_id": lease_id, "owner_pid": 4321}
     released_locks = []

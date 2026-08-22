@@ -1,7 +1,11 @@
 """Tests for hermes_cli.gateway_windows."""
 
+import ctypes
+import json
 import logging
 import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -77,6 +81,208 @@ def test_build_gateway_argv_keeps_venv_console_python_for_uv_venv(monkeypatch, t
     assert cwd == str(hermes_home.resolve())
     assert env_overlay["VIRTUAL_ENV"] == str(project / "venv")
     assert str(project) in env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
+
+
+@pytest.mark.windows_only
+def test_spawn_detached_process_returns_retained_handle(monkeypatch, tmp_path):
+    argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
+    process = SimpleNamespace(pid=12345)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_build_gateway_argv",
+        lambda: (argv, str(tmp_path), {"HERMES_GATEWAY_DETACHED": "1"}),
+    )
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", lambda *_a, **_k: process)
+
+    assert gateway_windows._spawn_detached_process() is process
+
+
+@pytest.mark.windows_only
+def test_spawn_detached_process_can_remain_in_parent_job(monkeypatch, tmp_path):
+    argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
+    calls = []
+    monkeypatch.setattr(
+        gateway_windows,
+        "_build_gateway_argv",
+        lambda: (argv, str(tmp_path), {"HERMES_GATEWAY_DETACHED": "1"}),
+    )
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        gateway_windows.subprocess,
+        "Popen",
+        lambda call_argv, **kwargs: calls.append((call_argv, kwargs))
+        or SimpleNamespace(pid=12345),
+    )
+
+    process = gateway_windows._spawn_detached_process(allow_breakaway=False)
+
+    assert process.pid == 12345
+    assert len(calls) == 1
+    _, kwargs = calls[0]
+    assert (
+        kwargs["creationflags"]
+        == gateway_windows.windows_detach_flags_without_breakaway()
+    )
+    assert kwargs["env"][_BREAKAWAY_MARKER] == "0"
+
+
+@pytest.mark.windows_only
+def test_spawn_detached_process_without_breakaway_never_retries(monkeypatch, tmp_path):
+    """A contained updater child must fail closed on its first spawn error."""
+    argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
+    calls = []
+    spawn_error = OSError(13, "contained spawn denied")
+
+    monkeypatch.setattr(
+        gateway_windows,
+        "_build_gateway_argv",
+        lambda: (argv, str(tmp_path), {"HERMES_GATEWAY_DETACHED": "1"}),
+    )
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+
+    def fake_popen(call_argv, **kwargs):
+        calls.append((call_argv, kwargs))
+        if len(calls) == 1:
+            raise spawn_error
+        return SimpleNamespace(pid=54321)
+
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(OSError) as raised:
+        gateway_windows._spawn_detached_process(allow_breakaway=False)
+
+    assert raised.value is spawn_error
+    assert len(calls) == 1
+    call_argv, kwargs = calls[0]
+    assert call_argv == argv
+    assert (
+        kwargs["creationflags"]
+        == gateway_windows.windows_detach_flags_without_breakaway()
+    )
+    assert kwargs["env"][_BREAKAWAY_MARKER] == "0"
+
+
+@pytest.mark.windows_only
+def test_spawn_detached_process_explicit_profile_is_hidden_and_profile_scoped(
+    monkeypatch, tmp_path
+):
+    """Exercise the real Windows spawn flags with a harmless receipt writer.
+
+    The command is substituted at the final argv seam so this cannot launch a
+    live gateway.  The production argv/env/cwd composition and real Popen call
+    remain in the path under test.
+    """
+    project = tmp_path / "checkout"
+    configured_home = tmp_path / "configured-home"
+    profile_home = tmp_path / "profiles" / "work"
+    receipt = tmp_path / "child-receipt.json"
+    for directory in (project, configured_home, profile_home):
+        directory.mkdir(parents=True)
+
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", project)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: sys.executable)
+
+    def profile_arg(home):
+        assert Path(home) == profile_home
+        return "--profile work"
+
+    monkeypatch.setattr(gateway, "_profile_arg", profile_arg)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_hermes_home", lambda: configured_home
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "poisoned-home"))
+    monkeypatch.setenv(_BREAKAWAY_MARKER, "1")
+    monkeypatch.setenv("PYTHONIOENCODING", "poisoned")
+    monkeypatch.setenv("HERMES_GATEWAY_DETACHED", "poisoned")
+
+    child_code = (
+        "import json, os, pathlib, sys, time; "
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
+        "'cwd': os.getcwd(), "
+        "'home': os.environ.get('HERMES_HOME'), "
+        "'breakaway': os.environ.get('_HERMES_GATEWAY_BREAKAWAY'), "
+        "'detached': os.environ.get('HERMES_GATEWAY_DETACHED'), "
+        "'encoding': os.environ.get('PYTHONIOENCODING')"
+        "}), encoding='utf-8'); time.sleep(1)"
+    )
+    real_build_gateway_argv = gateway_windows._build_gateway_argv
+    built = {}
+
+    def build_harmless_argv(*, hermes_home=None):
+        gateway_argv, cwd, env_overlay = real_build_gateway_argv(
+            hermes_home=hermes_home
+        )
+        built["gateway_argv"] = gateway_argv
+        built["cwd"] = cwd
+        return [sys.executable, "-c", child_code, str(receipt)], cwd, env_overlay
+
+    monkeypatch.setattr(
+        gateway_windows, "_build_gateway_argv", build_harmless_argv
+    )
+    real_popen = subprocess.Popen
+    popen_calls = []
+
+    def recording_popen(call_argv, **kwargs):
+        popen_calls.append((call_argv, kwargs))
+        return real_popen(call_argv, **kwargs)
+
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", recording_popen)
+
+    process = gateway_windows._spawn_detached_process(
+        hermes_home=profile_home,
+        allow_breakaway=False,
+    )
+    deadline = time.monotonic() + 5
+    while not receipt.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert receipt.exists()
+
+    visible_windows = []
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
+    )
+
+    @callback_type
+    def collect_visible_windows(hwnd, _lparam):
+        if ctypes.windll.user32.IsWindowVisible(hwnd):
+            owner_pid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(
+                hwnd, ctypes.byref(owner_pid)
+            )
+            if owner_pid.value == process.pid:
+                visible_windows.append(hwnd)
+        return 1
+
+    ctypes.windll.user32.EnumWindows(collect_visible_windows, 0)
+    assert visible_windows == []
+    assert process.wait(timeout=10) == 0
+
+    child = json.loads(receipt.read_text(encoding="utf-8"))
+    assert child == {
+        "cwd": str(profile_home),
+        "home": str(profile_home),
+        "breakaway": "0",
+        "detached": "1",
+        "encoding": "utf-8",
+    }
+    assert built["cwd"] == str(profile_home)
+    assert built["gateway_argv"][-4:] == [
+        "--profile",
+        "work",
+        "gateway",
+        "run",
+    ]
+    assert len(popen_calls) == 1
+    _call_argv, kwargs = popen_calls[0]
+    assert (
+        kwargs["creationflags"]
+        == gateway_windows.windows_detach_flags_without_breakaway()
+    )
+    assert kwargs["creationflags"] & 0x08000000  # CREATE_NO_WINDOW
+    assert not kwargs["creationflags"] & 0x01000000  # no BREAKAWAY_FROM_JOB
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is kwargs["stderr"]
 
 
 @pytest.mark.windows_only
@@ -362,10 +568,6 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
 # the gateway's marker-watcher thread to drain + exit cleanly, then escalates
 # to taskkill if drain times out.
 # ---------------------------------------------------------------------------
-
-
-
-
 
 
 
