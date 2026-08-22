@@ -99,7 +99,7 @@ def probe_sqlite_runtime(
         env.pop(key, None)
     try:
         result = subprocess.run(
-            [str(executable), "-I", "-c", _PROBE_SCRIPT],
+            [str(executable), "-I", "-B", "-c", _PROBE_SCRIPT],
             capture_output=True,
             text=True,
             timeout=timeout,

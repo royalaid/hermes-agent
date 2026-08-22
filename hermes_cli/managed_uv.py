@@ -107,11 +107,11 @@ def managed_python_env(
     ):
         env.pop(key, None)
     env.update({
-        "UV_MANAGED_PYTHON": "1",
-        "UV_NO_CONFIG": "1",
-        "UV_PYTHON_INSTALL_BIN": "0",
+        "UV_MANAGED_PYTHON": "true",
+        "UV_NO_CONFIG": "true",
+        "UV_PYTHON_INSTALL_BIN": "false",
         "UV_PYTHON_INSTALL_DIR": str(target),
-        "UV_PYTHON_INSTALL_REGISTRY": "0",
+        "UV_PYTHON_INSTALL_REGISTRY": "false",
     })
     return env
 
@@ -196,6 +196,7 @@ class _UvResult(str):
 def _ensure_uv_path(
     *,
     repair_observer: Callable[[RuntimeRepairResult], None] | None = None,
+    repair_runtime: bool = True,
 ) -> Optional[str]:
     """Resolve the managed uv path, installing it if necessary (plain ``str``/``None``)."""
     existing = resolve_uv()
@@ -228,17 +229,27 @@ def _ensure_uv_path(
         # freshly pulled ``ensure_uv()`` after bootstrapping uv.  Repair here so
         # that first update can migrate a vulnerable runtime without requiring
         # a second ``hermes update``.
-        try:
-            repair = repair_vulnerable_runtime(result)
-            if repair_observer is not None:
-                repair_observer(repair)
-            if repair.status == "failed":
-                _report_runtime_repair_failure(repair)
-        except Exception as exc:
-            logger.warning("Managed Python runtime repair failed: %s", exc)
+        if repair_runtime:
+            try:
+                repair = repair_vulnerable_runtime(result)
+                if repair_observer is not None:
+                    repair_observer(repair)
+                if repair.status == "failed":
+                    _report_runtime_repair_failure(repair)
+            except Exception as exc:
+                logger.warning("Managed Python runtime repair failed: %s", exc)
     else:
         print("  ✗ Managed uv install appeared to succeed but binary not found")
     return result
+
+
+def ensure_uv_without_runtime_cutover() -> Optional[str]:
+    """Resolve/bootstrap uv without replacing the live Hermes environment.
+
+    Desktop updater staging runs under the live venv. Activation belongs to
+    its outer handoff after that updater process exits.
+    """
+    return _ensure_uv_path(repair_runtime=False)
 
 
 def ensure_uv(
@@ -846,8 +857,9 @@ def _stage_candidate_venv(
         logger.warning("candidate dependency sync refused: uv.lock is missing")
         _remove_tree(candidate, boundary=runtime_root)
         return None
-    # Locked sync must see project [tool.uv] exclude-newer; --no-config /
-    # UV_NO_CONFIG drops it and uv 0.12+ refuses --locked.
+    # The fetched, Git-verified uv.lock is the immutable install authority.
+    # --frozen installs it without re-evaluating a relative exclude-newer
+    # cutoff against the current clock. The sync still sees project config.
     sync_env = dict(env)
     sync_env.pop("UV_NO_CONFIG", None)
     synced = subprocess.run(
@@ -856,7 +868,7 @@ def _stage_candidate_venv(
             "sync",
             "--extra",
             "all",
-            "--locked",
+            "--frozen",
             "--python",
             str(_venv_python(candidate)),
         ],
@@ -875,6 +887,72 @@ def _stage_candidate_venv(
         _remove_tree(candidate, boundary=runtime_root)
         return None
     return candidate
+
+
+@dataclass(frozen=True)
+class StagedUpdateVenv:
+    """A complete side-by-side environment awaiting outer activation."""
+
+    candidate: Path
+    python: Path
+    provisioned_generation: Path | None = None
+
+
+def stage_update_candidate_venv(
+    uv_bin: str,
+    *,
+    project_root: Path,
+) -> StagedUpdateVenv | None:
+    """Build a relocatable update venv without touching the live venv."""
+    root = Path(project_root).resolve()
+    live_python = _venv_python(_default_live_venv(root))
+    current = probe_sqlite_runtime(live_python)
+    if current is None:
+        logger.warning("could not probe the live interpreter before candidate staging")
+        return None
+
+    python_root = managed_python_install_dir(root).resolve()
+    base_python = current.base_prefix / (
+        "python.exe" if os.name == "nt" else "bin/python3"
+    )
+    try:
+        base_python.resolve().relative_to(python_root)
+        reuse_private_base = (
+            base_python.is_file() and not current.wal_reset_vulnerable
+        )
+    except (OSError, ValueError):
+        reuse_private_base = False
+
+    provisioned_generation: Path | None = None
+    if reuse_private_base:
+        python = base_python
+        generation = python_root
+    else:
+        provisioned = _install_safe_python_generation(
+            uv_bin,
+            project_root=root,
+            current=current,
+        )
+        if provisioned is None:
+            return None
+        provisioned_generation, python, _ = provisioned
+        generation = provisioned_generation
+
+    candidate = _stage_candidate_venv(
+        uv_bin,
+        project_root=root,
+        generation=generation,
+        python=python,
+    )
+    if candidate is None:
+        if provisioned_generation is not None:
+            _remove_tree(provisioned_generation, boundary=python_root)
+        return None
+    return StagedUpdateVenv(
+        candidate=candidate,
+        python=python,
+        provisioned_generation=provisioned_generation,
+    )
 
 
 def _rename_with_retry(source: Path, destination: Path) -> None:
