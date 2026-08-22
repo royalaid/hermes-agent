@@ -4404,7 +4404,9 @@ try {
     # An older checkout that lacks the stable flag also aborts. The downstream
     # legacy guard ran too late to prove a mutation-free handoff.
     $stablePreflightAvailable = $false
-    $preflightArgs = $cliPrefix + @('update', '--preflight', '--json')
+    $preflightArgs = $cliPrefix + @(
+        'update', '--preflight', '--json', '--branch', $Branch
+    )
     if ($BridgeLeaseId) {
         # The stable readiness probe uses the same private capability to
         # recognize the script-owned lease as this handoff, never as a foreign
