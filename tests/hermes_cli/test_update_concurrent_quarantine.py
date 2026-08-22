@@ -839,6 +839,79 @@ def test_pause_refuses_foreign_process_named_by_target_profile_state(
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_skips_unmapped_foreign_gateway_with_unreadable_service_ancestor(
+    _winp,
+    monkeypatch,
+    tmp_path,
+):
+    """An unrelated global gateway cannot block this install's update."""
+    import gateway.status as status_mod
+    import hermes_cli.gateway as gateway_mod
+    from hermes_cli import gateway_windows
+
+    worker_pid = 202
+    service_pid = 201
+    target_install = tmp_path / "target-install"
+    records = {
+        worker_pid: _gateway_record(
+            worker_pid,
+            exe=str(tmp_path / "foreign-runtime" / "python.exe"),
+            cwd=str(tmp_path / "foreign-install"),
+        ),
+        service_pid: _gateway_record(
+            service_pid,
+            exe=str(tmp_path / "system" / "service.exe"),
+            argv=[str(tmp_path / "system" / "service.exe")],
+            cwd=str(tmp_path / "system"),
+        ),
+    }
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_gateway_psutil(
+            records,
+            parents={worker_pid: service_pid},
+            unreadable={service_pid},
+        ),
+    )
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [worker_pid])
+    monkeypatch.setattr(gateway_mod, "find_profile_gateway_processes", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
+    monkeypatch.setattr(
+        cli_main,
+        "PROJECT_ROOT",
+        target_install,
+    )
+    waited_for = []
+    monkeypatch.setattr(
+        cli_main,
+        "_wait_for_windows_update_gateway_exit",
+        lambda pids, *, timeout: waited_for.extend(pids) or set(),
+    )
+    terminated = []
+    monkeypatch.setattr(
+        status_mod,
+        "terminate_pid",
+        lambda value, force=False: terminated.append((value, force)),
+    )
+
+    token = cli_main._pause_windows_gateways_for_update(
+        require_structured_resume=True
+    )
+
+    assert token == {
+        "resume_needed": False,
+        "profiles": {},
+        "profile_identities": {},
+        "unmapped_pids": [],
+        "unmapped": [],
+        "cold_start_if_installed": False,
+    }
+    assert waited_for == []
+    assert terminated == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
 def test_pause_refuses_reused_unmapped_pid_before_force_stop(
     _winp,
     monkeypatch,
