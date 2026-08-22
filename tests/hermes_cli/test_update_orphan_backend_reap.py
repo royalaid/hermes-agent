@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hermes_cli import main as cli_main
+from hermes_cli import update_cmd
 
 
 class _FakeNoSuchProcess(Exception):
@@ -207,8 +208,6 @@ def test_missing_psutil_keeps_refusal():
 
 
 def test_stop_process_trees_kills_full_tree():
-    from hermes_cli import update_cmd
-
     procs = {
         111: _proc(111, _SERVE_ARGV, ppid=999, create_time=111.0),
         222: _proc(222, _SERVE_ARGV, ppid=998, create_time=222.0),
@@ -230,8 +229,6 @@ def test_stop_process_trees_kills_full_tree():
 
 
 def test_stop_process_trees_never_raises():
-    from hermes_cli import update_cmd
-
     fake = _fake_psutil(
         {111: _proc(111, _SERVE_ARGV, ppid=999, create_time=111.0)}
     )
@@ -243,8 +240,6 @@ def test_stop_process_trees_never_raises():
 
 
 def test_stop_process_trees_refuses_reused_backend_pid():
-    from hermes_cli import update_cmd
-
     fake = _fake_psutil(
         {111: _proc(111, _SERVE_ARGV, ppid=999, create_time=999.0)}
     )
@@ -318,8 +313,6 @@ def _run_guard(detect_side_effect, orphan_return):
 
 
 def test_guard_reaps_orphan_backend_and_proceeds():
-    from hermes_cli import update_cmd
-
     holders = _holders()
     # 1st scan: backend present; 2nd (post-reap) scan: clear.
     result, killed = _run_guard(
@@ -340,8 +333,6 @@ def test_guard_still_refuses_when_not_orphaned():
 
 
 def test_guard_refuses_when_reap_does_not_clear_holders():
-    from hermes_cli import update_cmd
-
     holders = _holders()
     # Reap runs but a holder survives (unkillable child) → refuse.
     result, killed = _run_guard(

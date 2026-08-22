@@ -37,7 +37,12 @@ pytestmark = pytest.mark.skipif(
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _spawn(args: list[str], cwd: Path | None = None) -> subprocess.Popen:
+def _spawn(
+    args: list[str],
+    cwd: Path | None = None,
+    *,
+    executable: str | Path | None = None,
+) -> subprocess.Popen:
     """Spawn a real sleeper process whose argv carries the given tail.
 
     ``python -c "sleep" <tail...>`` — the tail is inert data to the child
@@ -45,13 +50,38 @@ def _spawn(args: list[str], cwd: Path | None = None) -> subprocess.Popen:
     code classifies on.
     """
     proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(300)", *args],
+        [
+            str(executable or sys.executable),
+            "-c",
+            "import time; time.sleep(300)",
+            *args,
+        ],
         cwd=str(cwd or PROJECT_ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     time.sleep(0.8)  # let the process table settle
     assert proc.poll() is None, "sleeper died at spawn"
+    return proc
+
+
+def _spawn_exact_gateway(cwd: Path) -> subprocess.Popen:
+    """Spawn an inert module whose live argv is an exact gateway invocation."""
+    package = cwd / "hermes_cli"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "main.py").write_text(
+        "import time\ntime.sleep(300)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+        cwd=str(cwd),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.8)
+    assert proc.poll() is None, "exact-argv sleeper died at spawn"
     return proc
 
 
@@ -62,12 +92,26 @@ def _detect() -> list[tuple[int, str, str]]:
 
 
 def _kill(*procs: subprocess.Popen) -> None:
+    import psutil
+
     for proc in procs:
+        descendants = []
+        try:
+            descendants = psutil.Process(proc.pid).children(recursive=True)
+        except Exception:
+            pass
+        for descendant in reversed(descendants):
+            try:
+                descendant.kill()
+            except Exception:
+                pass
         try:
             proc.kill()
             proc.wait(timeout=10)
         except Exception:
             pass
+        if descendants:
+            psutil.wait_procs(descendants, timeout=10)
 
 
 class TestDetection:
@@ -85,13 +129,25 @@ class TestDetection:
         finally:
             _kill(proc)
 
-    def test_foreign_python_not_detected(self):
+    def test_foreign_python_not_detected(self, tmp_path):
         """A python process with no Hermes argv and cwd OUTSIDE the install
         must not be reported as a holder."""
-        import tempfile
+        foreign_python = Path(sys._base_executable).resolve()
+        target_python_roots = (
+            (PROJECT_ROOT / "venv").resolve(),
+            (PROJECT_ROOT / ".venv").resolve(),
+            (PROJECT_ROOT / ".hermes-runtime" / "python").resolve(),
+        )
+        assert foreign_python.is_file()
+        assert all(
+            not foreign_python.is_relative_to(root) for root in target_python_roots
+        ), f"base interpreter unexpectedly belongs to target install: {foreign_python}"
 
-        outside = Path(tempfile.mkdtemp())
-        proc = _spawn(["totally", "unrelated"], cwd=outside)
+        proc = _spawn(
+            ["totally", "unrelated"],
+            cwd=tmp_path,
+            executable=foreign_python,
+        )
         try:
             pids = [pid for pid, _, _ in _detect()]
             assert proc.pid not in pids
@@ -117,9 +173,27 @@ class TestDetection:
 
 
 class TestClassification:
-    def test_pausable_exemption_sees_long_path_gateway(self):
-        """#78089 follow-through: `_leftover_pausable_gateway_pids` must
-        classify the long-path gateway as pausable (not None)."""
+    def test_pausable_matcher_sees_exact_long_path_gateway_argv(self):
+        """#78089: exact gateway argv remains visible past 120 characters."""
+        from hermes_cli._scan_venv_blockers import _is_pausable_gateway
+
+        interpreter = os.path.join(
+            "C:\\",
+            "Users",
+            "y" * 90,
+            ".hermes-runtime",
+            "python",
+            "generation-current",
+            "python.exe",
+        )
+        argv = [interpreter, "-m", "hermes_cli.main", "gateway", "run"]
+        flattened = " ".join(argv)
+
+        assert flattened.lower().index("gateway run") >= 120
+        assert _is_pausable_gateway(argv)
+
+    def test_inert_gateway_tail_is_not_classified_pausable(self):
+        """A `-c` sleeper cannot gain stop authority from inert tail data."""
         from hermes_cli.update_cmd import _leftover_pausable_gateway_pids
 
         padding = os.path.join("C:\\", "Users", "y" * 90, ".hermes-runtime")
@@ -127,10 +201,27 @@ class TestClassification:
         try:
             matches = [m for m in _detect() if m[0] == proc.pid]
             assert matches, "gateway not detected"
-            pids = _leftover_pausable_gateway_pids(matches)
-            assert pids == [proc.pid], (
-                f"pausable exemption failed for long-path gateway: {pids}"
-            )
+            assert _leftover_pausable_gateway_pids(matches) is None
+        finally:
+            _kill(proc)
+
+    def test_exact_gateway_returns_frozen_process_identity(self, tmp_path):
+        from hermes_cli.update_cmd import _leftover_pausable_gateway_pids
+
+        import psutil
+
+        proc = _spawn_exact_gateway(tmp_path)
+        try:
+            matches = [m for m in _detect() if m[0] == proc.pid]
+            assert matches, "exact gateway not detected"
+            expected_created_at = psutil.Process(proc.pid).create_time()
+
+            identities = _leftover_pausable_gateway_pids(matches)
+
+            assert identities is not None and len(identities) == 1
+            identity = identities[0]
+            assert identity.pid == proc.pid
+            assert identity.created_at == expected_created_at
         finally:
             _kill(proc)
 

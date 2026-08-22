@@ -1463,7 +1463,6 @@ def test_cmd_update_late_gateway_exact_exit_before_proof_is_harmless(monkeypatch
         cli_main._cmd_update_impl(
             args,
             gateway_mode=False,
-            transaction=update_cmd._UpdateTransaction(),
         )
 
     assert exit_info.value.code == 2
@@ -1482,7 +1481,6 @@ def test_cmd_update_late_gateway_taskkill_error_accepts_exact_exit(monkeypatch):
         cli_main._cmd_update_impl(
             args,
             gateway_mode=False,
-            transaction=update_cmd._UpdateTransaction(),
         )
 
     assert exit_info.value.code == 2
@@ -1506,7 +1504,6 @@ def test_cmd_update_late_gateway_taskkill_error_refuses_unproved_exit(
         cli_main._cmd_update_impl(
             args,
             gateway_mode=False,
-            transaction=update_cmd._UpdateTransaction(),
         )
 
     assert isinstance(exc_info.value.__cause__, OSError)
