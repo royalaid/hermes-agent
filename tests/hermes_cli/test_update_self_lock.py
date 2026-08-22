@@ -211,9 +211,8 @@ def test_abort_helper_defers_and_exits_2(capsys):
     assert "deferred" in out
 
 
-def test_abort_helper_resumes_paused_gateways_before_exit():
+def test_abort_helper_leaves_gateway_recovery_to_outer_owner():
     resume_calls = []
-    sentinel = object()
     with patch.object(
         cli_main,
         "_detect_self_loaded_native_modules",
@@ -223,8 +222,8 @@ def test_abort_helper_resumes_paused_gateways_before_exit():
         "_resume_windows_gateways_after_update",
         side_effect=lambda token: resume_calls.append(token),
     ), pytest.raises(SystemExit):
-        cli_main._abort_dependency_sync_if_self_locked(sentinel)
-    assert resume_calls == [sentinel]
+        cli_main._abort_dependency_sync_if_self_locked()
+    assert resume_calls == []
 
 
 # ---------------------------------------------------------------------------

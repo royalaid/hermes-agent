@@ -6923,7 +6923,7 @@ def _detect_self_loaded_native_modules() -> list[str]:
     return sorted(set(found))
 
 
-def _abort_dependency_sync_if_self_locked(gateway_resume=None) -> None:
+def _abort_dependency_sync_if_self_locked() -> None:
     """Defer the venv rewrite when THIS process holds something it must replace.
 
     Runs at the last moment before the venv rewrite — after the code swap —
@@ -6946,13 +6946,9 @@ def _abort_dependency_sync_if_self_locked(gateway_resume=None) -> None:
     locked = _m()._detect_self_loaded_native_modules()
     if locked:
         _m()._defer_update_for_self_lock(locked)
-        if gateway_resume is not None:
-            _m()._resume_windows_gateways_after_update(gateway_resume)
         sys.exit(2)
 
     if _m()._reexec_dependency_sync_off_windows_shim():
-        if gateway_resume is not None:
-            _m()._resume_windows_gateways_after_update(gateway_resume)
         sys.exit(0)
 
 
@@ -9216,14 +9212,11 @@ def _cmd_update_impl(
 
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
-        try:
-            desktop_build_ok = _update_via_zip(
-                args,
-                transaction=transaction,
-                had_desktop_app_before_update=had_desktop_app_before_update,
-            )
-        finally:
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        desktop_build_ok = _update_via_zip(
+            args,
+            transaction=transaction,
+            had_desktop_app_before_update=had_desktop_app_before_update,
+        )
         if gateway_mode:
             _write_gateway_update_exit_code(desktop_build_ok)
         return
@@ -9334,9 +9327,6 @@ def _cmd_update_impl(
                 print(
                     "⚠ Update finished — code update SKIPPED"
                     f"{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}"
-                )
-                _m()._resume_windows_gateways_after_update(
-                    _windows_gateway_resume
                 )
                 sys.exit(1)
             if switch_block_reason.startswith("unmerged:"):
@@ -9671,7 +9661,7 @@ def _cmd_update_impl(
             if handed_off_sync or healthy is not True:
                 # Self-lock deferral (#86735): the repair rewrites the venv
                 # too — same mapped-extension hazard as the update sync.
-                _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
+                _m()._abort_dependency_sync_if_self_locked()
                 python_repair_attempted = True
                 _write_update_incomplete_marker()
                 from hermes_cli.managed_uv import ensure_uv
@@ -10050,7 +10040,6 @@ def _cmd_update_impl(
                 "  Reattach to the branch and retry: "
                 f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update"
             )
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(1)
 
         # And verify HEAD actually sits on the target branch. The parked-
@@ -10083,7 +10072,6 @@ def _cmd_update_impl(
                 "  Switch to the target branch and retry: "
                 f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update"
             )
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(1)
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
@@ -10127,7 +10115,7 @@ def _cmd_update_impl(
         # holds a native extension the sync must rewrite, defer NOW — after
         # the code swap, so only the dependency install is pending and the
         # next fresh launch completes it via the marker.
-        _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
+        _m()._abort_dependency_sync_if_self_locked()
         #
         # Drop the core-install breadcrumb BEFORE touching the venv. If the
         # install is killed mid-flight (Ctrl-C, terminal close, WSL OOM), the
