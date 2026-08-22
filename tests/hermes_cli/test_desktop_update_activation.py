@@ -327,7 +327,7 @@ def test_any_existing_commit_coordinator_forbids_rollback(
     assert coordinator_path.read_bytes() == payload
 
 
-def test_commit_requires_coordinator_before_deleting_rollback_authority(
+def test_commit_finishes_after_receipt_without_external_coordinator(
     tmp_path, monkeypatch
 ):
     root, home, _live, candidate = _scope(tmp_path, monkeypatch)
@@ -341,11 +341,19 @@ def test_commit_requires_coordinator_before_deleting_rollback_authority(
     state = json.loads((home / activation._STATE_NAME).read_text(encoding="utf-8"))
     backup = root / state["backup_rel"]
 
-    with pytest.raises(activation.ActivationError, match="unavailable"):
-        activation.commit()
+    activation.commit()
 
-    assert backup.exists()
-    assert state["phase"] == "receipt-published"
+    assert not backup.exists()
+    assert (root / "venv" / "new.txt").is_file()
+    assert not (home / activation._MANIFEST_NAME).exists()
+    assert not (home / activation._STATE_NAME).exists()
+
+
+def test_commit_decided_is_not_a_public_activation_action(capsys):
+    assert activation.main(["commit-decided"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "FAILED\n"
 
 
 def test_commit_decision_rejects_authenticated_noninitial_revision(

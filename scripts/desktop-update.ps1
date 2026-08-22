@@ -64,6 +64,20 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+$desktopUpdateJsonHelper = Join-Path $PSScriptRoot 'desktop-update-json.ps1'
+try {
+    if (-not (Test-Path -LiteralPath $desktopUpdateJsonHelper -PathType Leaf)) {
+        throw 'shared Desktop update JSON helper is missing'
+    }
+    . $desktopUpdateJsonHelper
+    $desktopStampParser = Get-Command ConvertFrom-DesktopStampJson -CommandType Function -ErrorAction Stop
+    if (-not $desktopStampParser) {
+        throw 'shared Desktop update JSON parser is unavailable'
+    }
+} catch {
+    [Console]::Error.WriteLine('Desktop update JSON validation could not initialize; update aborted before mutation.')
+    exit 3
+}
 if (($TestDeferredGatewayPreAssignHoldMilliseconds -gt 0 -or
     $TestDeferredGatewayAssignFailure -or
     $TestDeferredGatewayInitialKillFailure -or
@@ -296,6 +310,9 @@ $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
 $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
 $UpdateReceiptPath = Join-Path $HermesHome ".hermes-update-receipt.json"
+$ActivationManifestPath = Join-Path $HermesHome ".hermes-update-activation.json"
+$ActivationStatePath = Join-Path $HermesHome ".hermes-update-activation-state.json"
+$DesktopHealthPath = Join-Path $HermesHome ".hermes-update-desktop-health.json"
 $script:Ui = $null
 $script:BridgeLeaseOwned = $false
 $script:BridgeLeaseRequired = $false
@@ -305,6 +322,15 @@ $script:BridgeLeaseTransferredPid = 0
 $script:HandoffStartedAt = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $script:VerifiedUpdateReceipt = $null
 $script:ReceiptVerifiedAt = 0L
+$script:PreUpdateGitHead = $null
+$script:PreUpdateGitBranch = $null
+$script:PreflightTargetGitHead = $null
+$script:PreflightTargetGitRemote = $null
+$script:PreflightTargetGitRef = $null
+$script:ActivationBasePython = $null
+$script:ActivationStarted = $false
+$script:ActivationReceiptPublished = $false
+$script:ActivationCommitted = $false
 $script:UpdateMarkerOwned = $false
 $script:UpdateMarkerStartedAt = 0
 $script:RelaunchRequired = -not [string]::IsNullOrWhiteSpace($RelaunchExe)
@@ -449,6 +475,31 @@ function Get-CanonicalInstallRoot([string]$Path) {
     }
 }
 
+function Read-BoundedUtf8Text([string]$Path, [int]$MaxBytes) {
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        ([System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete)
+    )
+    try {
+        if ($stream.Length -le 0 -or $stream.Length -gt $MaxBytes) {
+            throw 'protocol artifact size is outside its bounded contract'
+        }
+        $bytes = New-Object byte[] ([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $count = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($count -le 0) { throw 'protocol artifact ended before its claimed length' }
+            $offset += $count
+        }
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        return $strictUtf8.GetString($bytes)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Resolve-ManagedVenvPythonLaunch([string]$VenvPython) {
     try {
         $launcher = (Resolve-Path -LiteralPath $VenvPython -ErrorAction Stop).ProviderPath
@@ -485,6 +536,12 @@ function Resolve-ManagedVenvPythonLaunch([string]$VenvPython) {
         }
         $baseHome = (Resolve-Path -LiteralPath $values['home'] -ErrorAction Stop).ProviderPath
         $baseHome = [System.IO.Path]::GetFullPath($baseHome).TrimEnd([char[]]@('\', '/'))
+        $managedPythonRoot = (Resolve-Path -LiteralPath (Join-Path $InstallRoot '.hermes-runtime\python') -ErrorAction Stop).ProviderPath
+        $managedPythonRoot = [System.IO.Path]::GetFullPath($managedPythonRoot).TrimEnd([char[]]@('\', '/'))
+        $managedPythonPrefix = $managedPythonRoot + [System.IO.Path]::DirectorySeparatorChar
+        if (-not $baseHome.StartsWith($managedPythonPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'pyvenv.cfg base interpreter is outside the private managed runtime'
+        }
         $basePythonPath = if ($values.ContainsKey('executable')) {
             $values['executable']
         } else {
@@ -1862,12 +1919,14 @@ function Invoke-StreamedHermes(
     [string[]]$HermesArgs,
     [string]$Tag,
     [switch]$AllowBridgeLeaseTransfer,
-    [switch]$RequireBridgeLeaseReturn
+    [switch]$RequireBridgeLeaseReturn,
+    [switch]$SkipBridgeLeaseCheck
 ) {
     # Start-Process + output file + poll keeps the WinForms window pumping
     # during long silent stretches (pip installs); a blocking pipeline would
     # freeze the marquee. Returns @{ Code; Output }.
-    if (-not (Refresh-BridgeQuiesceLeaseIfOwned -Force)) {
+    if (-not $SkipBridgeLeaseCheck -and
+        -not (Refresh-BridgeQuiesceLeaseIfOwned -Force)) {
         return @{
             Code = 8
             ChildExitCode = $null
@@ -2131,7 +2190,8 @@ exit $LASTEXITCODE
                 $script:BridgeLeaseTransferredPid = 0
             }
         }
-    } elseif (-not (Refresh-BridgeQuiesceLeaseIfOwned -Force)) {
+    } elseif (-not $SkipBridgeLeaseCheck -and
+        -not (Refresh-BridgeQuiesceLeaseIfOwned -Force)) {
         $leaseLost = $true
     }
     if ($leaseLost) {
@@ -3850,6 +3910,261 @@ try {
     }
 }
 
+function Test-GitBranchName([object]$Value) {
+    if ($Value -isnot [string] -or [string]::IsNullOrEmpty($Value) -or
+        $Value.Length -gt 255 -or $Value -eq '@' -or
+        $Value.StartsWith('-') -or $Value.StartsWith('/') -or
+        $Value.EndsWith('/') -or $Value.EndsWith('.') -or
+        $Value.Contains('//') -or $Value.Contains('..') -or
+        $Value.Contains('@{') -or $Value -match '[\x00-\x20\x7f~^:?*\[\\]') {
+        return $false
+    }
+    foreach ($component in @($Value -split '/')) {
+        if ([string]::IsNullOrEmpty($component) -or $component.StartsWith('.') -or
+            $component.EndsWith('.') -or $component.EndsWith('.lock')) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-TransactionalGitPreflight([object]$Git) {
+    try {
+        if ($Git -isnot [pscustomobject]) { return $false }
+        $expected = @(
+            'head', 'branch', 'dirty', 'tracking_remote',
+            'target_branch', 'target_ref', 'target_sha'
+        )
+        $names = @($Git.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($names.Count -ne $expected.Count) { return $false }
+        foreach ($name in $expected) {
+            if ($names -notcontains $name) { return $false }
+        }
+        if ($Git.head -isnot [string] -or $Git.head -notmatch '^[0-9a-fA-F]{40}$' -or
+            -not (Test-GitBranchName $Git.branch) -or
+            $Git.dirty -isnot [bool] -or $Git.dirty -ne $false -or
+            $Git.tracking_remote -isnot [string] -or
+            $Git.tracking_remote -notmatch '^[A-Za-z0-9._-]{1,128}$' -or
+            $Git.target_branch -isnot [string] -or $Git.target_branch -ne $Branch -or
+            -not (Test-GitBranchName $Git.target_branch) -or
+            $Git.target_ref -isnot [string] -or
+            $Git.target_ref -ne "refs/remotes/$($Git.tracking_remote)/$Branch" -or
+            $Git.target_sha -isnot [string] -or
+            $Git.target_sha -notmatch '^[0-9a-fA-F]{40}$') {
+            return $false
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-DesktopActivationAction([string]$Action) {
+    if ($Action -notin @('activate', 'publish-receipt', 'rollback', 'rollback-source', 'commit') -or
+        -not $script:ActivationBasePython -or
+        -not (Test-Path -LiteralPath $script:ActivationBasePython -PathType Leaf)) {
+        Write-HandoffLog 'transactional activation action was unavailable'
+        return $false
+    }
+    $names = @(
+        'HERMES_INTERNAL_DESKTOP_UPDATE_ROOT',
+        'HERMES_INTERNAL_DESKTOP_UPDATE_HOME',
+        'HERMES_INTERNAL_DESKTOP_UPDATE_INVOCATION',
+        'HERMES_INTERNAL_DESKTOP_UPDATE_LEASE',
+        'HERMES_INTERNAL_DESKTOP_UPDATE_PRE_HEAD'
+    )
+    $prior = @{}
+    foreach ($name in $names) {
+        $prior[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    try {
+        [Environment]::SetEnvironmentVariable('HERMES_INTERNAL_DESKTOP_UPDATE_ROOT', $InstallRoot, 'Process')
+        [Environment]::SetEnvironmentVariable('HERMES_INTERNAL_DESKTOP_UPDATE_HOME', $HermesHome, 'Process')
+        [Environment]::SetEnvironmentVariable('HERMES_INTERNAL_DESKTOP_UPDATE_INVOCATION', $script:InvocationId, 'Process')
+        [Environment]::SetEnvironmentVariable('HERMES_INTERNAL_DESKTOP_UPDATE_LEASE', $BridgeLeaseId, 'Process')
+        [Environment]::SetEnvironmentVariable('HERMES_INTERNAL_DESKTOP_UPDATE_PRE_HEAD', $script:PreUpdateGitHead, 'Process')
+        $activationArgs = @('-B', '-m', 'hermes_cli.desktop_update_activation', $Action)
+        $activation = Invoke-StreamedHermes $script:ActivationBasePython $activationArgs 'activation' -SkipBridgeLeaseCheck
+        if ($activation.Code -eq 0) {
+            Write-HandoffLog "transactional activation action completed: $Action"
+            return $true
+        }
+        Write-HandoffLog "transactional activation action failed: $Action"
+        return $false
+    } finally {
+        foreach ($name in $names) {
+            [Environment]::SetEnvironmentVariable($name, $prior[$name], 'Process')
+        }
+    }
+}
+
+function Restore-DesktopActivationBeforeRelaunch([switch]$RelaunchExitProved) {
+    if (-not $script:ActivationStarted) { return $true }
+    if ($script:RelaunchStarted -and -not $RelaunchExitProved) { return $false }
+    if (-not (Invoke-DesktopActivationAction 'rollback')) { return $false }
+    $script:ActivationStarted = $false
+    $script:ActivationReceiptPublished = $false
+    $script:VerifiedUpdateReceipt = $null
+    Write-HandoffLog 'terminal failure restored the previous installation before relaunch'
+    return $true
+}
+
+function Test-DesktopBuildStamp([string]$ExpectedBuildId) {
+    try {
+        $stampPaths = @(
+            (Join-Path $InstallRoot 'apps\desktop\build\install-stamp.json'),
+            (Join-Path $InstallRoot 'apps\desktop\release\win-unpacked\resources\install-stamp.json')
+        )
+        foreach ($stampPath in $stampPaths) {
+            $raw = Read-BoundedUtf8Text $stampPath 65536
+            $stamp = ConvertFrom-DesktopStampJson $raw
+            if ($stamp -isnot [pscustomobject]) { return $false }
+            $expected = @('schemaVersion', 'commit', 'branch', 'builtAt', 'dirty', 'source')
+            $names = @($stamp.PSObject.Properties | ForEach-Object { $_.Name })
+            if ($names.Count -ne $expected.Count) { return $false }
+            foreach ($name in $expected) {
+                if ($names -notcontains $name) { return $false }
+            }
+            $builtAt = [DateTimeOffset]::MinValue
+            if (-not (Test-JsonInteger $stamp.schemaVersion) -or
+                [int64]$stamp.schemaVersion -ne 1 -or
+                $stamp.commit -isnot [string] -or
+                -not [string]::Equals($stamp.commit, $ExpectedBuildId, [StringComparison]::OrdinalIgnoreCase) -or
+                $stamp.branch -isnot [string] -or $stamp.branch -ne $Branch -or
+                $stamp.builtAt -isnot [string] -or $stamp.builtAt.Length -gt 64 -or
+                -not [DateTimeOffset]::TryParseExact(
+                    $stamp.builtAt,
+                    'yyyy-MM-ddTHH:mm:ss.fffZ',
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::AssumeUniversal,
+                    [ref]$builtAt
+                ) -or
+                $stamp.dirty -isnot [bool] -or $stamp.dirty -ne $false -or
+                $stamp.source -isnot [string] -or $stamp.source -ne 'ci') {
+                return $false
+            }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Publish-DesktopHealthProof([string]$ExpectedBuildId) {
+    try {
+        if (-not (Test-DesktopBuildStamp $ExpectedBuildId)) { return $false }
+        $canonicalRoot = Get-CanonicalInstallRoot $InstallRoot
+        if (-not $canonicalRoot) { return $false }
+        $proof = [ordered]@{
+            schema_version = 1
+            invocation_id = $script:InvocationId
+            lease_id = $BridgeLeaseId
+            root = $canonicalRoot
+            target_head = $ExpectedBuildId.ToLowerInvariant()
+            branch = $Branch
+            build_exit_code = 0
+            node_dependencies = $true
+            desktop_rebuild = $true
+            created_at = [int64](Get-UnixTimeSeconds)
+        } | ConvertTo-Json -Compress
+        if ([string]::IsNullOrWhiteSpace($proof) -or
+            [Text.Encoding]::UTF8.GetByteCount($proof) -gt 65536) {
+            return $false
+        }
+        Publish-HandoffFileNoGap $DesktopHealthPath $null $proof 'Desktop health proof'
+        $published = Read-BoundedUtf8Text $DesktopHealthPath 65536
+        return [string]::Equals($published, $proof, [StringComparison]::Ordinal)
+    } catch {
+        return $false
+    }
+}
+
+function Read-ActivationTargetHead {
+    try {
+        $raw = Read-BoundedUtf8Text $ActivationManifestPath 262144
+        $manifest = $raw | ConvertFrom-Json -ErrorAction Stop
+        if ($manifest -isnot [pscustomobject]) { return $null }
+        $expected = @(
+            'schema_version', 'invocation_id', 'lease_id', 'root',
+            'candidate_rel', 'provisioned_generation', 'pre_update_head',
+            'pre_update_branch', 'selected_pre_head', 'target_head', 'branch',
+            'remote', 'target_ref', 'prior_receipt_sha256',
+            'python_health', 'created_at'
+        )
+        $names = @($manifest.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($names.Count -ne $expected.Count) { return $null }
+        foreach ($name in $expected) {
+            if ($names -notcontains $name) { return $null }
+        }
+        $canonicalRoot = Get-CanonicalInstallRoot $InstallRoot
+        $manifestRoot = if ($manifest.root -is [string]) {
+            Get-CanonicalInstallRoot $manifest.root
+        } else { $null }
+        if (-not (Test-JsonInteger $manifest.schema_version) -or
+            [int64]$manifest.schema_version -ne 2 -or
+            $manifest.invocation_id -isnot [string] -or
+            -not [string]::Equals($manifest.invocation_id, $script:InvocationId, [StringComparison]::Ordinal) -or
+            $manifest.lease_id -isnot [string] -or
+            -not [string]::Equals($manifest.lease_id, $BridgeLeaseId, [StringComparison]::Ordinal) -or
+            -not $canonicalRoot -or -not $manifestRoot -or
+            -not [string]::Equals($manifestRoot, $canonicalRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            $manifest.candidate_rel -isnot [string] -or
+            $manifest.candidate_rel -notmatch '^\.hermes-runtime/venv-candidate-[A-Za-z0-9._-]{8,96}$' -or
+            $manifest.pre_update_head -isnot [string] -or
+            -not [string]::Equals($manifest.pre_update_head, $script:PreUpdateGitHead, [StringComparison]::OrdinalIgnoreCase) -or
+            $manifest.pre_update_branch -isnot [string] -or
+            -not [string]::Equals($manifest.pre_update_branch, $script:PreUpdateGitBranch, [StringComparison]::Ordinal) -or
+            -not (Test-GitBranchName $manifest.pre_update_branch) -or
+            ($null -ne $manifest.selected_pre_head -and
+                ($manifest.selected_pre_head -isnot [string] -or
+                 $manifest.selected_pre_head -notmatch '^[0-9a-fA-F]{40}$')) -or
+            $manifest.target_head -isnot [string] -or
+            $manifest.target_head -notmatch '^[0-9a-fA-F]{40}$' -or
+            -not [string]::Equals($manifest.target_head, $script:PreflightTargetGitHead, [StringComparison]::OrdinalIgnoreCase) -or
+            $manifest.branch -isnot [string] -or $manifest.branch -ne $Branch -or
+            $manifest.remote -isnot [string] -or
+            $manifest.remote -notmatch '^[A-Za-z0-9._-]{1,128}$' -or
+            -not [string]::Equals($manifest.remote, $script:PreflightTargetGitRemote, [StringComparison]::Ordinal) -or
+            $manifest.target_ref -isnot [string] -or
+            $manifest.target_ref -ne "refs/remotes/$($manifest.remote)/$Branch" -or
+            -not [string]::Equals($manifest.target_ref, $script:PreflightTargetGitRef, [StringComparison]::Ordinal) -or
+            ($null -ne $manifest.prior_receipt_sha256 -and
+                ($manifest.prior_receipt_sha256 -isnot [string] -or
+                 $manifest.prior_receipt_sha256 -notmatch '^[0-9a-f]{64}$')) -or
+            $manifest.python_health -isnot [pscustomobject] -or
+            -not (Test-JsonInteger $manifest.created_at) -or
+            [int64]$manifest.created_at -le 0) {
+            return $null
+        }
+        if ($null -ne $manifest.provisioned_generation) {
+            if ($manifest.provisioned_generation -isnot [pscustomobject]) { return $null }
+            $generationNames = @($manifest.provisioned_generation.PSObject.Properties | ForEach-Object { $_.Name })
+            if ($generationNames.Count -ne 2 -or
+                $generationNames -notcontains 'rel' -or
+                $generationNames -notcontains 'identity_sha256' -or
+                $manifest.provisioned_generation.rel -isnot [string] -or
+                $manifest.provisioned_generation.rel -notmatch '^\.hermes-runtime/python/generation-[A-Za-z0-9._-]{8,96}$' -or
+                $manifest.provisioned_generation.identity_sha256 -isnot [string] -or
+                $manifest.provisioned_generation.identity_sha256 -notmatch '^[0-9a-f]{64}$') {
+                return $null
+            }
+        }
+        $healthNames = @($manifest.python_health.PSObject.Properties | ForEach-Object { $_.Name })
+        $expectedHealth = @('critical_imports', 'critical_syntax', 'dependencies')
+        if ($healthNames.Count -ne $expectedHealth.Count) { return $null }
+        foreach ($name in $expectedHealth) {
+            if ($healthNames -notcontains $name -or
+                $manifest.python_health.$name -isnot [bool] -or
+                $manifest.python_health.$name -ne $true) {
+                return $null
+            }
+        }
+        return [string]$manifest.target_head
+    } catch {
+        return $null
+    }
+}
+
 function Test-UpdatePreflightUnavailable([object]$Result) {
     if ($Result.Code -ne 2 -or -not [string]::IsNullOrWhiteSpace([string]$Result.Stdout)) {
         return $false
@@ -3944,7 +4259,7 @@ function Test-VerifiedUpdateReceipt([object]$Receipt) {
             -not [string]::Equals($Receipt.lease_id, $BridgeLeaseId, [StringComparison]::Ordinal)) {
             return $false
         }
-        if ($Receipt.mode -isnot [string] -or $Receipt.mode -notin @('git', 'archive')) { return $false }
+        if ($Receipt.mode -isnot [string] -or $Receipt.mode -ne 'git') { return $false }
         $expectedRoot = Get-CanonicalInstallRoot $InstallRoot
         $receiptRoot = if ($Receipt.root -is [string]) { Get-CanonicalInstallRoot $Receipt.root } else { $null }
         if (-not $expectedRoot -or -not $receiptRoot -or
@@ -3966,22 +4281,18 @@ function Test-VerifiedUpdateReceipt([object]$Receipt) {
             if ($healthNames -notcontains $name -or $Receipt.health.$name -isnot [bool] -or
                 $Receipt.health.$name -ne $true) { return $false }
         }
-        if ($Receipt.mode -eq 'git') {
-            if ($Receipt.remote -isnot [string] -or [string]::IsNullOrWhiteSpace($Receipt.remote) -or
-                $Receipt.target_ref -isnot [string] -or
-                $Receipt.target_ref -ne "refs/remotes/$($Receipt.remote)/$Branch" -or
-                $Receipt.target_sha -isnot [string] -or $Receipt.target_sha -notmatch '^[0-9a-fA-F]{40}$' -or
-                $Receipt.resulting_head -isnot [string] -or $Receipt.resulting_head -notmatch '^[0-9a-fA-F]{40}$' -or
-                -not [string]::Equals($Receipt.target_sha, $Receipt.resulting_head, [StringComparison]::OrdinalIgnoreCase) -or
-                $null -ne $Receipt.archive_sha) {
-                return $false
-            }
-        } else {
-            if ($null -ne $Receipt.remote -or $null -ne $Receipt.target_ref -or
-                $null -ne $Receipt.target_sha -or $null -ne $Receipt.resulting_head -or
-                $Receipt.archive_sha -isnot [string] -or $Receipt.archive_sha -notmatch '^[0-9a-fA-F]{64}$') {
-                return $false
-            }
+        if ($Receipt.remote -isnot [string] -or
+            $Receipt.remote -notmatch '^[A-Za-z0-9._-]{1,128}$' -or
+            -not [string]::Equals($Receipt.remote, $script:PreflightTargetGitRemote, [StringComparison]::Ordinal) -or
+            $Receipt.target_ref -isnot [string] -or
+            $Receipt.target_ref -ne "refs/remotes/$($Receipt.remote)/$Branch" -or
+            -not [string]::Equals($Receipt.target_ref, $script:PreflightTargetGitRef, [StringComparison]::Ordinal) -or
+            $Receipt.target_sha -isnot [string] -or $Receipt.target_sha -notmatch '^[0-9a-fA-F]{40}$' -or
+            -not [string]::Equals($Receipt.target_sha, $script:PreflightTargetGitHead, [StringComparison]::OrdinalIgnoreCase) -or
+            $Receipt.resulting_head -isnot [string] -or $Receipt.resulting_head -notmatch '^[0-9a-fA-F]{40}$' -or
+            -not [string]::Equals($Receipt.target_sha, $Receipt.resulting_head, [StringComparison]::OrdinalIgnoreCase) -or
+            $null -ne $Receipt.archive_sha) {
+            return $false
         }
         return $true
     } catch {
@@ -4086,7 +4397,7 @@ try {
         Write-HandoffLog $finalMsg
         throw $script:HandoffAbort
     }
-    $cliPrefix = @('-m', 'hermes_cli.main')
+    $cliPrefix = @('-B', '-m', 'hermes_cli.main')
 
     # New checkouts expose a stable, read-only JSON preflight. Its answer is
     # authoritative: require exit 0, valid JSON, and a literal ready=true.
@@ -4115,6 +4426,7 @@ try {
             Write-HandoffLog $finalMsg
             throw $script:HandoffAbort
         }
+        $gitPreflightClear = Test-TransactionalGitPreflight $preflightPayload.git
         $preflightClear = (
             $preflight.Code -eq 0 -and
             $preflightPayload.ok -eq $true -and
@@ -4123,6 +4435,7 @@ try {
             $null -eq $preflightPayload.reason -and
             @($preflightPayload.processes).Count -eq 0 -and
             @($preflightPayload.mcp_bridges).Count -eq 0 -and
+            $gitPreflightClear -and
             $null -eq $preflightPayload.error
         )
         if (-not $preflightClear) {
@@ -4131,8 +4444,29 @@ try {
             Write-HandoffLog $finalMsg
             throw $script:HandoffAbort
         }
+        $script:PreUpdateGitHead = [string]$preflightPayload.git.head
+        $script:PreUpdateGitBranch = [string]$preflightPayload.git.branch
+        $script:PreflightTargetGitHead = [string]$preflightPayload.git.target_sha
+        $script:PreflightTargetGitRemote = [string]$preflightPayload.git.tracking_remote
+        $script:PreflightTargetGitRef = [string]$preflightPayload.git.target_ref
         $stablePreflightAvailable = $true
         Write-HandoffLog 'update safety preflight passed'
+    }
+    try {
+        $activationLaunch = Resolve-ManagedVenvPythonLaunch $hermesPython
+        $script:ActivationBasePython = [string]$activationLaunch.Executable
+    } catch {
+        $finalCode = 3
+        $finalMsg = 'Update aborted: the private managed base interpreter could not be authenticated. Nothing was changed.'
+        Write-HandoffLog $finalMsg
+        throw $script:HandoffAbort
+    }
+    if (-not $script:ActivationBasePython -or
+        $BridgeLeaseId -notmatch '^[A-Za-z0-9._-]{16,128}$') {
+        $finalCode = 3
+        $finalMsg = 'Update aborted: the private managed update capability is invalid. Nothing was changed.'
+        Write-HandoffLog $finalMsg
+        throw $script:HandoffAbort
     }
 
     $updateArgs = $cliPrefix + @(
@@ -4150,31 +4484,44 @@ try {
     $res = Invoke-StreamedHermes $hermesPython $updateArgs "update" -AllowBridgeLeaseTransfer:$requiresChildLeaseAdoption -RequireBridgeLeaseReturn:$requiresChildLeaseAdoption
     Write-HandoffLog "hermes update exit code: $($res.Code)"
 
-    if ($stablePreflightAvailable -and $res.Code -eq 0) {
-        # A successful exit is not sufficient. The child atomically writes a
-        # fresh receipt before returning the exact lease to this parent. Read
-        # that private install-global file directly: the public preflight API
-        # deliberately redacts an active lease-correlated receipt until the
-        # trusted resume child consumes the plan and clears the lease.
-        Write-HandoffLog 'verifying the private update receipt before gateway recovery'
-        $candidateReceipt = $null
-        try {
-            $receiptRaw = [System.IO.File]::ReadAllText($UpdateReceiptPath)
-            if (-not [string]::IsNullOrWhiteSpace($receiptRaw) -and $receiptRaw.Length -le 65536) {
-                $candidateReceipt = $receiptRaw | ConvertFrom-Json -ErrorAction Stop
-            }
-        } catch {}
-        if (-not (Test-VerifiedUpdateReceipt $candidateReceipt)) {
+    # The contained child stages a complete side-by-side venv and returns the
+    # lease; it never rewrites the running venv. Activate only after that Job
+    # has drained. Commit only after build, health, and receipt verification,
+    # and before any gateway or Desktop process is restarted.
+    $desktopBuildFailed = $false
+    $activationRollbackFailed = $false
+    $expectedBuildId = $null
+    if ($res.Code -eq 0) {
+        $expectedBuildId = Read-ActivationTargetHead
+        if (-not $expectedBuildId -or
+            -not (Invoke-DesktopActivationAction 'activate')) {
             $res.Code = 9
-            $res.Output += "`nHermes did not produce a matching healthy update receipt."
-            Write-HandoffLog 'update receipt verification failed; refusing to report success'
+            Write-HandoffLog 'candidate activation failed; success withheld'
         } else {
-            $script:VerifiedUpdateReceipt = $candidateReceipt
-            $script:ReceiptVerifiedAt = [int64][Math]::Max(
-                (Get-UnixTimeSeconds),
-                [int64]$candidateReceipt.timestamp
-            )
-            Write-HandoffLog 'private update receipt verified'
+            $script:ActivationStarted = $true
+            $hermesPython = Join-Path $InstallRoot 'venv\Scripts\python.exe'
+        }
+    }
+
+    # Post-activation launcher repair belongs here, before the shared failure
+    # rollback, Desktop build, and receipt.  After the upstream 999703 refresh,
+    # wire only the dedicated missing-only repair action at this boundary; it
+    # must never overwrite an existing bin\hermes.exe, and receipt publication
+    # must wait for its proof.
+
+    if ($res.Code -ne 0) {
+        $rollbackAction = if ($script:ActivationStarted -or
+            (Test-Path -LiteralPath $ActivationManifestPath) -or
+            (Test-Path -LiteralPath $ActivationStatePath)) { 'rollback' } else { 'rollback-source' }
+        if (-not (Invoke-DesktopActivationAction $rollbackAction)) {
+            $activationRollbackFailed = $true
+            $res.Code = 15
+            Write-HandoffLog 'pre-recovery installation rollback could not be proven'
+        } else {
+            $script:ActivationStarted = $false
+            $script:ActivationReceiptPublished = $false
+            $script:VerifiedUpdateReceipt = $null
+            $hermesPython = Join-Path $InstallRoot 'venv\Scripts\python.exe'
         }
     }
 
@@ -4183,17 +4530,11 @@ try {
     # a one-line warning, exits 0). For a Desktop-DRIVEN update that warning
     # is fatal: we would relaunch the old exe and call it success. Detect it,
     # retry the build once, and propagate honestly.
-    $desktopBuildFailed = $false
-    if ($res.Code -eq 0 -and $script:VerifiedUpdateReceipt) {
-        # Always force one receipt-correlated build. A content-hash no-op can
+    if ($res.Code -eq 0 -and $script:ActivationStarted) {
+        # Always force one target-correlated build. A content-hash no-op can
         # otherwise preserve an old install-stamp when the updated commit did
-        # not touch Desktop sources. Archive updates need their 64-hex archive
-        # digest in the stamp; git updates need the exact resulting HEAD.
-        $expectedBuildId = if ($script:VerifiedUpdateReceipt.mode -eq 'git') {
-            [string]$script:VerifiedUpdateReceipt.resulting_head
-        } else {
-            [string]$script:VerifiedUpdateReceipt.archive_sha
-        }
+        # not touch Desktop sources. Transactional activation supports only a
+        # clean, authenticated Git target and pins its exact 40-hex HEAD.
         $oldGithubSha = $env:GITHUB_SHA
         $oldGithubRefName = $env:GITHUB_REF_NAME
         try {
@@ -4202,11 +4543,80 @@ try {
             Write-HandoffLog 'running receipt-correlated Desktop rebuild'
             $rebuild = Invoke-StreamedHermes $hermesPython ($cliPrefix + @('desktop', '--force-build', '--build-only')) 'rebuild'
             Write-HandoffLog "desktop rebuild exit code: $($rebuild.Code)"
-            if ($rebuild.Code -ne 0) { $desktopBuildFailed = $true }
+            if ($rebuild.Code -ne 0 -or
+                -not (Publish-DesktopHealthProof $expectedBuildId)) {
+                $desktopBuildFailed = $true
+                Write-HandoffLog 'Desktop rebuild or its exact dependency proof failed; success withheld'
+            }
         } finally {
             if ($null -eq $oldGithubSha) { Remove-Item Env:GITHUB_SHA -ErrorAction SilentlyContinue } else { $env:GITHUB_SHA = $oldGithubSha }
             if ($null -eq $oldGithubRefName) { Remove-Item Env:GITHUB_REF_NAME -ErrorAction SilentlyContinue } else { $env:GITHUB_REF_NAME = $oldGithubRefName }
         }
+
+        if (-not $desktopBuildFailed) {
+            if (Invoke-DesktopActivationAction 'publish-receipt') {
+                $script:ActivationReceiptPublished = $true
+                $candidateReceipt = $null
+                try {
+                    $receiptRaw = Read-BoundedUtf8Text $UpdateReceiptPath 65536
+                    if (-not [string]::IsNullOrWhiteSpace($receiptRaw)) {
+                        $candidateReceipt = $receiptRaw | ConvertFrom-Json -ErrorAction Stop
+                    }
+                } catch {}
+                if (Test-VerifiedUpdateReceipt $candidateReceipt) {
+                    $script:VerifiedUpdateReceipt = $candidateReceipt
+                    $script:ReceiptVerifiedAt = [int64][Math]::Max(
+                        (Get-UnixTimeSeconds),
+                        [int64]$candidateReceipt.timestamp
+                    )
+                    Write-HandoffLog 'activated update receipt verified'
+                } else {
+                    $res.Code = 9
+                    Write-HandoffLog 'activated receipt verification failed; success withheld'
+                }
+            } else {
+                $res.Code = 9
+                Write-HandoffLog 'activated receipt could not be published; success withheld'
+            }
+        }
+
+        if ($desktopBuildFailed -or $res.Code -ne 0) {
+            if (-not (Invoke-DesktopActivationAction 'rollback')) {
+                $activationRollbackFailed = $true
+                $res.Code = 15
+                Write-HandoffLog 'post-build installation rollback could not be proven'
+            } else {
+                $script:ActivationStarted = $false
+                $script:ActivationReceiptPublished = $false
+                $script:VerifiedUpdateReceipt = $null
+                $hermesPython = Join-Path $InstallRoot 'venv\Scripts\python.exe'
+                Write-HandoffLog 'previous source, venv, receipt, and Desktop build restored'
+            }
+        }
+    }
+
+    if ($res.Code -eq 0 -and -not $desktopBuildFailed -and
+        $script:ActivationStarted -and $script:ActivationReceiptPublished -and
+        $script:VerifiedUpdateReceipt) {
+        if (Invoke-DesktopActivationAction 'commit') {
+            $script:ActivationCommitted = $true
+            $script:ActivationStarted = $false
+            Write-HandoffLog 'verified installation committed before process restart'
+        } else {
+            # Once commit is attempted, its durable commit-cleaning phase may
+            # already forbid rollback. Keep every Hermes process stopped and
+            # let an exact retry finish cleanup; never start mixed generations.
+            $script:ActivationStarted = $false
+            $script:RelaunchSuppressed = $true
+            $res.Code = 16
+            Write-HandoffLog 'installation commit did not finish; all process restart was withheld'
+        }
+    }
+
+    if ($res.Code -eq 16) {
+        $finalCode = 16
+        $finalMsg = 'The verified update reached its commit boundary, but cleanup did not finish. Hermes was left stopped so a retry can finish safely.'
+        throw $script:HandoffAbort
     }
 
     # The update child intentionally does not restart gateways inside the
@@ -4229,8 +4639,21 @@ try {
         $res.Output += "`nThe verified gateway fleet could not be restored after the update attempt."
     }
 
+    if ($resume.Code -ne 0 -and $script:ActivationStarted) {
+        if (Invoke-DesktopActivationAction 'rollback') {
+            $script:ActivationStarted = $false
+            $script:ActivationReceiptPublished = $false
+            $script:VerifiedUpdateReceipt = $null
+            $hermesPython = Join-Path $InstallRoot 'venv\Scripts\python.exe'
+            Write-HandoffLog 'gateway recovery failed; previous installation restored'
+        } else {
+            $activationRollbackFailed = $true
+            Write-HandoffLog 'gateway recovery and installation rollback both failed'
+        }
+    }
+
     if ($resume.Code -ne 0) {
-        $finalCode = 13
+        $finalCode = if ($activationRollbackFailed) { 15 } else { 13 }
         $recoveryFailure = if ($resume.PendingPlanVerified) {
             'The update attempt ended without restoring the verified Hermes gateway fleet.'
         } else {
@@ -4244,16 +4667,18 @@ try {
             }
             $finalMsg = "Hermes update failed (exit $reportedUpdateCode). See logs\desktop-update-handoff.log. $recoveryFailure"
         } elseif ($desktopBuildFailed) {
-            $finalMsg = "Code and dependencies updated, but the Desktop app rebuild failed. $recoveryFailure"
+            $finalMsg = "The Desktop app rebuild failed and the previous installation was restored. $recoveryFailure"
         } else {
             $finalMsg = $recoveryFailure
         }
-    } elseif ($res.Code -eq 0 -and -not $desktopBuildFailed) {
+    } elseif ($res.Code -eq 0 -and -not $desktopBuildFailed -and
+        $script:ActivationCommitted -and $script:ActivationReceiptPublished -and
+        $script:VerifiedUpdateReceipt) {
         $finalCode = 0
         $finalMsg = "Update complete."
     } elseif ($desktopBuildFailed) {
         $finalCode = 6
-        $finalMsg = "Code and dependencies updated, but the Desktop app REBUILD FAILED - you are running the previous build. Run `hermes desktop --force-build` from a terminal to retry."
+        $finalMsg = 'The Desktop app rebuild failed and the previous installation was restored. Retry the update after reviewing the handoff log.'
     } else {
         $finalCode = $res.Code
         $finalMsg = "hermes update failed (exit $($res.Code)). See logs\desktop-update-handoff.log."
@@ -4262,10 +4687,16 @@ try {
 } catch {
     if ($_.Exception.Message -ne $script:HandoffAbort) {
         $finalCode = 1
-        $finalMsg = "Update handoff failed unexpectedly: $($_.Exception.Message)"
+        $finalMsg = 'Update handoff failed unexpectedly. No unverified diagnostic detail was returned.'
         Write-HandoffLog $finalMsg
     }
 } finally {
+    if ($finalCode -ne 0 -and $script:ActivationStarted -and
+        -not (Restore-DesktopActivationBeforeRelaunch)) {
+        $finalCode = 15
+        $finalMsg = 'The update failed and the previous installation could not be restored automatically.'
+        Write-HandoffLog $finalMsg
+    }
     if ($script:RelaunchRequired -and -not (Prepare-DesktopSingleInstanceHandoff)) {
         $script:RelaunchSuppressed = $true
         if ($finalCode -eq 0) { $finalCode = 14 }
@@ -4274,6 +4705,12 @@ try {
         if (-not (Remove-RelaunchRequestExact)) {
             Write-HandoffLog 'WARNING: the failed relaunch request could not be retired exactly; it will expire automatically'
         }
+    }
+    if ($finalCode -ne 0 -and $script:ActivationStarted -and
+        -not (Restore-DesktopActivationBeforeRelaunch)) {
+        $finalCode = 15
+        $finalMsg = 'The update failed and the previous installation could not be restored automatically.'
+        Write-HandoffLog $finalMsg
     }
     $updateMarkerReleased = [bool](Remove-MarkerIfOwned)
     $bridgeLeaseReleased = [bool](Remove-BridgeQuiesceLeaseIfOwned)
@@ -4287,6 +4724,12 @@ try {
         if (-not (Remove-RelaunchRequestExact)) {
             Write-HandoffLog 'WARNING: the late relaunch request could not be retired exactly; it will expire automatically'
         }
+    }
+    if ($finalCode -ne 0 -and $script:ActivationStarted -and
+        -not (Restore-DesktopActivationBeforeRelaunch)) {
+        $finalCode = 15
+        $finalMsg = 'The update failed and the previous installation could not be restored automatically.'
+        Write-HandoffLog $finalMsg
     }
     Start-DesktopRelaunch
     $receiptVerified = $null -ne $script:VerifiedUpdateReceipt
@@ -4330,6 +4773,14 @@ try {
                         'exited' { 'The relaunched Desktop exited before it became ready.' }
                         'invalid' { 'The relaunched Desktop wrote a mismatched or unhealthy readiness acknowledgment.' }
                         default { 'The relaunched Desktop did not become ready within the bounded acknowledgment window.' }
+                    }
+                    if ($ack.Status -eq 'exited' -and $script:ActivationStarted) {
+                        if (Restore-DesktopActivationBeforeRelaunch -RelaunchExitProved) {
+                            Write-HandoffLog 'relaunch exited before readiness; previous installation restored'
+                        } else {
+                            $finalCode = 15
+                            $finalMsg = 'The relaunched Desktop exited and the previous installation could not be restored automatically.'
+                        }
                     }
                     $failedRaw = New-HandoffResultJson 'failed' $finalCode $finalMsg $updateMarkerReleased $bridgeLeaseReleased $null
                     if (-not (Publish-HandoffResult $failedRaw $pendingRaw)) {

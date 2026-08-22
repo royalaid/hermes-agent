@@ -3,13 +3,17 @@
 # These tests run the handoff in a temporary install with a tiny fake
 # hermes.exe. No real checkout, venv, Desktop process, or update is touched.
 
-param([switch]$DeferredGatewayContainmentOnly)
+param(
+    [switch]$DeferredGatewayContainmentOnly,
+    [switch]$ActivationBuildProofOnly,
+    [switch]$ActivationJournalRecoveryOnly
+)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path))
 $handoffScript = Join-Path $repoRoot 'scripts\desktop-update.ps1'
+$desktopUpdateJsonHelper = Join-Path $repoRoot 'scripts\desktop-update-json.ps1'
 $leaseFixture = Join-Path $repoRoot 'scripts\tests\fixtures\desktop-update-bridge-lease.json'
-$receiptFailureFixture = Join-Path $repoRoot 'scripts\tests\fixtures\desktop-update-receipt-failure.json'
 $powershellExe = (Get-Process -Id $PID).Path
 $failures = 0
 
@@ -430,8 +434,195 @@ public static class FakeHermes {
         return 0;
     }
 
+    static string JsonField(string raw, string name) {
+        var match = Regex.Match(
+            raw,
+            "\\\"" + Regex.Escape(name) + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\""
+        );
+        return match.Success ? match.Groups[1].Value.Replace("\\\\", "\\") : null;
+    }
+
+    static string LeaseAuthorityJson(string lease, string root, long createdAt) {
+        return "{\"schema_version\":1,\"lease_id\":\"" + Escape(lease) +
+            "\",\"owner_pid\":" + Process.GetCurrentProcess().Id +
+            ",\"created_at\":" + createdAt +
+            ",\"expires_at\":" + (createdAt + 1200) +
+            ",\"handoff_grace_until\":" + (createdAt + 90) +
+            ",\"install_root\":\"" + Escape(root) + "\"}";
+    }
+
+    static bool HasJournalLeaseAuthority(string raw, int schema, string lease, string root) {
+        if (!Regex.IsMatch(raw, "^\\{\\\"schema_version\\\":" + schema + ",") ||
+            JsonField(raw, "lease_id") != lease) return false;
+        var authority = Regex.Match(
+            raw,
+            "\\\"lease_authority\\\":\\{\\\"schema_version\\\":1," +
+            "\\\"lease_id\\\":\\\"" + Regex.Escape(Escape(lease)) + "\\\"," +
+            "\\\"owner_pid\\\":([1-9][0-9]*)," +
+            "\\\"created_at\\\":([0-9]+)," +
+            "\\\"expires_at\\\":([0-9]+)," +
+            "\\\"handoff_grace_until\\\":([0-9]+)," +
+            "\\\"install_root\\\":\\\"" + Regex.Escape(Escape(root)) + "\\\"\\}"
+        );
+        long created, expires, grace;
+        return authority.Success &&
+            Int64.TryParse(authority.Groups[2].Value, out created) &&
+            Int64.TryParse(authority.Groups[3].Value, out expires) &&
+            Int64.TryParse(authority.Groups[4].Value, out grace) &&
+            created > 0 && expires - created == 1200 && grace - created == 90;
+    }
+
+    static int Activation(string[] args, string mode) {
+        var moduleIndex = Array.IndexOf(args, "hermes_cli.desktop_update_activation");
+        if (moduleIndex < 0 || moduleIndex + 1 >= args.Length) return 1;
+        var action = args[moduleIndex + 1];
+        var root = Environment.GetEnvironmentVariable("HERMES_INTERNAL_DESKTOP_UPDATE_ROOT");
+        var home = Environment.GetEnvironmentVariable("HERMES_INTERNAL_DESKTOP_UPDATE_HOME");
+        var invocation = Environment.GetEnvironmentVariable("HERMES_INTERNAL_DESKTOP_UPDATE_INVOCATION");
+        var lease = Environment.GetEnvironmentVariable("HERMES_INTERNAL_DESKTOP_UPDATE_LEASE");
+        if (String.IsNullOrEmpty(root) || String.IsNullOrEmpty(home) ||
+            String.IsNullOrEmpty(invocation) || String.IsNullOrEmpty(lease)) return 1;
+        var manifestPath = Path.Combine(home, ".hermes-update-activation.json");
+        var statePath = Path.Combine(home, ".hermes-update-activation-state.json");
+        var priorPath = statePath + ".prior";
+        var receiptPath = Path.Combine(home, ".hermes-update-receipt.json");
+        var healthPath = Path.Combine(home, ".hermes-update-desktop-health.json");
+        var stagingPath = Path.Combine(home, ".hermes-update-staging.json");
+        var acquisitionPath = Path.Combine(home, ".hermes-update-acquisition.json");
+
+        if (action == "rollback-source") {
+            if (mode == "rollback-fail") return 1;
+            if (File.Exists(acquisitionPath)) {
+                var acquisition = File.ReadAllText(acquisitionPath);
+                if (!HasJournalLeaseAuthority(acquisition, 2, lease, root)) return 1;
+                var workspaceRel = JsonField(acquisition, "workspace_rel");
+                var workspace = String.IsNullOrEmpty(workspaceRel)
+                    ? null
+                    : Path.Combine(home, workspaceRel.Replace('/', Path.DirectorySeparatorChar));
+                if (!String.IsNullOrEmpty(workspace) && Directory.Exists(workspace))
+                    Directory.Delete(workspace, true);
+                File.Delete(acquisitionPath);
+            }
+            if (File.Exists(stagingPath)) {
+                if (!HasJournalLeaseAuthority(File.ReadAllText(stagingPath), 3, lease, root)) return 1;
+                var candidate = Path.Combine(root, ".hermes-runtime", "venv-candidate-12345678");
+                var generation = Path.Combine(root, ".hermes-runtime", "python", "generation-12345678");
+                if (Directory.Exists(candidate)) Directory.Delete(candidate, true);
+                if (Directory.Exists(generation)) Directory.Delete(generation, true);
+                File.Delete(stagingPath);
+            }
+            return 0;
+        }
+        if (action == "activate") {
+            if (!File.Exists(manifestPath) || File.Exists(statePath))
+                return 1;
+            if (mode == "activation-fail") {
+                File.WriteAllText(statePath, "prepared");
+                return 1;
+            }
+            if (File.Exists(receiptPath)) File.Copy(receiptPath, priorPath, true);
+            else if (File.Exists(priorPath)) File.Delete(priorPath);
+            File.WriteAllText(statePath, "active");
+            return 0;
+        }
+        if (action == "publish-receipt") {
+            if (mode == "receipt-fail" || !File.Exists(manifestPath) || !File.Exists(statePath))
+                return 1;
+            var manifest = File.ReadAllText(manifestPath);
+            var targetHead = JsonField(manifest, "target_head");
+            var branch = JsonField(manifest, "branch");
+            var remote = JsonField(manifest, "remote");
+            var targetRef = JsonField(manifest, "target_ref");
+            if (String.IsNullOrEmpty(targetHead) || String.IsNullOrEmpty(branch) ||
+                String.IsNullOrEmpty(remote) || String.IsNullOrEmpty(targetRef) ||
+                !File.Exists(healthPath)) return 1;
+            var health = File.ReadAllText(healthPath);
+            if (JsonField(health, "invocation_id") != invocation ||
+                JsonField(health, "lease_id") != lease ||
+                JsonField(health, "target_head") != targetHead ||
+                JsonField(health, "branch") != branch ||
+                !health.Contains("\"build_exit_code\":0") ||
+                !health.Contains("\"node_dependencies\":true") ||
+                !health.Contains("\"desktop_rebuild\":true")) return 1;
+            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (mode == "receipt-clock-rollback" || mode == "receipt-clock-rollback-resume-fail")
+                timestamp -= 60;
+            var receipt = "{\"schema_version\":1,\"invocation_id\":\"" + invocation +
+                "\",\"lease_id\":\"" + lease +
+                "\",\"mode\":\"git\",\"remote\":\"" + remote +
+                "\",\"target_ref\":\"" + targetRef +
+                "\",\"target_sha\":\"" + targetHead +
+                "\",\"resulting_head\":\"" + targetHead +
+                "\",\"archive_sha\":null,\"root\":\"" + Escape(root) +
+                "\",\"branch\":\"" + branch + "\",\"timestamp\":" + timestamp +
+                ",\"success\":true,\"gateway_resume_deferred\":true,\"health\":{" +
+                "\"critical_syntax\":true,\"critical_imports\":true,\"dependencies\":true," +
+                "\"node_dependencies\":true}}";
+            if (mode == "oversized-receipt") receipt = new string('x', 70 * 1024);
+            File.WriteAllText(receiptPath, receipt);
+            File.WriteAllText(statePath, "receipt-published");
+            return 0;
+        }
+        if (action == "rollback") {
+            if (mode == "rollback-fail") return 1;
+            if (File.Exists(stagingPath) &&
+                !HasJournalLeaseAuthority(File.ReadAllText(stagingPath), 3, lease, root)) return 1;
+            if (File.Exists(priorPath)) {
+                File.Copy(priorPath, receiptPath, true);
+                File.Delete(priorPath);
+            } else if (File.Exists(receiptPath)) {
+                File.Delete(receiptPath);
+            }
+            if (File.Exists(manifestPath)) {
+                var manifest = File.ReadAllText(manifestPath);
+                var candidateRel = JsonField(manifest, "candidate_rel");
+                var candidate = String.IsNullOrEmpty(candidateRel)
+                    ? null
+                    : Path.Combine(root, candidateRel.Replace('/', Path.DirectorySeparatorChar));
+                if (!String.IsNullOrEmpty(candidate) && Directory.Exists(candidate))
+                    Directory.Delete(candidate, true);
+                var provisionedRel = JsonField(manifest, "rel");
+                var provisioned = String.IsNullOrEmpty(provisionedRel)
+                    ? null
+                    : Path.Combine(root, provisionedRel.Replace('/', Path.DirectorySeparatorChar));
+                if (!String.IsNullOrEmpty(provisioned) && Directory.Exists(provisioned))
+                    Directory.Delete(provisioned, true);
+            }
+            if (File.Exists(statePath)) File.Delete(statePath);
+            if (File.Exists(manifestPath)) File.Delete(manifestPath);
+            if (File.Exists(healthPath)) File.Delete(healthPath);
+            if (File.Exists(stagingPath)) File.Delete(stagingPath);
+            return 0;
+        }
+        if (action == "commit") {
+            if (mode == "commit-fail" || !File.Exists(statePath) ||
+                File.ReadAllText(statePath) != "receipt-published") return 1;
+            if (File.Exists(priorPath)) File.Delete(priorPath);
+            if (File.Exists(manifestPath)) {
+                var candidateRel = JsonField(File.ReadAllText(manifestPath), "candidate_rel");
+                var candidate = String.IsNullOrEmpty(candidateRel)
+                    ? null
+                    : Path.Combine(root, candidateRel.Replace('/', Path.DirectorySeparatorChar));
+                if (!String.IsNullOrEmpty(candidate) && Directory.Exists(candidate))
+                    Directory.Delete(candidate, true);
+            }
+            File.Delete(statePath);
+            if (File.Exists(manifestPath)) File.Delete(manifestPath);
+            if (File.Exists(healthPath)) File.Delete(healthPath);
+            if (File.Exists(stagingPath)) File.Delete(stagingPath);
+            return 0;
+        }
+        return 1;
+    }
+
     public static int Main(string[] args) {
         if (args.Contains("--test-held-writer")) return HoldWriter();
+        var pythonArgsCapture = Environment.GetEnvironmentVariable("HERMES_TEST_PYTHON_ARGS_CAPTURE");
+        if (!String.IsNullOrEmpty(pythonArgsCapture))
+            File.AppendAllText(pythonArgsCapture, String.Join(" ", args) + Environment.NewLine);
+        var mode = Environment.GetEnvironmentVariable("HERMES_TEST_UPDATE_MODE") ?? "normal";
+        if (args.Contains("hermes_cli.desktop_update_activation"))
+            return Activation(args, mode);
         if (args.Contains("--preflight")) {
             var output = Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_OUTPUT") ?? "";
             var argsCapture = Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_ARGS_CAPTURE");
@@ -462,7 +653,6 @@ public static class FakeHermes {
         var capturePath = Environment.GetEnvironmentVariable("HERMES_TEST_LEASE_CAPTURE");
         var leaseId = Arg(args, "--bridge-lease-id");
         var invocationId = Arg(args, "--invocation-id");
-        var mode = Environment.GetEnvironmentVariable("HERMES_TEST_UPDATE_MODE") ?? "normal";
         if (mode == "pre-plan-fail") {
             Console.Error.WriteLine("simulated pre-plan updater refusal");
             return 2;
@@ -482,6 +672,25 @@ public static class FakeHermes {
             var buildCapture = Environment.GetEnvironmentVariable("HERMES_TEST_BUILD_SHA_CAPTURE");
             if (!String.IsNullOrEmpty(buildCapture))
                 File.WriteAllText(buildCapture, Environment.GetEnvironmentVariable("GITHUB_SHA") ?? "");
+            if (mode == "build-fail") {
+                Console.Error.WriteLine("simulated Desktop build failure");
+                return 1;
+            }
+            var root = Directory.GetCurrentDirectory();
+            var buildSha = Environment.GetEnvironmentVariable("GITHUB_SHA") ?? "";
+            var buildBranch = Environment.GetEnvironmentVariable("GITHUB_REF_NAME") ?? "";
+            var builtAt = mode == "build-stamp-offset"
+                ? "2026-08-22T00:00:00.000+00:00"
+                : "2026-08-22T00:00:00.000Z";
+            var stamp = "{\"schemaVersion\":1,\"commit\":\"" + buildSha +
+                "\",\"branch\":\"" + buildBranch +
+                "\",\"builtAt\":\"" + builtAt + "\",\"dirty\":false,\"source\":\"ci\"}";
+            var sourceStamp = Path.Combine(root, "apps", "desktop", "build", "install-stamp.json");
+            var packagedStamp = Path.Combine(root, "apps", "desktop", "release", "win-unpacked", "resources", "install-stamp.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(sourceStamp));
+            Directory.CreateDirectory(Path.GetDirectoryName(packagedStamp));
+            File.WriteAllText(sourceStamp, stamp);
+            File.WriteAllText(packagedStamp, stamp);
             Console.WriteLine("Desktop build complete.");
             return 0;
         }
@@ -554,30 +763,126 @@ public static class FakeHermes {
         if (mode == "stderr-heavy") Console.Error.Write(new string('x', 2 * 1024 * 1024));
         else if (mode == "silent") Thread.Sleep(1200);
 
+        if (mode == "archive") {
+            if (!String.IsNullOrEmpty(leasePath) && parentLeaseOwnerPid > 0 && File.Exists(leasePath)) {
+                var returned = File.ReadAllText(leasePath);
+                returned = Regex.Replace(returned, "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + parentLeaseOwnerPid);
+                ReplaceLease(leasePath, returned, "update-return-archive");
+            }
+            Console.WriteLine("Archive staging completed without a transactional Git claim.");
+            return 0;
+        }
+
+        if (mode == "acquisition-crash") {
+            var home = Path.GetDirectoryName(leasePath);
+            var root = Path.Combine(home, "hermes-agent");
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var workspaceRel = "tmp/update-acquisition-1234567890abcdef12345678";
+            var workspace = Path.Combine(home, workspaceRel.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(workspace);
+            File.WriteAllText(Path.Combine(workspace, "partial.pack"), "partial");
+            var journal = "{\"schema_version\":2,\"invocation_id\":\"" + invocationId +
+                "\",\"lease_id\":\"" + leaseId + "\",\"root\":\"" + Escape(root) +
+                "\",\"workspace_rel\":\"" + workspaceRel +
+                "\",\"workspace_identity_sha256\":\"" + new string('e', 64) +
+                "\",\"lease_authority\":" + LeaseAuthorityJson(leaseId, root, now) +
+                ",\"created_at\":" + now + "}";
+            File.WriteAllText(Path.Combine(home, ".hermes-update-acquisition.json"), journal);
+            if (File.Exists(leasePath) && parentLeaseOwnerPid > 0) {
+                var returned = File.ReadAllText(leasePath);
+                returned = Regex.Replace(returned, "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + parentLeaseOwnerPid);
+                ReplaceLease(leasePath, returned, "update-return-acquisition-crash");
+            }
+            Console.Error.WriteLine("simulated crash during isolated package acquisition");
+            return 1;
+        }
+
+        if (mode == "staging-crash") {
+            var home = Path.GetDirectoryName(leasePath);
+            var root = Path.Combine(home, "hermes-agent");
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var candidateRel = ".hermes-runtime/venv-candidate-12345678";
+            var generationRel = ".hermes-runtime/python/generation-12345678";
+            Directory.CreateDirectory(Path.Combine(root, candidateRel.Replace('/', Path.DirectorySeparatorChar)));
+            Directory.CreateDirectory(Path.Combine(root, generationRel.Replace('/', Path.DirectorySeparatorChar)));
+            var staging = "{\"schema_version\":3,\"invocation_id\":\"" + invocationId +
+                "\",\"lease_id\":\"" + leaseId + "\",\"root\":\"" + Escape(root) +
+                "\",\"phase\":\"candidate-staging\",\"pre_update_head\":\"" + new string('a', 40) +
+                "\",\"pre_update_branch\":\"main\",\"branch\":\"main\",\"selected_pre_head\":null" +
+                ",\"target_head\":\"" + new string('b', 40) +
+                "\",\"candidate\":{\"rel\":\"" + candidateRel +
+                "\",\"identity_sha256\":\"" + new string('c', 64) + "\"}" +
+                ",\"provisioned_generation\":{\"rel\":\"" + generationRel +
+                "\",\"identity_sha256\":\"" + new string('d', 64) + "\"}" +
+                ",\"lease_authority\":" + LeaseAuthorityJson(leaseId, root, now) +
+                ",\"created_at\":" + now + ",\"updated_at\":" + now + "}";
+            File.WriteAllText(Path.Combine(home, ".hermes-update-staging.json"), staging);
+            if (File.Exists(leasePath) && parentLeaseOwnerPid > 0) {
+                var returned = File.ReadAllText(leasePath);
+                returned = Regex.Replace(returned, "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + parentLeaseOwnerPid);
+                ReplaceLease(leasePath, returned, "update-return-staging-crash");
+            }
+            Console.Error.WriteLine("simulated crash after staging journal publication");
+            return 1;
+        }
+
         if (!String.IsNullOrEmpty(leaseId) && !String.IsNullOrEmpty(leasePath)) {
             var home = Path.GetDirectoryName(leasePath);
-            var root = Path.Combine(home, "hermes-agent").Replace("\\", "\\\\");
+            var root = Path.Combine(home, "hermes-agent");
             var branchIndex = Array.IndexOf(args, "--branch");
             var branch = branchIndex >= 0 && branchIndex + 1 < args.Length ? args[branchIndex + 1] : "main";
-            var archive = mode == "archive";
-            var sha = new string('a', 40);
-            var archiveSha = new string('b', 64);
-            var identity = archive
-                ? "\"mode\":\"archive\",\"remote\":null,\"target_ref\":null,\"target_sha\":null,\"resulting_head\":null,\"archive_sha\":\"" + archiveSha + "\""
-                : "\"mode\":\"git\",\"remote\":\"origin\",\"target_ref\":\"refs/remotes/origin/" + branch + "\",\"target_sha\":\"" + sha + "\",\"resulting_head\":\"" + sha + "\",\"archive_sha\":null";
-            var receiptTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            if (mode == "receipt-clock-rollback" || mode == "receipt-clock-rollback-resume-fail")
-                receiptTimestamp -= 60;
-            var receipt = "{\"schema_version\":1,\"invocation_id\":\"" + invocationId +
-                "\",\"lease_id\":\"" + leaseId + "\"," + identity + ",\"root\":\"" + root +
-                "\",\"branch\":\"" + branch + "\",\"timestamp\":" +
-                receiptTimestamp +
-                ",\"success\":true,\"gateway_resume_deferred\":true,\"health\":{\"critical_syntax\":true,\"critical_imports\":true,\"dependencies\":true,\"node_dependencies\":true}}";
-            File.WriteAllText(Path.Combine(home, ".hermes-update-receipt.json"), receipt);
+            var preUpdateBranch = JsonField(
+                Environment.GetEnvironmentVariable("HERMES_TEST_PREFLIGHT_OUTPUT") ?? "",
+                "branch"
+            ) ?? "main";
+            var candidateRel = ".hermes-runtime/venv-candidate-12345678";
+            var provisionedRel = ".hermes-runtime/python/generation-12345678";
+            var targetHead = mode == "target-mismatch"
+                ? new string('f', 40)
+                : new string('b', 40);
+            var targetRemote = mode == "target-remote-mismatch" ? "mirror" : "origin";
+            var targetRef = "refs/remotes/" + targetRemote + "/" + branch;
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            Directory.CreateDirectory(Path.Combine(root, candidateRel.Replace('/', Path.DirectorySeparatorChar)));
+            Directory.CreateDirectory(Path.Combine(root, provisionedRel.Replace('/', Path.DirectorySeparatorChar)));
+            var manifest = "{\"schema_version\":2,\"invocation_id\":\"" + invocationId +
+                "\",\"lease_id\":\"" + leaseId + "\",\"root\":\"" + Escape(root) +
+                "\",\"candidate_rel\":\"" + candidateRel +
+                "\",\"provisioned_generation\":{\"rel\":\"" + provisionedRel +
+                "\",\"identity_sha256\":\"" + new string('c', 64) + "\"}" +
+                ",\"pre_update_head\":\"" + new string('a', 40) +
+                "\",\"pre_update_branch\":\"" + preUpdateBranch +
+                "\",\"selected_pre_head\":null" +
+                ",\"target_head\":\"" + targetHead +
+                "\",\"branch\":\"" + branch +
+                "\",\"remote\":\"" + targetRemote + "\",\"target_ref\":\"" + targetRef +
+                "\",\"prior_receipt_sha256\":null,\"python_health\":{" +
+                "\"critical_imports\":true,\"critical_syntax\":true,\"dependencies\":true}," +
+                "\"created_at\":" + now + "}";
+            if (mode == "manifest-retire-crash") {
+                var staging = "{\"schema_version\":3,\"invocation_id\":\"" + invocationId +
+                    "\",\"lease_id\":\"" + leaseId + "\",\"root\":\"" + Escape(root) +
+                    "\",\"phase\":\"candidate-staging\",\"pre_update_head\":\"" + new string('a', 40) +
+                    "\",\"pre_update_branch\":\"" + preUpdateBranch +
+                    "\",\"branch\":\"" + branch + "\",\"selected_pre_head\":null" +
+                    ",\"target_head\":\"" + targetHead +
+                    "\",\"candidate\":{\"rel\":\"" + candidateRel +
+                    "\",\"identity_sha256\":\"" + new string('c', 64) + "\"}" +
+                    ",\"provisioned_generation\":{\"rel\":\"" + provisionedRel +
+                    "\",\"identity_sha256\":\"" + new string('d', 64) + "\"}" +
+                    ",\"lease_authority\":" + LeaseAuthorityJson(leaseId, root, now) +
+                    ",\"created_at\":" + now + ",\"updated_at\":" + now + "}";
+                File.WriteAllText(Path.Combine(home, ".hermes-update-staging.json"), staging);
+            }
+            File.WriteAllText(Path.Combine(home, ".hermes-update-activation.json"), manifest);
             if (File.Exists(leasePath) && parentLeaseOwnerPid > 0) {
                 var returned = File.ReadAllText(leasePath);
                 returned = Regex.Replace(returned, "\"owner_pid\"\\s*:\\s*\\d+", "\"owner_pid\":" + parentLeaseOwnerPid);
                 ReplaceLease(leasePath, returned, "update-return");
+            }
+            if (mode == "manifest-retire-crash") {
+                Console.Error.WriteLine("simulated crash before exact staging journal retirement");
+                return 1;
             }
         }
         Console.WriteLine("Update complete.");
@@ -603,6 +908,8 @@ public static class FakeDesktop {
         var captured = Path.Combine(home, "immediate-consumer-result.json");
         var pid = Path.Combine(home, "immediate-consumer-pid.txt");
         File.WriteAllText(pid, Process.GetCurrentProcess().Id.ToString());
+        if ((Environment.GetEnvironmentVariable("HERMES_TEST_UPDATE_MODE") ?? "") == "relaunch-fail")
+            return 17;
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (DateTime.UtcNow < deadline) {
             foreach (var requestPath in Directory.GetFiles(home, ".hermes-update-relaunch-request-*.json")) {
@@ -696,7 +1003,7 @@ function New-TestInstall([string]$Tag, [string]$FakeHermes) {
     $testHome = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-desktop-update-test-{0}-{1}" -f $Tag, [Guid]::NewGuid().ToString('N'))
     $root = Join-Path $testHome 'hermes-agent'
     $shimDir = Join-Path $root 'venv\Scripts'
-    $baseDir = Join-Path $root 'base-python'
+    $baseDir = Join-Path $root '.hermes-runtime\python\test-generation'
     New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
     New-Item -ItemType Directory -Path $baseDir -Force | Out-Null
     Copy-Item -LiteralPath $FakeHermes -Destination (Join-Path $shimDir 'hermes.exe')
@@ -717,6 +1024,7 @@ function New-TestInstall([string]$Tag, [string]$FakeHermes) {
         PreflightLeaseCapture = Join-Path $testHome 'lease-before-mutation.json'
         PreflightMarkerCapture = Join-Path $testHome 'marker-before-mutation.txt'
         PreflightArgsCapture = Join-Path $testHome 'preflight-args.txt'
+        PythonArgsCapture = Join-Path $testHome 'python-args.txt'
         TopologyCapture = Join-Path $testHome 'contained-process-topology.txt'
         ResumeCapture = Join-Path $testHome 'deferred-resume-args.txt'
         ResumeRedirectorCapture = Join-Path $testHome 'deferred-resume-redirector.txt'
@@ -742,16 +1050,36 @@ function Write-TestPyvenvConfig([object]$Install, [string[]]$Lines) {
 }
 
 function Assert-InvalidPyvenvRecoveryRejected([object]$Install, [int]$Code, [string]$Label) {
-    Assert-Equal 13 $Code "$Label exits with failed fleet recovery"
-    Assert-True (Test-Path -LiteralPath $Install.Sentinel) "$Label reaches the update before recovery validation"
+    Assert-Equal 3 $Code "$Label fails before mutation when the private base interpreter cannot be authenticated"
+    Assert-True (-not (Test-Path -LiteralPath $Install.Sentinel)) "$Label never reaches update mutation"
     Assert-True (-not (Test-Path -LiteralPath $Install.ResumeCapture)) "$Label starts no recovery interpreter"
     Assert-True (-not (Test-Path -LiteralPath $Install.UpdateMarker)) "$Label releases the exact update marker"
     Assert-True (-not (Test-Path -LiteralPath $Install.Lease)) "$Label releases the exact bridge lease"
     Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-update-in-progress.cas-*' -File -ErrorAction SilentlyContinue).Count) "$Label leaves no update-marker CAS artifacts"
     Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-venv-quiesce.cas-*' -File -ErrorAction SilentlyContinue).Count) "$Label leaves no lease CAS artifacts"
-    Assert-Equal 1 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-gateway-resume-*.json' -File -ErrorAction SilentlyContinue).Count) "$Label preserves one exact pending recovery plan"
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-gateway-resume-*.json' -File -ErrorAction SilentlyContinue).Count) "$Label creates no recovery plan before mutation"
     Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-gateway-resume-*.completed' -File -ErrorAction SilentlyContinue).Count) "$Label does not claim the recovery plan was completed"
     Assert-Equal 0 (@(Get-ChildItem -LiteralPath $Install.Home -Filter '.hermes-gateway-resume-*.consume-*' -File -ErrorAction SilentlyContinue).Count) "$Label leaves no plan-consume artifacts"
+}
+
+function Assert-ManagedPhaseOrder([object]$Install, [string[]]$Patterns, [string]$Label) {
+    $actual = @([System.IO.File]::ReadAllLines($Install.PythonArgsCapture) | Where-Object { $_ })
+    Assert-Equal $Patterns.Count $actual.Count "$Label executes exactly the required managed phases"
+    for ($phase = 0; $phase -lt $Patterns.Count; $phase++) {
+        $matches = $phase -lt $actual.Count -and $actual[$phase] -match $Patterns[$phase]
+        Assert-True $matches "$Label lifecycle phase $phase has the required exact order"
+    }
+}
+
+function Assert-RolledBackActivationArtifacts([object]$Install, [string]$Label) {
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $Install.Home '.hermes-update-activation.json'))) "$Label retires its activation manifest"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $Install.Home '.hermes-update-activation-state.json'))) "$Label retires its activation state"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $Install.Home '.hermes-update-receipt.json'))) "$Label restores the prior receipt state"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $Install.Home '.hermes-update-desktop-health.json'))) "$Label retires its exact Desktop health proof"
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $Install.Root '.hermes-runtime') -Filter 'venv-candidate-*' -Directory -ErrorAction SilentlyContinue).Count) "$Label removes its staged candidate generation"
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $Install.Root '.hermes-runtime\python') -Filter 'generation-*' -Directory -ErrorAction SilentlyContinue).Count) "$Label removes its provisioned Python generation"
+    Assert-True (-not (Test-Path -LiteralPath $Install.UpdateMarker)) "$Label releases the update marker"
+    Assert-True (-not (Test-Path -LiteralPath $Install.Lease)) "$Label releases the bridge lease"
 }
 
 function Write-TestLease([object]$Install, [string]$LeaseId) {
@@ -767,7 +1095,13 @@ function Write-TestLease([object]$Install, [string]$LeaseId) {
     [System.IO.File]::WriteAllText($Install.Lease, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-function New-PreflightJson([object]$Install, [bool]$Ok, [bool]$Ready) {
+function New-PreflightJson(
+    [object]$Install,
+    [bool]$Ok,
+    [bool]$Ready,
+    [string]$CurrentBranch = 'main',
+    [string]$TargetBranch = 'main'
+) {
     $payload = [ordered]@{
         schema_version = 1
         mode = 'preflight'
@@ -781,7 +1115,15 @@ function New-PreflightJson([object]$Install, [bool]$Ok, [bool]$Ready) {
         mcp_bridges = @()
         pausable_gateways = 0
         pausable_gateway_processes = @()
-        git = $null
+        git = [ordered]@{
+            head = ('a' * 40)
+            branch = $CurrentBranch
+            dirty = $false
+            tracking_remote = 'origin'
+            target_branch = $TargetBranch
+            target_ref = "refs/remotes/origin/$TargetBranch"
+            target_sha = ('b' * 40)
+        }
         last_update_receipt = $null
         lease = $null
         actions = @()
@@ -810,6 +1152,7 @@ function Invoke-TestHandoff(
     $oldPreflightLeaseCapture = $env:HERMES_TEST_PREFLIGHT_LEASE_CAPTURE
     $oldPreflightMarkerCapture = $env:HERMES_TEST_PREFLIGHT_MARKER_CAPTURE
     $oldPreflightArgsCapture = $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE
+    $oldPythonArgsCapture = $env:HERMES_TEST_PYTHON_ARGS_CAPTURE
     $oldTopologyCapture = $env:HERMES_TEST_TOPOLOGY_CAPTURE
     $oldResumeCapture = $env:HERMES_TEST_RESUME_CAPTURE
     $oldResumeRedirectorCapture = $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE
@@ -837,6 +1180,7 @@ function Invoke-TestHandoff(
         $env:HERMES_TEST_PREFLIGHT_LEASE_CAPTURE = $Install.PreflightLeaseCapture
         $env:HERMES_TEST_PREFLIGHT_MARKER_CAPTURE = $Install.PreflightMarkerCapture
         $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE = $Install.PreflightArgsCapture
+        $env:HERMES_TEST_PYTHON_ARGS_CAPTURE = $Install.PythonArgsCapture
         $env:HERMES_TEST_TOPOLOGY_CAPTURE = $Install.TopologyCapture
         $env:HERMES_TEST_RESUME_CAPTURE = $Install.ResumeCapture
         $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE = $Install.ResumeRedirectorCapture
@@ -898,6 +1242,7 @@ exit $LASTEXITCODE
         $env:HERMES_TEST_PREFLIGHT_LEASE_CAPTURE = $oldPreflightLeaseCapture
         $env:HERMES_TEST_PREFLIGHT_MARKER_CAPTURE = $oldPreflightMarkerCapture
         $env:HERMES_TEST_PREFLIGHT_ARGS_CAPTURE = $oldPreflightArgsCapture
+        $env:HERMES_TEST_PYTHON_ARGS_CAPTURE = $oldPythonArgsCapture
         $env:HERMES_TEST_TOPOLOGY_CAPTURE = $oldTopologyCapture
         $env:HERMES_TEST_RESUME_CAPTURE = $oldResumeCapture
         $env:HERMES_TEST_RESUME_REDIRECTOR_CAPTURE = $oldResumeRedirectorCapture
@@ -929,6 +1274,80 @@ function Invoke-LeasedTestHandoff(
     return Invoke-TestHandoff $Install $PreflightOutput $PreflightCode $PreflightStderr $leaseId
 }
 
+function Invoke-ActivationJournalRecoveryContracts([string]$FakeHermes) {
+    $installs = @()
+    try {
+        $acquisitionCrash = New-TestInstall 'acquisition-journal-crash' $FakeHermes
+        $installs += $acquisitionCrash
+        $acquisitionCrashLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $acquisitionCrash $acquisitionCrashLeaseId
+        $code = Invoke-TestHandoff $acquisitionCrash (New-PreflightJson $acquisitionCrash $true $true) 0 '' $acquisitionCrashLeaseId 'acquisition-crash'
+        Assert-Equal 1 $code 'isolated package acquisition crash fails closed before live installation mutation'
+        Assert-ManagedPhaseOrder $acquisitionCrash @(
+            '^-B -m hermes_cli\.main update --preflight ',
+            '^-B -m hermes_cli\.main update --yes ',
+            '^-B -m hermes_cli\.desktop_update_activation rollback-source$',
+            '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+        ) 'isolated package acquisition crash'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $acquisitionCrash.Home '.hermes-update-acquisition.json'))) 'acquisition crash consumes its exact authenticated journal'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $acquisitionCrash.Home 'tmp') -Filter 'update-acquisition-*' -Directory -ErrorAction SilentlyContinue).Count) 'acquisition crash removes only its journal-named workspace'
+        Assert-True (-not (Test-Path -LiteralPath $acquisitionCrash.UpdateMarker)) 'acquisition crash releases the update marker'
+        Assert-True (-not (Test-Path -LiteralPath $acquisitionCrash.Lease)) 'acquisition crash releases the bridge lease'
+        Start-Sleep -Milliseconds 7500
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $acquisitionCrash.Home '.hermes-update-acquisition.json'))) 'acquisition journal is not recreated 7.5 seconds after return'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $acquisitionCrash.Home 'tmp') -Filter 'update-acquisition-*' -Directory -ErrorAction SilentlyContinue).Count) 'acquisition workspace is not recreated 7.5 seconds after return'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath $acquisitionCrash.Home -Filter '*.tmp*' -File -Recurse -ErrorAction SilentlyContinue).Count) 'acquisition crash has no delayed temporary writer 7.5 seconds after return'
+
+        $stagingCrash = New-TestInstall 'staging-journal-crash' $FakeHermes
+        $installs += $stagingCrash
+        $stagingCrashLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $stagingCrash $stagingCrashLeaseId
+        $code = Invoke-TestHandoff $stagingCrash (New-PreflightJson $stagingCrash $true $true) 0 '' $stagingCrashLeaseId 'staging-crash'
+        Assert-Equal 1 $code 'post-journal staging crash restores the exact prior source and fails closed'
+        Assert-ManagedPhaseOrder $stagingCrash @(
+            '^-B -m hermes_cli\.main update --preflight ',
+            '^-B -m hermes_cli\.main update --yes ',
+            '^-B -m hermes_cli\.desktop_update_activation rollback-source$',
+            '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+        ) 'post-journal staging crash'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $stagingCrash.Home '.hermes-update-staging.json'))) 'staging crash consumes its exact authenticated journal'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $stagingCrash.Root '.hermes-runtime') -Filter 'venv-candidate-*' -Directory -ErrorAction SilentlyContinue).Count) 'staging crash removes only its journal-named candidate'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $stagingCrash.Root '.hermes-runtime\python') -Filter 'generation-*' -Directory -ErrorAction SilentlyContinue).Count) 'staging crash removes only its journal-named provisioned generation'
+        Assert-True (-not (Test-Path -LiteralPath $stagingCrash.UpdateMarker)) 'staging crash releases the update marker'
+        Assert-True (-not (Test-Path -LiteralPath $stagingCrash.Lease)) 'staging crash releases the bridge lease'
+        Start-Sleep -Milliseconds 7500
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $stagingCrash.Home '.hermes-update-staging.json'))) 'staging journal is not recreated 7.5 seconds after return'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $stagingCrash.Root '.hermes-runtime') -Filter 'venv-candidate-*' -Directory -ErrorAction SilentlyContinue).Count) 'staging candidate is not recreated 7.5 seconds after return'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $stagingCrash.Root '.hermes-runtime\python') -Filter 'generation-*' -Directory -ErrorAction SilentlyContinue).Count) 'provisioned generation is not recreated 7.5 seconds after return'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath $stagingCrash.Home -Filter '*.tmp*' -File -Recurse -ErrorAction SilentlyContinue).Count) 'staging crash has no delayed temporary writer 7.5 seconds after return'
+
+        $manifestRetireCrash = New-TestInstall 'manifest-staging-journal-coexistence' $FakeHermes
+        $installs += $manifestRetireCrash
+        $manifestRetireCrashLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $manifestRetireCrash $manifestRetireCrashLeaseId
+        $code = Invoke-TestHandoff $manifestRetireCrash (New-PreflightJson $manifestRetireCrash $true $true) 0 '' $manifestRetireCrashLeaseId 'manifest-retire-crash'
+        Assert-Equal 1 $code 'crash after manifest publication but before journal retirement fails closed'
+        Assert-ManagedPhaseOrder $manifestRetireCrash @(
+            '^-B -m hermes_cli\.main update --preflight ',
+            '^-B -m hermes_cli\.main update --yes ',
+            '^-B -m hermes_cli\.desktop_update_activation rollback$',
+            '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+        ) 'coexisting manifest and staging journal crash'
+        Assert-RolledBackActivationArtifacts $manifestRetireCrash 'coexisting manifest and staging journal crash'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $manifestRetireCrash.Home '.hermes-update-staging.json'))) 'manifest rollback consumes the exact coexisting staging journal'
+        Start-Sleep -Milliseconds 7500
+        Assert-RolledBackActivationArtifacts $manifestRetireCrash 'coexisting manifest and staging journal crash after 7.5 seconds'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $manifestRetireCrash.Home '.hermes-update-staging.json'))) 'coexisting staging journal is not recreated 7.5 seconds after return'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath $manifestRetireCrash.Home -Filter '*.tmp*' -File -Recurse -ErrorAction SilentlyContinue).Count) 'coexisting manifest and staging crash has no delayed temporary writer 7.5 seconds after return'
+    } finally {
+        foreach ($install in $installs) {
+            if ($install -and (Test-Path -LiteralPath $install.Home)) {
+                Remove-Item -LiteralPath $install.Home -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 $suiteRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-desktop-update-suite-{0}" -f [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $suiteRoot -Force | Out-Null
 $fakeHermes = Join-Path $suiteRoot 'fake-hermes.exe'
@@ -939,6 +1358,82 @@ try {
     New-FakeHermes $fakeHermes
     $fakeDesktopTemplate = Join-Path $suiteRoot 'fake-desktop-template.exe'
     New-FakeDesktop $fakeDesktopTemplate
+
+    . $desktopUpdateJsonHelper
+    $fallbackStampRaw = '{"schemaVersion":1,"commit":"' + ('b' * 40) +
+        '","branch":"main","builtAt":"2026-08-22T00:00:00.000Z","dirty":false,"source":"ci"}'
+    $nativeStamp = ConvertFrom-DesktopStampJson $fallbackStampRaw
+    Assert-True ($nativeStamp.builtAt -is [string] -and
+        $nativeStamp.builtAt -eq '2026-08-22T00:00:00.000Z') 'shared production parser preserves canonical timestamp bytes'
+    $fallbackStamp = ConvertFrom-DesktopStampJson $fallbackStampRaw -ForceCoreFallback
+    Assert-True ($fallbackStamp.builtAt -is [string] -and
+        $fallbackStamp.builtAt -eq '2026-08-22T00:00:00.000Z') 'shared forced parser seam preserves canonical timestamp bytes as a string'
+    $fallbackOffset = ConvertFrom-DesktopStampJson ($fallbackStampRaw.Replace('.000Z', '.000+00:00')) -ForceCoreFallback
+    Assert-True ($fallbackOffset.builtAt -is [string] -and
+        $fallbackOffset.builtAt -eq '2026-08-22T00:00:00.000+00:00') 'shared forced parser seam does not canonicalize an equivalent offset timestamp'
+
+    if ($ActivationJournalRecoveryOnly) {
+        Invoke-ActivationJournalRecoveryContracts $fakeHermes
+        if ($failures -gt 0) {
+            throw "focused activation journal recovery failed with $failures assertion(s)"
+        }
+        Write-Host 'Focused activation journal recovery passed.' -ForegroundColor Green
+        return
+    }
+
+    if ($ActivationBuildProofOnly) {
+        $missingHelperProbe = Join-Path $suiteRoot 'missing-json-helper'
+        $missingHelperRoot = Join-Path $missingHelperProbe 'install'
+        $missingHelperHome = Join-Path $missingHelperProbe 'home'
+        $missingHelperScript = Join-Path $missingHelperProbe 'desktop-update.ps1'
+        New-Item -ItemType Directory -Path $missingHelperRoot, $missingHelperHome -Force | Out-Null
+        Copy-Item -LiteralPath $handoffScript -Destination $missingHelperScript
+        $oldMissingHelperHome = $env:HERMES_HOME
+        $oldMissingHelperErrorAction = $ErrorActionPreference
+        try {
+            $env:HERMES_HOME = $missingHelperHome
+            $ErrorActionPreference = 'Continue'
+            & $powershellExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File $missingHelperScript -InstallRoot $missingHelperRoot -NoUi -TestMode 2>$null
+            $missingHelperCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $oldMissingHelperErrorAction
+            $env:HERMES_HOME = $oldMissingHelperHome
+        }
+        Assert-Equal 3 $missingHelperCode 'missing shared parser fails before updater initialization'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath $missingHelperHome -Force -Recurse -ErrorAction SilentlyContinue).Count) 'missing shared parser creates no marker, lease, result, or log'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath $missingHelperRoot -Force -Recurse -ErrorAction SilentlyContinue).Count) 'missing shared parser performs no install mutation'
+
+        $focusedSuccess = New-TestInstall 'focused-activation-success' $fakeHermes
+        $focusedSuccessDesktop = Join-Path $focusedSuccess.Home 'fake-desktop.exe'
+        Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $focusedSuccessDesktop
+        $focusedSuccessLease = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $focusedSuccess $focusedSuccessLease
+        $code = Invoke-TestHandoff $focusedSuccess (New-PreflightJson $focusedSuccess $true $true) 0 '' $focusedSuccessLease 'normal' $focusedSuccessDesktop
+        Assert-Equal 0 $code 'focused canonical stamp transaction completes through ACK and commit'
+        Assert-ManagedPhaseOrder $focusedSuccess @(
+            '^-B -m hermes_cli\.main update --preflight ',
+            '^-B -m hermes_cli\.main update --yes ',
+            '^-B -m hermes_cli\.desktop_update_activation activate$',
+            '^-B -m hermes_cli\.main desktop ',
+            '^-B -m hermes_cli\.desktop_update_activation publish-receipt$',
+            '^-B -m hermes_cli\.desktop_update_activation commit$',
+            '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+        ) 'focused canonical stamp transaction'
+
+        $focusedOffset = New-TestInstall 'focused-noncanonical-stamp' $fakeHermes
+        $focusedOffsetLease = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $focusedOffset $focusedOffsetLease
+        $code = Invoke-TestHandoff $focusedOffset (New-PreflightJson $focusedOffset $true $true) 0 '' $focusedOffsetLease 'build-stamp-offset'
+        Assert-Equal 6 $code 'focused build exit zero with +00:00 stamp remains failed'
+        Assert-True (Test-Path -LiteralPath $focusedOffset.BuildShaCapture) 'focused +00:00 fixture proves build exit zero'
+        Assert-RolledBackActivationArtifacts $focusedOffset 'focused +00:00 stamp rejection'
+        if ($failures -gt 0) {
+            throw "focused activation build proof failed with $failures assertion(s)"
+        }
+        Write-Host 'Focused activation build proof passed.' -ForegroundColor Green
+        return
+    }
 
     $realPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
     Assert-True (Test-Path -LiteralPath $realPython -PathType Leaf) 'real managed Python is available for the containment gate integration test'
@@ -1088,6 +1583,25 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
         Get-Content -LiteralPath (Join-Path $containmentSuccess.Home 'logs\desktop-update-handoff.log') -ErrorAction SilentlyContinue
     }
     Assert-Equal 0 $code 'deferred gateway writer starts only after its parent is assigned and terminal proof disarms containment'
+    $containmentSuccessPythonArgs = @(
+        [System.IO.File]::ReadAllLines($containmentSuccess.PythonArgsCapture) |
+            Where-Object { $_ }
+    )
+    Assert-Equal 1 (@($containmentSuccessPythonArgs | Where-Object {
+        $_ -match '^-B -m hermes_cli\.desktop_update_activation activate$'
+    }).Count) 'the real handoff activates exactly one staged candidate before recovery'
+    $commitIndex = [Array]::IndexOf(
+        $containmentSuccessPythonArgs,
+        '-B -m hermes_cli.desktop_update_activation commit'
+    )
+    $resumeIndex = -1
+    for ($index = 0; $index -lt $containmentSuccessPythonArgs.Count; $index++) {
+        if ($containmentSuccessPythonArgs[$index] -match '^-B -m hermes_cli\.main update --resume-deferred-gateway ') {
+            $resumeIndex = $index
+            break
+        }
+    }
+    Assert-True ($commitIndex -ge 0 -and $resumeIndex -gt $commitIndex) 'the verified installation commits before any gateway process restart'
     $nativeUnsignedCapture = $containmentSuccess.ManifestUnsignedCapture + '.native'
     Assert-True ((Test-Path -LiteralPath $containmentSuccess.ManifestUnsignedCapture -PathType Leaf) -and
         (Test-Path -LiteralPath $nativeUnsignedCapture -PathType Leaf) -and
@@ -1423,7 +1937,7 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
     Assert-Equal 1 (@([System.IO.File]::ReadAllLines((Join-Path $leased.Root 'venv\pyvenv.cfg')) | Where-Object { $_ -match '^\s*executable\s*=' }).Count) 'explicit-executable recovery fixture has one executable key'
     $code = Invoke-TestHandoff $leased (New-PreflightJson $leased $true $true) 0 'preflight diagnostic' $leaseId 'normal' $leasedDesktop
     Assert-Equal 0 $code 'ready preflight with matching lease completes'
-    Assert-Equal ('a' * 40) ([System.IO.File]::ReadAllText($leased.BuildShaCapture)) 'git rebuild stamp is pinned to the correlated resulting HEAD'
+    Assert-Equal ('b' * 40) ([System.IO.File]::ReadAllText($leased.BuildShaCapture)) 'git rebuild stamp is pinned to the staged target HEAD'
     Assert-True (Test-Path -LiteralPath $leased.Sentinel) 'ready preflight reaches update'
     Assert-True (-not (Test-Path -LiteralPath $leased.Lease)) 'exact update child clears its adopted lease before success'
     Assert-True (Test-Path -LiteralPath $leased.PreflightLeaseCapture) 'preflight observed the script-owned step-zero lease'
@@ -1434,7 +1948,7 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
         Assert-Equal 1 $preflightArgLines.Count 'successful handoff runs one capability-authorized initial preflight'
         $preflightRecord = @($preflightArgLines[0] -split "`t", 2)
         Assert-Equal 2 $preflightRecord.Count 'preflight capture records argv and working directory'
-        Assert-True ($preflightRecord[0] -match '^-m hermes_cli\.main update ') 'preflight bypasses the console shim and runs managed Python directly'
+        Assert-True ($preflightRecord[0] -match '^-B -m hermes_cli\.main update ') 'preflight bypasses the console shim and disables bytecode writes'
         Assert-True ($preflightRecord[0] -match '--bridge-lease-id' -and $preflightRecord[0] -match [regex]::Escape($leaseId)) 'initial preflight receives the matching private lease capability'
         if ($preflightRecord.Count -eq 2) {
             Assert-Equal ([System.IO.Path]::GetFullPath($leased.Root).TrimEnd([char[]]@('\', '/'))) ([System.IO.Path]::GetFullPath($preflightRecord[1]).TrimEnd([char[]]@('\', '/'))) 'first contained managed preflight starts in the exact install root'
@@ -1465,7 +1979,25 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
         Assert-Equal ([int64]$captured.owner_pid) ([int64]$topology[1]) 'lease transfer accepts the contained managed descendant as exact owner'
     }
     if (Test-Path -LiteralPath $leased.Sentinel) {
-        Assert-True ([System.IO.File]::ReadAllText($leased.Sentinel) -match '^-m hermes_cli\.main update ') 'mutation path bypasses the console shim and retains one exact Python PID'
+        Assert-True ([System.IO.File]::ReadAllText($leased.Sentinel) -match '^-B -m hermes_cli\.main update ') 'mutation path bypasses the console shim and disables bytecode writes'
+    }
+    Assert-True (Test-Path -LiteralPath $leased.PythonArgsCapture) 'every managed phase records its public argv seam'
+    if (Test-Path -LiteralPath $leased.PythonArgsCapture) {
+        $pythonArgLines = @([System.IO.File]::ReadAllLines($leased.PythonArgsCapture) | Where-Object { $_ })
+        $requiredOrder = @(
+            '^-B -m hermes_cli\.main update --preflight ',
+            '^-B -m hermes_cli\.main update --yes ',
+            '^-B -m hermes_cli\.desktop_update_activation activate$',
+            '^-B -m hermes_cli\.main desktop ',
+            '^-B -m hermes_cli\.desktop_update_activation publish-receipt$',
+            '^-B -m hermes_cli\.main update --resume-deferred-gateway ',
+            '^-B -m hermes_cli\.desktop_update_activation commit$'
+        )
+        Assert-Equal $requiredOrder.Count $pythonArgLines.Count 'successful handoff executes exactly the seven required managed phases'
+        for ($phase = 0; $phase -lt $requiredOrder.Count; $phase++) {
+            $matches = $phase -lt $pythonArgLines.Count -and $pythonArgLines[$phase] -match $requiredOrder[$phase]
+            Assert-True $matches "transactional lifecycle phase $phase has the required exact order"
+        }
     }
     Assert-True (Test-Path -LiteralPath $leased.ResumeCapture) 'trusted deferred gateway resume argv is captured'
     if ((Test-Path -LiteralPath $leased.Sentinel) -and (Test-Path -LiteralPath $leased.ResumeCapture)) {
@@ -1475,6 +2007,10 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
         Assert-Equal $updateInvocation $resumeInvocation 'update receipt plan and trusted resume share one invocation id'
     }
     Assert-True (Test-Path -LiteralPath $leased.Result) 'versioned handoff result is written after terminal cleanup'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $leased.Home '.hermes-update-activation.json'))) 'acknowledged success commits the activation manifest'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $leased.Home '.hermes-update-activation-state.json'))) 'acknowledged success removes retained rollback state'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $leased.Home '.hermes-update-desktop-health.json'))) 'acknowledged success consumes and retires the exact Desktop health proof'
+    Assert-Equal 1 (@(Get-ChildItem -LiteralPath (Join-Path $leased.Root '.hermes-runtime\python') -Filter 'generation-*' -Directory -ErrorAction SilentlyContinue).Count) 'acknowledged success retains the provisioned Python generation used by the active venv'
     if (Test-Path -LiteralPath $leased.Result) {
         $result = [System.IO.File]::ReadAllText($leased.Result) | ConvertFrom-Json
         $resultFields = @($result.PSObject.Properties | ForEach-Object { $_.Name })
@@ -1494,8 +2030,212 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
         Assert-True ([System.IO.File]::ReadAllText($handoffLog) -notmatch [regex]::Escape($leaseId)) 'lease capability is absent from user-visible handoff diagnostics'
     }
 
+    $crossBranch = New-TestInstall 'cross-branch-transaction' $fakeHermes
+    $crossBranchDesktop = Join-Path $crossBranch.Home 'fake-desktop.exe'
+    Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $crossBranchDesktop
+    $crossBranchLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $crossBranch $crossBranchLeaseId
+    $crossBranchTarget = 'disposable/update-target'
+    $code = Invoke-TestHandoff `
+        $crossBranch `
+        (New-PreflightJson $crossBranch $true $true 'fork-integration' $crossBranchTarget) `
+        0 '' $crossBranchLeaseId 'normal' $crossBranchDesktop $null `
+        @('-Branch', $crossBranchTarget)
+    Assert-Equal 0 $code 'clean cross-branch retarget commits only after exact Desktop readiness'
+    Assert-ManagedPhaseOrder $crossBranch @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation activate$',
+        '^-B -m hermes_cli\.main desktop ',
+        '^-B -m hermes_cli\.desktop_update_activation publish-receipt$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway ',
+        '^-B -m hermes_cli\.desktop_update_activation commit$'
+    ) 'cross-branch transaction'
+    if (Test-Path -LiteralPath $crossBranch.Result) {
+        $crossBranchResult = [System.IO.File]::ReadAllText($crossBranch.Result) | ConvertFrom-Json
+        Assert-Equal $crossBranchTarget ([string]$crossBranchResult.branch) 'cross-branch result reports the explicit target branch'
+        Assert-Equal $crossBranchTarget ([string]$crossBranchResult.receipt.branch) 'cross-branch receipt binds the explicit target branch'
+    }
+
+    Invoke-ActivationJournalRecoveryContracts $fakeHermes
+
+    $targetMismatch = New-TestInstall 'preflight-target-mismatch' $fakeHermes
+    $targetMismatchLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $targetMismatch $targetMismatchLeaseId
+    $code = Invoke-TestHandoff $targetMismatch (New-PreflightJson $targetMismatch $true $true) 0 '' $targetMismatchLeaseId 'target-mismatch'
+    Assert-Equal 9 $code 'manifest target differing from the stable preflight target fails closed'
+    Assert-ManagedPhaseOrder $targetMismatch @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation rollback$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+    ) 'preflight target mismatch'
+    Assert-RolledBackActivationArtifacts $targetMismatch 'preflight target mismatch'
+
+    $targetRemoteMismatch = New-TestInstall 'preflight-target-remote-mismatch' $fakeHermes
+    $targetRemoteMismatchLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $targetRemoteMismatch $targetRemoteMismatchLeaseId
+    $code = Invoke-TestHandoff $targetRemoteMismatch (New-PreflightJson $targetRemoteMismatch $true $true) 0 '' $targetRemoteMismatchLeaseId 'target-remote-mismatch'
+    Assert-Equal 9 $code 'manifest remote differing from the stable preflight target fails closed'
+    Assert-ManagedPhaseOrder $targetRemoteMismatch @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation rollback$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+    ) 'preflight target remote mismatch'
+    Assert-RolledBackActivationArtifacts $targetRemoteMismatch 'preflight target remote mismatch'
+
+    $activationFailure = New-TestInstall 'activation-failure-rollback' $fakeHermes
+    $activationFailureLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $activationFailure $activationFailureLeaseId
+    $code = Invoke-TestHandoff $activationFailure (New-PreflightJson $activationFailure $true $true) 0 '' $activationFailureLeaseId 'activation-fail'
+    Assert-Equal 9 $code 'candidate activation failure is terminal after restoring the previous installation'
+    $activationFailurePhases = @([System.IO.File]::ReadAllLines($activationFailure.PythonArgsCapture) | Where-Object { $_ })
+    $activationFailureOrder = @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation activate$',
+        '^-B -m hermes_cli\.desktop_update_activation rollback$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+    )
+    Assert-Equal $activationFailureOrder.Count $activationFailurePhases.Count 'activation failure executes only preflight, stage, activate, rollback, and recovery'
+    for ($phase = 0; $phase -lt $activationFailureOrder.Count; $phase++) {
+        Assert-True ($activationFailurePhases[$phase] -match $activationFailureOrder[$phase]) "activation failure lifecycle phase $phase has the required exact order"
+    }
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $activationFailure.Home '.hermes-update-activation.json'))) 'activation failure retires its manifest'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $activationFailure.Home '.hermes-update-activation-state.json'))) 'activation failure retires partial activation state'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $activationFailure.Root '.hermes-runtime') -Filter 'venv-candidate-*' -Directory -ErrorAction SilentlyContinue).Count) 'activation failure removes the staged candidate generation'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $activationFailure.Root '.hermes-runtime\python') -Filter 'generation-*' -Directory -ErrorAction SilentlyContinue).Count) 'activation failure removes the provisioned Python generation'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $activationFailure.Home '.hermes-update-receipt.json'))) 'activation failure never publishes a new receipt'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $activationFailure.Home '.hermes-update-desktop-health.json'))) 'activation failure never publishes a Desktop health proof'
+    Start-Sleep -Milliseconds 7500
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $activationFailure.Home -Filter '*.tmp*' -File -Recurse -ErrorAction SilentlyContinue).Count) 'activation failure has no delayed temporary writer 7.5 seconds after return'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $activationFailure.Root '.hermes-runtime') -Filter 'venv-candidate-*' -Directory -ErrorAction SilentlyContinue).Count) 'activation failure does not recreate its staged candidate 7.5 seconds after return'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath (Join-Path $activationFailure.Root '.hermes-runtime\python') -Filter 'generation-*' -Directory -ErrorAction SilentlyContinue).Count) 'activation failure does not recreate its provisioned generation 7.5 seconds after return'
+
+    $buildFailure = New-TestInstall 'build-failure-rollback' $fakeHermes
+    $buildFailureLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $buildFailure $buildFailureLeaseId
+    $code = Invoke-TestHandoff $buildFailure (New-PreflightJson $buildFailure $true $true) 0 '' $buildFailureLeaseId 'build-fail'
+    Assert-Equal 6 $code 'Desktop build failure is terminal after restoring the previous installation'
+    Assert-ManagedPhaseOrder $buildFailure @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation activate$',
+        '^-B -m hermes_cli\.main desktop ',
+        '^-B -m hermes_cli\.desktop_update_activation rollback$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+    ) 'build failure'
+    Assert-RolledBackActivationArtifacts $buildFailure 'build failure'
+    if (Test-Path -LiteralPath $buildFailure.Result) {
+        $buildFailureResult = [System.IO.File]::ReadAllText($buildFailure.Result) | ConvertFrom-Json
+        Assert-Equal 'failed' ([string]$buildFailureResult.state) 'build failure publishes no false success'
+        Assert-True ([string]$buildFailureResult.message -match 'previous installation was restored') 'build failure result truthfully reports rollback'
+    }
+
+    $noncanonicalStamp = New-TestInstall 'noncanonical-build-stamp' $fakeHermes
+    $noncanonicalStampLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $noncanonicalStamp $noncanonicalStampLeaseId
+    $code = Invoke-TestHandoff $noncanonicalStamp (New-PreflightJson $noncanonicalStamp $true $true) 0 '' $noncanonicalStampLeaseId 'build-stamp-offset'
+    Assert-Equal 6 $code 'build exit zero with a noncanonical offset stamp remains a failed build proof'
+    Assert-ManagedPhaseOrder $noncanonicalStamp @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation activate$',
+        '^-B -m hermes_cli\.main desktop ',
+        '^-B -m hermes_cli\.desktop_update_activation rollback$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+    ) 'noncanonical Desktop build stamp'
+    Assert-True (Test-Path -LiteralPath $noncanonicalStamp.BuildShaCapture) 'noncanonical stamp fixture proves the Desktop build itself exited successfully'
+    Assert-RolledBackActivationArtifacts $noncanonicalStamp 'noncanonical Desktop build stamp'
+
+    $receiptFailure = New-TestInstall 'receipt-failure-rollback' $fakeHermes
+    $receiptFailureLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $receiptFailure $receiptFailureLeaseId
+    $code = Invoke-TestHandoff $receiptFailure (New-PreflightJson $receiptFailure $true $true) 0 '' $receiptFailureLeaseId 'receipt-fail'
+    Assert-Equal 9 $code 'receipt publication failure is terminal after restoring the previous installation'
+    Assert-ManagedPhaseOrder $receiptFailure @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation activate$',
+        '^-B -m hermes_cli\.main desktop ',
+        '^-B -m hermes_cli\.desktop_update_activation publish-receipt$',
+        '^-B -m hermes_cli\.desktop_update_activation rollback$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway '
+    ) 'receipt failure'
+    Assert-RolledBackActivationArtifacts $receiptFailure 'receipt failure'
+
+    $recoveryFailure = New-TestInstall 'recovery-failure-rollback' $fakeHermes
+    $recoveryFailureLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $recoveryFailure $recoveryFailureLeaseId
+    $code = Invoke-TestHandoff $recoveryFailure (New-PreflightJson $recoveryFailure $true $true) 0 '' $recoveryFailureLeaseId 'resume-fail'
+    Assert-Equal 13 $code 'gateway recovery failure is terminal after restoring the previous installation'
+    Assert-ManagedPhaseOrder $recoveryFailure @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation activate$',
+        '^-B -m hermes_cli\.main desktop ',
+        '^-B -m hermes_cli\.desktop_update_activation publish-receipt$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway ',
+        '^-B -m hermes_cli\.desktop_update_activation rollback$'
+    ) 'recovery failure'
+    Assert-RolledBackActivationArtifacts $recoveryFailure 'recovery failure'
+
+    $relaunchFailure = New-TestInstall 'relaunch-failure-rollback' $fakeHermes
+    $relaunchFailureDesktop = Join-Path $relaunchFailure.Home 'fake-desktop.exe'
+    Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $relaunchFailureDesktop
+    $relaunchFailureLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $relaunchFailure $relaunchFailureLeaseId
+    $code = Invoke-TestHandoff $relaunchFailure (New-PreflightJson $relaunchFailure $true $true) 0 '' $relaunchFailureLeaseId 'relaunch-fail' $relaunchFailureDesktop
+    Assert-Equal 12 $code 'exact relaunched Desktop exit before readiness restores the previous installation'
+    Assert-ManagedPhaseOrder $relaunchFailure @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation activate$',
+        '^-B -m hermes_cli\.main desktop ',
+        '^-B -m hermes_cli\.desktop_update_activation publish-receipt$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway ',
+        '^-B -m hermes_cli\.desktop_update_activation rollback$'
+    ) 'relaunch failure'
+    Assert-RolledBackActivationArtifacts $relaunchFailure 'relaunch failure'
+
+    $commitFailure = New-TestInstall 'commit-failure-retained' $fakeHermes
+    $commitFailureDesktop = Join-Path $commitFailure.Home 'fake-desktop.exe'
+    Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $commitFailureDesktop
+    $commitFailureLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+    Write-TestLease $commitFailure $commitFailureLeaseId
+    $code = Invoke-TestHandoff $commitFailure (New-PreflightJson $commitFailure $true $true) 0 '' $commitFailureLeaseId 'commit-fail' $commitFailureDesktop
+    Assert-Equal 16 $code 'commit failure with a ready Desktop retains rollback state and withholds success'
+    Assert-ManagedPhaseOrder $commitFailure @(
+        '^-B -m hermes_cli\.main update --preflight ',
+        '^-B -m hermes_cli\.main update --yes ',
+        '^-B -m hermes_cli\.desktop_update_activation activate$',
+        '^-B -m hermes_cli\.main desktop ',
+        '^-B -m hermes_cli\.desktop_update_activation publish-receipt$',
+        '^-B -m hermes_cli\.main update --resume-deferred-gateway ',
+        '^-B -m hermes_cli\.desktop_update_activation commit$'
+    ) 'commit failure'
+    Assert-True (Test-Path -LiteralPath (Join-Path $commitFailure.Home '.hermes-update-activation.json')) 'commit failure retains its exact activation manifest for controlled recovery'
+    Assert-True (Test-Path -LiteralPath (Join-Path $commitFailure.Home '.hermes-update-activation-state.json')) 'commit failure retains its exact activation state for controlled recovery'
+    Assert-True (Test-Path -LiteralPath (Join-Path $commitFailure.Home '.hermes-update-receipt.json')) 'commit failure retains the verified active receipt'
+    Assert-True (Test-Path -LiteralPath (Join-Path $commitFailure.Home '.hermes-update-desktop-health.json')) 'commit failure retains the exact Desktop health proof with rollback state'
+    Assert-Equal 1 (@(Get-ChildItem -LiteralPath (Join-Path $commitFailure.Root '.hermes-runtime\python') -Filter 'generation-*' -Directory -ErrorAction SilentlyContinue).Count) 'commit failure retains the provisioned Python generation until controlled recovery'
+    Assert-True (-not (Test-Path -LiteralPath $commitFailure.UpdateMarker)) 'commit failure releases the update marker'
+    Assert-True (-not (Test-Path -LiteralPath $commitFailure.Lease)) 'commit failure releases the bridge lease'
+    $commitManifestRaw = [System.IO.File]::ReadAllText((Join-Path $commitFailure.Home '.hermes-update-activation.json'))
+    $commitStateRaw = [System.IO.File]::ReadAllText((Join-Path $commitFailure.Home '.hermes-update-activation-state.json'))
+
+    Start-Sleep -Milliseconds 7500
+    foreach ($rolledBackFailure in @($targetMismatch, $targetRemoteMismatch, $buildFailure, $noncanonicalStamp, $receiptFailure, $recoveryFailure, $relaunchFailure)) {
+        Assert-RolledBackActivationArtifacts $rolledBackFailure 'rolled-back fault after 7.5 seconds'
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath $rolledBackFailure.Home -Filter '*.tmp*' -File -Recurse -ErrorAction SilentlyContinue).Count) 'rolled-back fault has no delayed temporary writer 7.5 seconds after return'
+    }
+    Assert-Equal $commitManifestRaw ([System.IO.File]::ReadAllText((Join-Path $commitFailure.Home '.hermes-update-activation.json'))) 'commit failure manifest remains byte-stable 7.5 seconds after return'
+    Assert-Equal $commitStateRaw ([System.IO.File]::ReadAllText((Join-Path $commitFailure.Home '.hermes-update-activation-state.json'))) 'commit failure state remains byte-stable 7.5 seconds after return'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $commitFailure.Home -Filter '*.tmp*' -File -Recurse -ErrorAction SilentlyContinue).Count) 'commit failure has no delayed temporary writer 7.5 seconds after return'
+
     $trampoline = New-TestInstall 'resume-trampoline' $fakeHermes
-    $trampolineBaseDir = Join-Path $trampoline.Root 'base-python'
+    $trampolineBaseDir = Join-Path $trampoline.Root '.hermes-runtime\python\test-generation'
     [System.IO.File]::WriteAllText(
         (Join-Path $trampoline.Root 'venv\pyvenv.cfg'),
         "home = $trampolineBaseDir`n",
@@ -1531,7 +2271,7 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
             Label = 'malformed pyvenv home entry'
             Configure = {
                 param($Install)
-                $baseDir = Join-Path $Install.Root 'base-python'
+                $baseDir = Join-Path $Install.Root '.hermes-runtime\python\test-generation'
                 Write-TestPyvenvConfig $Install @("home $baseDir", 'implementation = CPython')
             }
         },
@@ -1540,7 +2280,7 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
             Label = 'duplicate pyvenv home key'
             Configure = {
                 param($Install)
-                $baseDir = Join-Path $Install.Root 'base-python'
+                $baseDir = Join-Path $Install.Root '.hermes-runtime\python\test-generation'
                 Write-TestPyvenvConfig $Install @("home = $baseDir", "HOME = $baseDir")
             }
         },
@@ -1549,7 +2289,7 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
             Label = 'missing home-derived python.exe'
             Configure = {
                 param($Install)
-                $baseDir = Join-Path $Install.Root 'base-python'
+                $baseDir = Join-Path $Install.Root '.hermes-runtime\python\test-generation'
                 Remove-Item -LiteralPath (Join-Path $baseDir 'python.exe') -Force
                 Write-TestPyvenvConfig $Install @("home = $baseDir")
             }
@@ -1559,7 +2299,7 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
             Label = 'non-file home-derived python.exe'
             Configure = {
                 param($Install)
-                $baseDir = Join-Path $Install.Root 'base-python'
+                $baseDir = Join-Path $Install.Root '.hermes-runtime\python\test-generation'
                 $basePython = Join-Path $baseDir 'python.exe'
                 Remove-Item -LiteralPath $basePython -Force
                 New-Item -ItemType Directory -Path $basePython | Out-Null
@@ -1571,7 +2311,7 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
             Label = 'explicit python.exe outside canonical home'
             Configure = {
                 param($Install)
-                $baseDir = Join-Path $Install.Root 'base-python'
+                $baseDir = Join-Path $Install.Root '.hermes-runtime\python\test-generation'
                 $outsideDir = Join-Path $Install.Root 'outside-base-python'
                 New-Item -ItemType Directory -Path $outsideDir | Out-Null
                 $outsidePython = Join-Path $outsideDir 'python.exe'
@@ -1591,17 +2331,19 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
         Assert-InvalidPyvenvRecoveryRejected $invalidVenv $code $invalidVenvCase.Label
     }
 
-    $archive = New-TestInstall 'archive-build-identity' $fakeHermes
+    $archive = New-TestInstall 'archive-transaction-refusal' $fakeHermes
     $archiveLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $archive $archiveLeaseId
     $archiveDesktop = Join-Path $archive.Home 'fake-desktop.exe'
     Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $archiveDesktop
     $code = Invoke-TestHandoff $archive (New-PreflightJson $archive $true $true) 0 '' $archiveLeaseId 'archive' $archiveDesktop
-    Assert-Equal 0 $code 'archive-mode handoff completes with receipt-correlated Desktop proof'
-    Assert-Equal ('b' * 64) ([System.IO.File]::ReadAllText($archive.BuildShaCapture)) 'archive rebuild stamp is pinned to the correlated 64-hex archive digest'
+    Assert-Equal 9 $code 'archive-mode staging without a transactional Git manifest fails closed'
+    Assert-True (-not (Test-Path -LiteralPath $archive.BuildShaCapture)) 'archive-mode staging never rebuilds an unauthenticated target'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $archive.Home '.hermes-update-activation.json'))) 'archive-mode refusal rolls back its staged activation claim'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $archive.Home '.hermes-update-activation-state.json'))) 'archive-mode refusal leaves no activation state'
     if (Test-Path -LiteralPath $archive.Result) {
         $archiveResult = [System.IO.File]::ReadAllText($archive.Result) | ConvertFrom-Json
-        Assert-Equal ('b' * 64) ([string]$archiveResult.desktop.build_id) 'archive Desktop ACK proves the same receipt-derived build identity'
+        Assert-Equal 'failed' ([string]$archiveResult.state) 'archive-mode refusal publishes a terminal failure'
     }
 
     $immediate = New-TestInstall 'immediate-consumer' $fakeHermes
@@ -1686,26 +2428,16 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
     $rollbackLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
     Write-TestLease $rollbackReceipt $rollbackLeaseId
     $code = Invoke-TestHandoff $rollbackReceipt (New-PreflightJson $rollbackReceipt $true $true) 0 '' $rollbackLeaseId 'receipt-clock-rollback-resume-fail'
-    Assert-Equal 13 $code 'a capability-correlated receipt survives a bounded backward wall-clock step'
+    Assert-Equal 13 $code 'a capability-correlated receipt tolerates a bounded backward wall-clock step before recovery fails'
     if (Test-Path -LiteralPath $rollbackReceipt.Result) {
         $rollbackResult = [System.IO.File]::ReadAllText($rollbackReceipt.Result) | ConvertFrom-Json
-        Assert-True ($null -ne $rollbackResult.receipt) 'rollback failure preserves the verified receipt for Desktop'
-        Assert-True ([int64]$rollbackResult.relaunch.requested_at -ge [int64]$rollbackResult.receipt.timestamp) 'receipt-bearing pre-spawn failure uses a post-receipt attempt baseline'
-        Assert-True ([int64]$rollbackResult.finished_at -ge [int64]$rollbackResult.relaunch.requested_at) 'rollback failure retains monotonic result ordering'
-        $fixtureResult = [System.IO.File]::ReadAllText($receiptFailureFixture) | ConvertFrom-Json
-        $rollbackResult.attempt_id = $fixtureResult.attempt_id
-        $rollbackResult.invocation_id = $fixtureResult.invocation_id
-        $rollbackResult.lease_id = $fixtureResult.lease_id
-        $rollbackResult.root = $fixtureResult.root
-        $rollbackResult.receipt.invocation_id = $fixtureResult.receipt.invocation_id
-        $rollbackResult.receipt.lease_id = $fixtureResult.receipt.lease_id
-        $rollbackResult.receipt.root = $fixtureResult.receipt.root
-        $rollbackResult.receipt.timestamp = $fixtureResult.receipt.timestamp
-        $rollbackResult.relaunch.requested_at = $fixtureResult.relaunch.requested_at
-        $rollbackResult.finished_at = $fixtureResult.finished_at
-        Assert-Equal ($fixtureResult | ConvertTo-Json -Compress -Depth 12) ($rollbackResult | ConvertTo-Json -Compress -Depth 12) 'PowerShell emits the exact receipt-bearing failure fixture consumed by Desktop'
+        Assert-True ($null -eq $rollbackResult.receipt) 'recovery failure restores the prior receipt before publishing failure'
+        Assert-True ([int64]$rollbackResult.finished_at -ge [int64]$rollbackResult.relaunch.requested_at) 'recovery failure retains monotonic result ordering'
+        Assert-Equal 'failed' ([string]$rollbackResult.state) 'recovery rollback publishes a strict terminal failure'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $rollbackReceipt.Home '.hermes-update-activation.json'))) 'recovery rollback retires the activation manifest'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $rollbackReceipt.Home '.hermes-update-activation-state.json'))) 'recovery rollback retires activation state'
     } else {
-        Assert-True $false 'rollback failure publishes a strict receipt-bearing terminal result'
+        Assert-True $false 'recovery rollback publishes a strict terminal result'
     }
 
     $prePlanFailure = New-TestInstall 'pre-plan-failure' $fakeHermes
@@ -1777,7 +2509,7 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
     foreach ($identity in $containmentWriterIdentities) {
         Stop-TestWriterExact $identity (Join-Path $suiteRoot 'cleanup-writer.release')
     }
-    $cleanupPaths = @($containmentSuccess.Home, $containmentDrain.Home, $containmentAssignFailure.Home, $noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $selfPreclaim.Home, $impossibleSelfPreclaim.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $deadMarker.Home, $leased.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $rollbackReceipt.Home, $prePlanFailure.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
+    $cleanupPaths = @($focusedSuccess.Home, $focusedOffset.Home, $containmentNoncooperative.Home, $bufferedAdoption.Home, $containmentFastSuccess.Home, $containmentSuccess.Home, $containmentBoundaryFailure.Home, $containmentDrain.Home, $containmentAssignFailure.Home, $logContention.Home, $noCapability.Home, $invalid.Home, $blocked.Home, $probeFailure.Home, $legacy.Home, $partial.Home, $selfPreclaim.Home, $impossibleSelfPreclaim.Home, $missingLease.Home, $unreadableMarker.Home, $foreignMarker.Home, $oldLiveMarker.Home, $deadMarker.Home, $leased.Home, $crossBranch.Home, $targetMismatch.Home, $targetRemoteMismatch.Home, $activationFailure.Home, $buildFailure.Home, $noncanonicalStamp.Home, $receiptFailure.Home, $recoveryFailure.Home, $relaunchFailure.Home, $commitFailure.Home, $trampoline.Home, $archive.Home, $immediate.Home, $survivor.Home, $unwritableResult.Home, $silent.Home, $stderrHeavy.Home, $rollbackReceipt.Home, $prePlanFailure.Home, $foreignRace.Home, $foreign.Home, $suiteRoot) + $invalidVenvHomes
     foreach ($path in $cleanupPaths) {
         if ($path -and (Test-Path -LiteralPath $path)) {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue

@@ -3015,16 +3015,6 @@ def commit() -> None:
         )
         receipt_raw = _read_bytes(receipt_path, _MAX_RECEIPT_BYTES)
         assert receipt_raw is not None
-        _validated_commit_coordinator(
-            root,
-            home,
-            invocation,
-            lease,
-            manifest_raw=None,
-            state=state,
-            state_raw=state_raw,
-            receipt_raw=receipt_raw,
-        )
         _unlink_exact(state_path, state_raw)
         return
 
@@ -3037,16 +3027,6 @@ def commit() -> None:
     assert current_receipt is not None
     if _digest(current_receipt) != state.get("published_receipt_sha256"):
         raise ActivationError("the committed receipt changed before cleanup")
-    _validated_commit_coordinator(
-        root,
-        home,
-        invocation,
-        lease,
-        manifest_raw=manifest_raw,
-        state=state,
-        state_raw=state_raw,
-        receipt_raw=current_receipt,
-    )
     if (
         _git_head(root) != manifest["target_head"]
         or _git_branch(root) != manifest["branch"]
@@ -3083,9 +3063,8 @@ def commit() -> None:
             ):
                 raise ActivationError("coexisting staging journal identity changed")
         state["phase"] = "commit-cleaning"
-        # Preserve every byte-equivalent field except the phase. Retries can
-        # then reconstruct and authenticate the coordinator-bound decision
-        # state instead of trusting an unauthenticated cleanup phase claim.
+        # This durable phase is the irreversible boundary. Retries finish the
+        # same cleanup; rollback rejects commit-cleaning state.
         _atomic_write(state_path, _json_bytes(state))
         state, _, state_raw = _load_state(root, home, invocation, lease)
 
@@ -3117,7 +3096,6 @@ def commit() -> None:
 _ACTIONS = {
     "activate": activate,
     "publish-receipt": publish_receipt,
-    "commit-decided": commit_decided,
     "rollback": rollback,
     "rollback-source": rollback_source_only,
     "commit": commit,
