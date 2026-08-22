@@ -73,9 +73,9 @@ class UpdateReceipt:
             "schema": 1,
             "started_at": _utc_now_iso(),
             "finished_at": None,
-            "argv": list(sys.argv),
             "pid": os.getpid(),
             "outcome": "running",  # running | success | partial | failed
+            "gateway_resume_deferred": "--defer-gateway-resume" in sys.argv[1:],
             "pre_update": {},
             "post_update": {},
             "steps": [],
@@ -125,6 +125,11 @@ class UpdateReceipt:
         }
 
     def finalize(self, outcome: str) -> None:
+        # A deferred staging child proves source mutation, not terminal
+        # activation. The native parent still owns gateway relaunch and lease
+        # cleanup, so child-local exit 0 cannot publish terminal success.
+        if outcome == "success" and self.data["gateway_resume_deferred"]:
+            outcome = "partial"
         self.data["outcome"] = outcome
         self.data["finished_at"] = _utc_now_iso()
         try:

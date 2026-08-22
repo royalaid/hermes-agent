@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import hermes_cli.main as m
+from hermes_cli.update_transaction import _UpdateTransaction
 import pytest
 
 
@@ -201,7 +202,9 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
     )
     monkeypatch.setattr(m, "_is_windows", lambda: False)
     monkeypatch.setattr(m, "_run_pre_update_backup", lambda args: None)
-    monkeypatch.setattr(m, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(
+        m, "_pause_windows_gateways_for_update", lambda **_kwargs: None
+    )
     monkeypatch.setattr(m, "_resume_windows_gateways_after_update", lambda state: None)
     monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *args: None)
     monkeypatch.setattr(m, "_get_origin_url", lambda *args: "https://github.com/NousResearch/hermes-agent.git")
@@ -230,25 +233,23 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
         branch=None,
     )
     with pytest.raises(RestoreReached):
-        m._cmd_update_impl(args, gateway_mode=False)
-
-    assert refresh_calls == [
-        (
-            ["uv", "pip"],
-            {**m.os.environ, "VIRTUAL_ENV": str(tmp_path / "venv")},
-            snapshot,
+        m._cmd_update_impl(
+            args,
+            gateway_mode=False,
+            transaction=_UpdateTransaction(),
         )
-    ]
-    assert restore_calls == [
-        (
-            tool_snapshot,
-            ["uv", "pip"],
-            {**m.os.environ, "VIRTUAL_ENV": str(tmp_path / "venv")},
-        )
-    ]
 
+    assert len(refresh_calls) == 1
+    refresh_prefix, refresh_env, refresh_features = refresh_calls[0]
+    assert refresh_prefix == ["uv", "pip"]
+    assert refresh_env["VIRTUAL_ENV"] == str(tmp_path / "venv")
+    assert refresh_features == snapshot
 
-
+    assert len(restore_calls) == 1
+    restored_dependencies, restore_prefix, restore_env = restore_calls[0]
+    assert restored_dependencies == tool_snapshot
+    assert restore_prefix == ["uv", "pip"]
+    assert restore_env["VIRTUAL_ENV"] == str(tmp_path / "venv")
 
 
 

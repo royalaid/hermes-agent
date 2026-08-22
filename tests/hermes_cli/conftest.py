@@ -66,6 +66,9 @@ def platform_neutral_update_lifecycle(monkeypatch):
     doubles.  That preserves truthful platform selection while preventing a
     unit test from touching live Hermes processes or install-global markers.
     """
+    import os
+
+    import hermes_mcp_update_gate as update_gate
     from hermes_cli import main as cli_main
     from hermes_cli import update_lock
 
@@ -102,10 +105,21 @@ def platform_neutral_update_lifecycle(monkeypatch):
             return None
 
     monkeypatch.setattr(update_lock, "UpdateLock", _TestUpdateLock)
+
+    test_lease = {
+        "schema_version": 1,
+        "lease_id": "test-lease-123456",
+        "owner_pid": os.getpid(),
+    }
+
+    def _prepare_test_update(_args, *, root, transaction):
+        transaction.lease = dict(test_lease)
+        transaction.invocation_id = "test-invocation-123456"
+
     monkeypatch.setattr(
         cli_main,
         "_prepare_atomic_windows_update",
-        lambda _args, *, root: (None, "test-invocation-123456"),
+        _prepare_test_update,
     )
     monkeypatch.setattr(cli_main, "_WindowsMutationJob", _TestMutationJob)
     monkeypatch.setattr(cli_main, "_UpdateLeaseHeartbeat", _TestLeaseHeartbeat)
@@ -114,3 +128,13 @@ def platform_neutral_update_lifecycle(monkeypatch):
     )
     monkeypatch.setattr(cli_main, "_detect_venv_python_processes", lambda: [])
     monkeypatch.setattr(cli_main, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(
+        update_gate,
+        "live_quiesce_lease",
+        lambda *_args, **_kwargs: dict(test_lease),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_release_update_quiesce_lease",
+        lambda _root, _lease: True,
+    )

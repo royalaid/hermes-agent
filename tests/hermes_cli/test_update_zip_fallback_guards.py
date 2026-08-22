@@ -18,6 +18,7 @@ import pytest
 
 from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
+from hermes_cli.update_transaction import _UpdateTransaction
 
 
 def _cpe(cmd, returncode=2, stderr="", stdout="") -> subprocess.CalledProcessError:
@@ -179,7 +180,10 @@ def test_update_via_zip_aborts_before_download_when_dirty(
 
     with patch("urllib.request.urlretrieve") as download:
         with pytest.raises(SystemExit) as exc_info:
-            hermes_main._update_via_zip(SimpleNamespace(branch=None))
+            hermes_main._update_via_zip(
+                SimpleNamespace(branch=None),
+                transaction=_UpdateTransaction(),
+            )
 
     assert exc_info.value.code == 1
     download.assert_not_called()

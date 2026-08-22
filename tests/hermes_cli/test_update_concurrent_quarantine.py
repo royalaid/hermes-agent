@@ -20,6 +20,7 @@ import pytest
 
 from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
+from hermes_cli.update_transaction import _UpdateTransaction
 
 
 # Tests in this module either exercise the REAL _detect_concurrent_hermes_instances
@@ -601,9 +602,11 @@ def test_ordinary_partial_gateway_pause_is_resumed_by_outer_transaction(
         def stop(self):
             events.append("heartbeat-stop")
 
-    def prepare(_args, *, root):
+    def prepare(_args, *, root, transaction):
         assert root == cli_main.PROJECT_ROOT
-        return {"lease_id": "ordinary-pause-lease"}, "ordinary-pause-invocation"
+        assert isinstance(transaction, _UpdateTransaction)
+        transaction.lease = {"lease_id": "ordinary-pause-lease"}
+        transaction.invocation_id = "ordinary-pause-invocation"
 
     def fail_after_first_drain(*, require_structured_resume=False, before_stop=None):
         assert require_structured_resume is False
@@ -1463,6 +1466,7 @@ def test_cmd_update_late_gateway_exact_exit_before_proof_is_harmless(monkeypatch
         cli_main._cmd_update_impl(
             args,
             gateway_mode=False,
+            transaction=_UpdateTransaction(),
         )
 
     assert exit_info.value.code == 2
@@ -1481,6 +1485,7 @@ def test_cmd_update_late_gateway_taskkill_error_accepts_exact_exit(monkeypatch):
         cli_main._cmd_update_impl(
             args,
             gateway_mode=False,
+            transaction=_UpdateTransaction(),
         )
 
     assert exit_info.value.code == 2
@@ -1504,6 +1509,7 @@ def test_cmd_update_late_gateway_taskkill_error_refuses_unproved_exit(
         cli_main._cmd_update_impl(
             args,
             gateway_mode=False,
+            transaction=_UpdateTransaction(),
         )
 
     assert isinstance(exc_info.value.__cause__, OSError)
