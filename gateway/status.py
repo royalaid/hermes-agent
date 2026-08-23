@@ -812,7 +812,10 @@ def write_runtime_status(
         }
     # Re-stamp identity + code fields on every write: the file can outlive its creator and the
     # top-level record must describe the CURRENT writer.
-    payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
+    payload.update({
+        key: current_record[key]
+        for key in ("kind", "pid", "argv", "start_time", "hermes_home")
+    })
     payload["updated_at"] = _utc_now_iso()
     payload.update(_get_code_identity_fields())
     _apply_set_fields(payload, (
