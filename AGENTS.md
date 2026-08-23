@@ -4,6 +4,29 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## The fork-integration line
+
+This branch is `fork-integration`: **current upstream `main` plus our PRs, and
+nothing else.** Every substantive change here corresponds to an upstream PR —
+the *same commits we propose*, in their upstream-shaped form. That is the
+contract:
+
+- **No un-PR'd accretion.** Disposable machinery, spiral scar tissue, and heavy
+  local implementations that no PR carries do not belong on this branch. If a
+  fix is worth keeping, reduce it to the form we propose upstream.
+- **Converge the fork to the PR, never the reverse.** When our local
+  implementation and its PR diverge, the PR — the smaller, upstream-shaped
+  version — is canonical; bring the fork to it. A heavier local version that
+  "already works" is drift, not a superset.
+- **Stay cleanly rebasable.** Divergence from what we propose is debt that
+  detonates at the next upstream rebase. Keep this branch a fast rebase onto
+  `upstream/main`.
+- **Prove live-path changes before cutover.** An updater or other live-path
+  architecture change is proven with the real mechanism — for the updater, two
+  clean end-to-end runs — from an isolated worktree, with a `known-good`
+  rollback ref pushed, before it replaces the running version. The full workflow
+  is `docs/solution-fork-upstream-canonicalization.md`.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
