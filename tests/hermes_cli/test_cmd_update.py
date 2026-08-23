@@ -1015,6 +1015,116 @@ class TestCmdUpdateBranchFallback:
         ).stdout.strip() == selected_pre_head
 
     @pytest.mark.windows_only
+    @pytest.mark.parametrize("stage_fails", [False, True])
+    def test_deferred_windows_update_accepts_rewritten_same_branch(
+        self, tmp_path, monkeypatch, stage_fails
+    ):
+        from hermes_cli import desktop_update_activation as activation
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        root = tmp_path / "checkout"
+        home = tmp_path / "home"
+        home.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(root)], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.name", "Hermes Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        (root / "base.txt").write_text("base", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "base.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "base"], check=True)
+        base_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        (root / "old.txt").write_text("old", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "old.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "old"], check=True)
+        old_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        subprocess.run(["git", "-C", str(root), "checkout", "--detach", base_sha], check=True)
+        (root / "target.txt").write_text("target", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "target.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "target"], check=True)
+        target_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(root), "checkout", "main"], check=True)
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", root)
+        monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: home)
+        transaction = _UpdateTransaction(
+            invocation_id="invocation-rewritten-branch-123456",
+            lease=_transaction_lease(root, "lease-rewritten-branch-123456"),
+        )
+
+        def stage(**_kwargs):
+            assert update_cmd._capture_head_sha(update_cmd._git_cmd(), root) == target_sha
+            if stage_fails:
+                raise RuntimeError("injected staging failure")
+            activation.retire_staging_journal(
+                root,
+                home=home,
+                invocation_id=transaction.invocation_id,
+                lease_id=transaction.lease["lease_id"],
+            )
+
+        monkeypatch.setattr(update_cmd, "_stage_transactional_desktop_environment", stage)
+        call = lambda: update_cmd._run_transactional_desktop_route(
+            git_cmd=update_cmd._git_cmd(),
+            git_env=update_cmd._sanitized_git_env(),
+            transaction=transaction,
+            update_target=update_cmd._UpdateTarget(
+                branch="main",
+                remote="origin",
+                tracking_ref="refs/remotes/origin/main",
+                refspec="+refs/heads/main:refs/remotes/origin/main",
+            ),
+            target_sha=target_sha,
+            source_mutation=update_cmd._SourceMutationState(),
+            active_lazy_features=[],
+            active_tool_dependencies=[],
+        )
+        if stage_fails:
+            from hermes_cli.update_diagnostics import UpdateDiagnosticError
+
+            with pytest.raises(UpdateDiagnosticError) as failure:
+                call()
+            assert failure.value.code == "HDU201"
+            assert failure.value.stage == "candidate-staging"
+        else:
+            call()
+
+        assert subprocess.run(
+            ["git", "-C", str(root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == "main"
+        assert subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == (old_sha if stage_fails else target_sha)
+
+    @pytest.mark.windows_only
     def test_crash_after_selected_branch_checkout_restores_exact_original(
         self, tmp_path
     ):

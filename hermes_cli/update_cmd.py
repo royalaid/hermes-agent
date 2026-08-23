@@ -651,16 +651,22 @@ def _run_transactional_desktop_route(
                     lease_id=lease_id,
                     phase="source-fast-forwarding",
                 )
-                merged = subprocess.run(
-                    git_cmd + ["merge", "--ff-only", target_sha],
+                if pre_update_branch == update_target.branch:
+                    command = ["reset", "--hard", target_sha]
+                    failure = "selected update branch could not be replaced exactly"
+                else:
+                    command = ["merge", "--ff-only", target_sha]
+                    failure = "selected update branch cannot fast-forward"
+                updated = subprocess.run(
+                    git_cmd + command,
                     cwd=root,
                     env=git_env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=False,
                 )
-                if merged.returncode != 0:
-                    raise RuntimeError("selected update branch cannot fast-forward")
+                if updated.returncode != 0:
+                    raise RuntimeError(failure)
 
         source_mutation.run(retarget_source)
         if (
