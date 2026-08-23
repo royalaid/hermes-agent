@@ -1132,6 +1132,10 @@ def write_runtime_status(
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
+    # The desktop updater's deferred-gateway readiness proof (Python and
+    # PowerShell sides) binds a running record to the launch home via this
+    # field; without it the proof can never accept a spawned gateway.
+    payload["hermes_home"] = current_record["hermes_home"]
     payload["updated_at"] = _utc_now_iso()
     # Re-stamp code identity on every write: the file can outlive the process
     # that created it, and the top-level record must always describe the
