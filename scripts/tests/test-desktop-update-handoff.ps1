@@ -1050,6 +1050,28 @@ function Write-TestPyvenvConfig([object]$Install, [string[]]$Lines) {
     )
 }
 
+# Mirror the managed runtime uv actually publishes: the generation directory
+# named by pyvenv.cfg is a reparse point onto the concrete versioned directory
+# (cpython-3.11-... -> cpython-3.11.15-...), so the configured base interpreter
+# path and the image path Windows reports for the live target name one file
+# through two different links.
+function ConvertTo-AliasedTestBasePython([object]$Install) {
+    $pythonRoot = Join-Path $Install.Root '.hermes-runtime\python'
+    $aliasDir = Join-Path $pythonRoot 'test-generation'
+    $concreteDir = Join-Path $pythonRoot 'test-generation-1.2.3'
+    try {
+        Move-Item -LiteralPath $aliasDir -Destination $concreteDir -ErrorAction Stop
+        New-Item -ItemType Junction -Path $aliasDir -Target $concreteDir -ErrorAction Stop | Out-Null
+    } catch {
+        return $false
+    }
+    Write-TestPyvenvConfig $Install @(
+        "home = $aliasDir",
+        ("executable = " + (Join-Path $aliasDir 'python.exe'))
+    )
+    return $true
+}
+
 function Assert-InvalidPyvenvRecoveryRejected([object]$Install, [int]$Code, [string]$Label) {
     Assert-Equal 3 $Code "$Label fails before mutation when the private base interpreter cannot be authenticated"
     Assert-True (-not (Test-Path -LiteralPath $Install.Sentinel)) "$Label never reaches update mutation"
@@ -1528,6 +1550,26 @@ Path(os.environ["HERMES_TEST_REAL_GATE_CAPTURE"]).write_text("armed", encoding="
     Assert-Equal 0 $code 'a buffered adoption frame proves the exact child after it clears the lease'
     $bufferedAdoptionLog = Get-Content -LiteralPath (Join-Path $bufferedAdoption.Home 'logs\desktop-update-handoff.log') -Raw
     Assert-True ($bufferedAdoptionLog -notmatch 'lost its bridge-quiesce lease') 'buffered adoption is not misclassified as lease loss'
+
+    $aliasedBase = New-TestInstall 'deferred-aliased-base-python' $fakeHermes
+    $aliasedBaseDesktop = Join-Path $aliasedBase.Home 'fake-desktop.exe'
+    Copy-Item -LiteralPath $fakeDesktopTemplate -Destination $aliasedBaseDesktop
+    $aliasedBaseLinked = ConvertTo-AliasedTestBasePython $aliasedBase
+    Assert-True $aliasedBaseLinked 'the aliased base interpreter fixture publishes its generation reparse point'
+    if ($aliasedBaseLinked) {
+        $aliasedBaseLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
+        Write-TestLease $aliasedBase $aliasedBaseLeaseId
+        $code = Invoke-TestHandoff `
+            -Install $aliasedBase `
+            -PreflightOutput (New-PreflightJson $aliasedBase $true $true) `
+            -PreflightCode 0 `
+            -BridgeLeaseId $aliasedBaseLeaseId `
+            -UpdateMode 'normal' `
+            -RelaunchExe $aliasedBaseDesktop
+        Assert-Equal 0 $code 'a base interpreter reached through a directory reparse point still proves its recovery target'
+        $aliasedBaseLog = Get-Content -LiteralPath (Join-Path $aliasedBase.Home 'logs\desktop-update-handoff.log') -Raw
+        Assert-True ($aliasedBaseLog -notmatch 'unexpected recovery protocol frame rejected') 'an aliased base interpreter does not reject its own target start frame'
+    }
 
     $containmentFastSuccess = New-TestInstall 'deferred-containment-fast-success' $fakeHermes
     $containmentFastSuccessLeaseId = 'lease-' + [Guid]::NewGuid().ToString('N')
