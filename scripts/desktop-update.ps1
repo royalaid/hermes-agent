@@ -2578,11 +2578,13 @@ function Read-PreparedGatewayNativeProofCore(
             )
         }
         $launcherValues = @($manifest.launchers)
-        if ($launcherValues.Count -gt 64) {
+        if ($launcherValues.Count -gt 128) {
             $script:PreparedGatewayProofState = 'launcher-count'
             return $null
         }
         $launcherJson = New-Object System.Collections.Generic.List[string]
+        $launcherPids = @{}
+        $launcherKinds = @{}
         $lastLauncherProfile = $null
         $lastLauncherPid = 0
         foreach ($launcher in $launcherValues) {
@@ -2609,6 +2611,7 @@ function Read-PreparedGatewayNativeProofCore(
                 -not (Test-JsonInteger $launcher.pid) -or [int64]$launcher.pid -le 0 -or
                 [int64]$launcher.pid -gt [int]::MaxValue -or
                 $runtimePids.ContainsKey([int]$launcher.pid) -or
+                $launcherPids.ContainsKey([int]$launcher.pid) -or
                 $launcher.creation_file_time -isnot [string] -or
                 $launcher.creation_file_time -notmatch '^[1-9][0-9]{0,19}$' -or
                 $launcher.executable_path -isnot [string]) {
@@ -2645,18 +2648,29 @@ function Read-PreparedGatewayNativeProofCore(
             }
             $lastLauncherProfile = [string]$launcher.profile
             $lastLauncherPid = [int]$launcher.pid
+            $launcherPids[[int]$launcher.pid] = $true
             $launcherExecutablePath = (
                 Resolve-Path -LiteralPath $launcher.executable_path -ErrorAction Stop
             ).ProviderPath
             $launcherExecutablePath = [System.IO.Path]::GetFullPath($launcherExecutablePath)
             $installPrefix = $InstallRoot.TrimEnd([char[]]@('\', '/')) +
                 [System.IO.Path]::DirectorySeparatorChar
-            if (-not $launcherExecutablePath.StartsWith(
-                $installPrefix, [StringComparison]::OrdinalIgnoreCase
-            )) {
+            $systemConsoleHost = [System.IO.Path]::GetFullPath(
+                (Join-Path $env:SystemRoot 'System32\conhost.exe')
+            )
+            $launcherKind = if ([string]::Equals(
+                $launcherExecutablePath, $systemConsoleHost,
+                [StringComparison]::OrdinalIgnoreCase
+            )) { 'console' } else { 'launcher' }
+            $launcherKindKey = ([string]$launcher.profile) + '|' + $launcherKind
+            if ($launcherKinds.ContainsKey($launcherKindKey) -or
+                ($launcherKind -eq 'launcher' -and -not $launcherExecutablePath.StartsWith(
+                    $installPrefix, [StringComparison]::OrdinalIgnoreCase
+                ))) {
                 $script:PreparedGatewayProofState = 'launcher-scope'
                 return $null
             }
+            $launcherKinds[$launcherKindKey] = $true
             if ($RequireLiveRuntimes) {
                 $launcherHandle = [HermesHandoff.UpdaterJob]::OpenRuntimeProcess([int]$launcher.pid)
                 $launcherHandles.Add($launcherHandle)
