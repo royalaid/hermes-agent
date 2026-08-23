@@ -1534,6 +1534,55 @@ def _write_prepared_gateway_runtime_manifest(
                     "executable_path": launcher_executable,
                 }
             )
+            try:
+                console_host_path = os.path.normcase(
+                    os.path.realpath(
+                        Path(os.environ["SystemRoot"]) / "System32" / "conhost.exe"
+                    )
+                )
+                launcher_children = launcher_process.children()
+            except Exception as exc:
+                raise RuntimeError(
+                    "deferred gateway console host identity could not be captured"
+                ) from exc
+            for child in launcher_children:
+                child_pid = int(child.pid)
+                try:
+                    child_executable = os.path.normcase(os.path.realpath(child.exe()))
+                except Exception as exc:
+                    raise RuntimeError(
+                        "deferred gateway child identity could not be captured"
+                    ) from exc
+                if child_pid == int(identity.pid) or child_executable != console_host_path:
+                    continue
+                try:
+                    child_created_at = float(child.create_time())
+                    child_file_time = _windows_process_creation_file_time(child_pid)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "deferred gateway console host generation could not be captured"
+                    ) from exc
+                if (
+                    child_pid <= 0
+                    or not math.isfinite(child_created_at)
+                    or re.fullmatch(r"[1-9][0-9]{0,19}", child_file_time) is None
+                    or int(child_file_time) > (1 << 64) - 1
+                ):
+                    raise RuntimeError(
+                        "deferred gateway console host identity is invalid"
+                    )
+                launchers.append(
+                    {
+                        "profile": profile,
+                        "pid": child_pid,
+                        "created_at": round(child_created_at, 2),
+                        "creation_file_time": child_file_time,
+                        "executable_path": child_executable,
+                    }
+                )
+    launchers.sort(key=lambda item: (item["profile"], item["pid"]))
+    if len(launchers) > 128:
+        raise RuntimeError("deferred gateway launcher manifest is too large")
     unsigned = {
         "schema_version": 2,
         "invocation_id": invocation_id,

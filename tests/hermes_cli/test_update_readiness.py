@@ -1920,6 +1920,7 @@ def test_prepared_runtime_manifest_is_bounded_scoped_and_authenticated(
     executable.write_bytes(b"")
     launcher_executable = root / "venv" / "Scripts" / "hermes.exe"
     launcher_executable.write_bytes(b"")
+    console_host = Path(os.environ["SystemRoot"]) / "System32" / "conhost.exe"
     monkeypatch.setenv("HERMES_HOME", str(home))
     pending = root / ".hermes-gateway-resume-invocation-manifest-123456.json"
     plan_raw = "authenticated-plan-bytes"
@@ -1933,14 +1934,19 @@ def test_prepared_runtime_manifest_is_bounded_scoped_and_authenticated(
 
     class Process:
         def __init__(self, pid):
-            assert pid in {404, 405}
+            assert pid in {403, 404, 405}
             self.pid = pid
 
         def create_time(self):
-            return 59.0 if self.pid == 404 else 60.0
+            return {403: 58.0, 404: 59.0, 405: 60.0}[self.pid]
 
         def exe(self):
+            if self.pid == 403:
+                return str(console_host)
             return str(launcher_executable if self.pid == 404 else executable)
+
+        def children(self):
+            return [Process(403), Process(405)] if self.pid == 404 else []
 
     monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=Process))
     monkeypatch.setattr(
@@ -1953,6 +1959,7 @@ def test_prepared_runtime_manifest_is_bounded_scoped_and_authenticated(
         update_cmd,
         "_windows_process_creation_file_time",
         lambda pid: {
+            403: "133801632580000000",
             404: "133801632590000000",
             405: "133801632600000000",
         }[pid],
@@ -1983,6 +1990,13 @@ def test_prepared_runtime_manifest_is_bounded_scoped_and_authenticated(
     assert payload["plan_sha256"] == hashlib.sha256(plan_raw.encode()).hexdigest()
     assert payload["schema_version"] == 2
     assert payload["launchers"] == [
+        {
+            "profile": "default",
+            "pid": 403,
+            "created_at": 58.0,
+            "creation_file_time": "133801632580000000",
+            "executable_path": os.path.normcase(os.path.realpath(console_host)),
+        },
         {
             "profile": "default",
             "pid": 404,

@@ -1321,9 +1321,14 @@ def _validated_gateway_runtime_manifest(
         raise ActivationError("gateway runtime identities changed before commit")
     runtime_pids = {runtime["profile"]: runtime["pid"] for runtime in runtimes}
     launchers = value.get("launchers")
-    if not isinstance(launchers, list) or len(launchers) > _MAX_COMMIT_RUNTIMES:
+    if not isinstance(launchers, list) or len(launchers) > 2 * _MAX_COMMIT_RUNTIMES:
         raise ActivationError("gateway launcher manifest is invalid")
-    seen_launchers: set[str] = set()
+    seen_launcher_pids: set[int] = set()
+    seen_launcher_kinds: set[tuple[str, str]] = set()
+    all_runtime_pids = set(runtime_pids.values())
+    console_host = _canonical(
+        Path(os.environ["SystemRoot"]) / "System32" / "conhost.exe"
+    )
     for launcher in launchers:
         if not isinstance(launcher, dict) or set(launcher) != {
             "profile",
@@ -1339,10 +1344,10 @@ def _validated_gateway_runtime_manifest(
         if (
             not isinstance(profile, str)
             or profile not in runtime_pids
-            or profile in seen_launchers
             or type(launcher.get("pid")) is not int
             or launcher["pid"] <= 0
-            or launcher["pid"] == runtime_pids[profile]
+            or launcher["pid"] in all_runtime_pids
+            or launcher["pid"] in seen_launcher_pids
             or isinstance(created_at, bool)
             or not isinstance(created_at, (int, float))
             or not math.isfinite(float(created_at))
@@ -1352,14 +1357,17 @@ def _validated_gateway_runtime_manifest(
             or int(creation) > (1 << 64) - 1
         ):
             raise ActivationError("gateway launcher identity is invalid")
-        executable = _validate_commit_path(
-            launcher.get("executable_path"),
-            root=root,
-            label="gateway launcher executable",
-        )
-        if not Path(executable).is_file():
+        executable_value = launcher.get("executable_path")
+        if not isinstance(executable_value, str) or not Path(executable_value).is_absolute():
+            raise ActivationError("gateway launcher executable is invalid")
+        executable = _canonical(executable_value)
+        kind = "console" if executable == console_host else "launcher"
+        if kind == "launcher" and not _is_within(Path(executable_value), root):
+            raise ActivationError("gateway launcher executable is outside scope")
+        if (profile, kind) in seen_launcher_kinds or not Path(executable).is_file():
             raise ActivationError("gateway launcher path identity is unavailable")
-        seen_launchers.add(profile)
+        seen_launcher_pids.add(launcher["pid"])
+        seen_launcher_kinds.add((profile, kind))
     if launchers != sorted(launchers, key=lambda item: (item["profile"], item["pid"])):
         raise ActivationError("gateway launcher identities are not canonical")
     unsigned = {key: value[key] for key in expected if key != "auth"}
