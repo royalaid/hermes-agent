@@ -226,6 +226,31 @@ export async function runWindowsUpdatePreflight(
     }
   }
 
+  if (purpose === 'normal-update') {
+    let lease: McpBridgeQuiesceLease | null = null
+
+    try {
+      lease = deps.acquireMcpBridgeLease()
+    } catch {
+      lease = null
+    }
+
+    if (!lease) {
+      return {
+        kind: 'blocked',
+        reason: 'lease-unavailable',
+        message: 'Update aborted: Hermes could not acquire the MCP bridge pause safely.'
+      }
+    }
+
+    const outcome: Extract<UpdatePreflightOutcome, { kind: 'clear' }> = Object.freeze({ kind: 'clear', lease })
+    const permit: UpdateMutationPermit = Object.freeze({ preflight: outcome })
+    successfulPreflightPermits.set(outcome, permit)
+    updateMutationPermits.add(permit)
+
+    return outcome
+  }
+
   // Observe before activating the prevention lease. Existing bridge watchers
   // exit when they see that lease, while this first scan defines the exact
   // current holder set authorized by the user's Update action.

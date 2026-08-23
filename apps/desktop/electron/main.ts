@@ -3791,6 +3791,20 @@ function reapOrphanedBackendsOnce() {
 // aggressively SIGKILL-ing the backend here would be an untested behavior change
 // for no benefit. So we no-op off Windows and leave that path exactly as it was.
 async function releaseBackendLockForUpdate(updateRoot: string, tag = 'updates', deadline?: UpdateBlockerDeadline) {
+  const inventory = await scanVenvBlockersWithinDeadline(updateRoot, deadline)
+
+  if (inventory.kind === 'blocked') {
+    const pids = new Set([
+      ...inventory.result.processes.map(holder => holder.pid),
+      ...inventory.result.mcpBridges.map(holder => holder.pid),
+      ...inventory.result.desktopPluginServices.map(holder => holder.pid)
+    ])
+
+    for (const pid of pids) {
+      forceKillProcessTree(pid)
+    }
+  }
+
   const settleMs = deadline ? Math.max(0, Math.min(2_000, deadline.deadlineAt - Date.now())) : 2_000
 
   return releaseBackendLock(updateRoot, tag, { settleMs })
