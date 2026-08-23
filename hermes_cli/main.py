@@ -8039,6 +8039,17 @@ def cmd_gui(args: argparse.Namespace):
                     print("  ⚠ Dependency install failed with a missing Electron dist; "
                           "continuing to the build so electron-builder can attempt "
                           "the Electron fetch itself.")
+            else:
+                # This is the same deterministic root install used by
+                # ``hermes update``.  Persist its exact manifest digest so the
+                # later read-only transactional receipt check can prove the
+                # freshly installed Node dependency tree instead of rejecting
+                # a successful Desktop rebuild merely because its cache entry
+                # was never written.
+                from hermes_constants import get_default_hermes_root
+                from hermes_cli.update_cmd import _record_npm_lockfile_hash
+
+                _record_npm_lockfile_hash(get_default_hermes_root())
 
             build_label = "source build" if source_mode else "packaged app"
             print(f"→ Building desktop {build_label}...")
