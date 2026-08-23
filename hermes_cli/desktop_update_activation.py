@@ -503,6 +503,8 @@ def _validated_staging_artifact(
     kind: str,
     invocation: str,
     lease: str,
+    *,
+    allow_unidentified_nonempty: bool = False,
 ) -> Path | None:
     if claim is None:
         return None
@@ -525,7 +527,7 @@ def _validated_staging_artifact(
     identity = _directory_identity(path)
     if digest is None:
         try:
-            if any(path.iterdir()):
+            if any(path.iterdir()) and not allow_unidentified_nonempty:
                 raise ActivationError("unidentified staging artifact is not empty")
         except OSError as exc:
             raise ActivationError("staging artifact is unreadable") from exc
@@ -597,6 +599,8 @@ def _validated_staging_journal(
     home: Path,
     invocation: str,
     lease: str,
+    *,
+    finalizing_candidate: Path | None = None,
 ) -> tuple[dict, bytes]:
     value, raw = _read_json(_staging_path(home))
     expected = {
@@ -644,8 +648,24 @@ def _validated_staging_journal(
     selected_pre_head = value.get("selected_pre_head")
     if selected_pre_head is not None:
         _validate_sha(selected_pre_head, "selected pre-update head")
+    candidate_claim = value.get("candidate")
+    allow_candidate_finalization = False
+    if finalizing_candidate is not None and value.get("phase") == "candidate-staging":
+        final_relative = _planned_artifact_relative(
+            root, finalizing_candidate, "candidate"
+        )
+        allow_candidate_finalization = (
+            isinstance(candidate_claim, dict)
+            and candidate_claim.get("rel") == final_relative
+            and candidate_claim.get("identity_sha256") is None
+        )
     _validated_staging_artifact(
-        root, value.get("candidate"), "candidate", invocation, lease
+        root,
+        candidate_claim,
+        "candidate",
+        invocation,
+        lease,
+        allow_unidentified_nonempty=allow_candidate_finalization,
     )
     _validated_staging_artifact(
         root,
@@ -677,7 +697,13 @@ def update_staging_journal(
     provisioned_generation: Path | None = None,
 ) -> None:
     value, _ = _validated_staging_journal(
-        root, home, invocation_id, lease_id
+        root,
+        home,
+        invocation_id,
+        lease_id,
+        finalizing_candidate=(
+            candidate if phase == "candidate-staging" else None
+        ),
     )
     if phase not in {
         "source-mutating",
