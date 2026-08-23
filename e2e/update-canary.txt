@@ -1,1 +1,1 @@
-disposable-updater-canary-7
+disposable-updater-canary-8
