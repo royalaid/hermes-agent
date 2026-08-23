@@ -116,6 +116,7 @@ class _GatewayStartupAttempt:
     profile: str
     process: subprocess.Popen
     runtime: _GatewayRuntimeIdentity
+    launcher_created_at: float
 
 
 @dataclass(frozen=True)
@@ -1439,6 +1440,7 @@ def _write_prepared_gateway_runtime_manifest(
     canonical_root = os.path.normcase(os.path.realpath(root))
     default_home = get_default_hermes_root()
     runtimes: list[dict] = []
+    launchers: list[dict] = []
     seen_profiles: set[str] = set()
     for attempt in sorted(attempts, key=lambda item: (item.profile, item.runtime.pid)):
         profile = str(attempt.profile)
@@ -1487,11 +1489,57 @@ def _write_prepared_gateway_runtime_manifest(
                 "profile_home": canonical_profile_home,
             }
         )
+        launcher_pid = int(attempt.process.pid)
+        if launcher_pid != int(identity.pid):
+            try:
+                if attempt.process.poll() is not None:
+                    raise RuntimeError("deferred gateway launcher exited")
+                launcher_process = psutil.Process(launcher_pid)
+                launcher_created_at = float(launcher_process.create_time())
+                launcher_executable = os.path.normcase(
+                    os.path.realpath(launcher_process.exe())
+                )
+                launcher_file_time = _windows_process_creation_file_time(launcher_pid)
+            except Exception as exc:
+                raise RuntimeError(
+                    "deferred gateway launcher identity could not be captured"
+                ) from exc
+            if (
+                launcher_pid <= 0
+                or not math.isfinite(launcher_created_at)
+                or abs(launcher_created_at - attempt.launcher_created_at) > 0.001
+                or not launcher_executable
+                or re.fullmatch(r"[1-9][0-9]{0,19}", launcher_file_time) is None
+                or int(launcher_file_time) > (1 << 64) - 1
+            ):
+                raise RuntimeError("deferred gateway launcher identity changed")
+            try:
+                if (
+                    os.path.commonpath([launcher_executable, canonical_root])
+                    != canonical_root
+                ):
+                    raise RuntimeError(
+                        "deferred gateway launcher escaped install root"
+                    )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "deferred gateway launcher scope is invalid"
+                ) from exc
+            launchers.append(
+                {
+                    "profile": profile,
+                    "pid": launcher_pid,
+                    "created_at": round(launcher_created_at, 2),
+                    "creation_file_time": launcher_file_time,
+                    "executable_path": launcher_executable,
+                }
+            )
     unsigned = {
-        "schema_version": 1,
+        "schema_version": 2,
         "invocation_id": invocation_id,
         "install_root": canonical_root,
         "plan_sha256": hashlib.sha256(plan_raw.encode("utf-8")).hexdigest(),
+        "launchers": launchers,
         "runtimes": runtimes,
     }
     payload = {**unsigned, "auth": _gateway_plan_auth(unsigned, lease_id)}
@@ -1840,7 +1888,7 @@ def _spawn_and_verify_deferred_gateway_profile(
         _terminate_unready_gateway_generation(process)
         raise
     if readiness.ready and readiness.runtime is not None:
-        return _GatewayStartupAttempt(profile, process, readiness.runtime)
+        return _GatewayStartupAttempt(profile, process, readiness.runtime, created_at)
     _terminate_unready_gateway_generation(process, readiness.runtime)
     raise RuntimeError(f"gateway profile {profile!r} did not become ready")
 

@@ -1264,13 +1264,14 @@ def _validated_gateway_runtime_manifest(
         "invocation_id",
         "install_root",
         "plan_sha256",
+        "launchers",
         "runtimes",
         "auth",
     }
     if not isinstance(value, dict) or set(value) != expected:
         raise ActivationError("gateway runtime manifest schema is invalid")
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version") != 2
         or value.get("invocation_id") != invocation
         or _canonical(str(value.get("install_root", ""))) != _canonical(root)
         or value.get("plan_sha256") != plan_digest
@@ -1318,6 +1319,49 @@ def _validated_gateway_runtime_manifest(
     _validate_gateway_runtime_claims(projected, root=root, home=home)
     if projected != claimed_runtimes:
         raise ActivationError("gateway runtime identities changed before commit")
+    runtime_pids = {runtime["profile"]: runtime["pid"] for runtime in runtimes}
+    launchers = value.get("launchers")
+    if not isinstance(launchers, list) or len(launchers) > _MAX_COMMIT_RUNTIMES:
+        raise ActivationError("gateway launcher manifest is invalid")
+    seen_launchers: set[str] = set()
+    for launcher in launchers:
+        if not isinstance(launcher, dict) or set(launcher) != {
+            "profile",
+            "pid",
+            "created_at",
+            "creation_file_time",
+            "executable_path",
+        }:
+            raise ActivationError("gateway launcher manifest entry is invalid")
+        profile = launcher.get("profile")
+        created_at = launcher.get("created_at")
+        creation = launcher.get("creation_file_time")
+        if (
+            not isinstance(profile, str)
+            or profile not in runtime_pids
+            or profile in seen_launchers
+            or type(launcher.get("pid")) is not int
+            or launcher["pid"] <= 0
+            or launcher["pid"] == runtime_pids[profile]
+            or isinstance(created_at, bool)
+            or not isinstance(created_at, (int, float))
+            or not math.isfinite(float(created_at))
+            or created_at <= 0
+            or not isinstance(creation, str)
+            or re.fullmatch(r"[1-9][0-9]{0,19}", creation) is None
+            or int(creation) > (1 << 64) - 1
+        ):
+            raise ActivationError("gateway launcher identity is invalid")
+        executable = _validate_commit_path(
+            launcher.get("executable_path"),
+            root=root,
+            label="gateway launcher executable",
+        )
+        if not Path(executable).is_file():
+            raise ActivationError("gateway launcher path identity is unavailable")
+        seen_launchers.add(profile)
+    if launchers != sorted(launchers, key=lambda item: (item["profile"], item["pid"])):
+        raise ActivationError("gateway launcher identities are not canonical")
     unsigned = {key: value[key] for key in expected if key != "auth"}
     if not isinstance(value.get("auth"), str) or not hmac.compare_digest(
         value["auth"], _commit_document_auth(unsigned, lease)
