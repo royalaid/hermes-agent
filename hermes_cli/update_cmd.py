@@ -1810,7 +1810,7 @@ def _wait_for_deferred_gateway_profile(
     process: subprocess.Popen,
     created_at: float,
     *,
-    timeout: float = 20.0,
+    timeout: float = 90.0,
 ) -> _GatewayReadinessResult:
     deadline = _time.monotonic() + max(0.1, float(timeout))
     consecutive = 0
