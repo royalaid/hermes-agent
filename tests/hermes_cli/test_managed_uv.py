@@ -467,6 +467,75 @@ def test_stage_candidate_sync_uses_tracked_lock_without_relocking(tmp_path):
     assert relocate_env.get("UV_NO_CONFIG") == "true"
 
 
+def test_stage_update_candidate_reports_identity_after_sync_replaces_root(tmp_path):
+    from dataclasses import replace
+
+    from hermes_cli.managed_uv import (
+        managed_python_install_dir,
+        stage_update_candidate_venv,
+    )
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "uv.lock").write_text("# lock\n", encoding="utf-8")
+    live_python = root / ".venv" / (
+        "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
+    )
+    live_python.parent.mkdir(parents=True)
+    live_python.write_text("live interpreter", encoding="utf-8")
+    generation = managed_python_install_dir(root).resolve() / "generation-safe"
+    base_python = generation / (
+        "python.exe" if sys.platform == "win32" else "bin/python3"
+    )
+    base_python.parent.mkdir(parents=True)
+    base_python.write_text("safe private base", encoding="utf-8")
+    current = replace(
+        _runtime_info(live_python, (3, 53, 1)),
+        base_prefix=generation,
+    )
+    observed: list[tuple[Path, tuple[int, int] | None]] = []
+
+    def observe(candidate: Path | None, _generation: Path | None) -> None:
+        assert candidate is not None
+        identity = None
+        if candidate.exists():
+            value = candidate.stat(follow_symlinks=False)
+            identity = (int(value.st_dev), int(value.st_ino))
+        observed.append((candidate, identity))
+
+    def fake_run(argv, **kwargs):
+        candidate = Path(kwargs["env"]["UV_PROJECT_ENVIRONMENT"])
+        if argv[1] == "sync":
+            parked = candidate.with_name(f"{candidate.name}-replaced")
+            candidate.rename(parked)
+            candidate.mkdir()
+        return MagicMock(returncode=0)
+
+    with patch(
+        "hermes_cli.managed_uv.probe_sqlite_runtime",
+        return_value=current,
+    ), patch(
+        "hermes_cli.managed_uv.subprocess.run",
+        side_effect=fake_run,
+    ), patch(
+        "hermes_cli.managed_uv._smoke_candidate_venv",
+        return_value=(True, "", None),
+    ):
+        staged = stage_update_candidate_venv(
+            "uv",
+            project_root=root,
+            staging_observer=observe,
+        )
+
+    assert staged is not None
+    current_value = staged.candidate.stat(follow_symlinks=False)
+    current_identity = (int(current_value.st_dev), int(current_value.st_ino))
+    assert observed == [
+        (staged.candidate, None),
+        (staged.candidate, current_identity),
+    ]
+
+
 def test_stage_update_candidate_reuses_safe_private_base_without_cutover(tmp_path):
     from dataclasses import replace
 

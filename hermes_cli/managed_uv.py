@@ -829,8 +829,6 @@ def _stage_candidate_venv(
     if staging_observer is not None:
         staging_observer(candidate, provisioned_generation)
     candidate.mkdir(parents=True, exist_ok=False)
-    if staging_observer is not None:
-        staging_observer(candidate, provisioned_generation)
     env = managed_python_env(
         project_root,
         install_dir=generation,
@@ -926,6 +924,8 @@ def _stage_candidate_venv(
         logger.warning("candidate relocation failed (rc=%d)", relocated.returncode)
         _remove_tree(candidate, boundary=runtime_root)
         return None
+    if staging_observer is not None:
+        staging_observer(candidate, provisioned_generation)
 
     healthy, detail, _ = _smoke_candidate_venv(candidate)
     if not healthy:

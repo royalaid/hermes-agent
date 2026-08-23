@@ -1120,6 +1120,59 @@ def test_absent_staging_artifact_accepts_none_or_valid_digest(
     assert path == root / relative
 
 
+def test_staging_journal_binds_candidate_after_dependency_sync(tmp_path):
+    root = tmp_path / "hermes-agent"
+    home = tmp_path / "hermes"
+    root.mkdir()
+    home.mkdir()
+    lease = _journal_lease(
+        root,
+        lease_id=LEASE,
+        owner_pid=os.getpid(),
+        created_at=100,
+    )
+    activation.write_staging_journal(
+        root,
+        home=home,
+        invocation_id=INVOCATION,
+        lease=lease,
+        pre_update_head=OLD_HEAD,
+        pre_update_branch="main",
+        branch="main",
+        selected_pre_head=OLD_HEAD,
+        target_head=NEW_HEAD,
+    )
+    candidate = root / ".hermes-runtime" / "venv-candidate-final123"
+    activation.update_staging_journal(
+        root,
+        home=home,
+        invocation_id=INVOCATION,
+        lease_id=LEASE,
+        phase="candidate-staging",
+        candidate=candidate,
+    )
+    candidate.mkdir(parents=True)
+    (candidate / "synced-package.txt").write_text("complete", encoding="utf-8")
+
+    activation.update_staging_journal(
+        root,
+        home=home,
+        invocation_id=INVOCATION,
+        lease_id=LEASE,
+        phase="candidate-staging",
+        candidate=candidate,
+    )
+    activation.retire_staging_journal(
+        root,
+        home=home,
+        invocation_id=INVOCATION,
+        lease_id=LEASE,
+    )
+
+    assert candidate.is_dir()
+    assert not (home / activation._STAGING_NAME).exists()
+
+
 def test_coordinator_only_stale_recovery_refuses_without_parsing_or_deleting(
     tmp_path,
 ):
