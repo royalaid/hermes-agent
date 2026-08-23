@@ -420,14 +420,15 @@ public static class FakeHermes {
                 ",\"profile\":\"default\",\"profile_home\":" + JsonString(home.ToLowerInvariant()) + "}]";
         }
         var unsigned = "{\"install_root\":" + JsonString(root) + ",\"invocation_id\":" +
-            JsonString(invocationId) + ",\"plan_sha256\":\"" + Fingerprint(planRaw) +
-            "\",\"runtimes\":" + runtimes + ",\"schema_version\":1}";
+            JsonString(invocationId) + ",\"launchers\":[],\"plan_sha256\":\"" +
+            Fingerprint(planRaw) + "\",\"runtimes\":" + runtimes +
+            ",\"schema_version\":2}";
         var unsignedCapture = Environment.GetEnvironmentVariable("HERMES_TEST_MANIFEST_UNSIGNED_CAPTURE");
         if (!String.IsNullOrEmpty(unsignedCapture)) File.WriteAllText(unsignedCapture, unsigned);
         var manifest = "{\"auth\":\"" + HmacHex(unsigned, leaseId) + "\",\"install_root\":" +
             JsonString(root) + ",\"invocation_id\":" + JsonString(invocationId) +
-            ",\"plan_sha256\":\"" + Fingerprint(planRaw) + "\",\"runtimes\":" + runtimes +
-            ",\"schema_version\":1}";
+            ",\"launchers\":[],\"plan_sha256\":\"" + Fingerprint(planRaw) +
+            "\",\"runtimes\":" + runtimes + ",\"schema_version\":2}";
         File.WriteAllText(manifestPath, manifest);
         if (File.Exists(leasePath)) File.Delete(leasePath);
         Console.WriteLine("Deferred gateway fleet prepared for native commit.");

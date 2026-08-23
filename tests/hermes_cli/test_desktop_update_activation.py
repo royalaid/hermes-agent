@@ -196,10 +196,11 @@ def _write_commit_proposal(root: Path, home: Path) -> tuple[Path, Path]:
     }
     plan_path.write_bytes(activation._json_bytes(plan))
     runtime_unsigned = {
-        "schema_version": 1,
+        "schema_version": 2,
         "invocation_id": INVOCATION,
         "install_root": str(root.resolve()),
         "plan_sha256": activation._digest(plan_path.read_bytes()),
+        "launchers": [],
         "runtimes": [],
     }
     runtime = {

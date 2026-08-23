@@ -1694,6 +1694,7 @@ def test_deferred_fleet_partial_failure_drains_before_clean_retry(monkeypatch):
             profile,
             SimpleNamespace(pid=pid, profile=profile),
             update_cmd._GatewayRuntimeIdentity(pid, float(pid)),
+            float(pid),
         )
 
     monkeypatch.setattr(
@@ -1917,25 +1918,29 @@ def test_prepared_runtime_manifest_is_bounded_scoped_and_authenticated(
     executable = root / "venv" / "Scripts" / "python.exe"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"")
+    launcher_executable = root / "venv" / "Scripts" / "hermes.exe"
+    launcher_executable.write_bytes(b"")
     monkeypatch.setenv("HERMES_HOME", str(home))
     pending = root / ".hermes-gateway-resume-invocation-manifest-123456.json"
     plan_raw = "authenticated-plan-bytes"
     lease_id = "lease-manifest-123456"
     attempt = update_cmd._GatewayStartupAttempt(
         "default",
-        SimpleNamespace(pid=404),
+        SimpleNamespace(pid=404, poll=lambda: None),
         update_cmd._GatewayRuntimeIdentity(405, 60.0),
+        59.0,
     )
 
     class Process:
         def __init__(self, pid):
-            assert pid == 405
+            assert pid in {404, 405}
+            self.pid = pid
 
         def create_time(self):
-            return 60.0
+            return 59.0 if self.pid == 404 else 60.0
 
         def exe(self):
-            return str(executable)
+            return str(launcher_executable if self.pid == 404 else executable)
 
     monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=Process))
     monkeypatch.setattr(
@@ -1947,7 +1952,10 @@ def test_prepared_runtime_manifest_is_bounded_scoped_and_authenticated(
     monkeypatch.setattr(
         update_cmd,
         "_windows_process_creation_file_time",
-        lambda pid: "133801632600000000" if pid == 405 else "",
+        lambda pid: {
+            404: "133801632590000000",
+            405: "133801632600000000",
+        }[pid],
     )
 
     manifest_path, manifest_raw = update_cmd._write_prepared_gateway_runtime_manifest(
@@ -1967,11 +1975,24 @@ def test_prepared_runtime_manifest_is_bounded_scoped_and_authenticated(
         "invocation_id",
         "install_root",
         "plan_sha256",
+        "launchers",
         "runtimes",
         "auth",
     }
     assert "lease_id" not in payload
     assert payload["plan_sha256"] == hashlib.sha256(plan_raw.encode()).hexdigest()
+    assert payload["schema_version"] == 2
+    assert payload["launchers"] == [
+        {
+            "profile": "default",
+            "pid": 404,
+            "created_at": 59.0,
+            "creation_file_time": "133801632590000000",
+            "executable_path": os.path.normcase(
+                os.path.realpath(launcher_executable)
+            ),
+        }
+    ]
     assert payload["runtimes"] == [
         {
             "profile": "default",

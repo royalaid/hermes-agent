@@ -2368,6 +2368,7 @@ function Read-PreparedGatewayNativeProofCore(
 ) {
     $script:PreparedGatewayProofState = 'unreadable'
     $runtimeHandles = New-Object 'System.Collections.Generic.List[System.IntPtr]'
+    $launcherHandles = New-Object 'System.Collections.Generic.List[System.IntPtr]'
     $proofSucceeded = $false
     try {
         if (($RequireLiveRuntimes -and $JobHandle -eq [System.IntPtr]::Zero) -or
@@ -2395,7 +2396,10 @@ function Read-PreparedGatewayNativeProofCore(
             $script:PreparedGatewayProofState = 'manifest-shape'
             return $null
         }
-        $expectedFields = @('schema_version', 'invocation_id', 'install_root', 'plan_sha256', 'runtimes', 'auth')
+        $expectedFields = @(
+            'schema_version', 'invocation_id', 'install_root', 'plan_sha256',
+            'launchers', 'runtimes', 'auth'
+        )
         $manifestFields = @($manifest.PSObject.Properties | ForEach-Object { $_.Name })
         if ($manifestFields.Count -ne $expectedFields.Count) {
             $script:PreparedGatewayProofState = 'manifest-fields'
@@ -2407,13 +2411,14 @@ function Read-PreparedGatewayNativeProofCore(
                 return $null
             }
         }
-        if (-not (Test-JsonInteger $manifest.schema_version) -or [int64]$manifest.schema_version -ne 1 -or
+        if (-not (Test-JsonInteger $manifest.schema_version) -or [int64]$manifest.schema_version -ne 2 -or
             $manifest.invocation_id -isnot [string] -or
             -not [string]::Equals($manifest.invocation_id, $script:InvocationId, [StringComparison]::Ordinal) -or
             $manifest.install_root -isnot [string] -or
             $manifest.plan_sha256 -isnot [string] -or $manifest.plan_sha256 -notmatch '^[0-9a-f]{64}$' -or
             -not [string]::Equals($manifest.plan_sha256, (Get-Sha256Hex $ExpectedPlanRaw), [StringComparison]::Ordinal) -or
             $manifest.auth -isnot [string] -or $manifest.auth -notmatch '^[0-9a-f]{64}$' -or
+            $manifest.launchers -isnot [System.Array] -or
             $manifest.runtimes -isnot [System.Array]) {
             $script:PreparedGatewayProofState = 'manifest-core'
             return $null
@@ -2430,6 +2435,8 @@ function Read-PreparedGatewayNativeProofCore(
             return $null
         }
         $runtimeJson = New-Object System.Collections.Generic.List[string]
+        $runtimePidsByProfile = @{}
+        $runtimePids = @{}
         $lastProfile = $null
         $lastPid = 0
         foreach ($runtime in $runtimeValues) {
@@ -2488,6 +2495,8 @@ function Read-PreparedGatewayNativeProofCore(
             }
             $lastProfile = [string]$runtime.profile
             $lastPid = [int]$runtime.pid
+            $runtimePidsByProfile[[string]$runtime.profile] = [int]$runtime.pid
+            $runtimePids[[int]$runtime.pid] = $true
             $expectedProfileHome = if ($runtime.profile -eq 'default') {
                 $HermesHome
             } else {
@@ -2568,6 +2577,130 @@ function Read-PreparedGatewayNativeProofCore(
                 ',"profile_home":' + (ConvertTo-CanonicalAsciiJsonString ([string]$runtime.profile_home)) + '}'
             )
         }
+        $launcherValues = @($manifest.launchers)
+        if ($launcherValues.Count -gt 64) {
+            $script:PreparedGatewayProofState = 'launcher-count'
+            return $null
+        }
+        $launcherJson = New-Object System.Collections.Generic.List[string]
+        $lastLauncherProfile = $null
+        $lastLauncherPid = 0
+        foreach ($launcher in $launcherValues) {
+            if ($launcher -isnot [pscustomobject]) {
+                $script:PreparedGatewayProofState = 'launcher-shape'
+                return $null
+            }
+            $launcherFields = @($launcher.PSObject.Properties | ForEach-Object { $_.Name })
+            $expectedLauncherFields = @(
+                'profile', 'pid', 'created_at', 'creation_file_time', 'executable_path'
+            )
+            if ($launcherFields.Count -ne $expectedLauncherFields.Count) {
+                $script:PreparedGatewayProofState = 'launcher-fields'
+                return $null
+            }
+            foreach ($field in $expectedLauncherFields) {
+                if ($launcherFields -notcontains $field) {
+                    $script:PreparedGatewayProofState = 'launcher-fields'
+                    return $null
+                }
+            }
+            if ($launcher.profile -isnot [string] -or $launcher.profile -notmatch '^[A-Za-z0-9._-]{1,128}$' -or
+                -not $runtimePidsByProfile.ContainsKey([string]$launcher.profile) -or
+                -not (Test-JsonInteger $launcher.pid) -or [int64]$launcher.pid -le 0 -or
+                [int64]$launcher.pid -gt [int]::MaxValue -or
+                $runtimePids.ContainsKey([int]$launcher.pid) -or
+                $launcher.creation_file_time -isnot [string] -or
+                $launcher.creation_file_time -notmatch '^[1-9][0-9]{0,19}$' -or
+                $launcher.executable_path -isnot [string]) {
+                $script:PreparedGatewayProofState = 'launcher-core'
+                return $null
+            }
+            $launcherCreatedAt = 0.0
+            try { $launcherCreatedAt = [double]$launcher.created_at } catch {
+                $script:PreparedGatewayProofState = 'launcher-created'
+                return $null
+            }
+            if ([double]::IsNaN($launcherCreatedAt) -or
+                [double]::IsInfinity($launcherCreatedAt) -or $launcherCreatedAt -le 0) {
+                $script:PreparedGatewayProofState = 'launcher-created'
+                return $null
+            }
+            $launcherCreationFileTime = [uint64]0
+            if (-not [uint64]::TryParse(
+                [string]$launcher.creation_file_time,
+                [System.Globalization.NumberStyles]::None,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$launcherCreationFileTime
+            ) -or $launcherCreationFileTime -le 0) {
+                $script:PreparedGatewayProofState = 'launcher-filetime'
+                return $null
+            }
+            $launcherProfileCompare = if ($null -eq $lastLauncherProfile) { 1 } else {
+                [string]::CompareOrdinal([string]$launcher.profile, [string]$lastLauncherProfile)
+            }
+            if ($launcherProfileCompare -lt 0 -or
+                ($launcherProfileCompare -eq 0 -and [int]$launcher.pid -le $lastLauncherPid)) {
+                $script:PreparedGatewayProofState = 'launcher-order'
+                return $null
+            }
+            $lastLauncherProfile = [string]$launcher.profile
+            $lastLauncherPid = [int]$launcher.pid
+            $launcherExecutablePath = (
+                Resolve-Path -LiteralPath $launcher.executable_path -ErrorAction Stop
+            ).ProviderPath
+            $launcherExecutablePath = [System.IO.Path]::GetFullPath($launcherExecutablePath)
+            $installPrefix = $InstallRoot.TrimEnd([char[]]@('\', '/')) +
+                [System.IO.Path]::DirectorySeparatorChar
+            if (-not $launcherExecutablePath.StartsWith(
+                $installPrefix, [StringComparison]::OrdinalIgnoreCase
+            )) {
+                $script:PreparedGatewayProofState = 'launcher-scope'
+                return $null
+            }
+            if ($RequireLiveRuntimes) {
+                $launcherHandle = [HermesHandoff.UpdaterJob]::OpenRuntimeProcess([int]$launcher.pid)
+                $launcherHandles.Add($launcherHandle)
+                if (-not [HermesHandoff.UpdaterJob]::RuntimeProcessIsLive($launcherHandle) -or
+                    -not [HermesHandoff.UpdaterJob]::ContainsProcessHandle($JobHandle, $launcherHandle) -or
+                    -not [string]::Equals(
+                        [HermesHandoff.UpdaterJob]::RuntimeCreationFileTime($launcherHandle),
+                        [string]$launcher.creation_file_time,
+                        [StringComparison]::Ordinal
+                    ) -or
+                    -not [string]::Equals(
+                        [System.IO.Path]::GetFullPath(
+                            [HermesHandoff.UpdaterJob]::RuntimeExecutablePath($launcherHandle)
+                        ),
+                        $launcherExecutablePath,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    $script:PreparedGatewayProofState = 'launcher-identity'
+                    return $null
+                }
+                $liveLauncherCreatedAt = [Math]::Round(
+                    ($launcherCreationFileTime / 10000000.0) - 11644473600.0, 2
+                )
+                if ([Math]::Abs($liveLauncherCreatedAt - $launcherCreatedAt) -gt 0.001) {
+                    $script:PreparedGatewayProofState = 'launcher-generation'
+                    return $null
+                }
+            }
+            $launcherCreatedText = $launcherCreatedAt.ToString(
+                '0.0#', [System.Globalization.CultureInfo]::InvariantCulture
+            )
+            $launcherJson.Add(
+                '{"created_at":' + $launcherCreatedText +
+                ',"creation_file_time":' +
+                    (ConvertTo-CanonicalAsciiJsonString ([string]$launcher.creation_file_time)) +
+                ',"executable_path":' +
+                    (ConvertTo-CanonicalAsciiJsonString ([string]$launcher.executable_path)) +
+                ',"pid":' + ([int]$launcher.pid).ToString(
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                ) +
+                ',"profile":' +
+                    (ConvertTo-CanonicalAsciiJsonString ([string]$launcher.profile)) + '}'
+            )
+        }
         if ($RequireLiveRuntimes) {
             # The terminated wrapper can remain in Job accounting for a short
             # native teardown edge after WaitForExit. Wait only for that bounded
@@ -2575,18 +2708,19 @@ function Read-PreparedGatewayNativeProofCore(
             $memberCountDeadline = (Get-Date).AddMilliseconds(750)
             do {
                 $activeRuntimeCount = [HermesHandoff.UpdaterJob]::ActiveProcesses($JobHandle)
-                if ($activeRuntimeCount -eq [uint32]$runtimeValues.Count) { break }
+                if ($activeRuntimeCount -eq [uint32]($runtimeValues.Count + $launcherValues.Count)) { break }
                 Start-Sleep -Milliseconds 25
             } while ((Get-Date) -lt $memberCountDeadline)
-            if ($activeRuntimeCount -ne [uint32]$runtimeValues.Count) {
+            if ($activeRuntimeCount -ne [uint32]($runtimeValues.Count + $launcherValues.Count)) {
                 $script:PreparedGatewayProofState = 'job-member-count'
                 return $null
             }
         }
         $unsigned = '{"install_root":' + (ConvertTo-CanonicalAsciiJsonString ([string]$manifest.install_root)) +
             ',"invocation_id":' + (ConvertTo-CanonicalAsciiJsonString ([string]$manifest.invocation_id)) +
+            ',"launchers":[' + ([string]::Join(',', $launcherJson.ToArray())) + ']' +
             ',"plan_sha256":' + (ConvertTo-CanonicalAsciiJsonString ([string]$manifest.plan_sha256)) +
-            ',"runtimes":[' + ([string]::Join(',', $runtimeJson.ToArray())) + '],"schema_version":1}'
+            ',"runtimes":[' + ([string]::Join(',', $runtimeJson.ToArray())) + '],"schema_version":2}'
         if ($TestMode -and
             [System.IO.Path]::IsPathRooted($env:HERMES_TEST_MANIFEST_UNSIGNED_CAPTURE)) {
             [System.IO.File]::WriteAllText(
@@ -2605,7 +2739,9 @@ function Read-PreparedGatewayNativeProofCore(
             PreparedRaw = $preparedRaw
             ManifestRaw = $manifestRaw
             Runtimes = $runtimeValues
+            Launchers = $launcherValues
             RuntimeHandles = @($runtimeHandles.ToArray())
+            LauncherHandles = @($launcherHandles.ToArray())
         }
         $proofSucceeded = $true
         return $proof
@@ -2615,6 +2751,9 @@ function Read-PreparedGatewayNativeProofCore(
         if (-not $proofSucceeded) {
             foreach ($runtimeHandle in $runtimeHandles) {
                 [HermesHandoff.UpdaterJob]::CloseRuntimeProcess($runtimeHandle)
+            }
+            foreach ($launcherHandle in $launcherHandles) {
+                [HermesHandoff.UpdaterJob]::CloseRuntimeProcess($launcherHandle)
             }
         }
     }
@@ -3694,7 +3833,8 @@ try {
                 $nativeCommitProof = Read-PreparedGatewayNativeCommitProof $initialPlan.Raw $jobHandle
                 $planStateProved = $null -ne $nativeCommitProof
                 if ($planStateProved) {
-                    $retainedRuntimeHandles = @($nativeCommitProof.RuntimeHandles)
+                    $retainedRuntimeHandles = @($nativeCommitProof.RuntimeHandles) +
+                        @($nativeCommitProof.LauncherHandles)
                 }
                 if (-not $planStateProved) {
                     $proofState = if ($script:PreparedGatewayProofState -match '^[a-z-]{1,40}$') {
@@ -3731,7 +3871,8 @@ try {
             } else {
                 $nativeBoundaryProved = $true
                 if ($initialPlan.Source -ne 'completed') {
-                    if ($retainedRuntimeHandles.Count -ne @($nativeCommitProof.Runtimes).Count) {
+                    if ($retainedRuntimeHandles.Count -ne
+                        (@($nativeCommitProof.Runtimes).Count + @($nativeCommitProof.Launchers).Count)) {
                         $nativeBoundaryProved = $false
                     }
                     foreach ($runtimeHandle in $retainedRuntimeHandles) {
