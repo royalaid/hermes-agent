@@ -107,10 +107,11 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     pack_ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
     launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
+         patch("hermes_cli.main._ensure_desktop_exe_launchable", return_value=(packaged_exe, False)), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.main._register_linux_desktop_entry"), \
@@ -130,6 +131,37 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     assert mock_run.call_args_list[0].kwargs["cwd"] == desktop_dir
     assert mock_run.call_args_list[1].args[0] == [str(packaged_exe)]
     assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
+
+
+def test_gui_successful_install_records_node_manifest_health(tmp_path, monkeypatch):
+    """A successful forced rebuild must satisfy the receipt health probe.
+
+    The Desktop updater rebuild runs the same deterministic root npm install as
+    ``hermes update``.  Recording its manifest digest is what lets the later
+    read-only receipt publisher prove those freshly installed dependencies.
+    """
+    root = _make_desktop_tree(tmp_path)
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+
+    install_ok = subprocess.CompletedProcess(["npm", "ci"], 0)
+    pack_ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
+
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=True), \
+         patch("hermes_cli.main._write_desktop_build_stamp"), \
+         patch("hermes_cli.main._ensure_desktop_exe_launchable", return_value=(packaged_exe, False)), \
+         patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._register_linux_desktop_entry"), \
+         patch("hermes_cli.main.subprocess.run", return_value=pack_ok), \
+         patch("hermes_cli.update_cmd._record_npm_lockfile_hash") as record_hash:
+        cli_main.cmd_gui(_ns(build_only=True, force_build=True))
+
+    record_hash.assert_called_once_with(home)
 
 
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
@@ -259,7 +291,7 @@ def test_gui_does_not_retry_after_packaged_executable_exists(tmp_path, monkeypat
     install_ok = subprocess.CompletedProcess(["npm", "ci"], 0)
     pack_fail = subprocess.CompletedProcess(["npm", "run", "pack"], 1)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
          patch("hermes_cli.main._purge_electron_build_cache", return_value=[Path("/c/electron.zip")]) as mock_purge, \
