@@ -165,6 +165,8 @@ namespace HermesHandoff {
         private static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandle(IntPtr file, StringBuilder path, uint size, uint flags);
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -236,6 +238,30 @@ namespace HermesHandoff {
             if (!QueryFullProcessImageName(process, 0, path, ref size))
                 throw new Win32Exception();
             return path.ToString();
+        }
+        // uv publishes the managed CPython home as a version-alias directory
+        // symlink (cpython-3.11-... -> cpython-3.11.15-...), so a path taken
+        // from pyvenv.cfg and the path Windows reports for the live process
+        // image name the same file through different links. Resolve every
+        // reparse point on both sides before they are compared so executable
+        // identity is decided by the file itself, not by which link named it.
+        public static string CanonicalFilePath(string path) {
+            using (var stream = new System.IO.FileStream(
+                path,
+                System.IO.FileMode.Open,
+                System.IO.FileAccess.Read,
+                System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete)) {
+                var resolved = new StringBuilder(32768);
+                uint written = GetFinalPathNameByHandle(
+                    stream.SafeFileHandle.DangerousGetHandle(), resolved, (uint)resolved.Capacity, 0);
+                if (written == 0 || written >= (uint)resolved.Capacity) throw new Win32Exception();
+                string full = resolved.ToString();
+                if (full.StartsWith("\\\\?\\UNC\\", StringComparison.Ordinal))
+                    full = "\\\\" + full.Substring(8);
+                else if (full.StartsWith("\\\\?\\", StringComparison.Ordinal))
+                    full = full.Substring(4);
+                return System.IO.Path.GetFullPath(full);
+            }
         }
         public static void CloseRuntimeProcess(IntPtr process) {
             if (process != IntPtr.Zero) CloseHandle(process);
@@ -3117,11 +3143,15 @@ function Open-DeferredGatewayTargetStartFrame(
             $JobHandle -eq [System.IntPtr]::Zero) {
             return $null
         }
-        $expectedPath = [System.IO.Path]::GetFullPath(
-            (Resolve-Path -LiteralPath $ExpectedExecutable -ErrorAction Stop).ProviderPath
+        $expectedPath = [HermesHandoff.UpdaterJob]::CanonicalFilePath(
+            [System.IO.Path]::GetFullPath(
+                (Resolve-Path -LiteralPath $ExpectedExecutable -ErrorAction Stop).ProviderPath
+            )
         )
-        $framePath = [System.IO.Path]::GetFullPath(
-            (Resolve-Path -LiteralPath ([string]$frame.executable_path) -ErrorAction Stop).ProviderPath
+        $framePath = [HermesHandoff.UpdaterJob]::CanonicalFilePath(
+            [System.IO.Path]::GetFullPath(
+                (Resolve-Path -LiteralPath ([string]$frame.executable_path) -ErrorAction Stop).ProviderPath
+            )
         )
         if (-not [string]::Equals($framePath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
             return $null
@@ -3141,8 +3171,10 @@ function Open-DeferredGatewayTargetStartFrame(
             )) {
             return $null
         }
-        $livePath = [System.IO.Path]::GetFullPath(
-            [HermesHandoff.UpdaterJob]::RuntimeExecutablePath($targetHandle)
+        $livePath = [HermesHandoff.UpdaterJob]::CanonicalFilePath(
+            [System.IO.Path]::GetFullPath(
+                [HermesHandoff.UpdaterJob]::RuntimeExecutablePath($targetHandle)
+            )
         )
         if (-not [string]::Equals($livePath, $expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
             -not [string]::Equals($livePath, $framePath, [StringComparison]::OrdinalIgnoreCase)) {
