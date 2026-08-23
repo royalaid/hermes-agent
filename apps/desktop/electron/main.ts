@@ -3791,27 +3791,9 @@ function reapOrphanedBackendsOnce() {
 // aggressively SIGKILL-ing the backend here would be an untested behavior change
 // for no benefit. So we no-op off Windows and leave that path exactly as it was.
 async function releaseBackendLockForUpdate(updateRoot: string, tag = 'updates', deadline?: UpdateBlockerDeadline) {
-  if (!IS_WINDOWS) {
-    return { unlocked: true }
-  }
+  const settleMs = deadline ? Math.max(0, Math.min(2_000, deadline.deadlineAt - Date.now())) : 2_000
 
-  if (deadline && Date.now() >= deadline.deadlineAt) {
-    return { unlocked: false }
-  }
-
-  // Ordinary update preparation must not use taskkill /T /F. Broadly killing
-  // a captured root before the native holder worker authenticates its current
-  // PID generation, executable scope, and live resource ownership recreates
-  // the rejected "kill all the things" race. The in-flight gate already
-  // prevents a new Desktop backend from being started; leave current holders
-  // alive for the exact native force-release boundary below.
-  const unlocked = !isAnyInstallResourceLocked(updateRoot) && !isShimLocked(venvHermesShimPath(updateRoot))
-
-  if (!unlocked) {
-    rememberLog(`[${tag}] tracked install holder release deferred to authenticated native force-release`)
-  }
-
-  return { unlocked }
+  return releaseBackendLock(updateRoot, tag, { settleMs })
 }
 
 function windowsPreflightErrorCode(outcome: Exclude<UpdatePreflightOutcome, { kind: 'clear' }>): string {
