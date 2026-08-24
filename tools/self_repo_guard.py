@@ -354,7 +354,8 @@ def _read_git_alias(executable: str, target: Path, alias: str) -> str | None:
 
 
 def _inspect_git(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int
+    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int,
+    allowed_worktree: Path | None,
 ) -> str | None:
     target, subcommand, sub_args, inline_aliases = _git_target_and_subcommand(
         args, current_dir, env)
@@ -365,6 +366,8 @@ def _inspect_git(
     if not _is_within(target, root):
         return None
     if _mutates_worktree(subcommand, sub_args):
+        if allowed_worktree is not None and _is_within(target, allowed_worktree):
+            return None
         return f"git {subcommand}"
     if subcommand in _KNOWN_GIT_BUILTINS or depth >= _MAX_RECURSION:
         return None
@@ -373,16 +376,19 @@ def _inspect_git(
     if not alias:
         return None
     if alias.startswith("!"):  # shell alias: scan it as a command
-        return _find_mutation(alias[1:], target, root, depth + 1)
+        return _find_mutation(alias[1:], target, root, depth + 1, allowed_worktree)
     try:
         alias_args = shlex.split(alias, posix=True)
     except ValueError:
         return None
-    return _inspect_git(executable, [*alias_args, *sub_args], target, {}, root, depth + 1)
+    return _inspect_git(
+        executable, [*alias_args, *sub_args], target, {}, root, depth + 1, allowed_worktree
+    )
 
 
 def _inspect_github_cli(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int
+    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int,
+    allowed_worktree: Path | None,
 ) -> str | None:
     if not _is_within(current_dir, root):
         return None
@@ -392,10 +398,11 @@ def _inspect_github_cli(
 
 
 def _inspect_shell(
-    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int
+    executable: str, args: list[str], current_dir: Path, env: dict[str, str], root: Path, depth: int,
+    allowed_worktree: Path | None,
 ) -> str | None:
     script = _shell_script_arg(args)
-    return _find_mutation(script, current_dir, root, depth + 1) if script else None
+    return _find_mutation(script, current_dir, root, depth + 1, allowed_worktree) if script else None
 
 
 # executable name -> inspector(executable, args, current_dir, env, root, depth)
@@ -404,13 +411,16 @@ _INSPECTORS: dict[str, Callable[..., str | None]] = {
     **{shell: _inspect_shell for shell in _SHELL_EXECUTABLES}}
 
 
-def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str | None:
+def _find_mutation(
+    command: str, cwd: Path, root: Path, depth: int = 0,
+    allowed_worktree: Path | None = None,
+) -> str | None:
     """Name of the first command in ``command`` that would rewrite ``root``, else None."""
     if depth > _MAX_RECURSION:
         return None
     masked_command, heredoc_scripts = _mask_heredocs(command)
     for script in heredoc_scripts:
-        if operation := _find_mutation(script, cwd, root, depth + 1):
+        if operation := _find_mutation(script, cwd, root, depth + 1, allowed_worktree):
             return operation
     starts = sorted(set(_iter_shell_command_starts(masked_command)))
     scopes = _scope_keys(masked_command, starts)
@@ -430,7 +440,7 @@ def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str |
         if (cd_target := _cd_target(executable, args, current_dir)) is not None:
             pending_cd[scope] = cd_target
         elif (inspect := _INSPECTORS.get(_executable_name(executable))) and (
-                operation := inspect(executable, args, current_dir, env, root, depth)):
+                operation := inspect(executable, args, current_dir, env, root, depth, allowed_worktree)):
             return operation
     return None
 
@@ -449,8 +459,31 @@ def detect_self_repo_git_mutation(
     if root is None or not command:
         return False, None
     root = _resolve(str(root), Path("/"))
-    operation = _find_mutation(command, _resolve(cwd or "/", Path("/")), root)
+    operation = _find_mutation(
+        command,
+        _resolve(cwd or "/", Path("/")),
+        root,
+        allowed_worktree=_kanban_worker_worktree(root),
+    )
     return (True, _block_message(operation, root)) if operation is not None else (False, None)
+
+
+def _kanban_worker_worktree(root: Path) -> Path | None:
+    """Return the exact isolated worktree a dispatched worker may rewrite."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    raw_workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    if not task_id or not raw_workspace:
+        return None
+
+    workspace = _resolve(raw_workspace, Path("/"))
+    if workspace == root or not _is_within(workspace, root):
+        return None
+    try:
+        if not (workspace / ".git").is_file():
+            return None
+    except OSError:
+        return None
+    return workspace
 
 
 def _block_message(operation: str, root: Path) -> str:
