@@ -1990,7 +1990,13 @@ def _resolve_hermes_argv() -> list[str]:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
 
-    hermes_bin = _safe_which_no_cwd("hermes") if _kb._IS_WINDOWS else shutil.which("hermes")
+    # Managed Windows updates can leave the implicit hermes.exe console script as a stale uv
+    # trampoline even though the venv interpreter and installed module are healthy. Keep an
+    # explicit HERMES_BIN override, but never let PATH select that fragile shim for workers.
+    if _kb._IS_WINDOWS:
+        return _module_hermes_argv()
+
+    hermes_bin = shutil.which("hermes")
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
@@ -2183,6 +2189,15 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         scrub_secrets=is_multiplex_active(),
         inherit_profile_home=True,
     )
+    if _kb._IS_WINDOWS:
+        # Keep the worker runtime anchored to the dispatcher's stable source while cwd and
+        # TERMINAL_CWD continue to point at the task worktree.
+        env["PYTHONSAFEPATH"] = "1"
+        runtime_source = str(Path(__file__).resolve().parent.parent)
+        inherited_pythonpath = env.get("PYTHONPATH", "").strip()
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (runtime_source, inherited_pythonpath) if part
+        )
     # The dispatcher is detached from every conversation; its worker must never
     # inherit routing mirrored by a previous gateway turn.
     from gateway.session_context import _VAR_MAP
