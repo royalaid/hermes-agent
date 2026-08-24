@@ -333,12 +333,6 @@ import {
   stagedUpdaterSupportsPrewrittenMarker,
   wrapHandoffForDetachedConsole
 } from './updater-process'
-import {
-  formatBlockerMessage,
-  formatProbeFailedMessage,
-  scanVenvBlockers,
-  stopSafeVenvBlockers
-} from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, readWindowBelow } from './window-below'
@@ -3178,6 +3172,50 @@ function forceKillProcessTree(pid) {
   }
 }
 
+// Kill every non-Desktop process executing from this Hermes install. Selecting
+// tree roots keeps taskkill /T authoritative across Python/Node trampolines;
+// this is target collection only, never a holder-classification gate.
+function forceKillAllHermesBackendTrees(updateRoot: string) {
+  if (!IS_WINDOWS) {
+    return
+  }
+
+  const root = `${path.resolve(updateRoot).replace(/'/g, "''").replace(/[\\/]+$/, '')}\\`
+  const desktopExecutable = path.resolve(process.execPath).replace(/'/g, "''")
+  const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+$root = '${root}'
+$desktopExecutable = '${desktopExecutable}'
+$processes = @(Get-CimInstance Win32_Process)
+$targets = @($processes | Where-Object {
+  $executable = [string]$_.ExecutablePath
+  $_.ProcessId -ne ${process.pid} -and
+    $executable.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and
+    -not $executable.Equals($desktopExecutable, [StringComparison]::OrdinalIgnoreCase)
+})
+$targetIds = @{}
+foreach ($target in $targets) {
+  $targetIds[[int]$target.ProcessId] = $true
+}
+foreach ($target in $targets) {
+  if (-not $targetIds.ContainsKey([int]$target.ParentProcessId)) {
+    & taskkill.exe /PID ([string]$target.ProcessId) /T /F *> $null
+  }
+}
+`
+
+  try {
+    execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      hiddenWindowsChildOptions({ stdio: 'ignore' })
+    )
+  } catch {
+    // Each tree kill is best effort; the existing shim-unlock wait below is
+    // still the fail-closed hand-off gate.
+  }
+}
+
 function writeBackendOwnership(contents) {
   fs.mkdirSync(path.dirname(DESKTOP_BACKEND_OWNERSHIP_PATH), { recursive: true })
   const tempPath = `${DESKTOP_BACKEND_OWNERSHIP_PATH}.${process.pid}.tmp`
@@ -3651,6 +3689,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // spawn the updater. Without this the updater races a still-locked
     // hermes.exe (held by the backend child / its grandchildren) and the update
     // bricks. See releaseBackendLockForUpdate for the full failure analysis.
+    forceKillAllHermesBackendTrees(updateRoot)
     const lock = await releaseBackendLockForUpdate(updateRoot)
 
     if (!lock.unlocked) {
@@ -3667,50 +3706,6 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       startHermes().catch(() => {})
 
       return { ok: false, error: message }
-    }
-
-    // Preflight: after releasing our own backends, check for remaining
-    // Hermes processes running from this venv.  The updater normally refuses
-    // when it detects a holder, but because the updater is spawned detached
-    // with stdio:ignore, the user never sees that refusal and the update
-    // silently fails.  This preflight detects holders early and gives the
-    // user an actionable error.  Windows-only; the .pyd lock hazard is a
-    // Windows phenomenon.  ALL failures (blocked, missing python, timeout,
-    // malformed output, missing psutil) abort the handoff — never proceed
-    // to the detached updater when the venv state is unknown.
-    if (IS_WINDOWS) {
-      let scanOutcome = await scanVenvBlockers(updateRoot)
-
-      if (scanOutcome.kind === 'blocked' && opts.stopSafeBlockers) {
-        const stopResult = await stopSafeVenvBlockers(updateRoot, scanOutcome.result)
-        rememberLog(
-          `[updates] user-approved blocker cleanup: stopped=${stopResult.stopped.join(',') || 'none'} failed=${stopResult.failed.join(',') || 'none'}`
-        )
-        // Let verified process-tree termination finish unwinding wrapper shells,
-        // then make the scanner — not the stale renderer payload — authoritative.
-        await new Promise(resolve => setTimeout(resolve, 300))
-        scanOutcome = await scanVenvBlockers(updateRoot)
-      }
-
-      if (scanOutcome.kind === 'blocked') {
-        const message = formatBlockerMessage(scanOutcome.result)
-
-        rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
-        emitUpdateProgress({ stage: 'error', message, percent: null })
-        startHermes().catch(() => {})
-
-        return { ok: false, error: 'venv-blocked', message, blockers: scanOutcome.result.processes }
-      }
-
-      if (scanOutcome.kind === 'probe-failure') {
-        const message = formatProbeFailedMessage()
-
-        rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
-        emitUpdateProgress({ stage: 'error', message, percent: null })
-        startHermes().catch(() => {})
-
-        return { ok: false, error: 'venv-probe-failed', message }
-      }
     }
 
     // Detached so the updater outlives this process — it needs us GONE before
