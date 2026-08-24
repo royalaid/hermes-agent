@@ -10621,7 +10621,14 @@ def _resolve_hermes_argv() -> list[str]:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
 
-    hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
+    # Managed Windows updates can leave an implicit ``hermes.exe`` console
+    # script as a stale uv trampoline even though the venv's interpreter and
+    # installed module are healthy.  Keep an explicit HERMES_BIN override,
+    # but never let PATH select that fragile shim for dispatcher workers.
+    if _IS_WINDOWS:
+        return _module_hermes_argv()
+
+    hermes_bin = shutil.which("hermes")
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
@@ -10745,6 +10752,19 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    if _IS_WINDOWS:
+        # ``python -m`` normally prepends cwd to sys.path.  A Kanban worker's
+        # cwd is its task worktree, so that default makes Hermes import its
+        # own runtime from the checkout it is about to merge/rebase.  The
+        # Windows self-repo guard then correctly refuses to rewrite that live
+        # module tree.  Keep the runtime anchored to the dispatcher's stable
+        # source while leaving cwd/TERMINAL_CWD pointed at the task worktree.
+        env["PYTHONSAFEPATH"] = "1"
+        runtime_source = str(Path(__file__).resolve().parent.parent)
+        inherited_pythonpath = env.get("PYTHONPATH", "").strip()
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (runtime_source, inherited_pythonpath) if part
+        )
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.
