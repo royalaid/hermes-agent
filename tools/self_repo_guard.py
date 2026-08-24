@@ -586,6 +586,7 @@ def _inspect_git(
     env: dict[str, str],
     root: Path,
     depth: int,
+    allowed_worktree: Path | None,
 ) -> str | None:
     target, subcommand, sub_args, inline_aliases = _git_target_and_subcommand(
         args, current_dir, env
@@ -598,6 +599,8 @@ def _inspect_git(
     if not _is_within(target, root):
         return None
     if _mutates_worktree(subcommand, sub_args):
+        if allowed_worktree is not None and _is_within(target, allowed_worktree):
+            return None
         return f"git {subcommand}"
     if subcommand in _KNOWN_GIT_BUILTINS:
         return None
@@ -610,7 +613,9 @@ def _inspect_git(
     if not alias:
         return None
     if alias.startswith("!"):
-        return _find_mutation(alias[1:], target, root, depth + 1)
+        return _find_mutation(
+            alias[1:], target, root, depth + 1, allowed_worktree
+        )
     try:
         alias_args = shlex.split(alias, posix=True)
     except ValueError:
@@ -622,6 +627,7 @@ def _inspect_git(
         {},
         root,
         depth + 1,
+        allowed_worktree,
     )
 
 
@@ -640,13 +646,21 @@ def _inspect_github_cli(
     return None
 
 
-def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str | None:
+def _find_mutation(
+    command: str,
+    cwd: Path,
+    root: Path,
+    depth: int = 0,
+    allowed_worktree: Path | None = None,
+) -> str | None:
     if depth > _MAX_RECURSION:
         return None
 
     masked_command, heredoc_scripts = _mask_heredocs(command)
     for script in heredoc_scripts:
-        operation = _find_mutation(script, cwd, root, depth + 1)
+        operation = _find_mutation(
+            script, cwd, root, depth + 1, allowed_worktree
+        )
         if operation:
             return operation
 
@@ -678,7 +692,15 @@ def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str |
 
         executable_name = _executable_name(executable)
         if executable_name == "git":
-            operation = _inspect_git(executable, args, current_dir, env, root, depth)
+            operation = _inspect_git(
+                executable,
+                args,
+                current_dir,
+                env,
+                root,
+                depth,
+                allowed_worktree,
+            )
             if operation:
                 return operation
         elif executable_name in {"gh", "hub"}:
@@ -688,7 +710,9 @@ def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str |
         elif executable_name in _SHELL_EXECUTABLES:
             script = _shell_script_arg(args)
             if script:
-                operation = _find_mutation(script, current_dir, root, depth + 1)
+                operation = _find_mutation(
+                    script, current_dir, root, depth + 1, allowed_worktree
+                )
                 if operation:
                     return operation
 
@@ -720,10 +744,35 @@ def detect_self_repo_git_mutation(
 
     root = _resolve(str(root), Path("/"))
     base = _resolve(cwd, Path("/")) if cwd else Path("/")
-    operation = _find_mutation(command, base, root)
+    allowed_worktree = _kanban_worker_worktree(root)
+    operation = _find_mutation(command, base, root, allowed_worktree=allowed_worktree)
     if operation is None:
         return False, None
     return True, _block_message(operation, root)
+
+
+def _kanban_worker_worktree(root: Path) -> Path | None:
+    """Return the exact isolated worktree a dispatched worker may rewrite.
+
+    The exception is valid only when the process is explicitly task-scoped,
+    the workspace is a linked Git worktree below (but not equal to) the live
+    source root, and the dispatcher supplied both environment variables.  A
+    command that targets the live root with ``git -C`` remains blocked.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    raw_workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    if not task_id or not raw_workspace:
+        return None
+
+    workspace = _resolve(raw_workspace, Path("/"))
+    if workspace == root or not _is_within(workspace, root):
+        return None
+    try:
+        if not (workspace / ".git").is_file():
+            return None
+    except OSError:
+        return None
+    return workspace
 
 
 def _block_message(operation: str, root: Path) -> str:
