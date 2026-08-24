@@ -96,11 +96,11 @@ describe('openSession', () => {
     $selectedStoredSessionId.set(null)
   })
 
-  it('default in-place fronts an existing tile without navigating', () => {
+  it('in-place routes a TILE hit into main (#92926) — no more dead click', () => {
     focusOpenSession.mockReturnValue('tile')
     openSession('s1', navigate)
     expect(focusOpenSession).toHaveBeenCalledWith('s1', { workspaceMode: 'sessions' })
-    expect(navigate).not.toHaveBeenCalled()
+    expect(navigate).toHaveBeenCalledWith('/c/s1')
     expect(openSessionTile).not.toHaveBeenCalled()
   })
 
