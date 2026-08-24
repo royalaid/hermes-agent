@@ -13,7 +13,9 @@ Pinning ``TERMINAL_CWD`` to the workspace fixes both.
 
 from __future__ import annotations
 
+import os
 import subprocess
+from pathlib import Path
 
 
 def _make_task(kb, *, assignee: str = "w"):
@@ -77,3 +79,32 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
+def test_windows_worker_imports_runtime_outside_task_worktree(
+    monkeypatch, tmp_path
+):
+    """Worker cwd must not become the source tree backing its own process."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("PYTHONPATH", "inherited-path")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    runtime_source = str(Path(kb.__file__).resolve().parent.parent)
+    assert captured["env"]["PYTHONSAFEPATH"] == "1"
+    assert captured["env"]["PYTHONPATH"].split(os.pathsep, 1) == [
+        runtime_source,
+        "inherited-path",
+    ]
