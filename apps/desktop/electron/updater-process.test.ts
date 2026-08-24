@@ -11,6 +11,7 @@ import {
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
+  resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
   stagedUpdaterSupportsPrewrittenMarker,
@@ -216,6 +217,27 @@ test('resolveUpdateScriptHandoff is Windows-only (POSIX updates in place)', () =
   })
 
   assert.equal(handoff, null)
+})
+
+test('resolveWindowsUpdateTransport selects the live checkout script', () => {
+  const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
+  const scriptPath = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
+  const transport = resolveWindowsUpdateTransport(root, {
+    isWindows: true,
+    fileExists: candidate => candidate === scriptPath
+  })
+
+  assert.equal(transport.kind, 'script')
+  assert.equal(transport.kind === 'script' ? transport.handoff.scriptPath : null, scriptPath)
+})
+
+test('resolveWindowsUpdateTransport requires a manual update without a live script', () => {
+  const transport = resolveWindowsUpdateTransport(String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`, {
+    isWindows: true,
+    fileExists: () => false
+  })
+
+  assert.deepEqual(transport, { kind: 'manual' })
 })
 
 test('wrapHandoffForDetachedConsole routes through cmd start with own console', () => {
