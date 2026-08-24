@@ -391,12 +391,6 @@ import {
   stagedUpdaterSupportsPrewrittenMarker,
   wrapHandoffForDetachedConsole
 } from './updater-process'
-import {
-  formatBlockerMessage,
-  formatProbeFailedMessage,
-  scanVenvBlockers,
-  stopSafeVenvBlockers
-} from './venv-blocker-scan'
 import { isHermesOwnedVenvDaemon } from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
@@ -3389,6 +3383,50 @@ function forceKillProcessTree(pid) {
   }
 }
 
+// Kill every non-Desktop process executing from this Hermes install. Selecting
+// tree roots keeps taskkill /T authoritative across Python/Node trampolines;
+// this is target collection only, never a holder-classification gate.
+function forceKillAllHermesBackendTrees(updateRoot: string) {
+  if (!IS_WINDOWS) {
+    return
+  }
+
+  const root = `${path.resolve(updateRoot).replace(/'/g, "''").replace(/[\\/]+$/, '')}\\`
+  const desktopExecutable = path.resolve(process.execPath).replace(/'/g, "''")
+  const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+$root = '${root}'
+$desktopExecutable = '${desktopExecutable}'
+$processes = @(Get-CimInstance Win32_Process)
+$targets = @($processes | Where-Object {
+  $executable = [string]$_.ExecutablePath
+  $_.ProcessId -ne ${process.pid} -and
+    $executable.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and
+    -not $executable.Equals($desktopExecutable, [StringComparison]::OrdinalIgnoreCase)
+})
+$targetIds = @{}
+foreach ($target in $targets) {
+  $targetIds[[int]$target.ProcessId] = $true
+}
+foreach ($target in $targets) {
+  if (-not $targetIds.ContainsKey([int]$target.ParentProcessId)) {
+    & taskkill.exe /PID ([string]$target.ProcessId) /T /F *> $null
+  }
+}
+`
+
+  try {
+    execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      hiddenWindowsChildOptions({ stdio: 'ignore' })
+    )
+  } catch {
+    // Each tree kill is best effort; the existing shim-unlock wait below is
+    // still the fail-closed hand-off gate.
+  }
+}
+
 function writeBackendOwnership(contents) {
   fs.mkdirSync(path.dirname(DESKTOP_BACKEND_OWNERSHIP_PATH), { recursive: true })
   const tempPath = `${DESKTOP_BACKEND_OWNERSHIP_PATH}.${process.pid}.tmp`
@@ -3903,6 +3941,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // spawn the updater. Without this the updater races a still-locked
     // hermes.exe (held by the backend child / its grandchildren) and the update
     // bricks. See releaseBackendLockForUpdate for the full failure analysis.
+    forceKillAllHermesBackendTrees(updateRoot)
     const lock = await releaseBackendLockForUpdate(updateRoot)
 
     if (!lock.unlocked) {
