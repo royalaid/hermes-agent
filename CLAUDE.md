@@ -1,3 +1,5 @@
+@AGENTS.md
+
 # Hermes Agent
 
 This checkout tracks **fork-integration** — current upstream `main` plus our
