@@ -20,6 +20,8 @@ export interface UpdateScriptHandoff {
   scriptPath: string
 }
 
+export type WindowsUpdateTransport = { kind: 'script'; handoff: UpdateScriptHandoff } | { kind: 'manual' }
+
 /**
  * Repo-owned Windows update hand-off (frozen-binary escape hatch).
  *
@@ -66,6 +68,20 @@ export function resolveUpdateScriptHandoff(
   }
 
   return null
+}
+
+/**
+ * Ordinary Windows updates must use the updater logic shipped with the live
+ * checkout. The staged installer is frozen at build time and remains reserved
+ * for bootstrap recovery, where the checkout may not yet provide a script.
+ */
+export function resolveWindowsUpdateTransport(
+  updateRoot: string,
+  deps: ResolveUpdateScriptHandoffDeps = {}
+): WindowsUpdateTransport {
+  const handoff = resolveUpdateScriptHandoff(updateRoot, deps)
+
+  return handoff ? { kind: 'script', handoff } : { kind: 'manual' }
 }
 
 /**
