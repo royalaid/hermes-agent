@@ -262,6 +262,49 @@ class TestAllowsSafeCommands:
         assert msg is None
 
 
+class TestKanbanWorkerWorktree:
+    def test_allows_mutation_in_exact_dispatched_worktree(
+        self, repo, monkeypatch
+    ):
+        workspace = repo / ".worktrees" / "t_12345678"
+        workspace.mkdir(parents=True)
+        (workspace / ".git").write_text(
+            "gitdir: ../../.git/worktrees/t_12345678\n"
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+        hit, msg = _detect("git merge upstream/main", workspace, repo)
+
+        assert hit is False
+        assert msg is None
+
+    def test_still_blocks_live_root_from_dispatched_worktree(
+        self, repo, monkeypatch
+    ):
+        workspace = repo / ".worktrees" / "t_12345678"
+        workspace.mkdir(parents=True)
+        (workspace / ".git").write_text(
+            "gitdir: ../../.git/worktrees/t_12345678\n"
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+        hit, _ = _detect(
+            f"git -C {repo.as_posix()} merge upstream/main", workspace, repo
+        )
+
+        assert hit is True
+
+    def test_rejects_live_root_as_workspace(self, repo, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_12345678")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(repo))
+
+        hit, _ = _detect("git merge upstream/main", repo, repo)
+
+        assert hit is True
+
+
 class TestWorktreeTargetingSourceRoot:
     @pytest.mark.parametrize(
         "sub",
