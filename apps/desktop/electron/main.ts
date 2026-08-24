@@ -377,7 +377,7 @@ import {
   observeUpdaterHandoff,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
-  resolveUpdateScriptHandoff,
+  resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
   stagedUpdaterSupportsPrewrittenMarker,
@@ -3717,48 +3717,35 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       return await applyUpdatesPosixHandoff(opts)
     }
 
-    if (!updater) {
-      // No staged updater binary — this is a CLI-installed user (they ran
-      // `hermes desktop`, never the Tauri installer that self-copies
-      // hermes-setup.exe into HERMES_HOME). On Windows the repo hand-off
-      // script serves them just as well as installer users — it only needs
-      // PowerShell and the checkout — so fall through to the normal hand-off
-      // when the script exists. Only when the checkout predates the script do
-      // we surface the manual one-liner.
+    const windowsUpdateTransport = IS_WINDOWS ? resolveWindowsUpdateTransport(resolveUpdateRoot()) : null
+
+    if (windowsUpdateTransport?.kind === 'manual') {
+      // The live checkout predates the repo-owned hand-off script. Do not fall
+      // back to the frozen staged installer for an ordinary update; surface the
+      // branch-pinned CLI command instead. Bootstrap recovery still owns the
+      // staged-binary path.
       const updateRoot = resolveUpdateRoot()
+      let command = 'hermes update'
 
-      if (!resolveUpdateScriptHandoff(updateRoot)) {
-        // They DO have a working `hermes` on PATH / in the venv, so the
-        // correct path is the one-liner in their native medium. We show the
-        // EXACT command, branch-pinned to the checkout they're on — bare
-        // `hermes update` defaults to main and would silently switch a
-        // bb/gui (or any non-main) install off-branch. Mirror the GUI
-        // button's contract: append --branch <current> for non-main
-        // checkouts, keep it bare for main so the card stays clean.
-        let command = 'hermes update'
+      try {
+        const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
+        const current = (head.stdout || '').trim()
 
-        try {
-          const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-          const current = (head.stdout || '').trim()
+        if (head.code === 0 && current && current !== 'HEAD') {
+          const branch = await resolveHealedBranch(updateRoot, current)
 
-          if (head.code === 0 && current && current !== 'HEAD') {
-            const branch = await resolveHealedBranch(updateRoot, current)
-
-            if (branch !== 'main') {
-              command = `hermes update --branch ${branch}`
-            }
+          if (branch !== 'main') {
+            command = `hermes update --branch ${branch}`
           }
-        } catch {
-          // Best-effort: fall back to bare `hermes update` if branch detection fails.
         }
-
-        rememberLog(`[updates] no staged updater; surfacing manual \`${command}\` for CLI install at ${updateRoot}`)
-        emitUpdateProgress({ stage: 'manual', message: command, percent: null })
-
-        return { ok: true, manual: true, command, hermesRoot: updateRoot }
+      } catch {
+        // Best-effort: fall back to bare `hermes update` if branch detection fails.
       }
 
-      rememberLog('[updates] no staged updater; using repo hand-off script for CLI install')
+      rememberLog(`[updates] no repo hand-off script; surfacing manual \`${command}\` for ${updateRoot}`)
+      emitUpdateProgress({ stage: 'manual', message: command, percent: null })
+
+      return { ok: true, manual: true, command, hermesRoot: updateRoot }
     }
 
     const handoffConflict = updateHandoffConflict(HERMES_HOME)
@@ -3824,15 +3811,9 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
     //
-    // Prefer the repo-owned hand-off script over the staged Tauri binary.
-    // The staged binary is frozen (no self-update path) and historically runs
-    // months-stale updater logic — pre-#67369 cache resolver, pre-#74782
-    // marker adoption — producing failures that were fixed on main long ago
-    // (2026-08-09 incident). scripts/desktop-update/windows.ps1 ships WITH the
-    // checkout, so each `hermes update` refreshes the code that drives the
-    // next one. Checkouts that predate the script fall back to the binary
-    // path unchanged.
-    const scriptHandoff = resolveUpdateScriptHandoff(updateRoot)
+    // Ordinary Windows updates use only the repo-owned script. POSIX keeps its
+    // existing staged-binary route; packaged bootstrap recovery is separate.
+    const scriptHandoff = windowsUpdateTransport?.kind === 'script' ? windowsUpdateTransport.handoff : null
     let child
 
     if (scriptHandoff) {
