@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import subprocess
 import sys
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -438,3 +440,37 @@ def test_main_preserves_quoted_check_arguments(
     output = capsys.readouterr().out
     assert '"status": "failed"' in output
     assert "focused check failed" in output
+
+
+def test_cron_adapter_publishes_debounced_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[str] = []
+    fake_refresh = types.ModuleType("refresh")
+    fake_refresh.main = lambda argv: captured.extend(argv) or 0
+    monkeypatch.setitem(sys.modules, "refresh", fake_refresh)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    preferred = tmp_path / "hermes-agent" / ".venv" / "Scripts" / "python.exe"
+    preferred.parent.mkdir(parents=True)
+    preferred.touch()
+
+    with pytest.raises(SystemExit) as stopped:
+        runpy.run_path(Path(refresh.__file__).with_name("job.py"), run_name="__main__")
+
+    assert stopped.value.code == 0
+    assert captured[:6] == ["--repo", str(tmp_path / "hermes-agent"), "--upstream-cutoff-hour", "8", "--publish", "--check"]
+    assert json.loads(captured[6]) == [str(preferred),
+        "-m", "pytest", "tests/cron/test_fork_integration_refresh.py", "-q"]
+
+
+def test_cron_adapter_uses_source_repo_without_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[str] = []
+    fake_refresh = types.ModuleType("refresh")
+    fake_refresh.main = lambda argv: captured.extend(argv) or 0
+    monkeypatch.setitem(sys.modules, "refresh", fake_refresh)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    with pytest.raises(SystemExit):
+        runpy.run_path(Path(refresh.__file__).with_name("job.py"), run_name="__main__")
+
+    repo = Path(refresh.__file__).resolve().parents[2]
+    assert captured[:2] == ["--repo", str(repo)]
+    assert json.loads(captured[6])[0] == str(repo / "venv" / "Scripts" / "python.exe")
