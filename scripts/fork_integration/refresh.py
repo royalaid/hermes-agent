@@ -181,6 +181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--upstream-ref", default="refs/heads/main")
     parser.add_argument("--published-ref", default="refs/heads/fork-integration")
     parser.add_argument("--publish", action="store_true"); parser.add_argument("--check", action="append", default=[])
+    parser.add_argument("--wake-agent-on-failure", action="store_true")
     parser.add_argument("--upstream-sha")
     parser.add_argument("--upstream-cutoff-hour", type=int)
     args = parser.parse_args(argv)
@@ -191,6 +192,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             upstream_ref=args.upstream_ref, published_ref=args.published_ref, dry_run=not args.publish,
             upstream_sha=args.upstream_sha, upstream_cutoff_hour=args.upstream_cutoff_hour,
             checks=tuple(tuple(command) for command in decoded_checks))
+        if args.wake_agent_on_failure:
+            result["wakeAgent"] = False
         print(json.dumps(result, sort_keys=True))
         return 0
     except (RefreshError, subprocess.TimeoutExpired, OSError, TypeError, ValueError) as error:

@@ -442,6 +442,35 @@ def test_main_preserves_quoted_check_arguments(
     assert "focused check failed" in output
 
 
+def test_main_gates_agent_only_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(refresh, "compose", lambda *_args, **_kwargs: {"status": "published"})
+
+    assert refresh.main(["--repo", str(tmp_path), "--wake-agent-on-failure"]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "published",
+        "wakeAgent": False,
+    }
+
+
+def test_main_leaves_failure_eligible_to_wake_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(*_args, **_kwargs):
+        raise refresh.RefreshError("rebase conflict")
+
+    monkeypatch.setattr(refresh, "compose", fail)
+
+    assert refresh.main(["--repo", str(tmp_path), "--wake-agent-on-failure"]) == 1
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "rebase conflict",
+        "status": "failed",
+    }
+
+
 def test_cron_adapter_publishes_debounced_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[str] = []
     fake_refresh = types.ModuleType("refresh")
@@ -460,6 +489,7 @@ def test_cron_adapter_publishes_debounced_candidate(tmp_path: Path, monkeypatch:
     assert captured[:6] == ["--repo", str(tmp_path / "hermes-agent"), "--upstream-cutoff-hour", "8", "--publish", "--check"]
     assert json.loads(captured[6]) == [str(preferred),
         "-m", "pytest", "tests/cron/test_fork_integration_refresh.py", "-q"]
+    assert captured[7:] == ["--wake-agent-on-failure"]
 
 
 def test_cron_adapter_uses_source_repo_without_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
