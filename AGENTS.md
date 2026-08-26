@@ -4,6 +4,14 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Goal-drift stop rule
+
+- Keep one explicit user-visible goal and a short proof chain for the active campaign.
+- Before starting a new workstream, name the proof-chain link it advances. If it advances none, stop and ask the user what to do.
+- Recheck goal alignment after every failed attempt, review finding, or proposed scope expansion. More machinery, validation, or hardening is not progress unless it removes a demonstrated blocker on the proof chain.
+- When the work starts optimizing the process instead of delivering the stated outcome, stop all mutation and ask the user to redirect or confirm the expanded scope.
+- A user reframing replaces superseded plan scope immediately; strike or rewrite the stale work instead of carrying it forward as cautionary complexity.
+
 ## The fork-integration line
 
 This branch is `fork-integration`: **current upstream `main` plus our PRs, and
