@@ -451,6 +451,7 @@ def test_cron_adapter_publishes_debounced_candidate(tmp_path: Path, monkeypatch:
     preferred = tmp_path / "hermes-agent" / ".venv" / "Scripts" / "python.exe"
     preferred.parent.mkdir(parents=True)
     preferred.touch()
+    monkeypatch.setenv("HERMES_PYTHON", str(preferred))
 
     with pytest.raises(SystemExit) as stopped:
         runpy.run_path(Path(refresh.__file__).with_name("job.py"), run_name="__main__")
@@ -461,16 +462,19 @@ def test_cron_adapter_publishes_debounced_candidate(tmp_path: Path, monkeypatch:
         "-m", "pytest", "tests/cron/test_fork_integration_refresh.py", "-q"]
 
 
-def test_cron_adapter_uses_source_repo_without_home(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cron_adapter_uses_source_repo_without_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[str] = []
     fake_refresh = types.ModuleType("refresh")
     fake_refresh.main = lambda argv: captured.extend(argv) or 0
     monkeypatch.setitem(sys.modules, "refresh", fake_refresh)
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    repo = Path(refresh.__file__).resolve().parents[2]
+    configured = tmp_path / "test-python.exe"
+    configured.touch()
+    monkeypatch.setenv("HERMES_PYTHON", str(configured))
 
     with pytest.raises(SystemExit):
         runpy.run_path(Path(refresh.__file__).with_name("job.py"), run_name="__main__")
 
-    repo = Path(refresh.__file__).resolve().parents[2]
     assert captured[:2] == ["--repo", str(repo)]
-    assert json.loads(captured[6])[0] == str(repo / "venv" / "Scripts" / "python.exe")
+    assert json.loads(captured[6])[0] == str(configured)
