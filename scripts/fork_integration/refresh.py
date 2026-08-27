@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Compose fresh upstream with the published fork range, then publish by lease."""
 from __future__ import annotations
-import argparse, json, os, shutil, subprocess, sys, tempfile
+import argparse, json, os, shutil, subprocess, sys, tempfile, time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
+FETCH_RATE_LIMIT_RETRY_DELAYS = (30, 120, 300)
 class RefreshError(RuntimeError): pass
 @dataclass(frozen=True)
 class TreeAssertion:
@@ -40,7 +41,16 @@ def _git(repo: Path, *args: str, check: bool = True, timeout: int = 600) -> subp
     if check and done.returncode: raise RefreshError(f"git {' '.join(args)} failed: {(done.stderr or done.stdout).strip()}")
     return done
 def _fetch(repo: Path, remote: str, ref: str) -> str:
-    _git(repo, "fetch", "--no-tags", "--quiet", remote, ref); return _git(repo, "rev-parse", "FETCH_HEAD").stdout.strip()
+    for delay in (*FETCH_RATE_LIMIT_RETRY_DELAYS, None):
+        try:
+            _git(repo, "fetch", "--no-tags", "--quiet", remote, ref)
+            return _git(repo, "rev-parse", "FETCH_HEAD").stdout.strip()
+        except RefreshError as error:
+            message = str(error).lower()
+            if delay is None or ("429" not in message and "rate limit" not in message and "rate-limit" not in message):
+                raise
+            time.sleep(delay)
+    raise AssertionError("fetch retry loop exhausted without returning or raising")
 def _select_upstream(repo: Path, fetched: str, explicit: str | None, hour: int | None,
                      now: datetime | None) -> tuple[str, str | None]:
     if explicit:
