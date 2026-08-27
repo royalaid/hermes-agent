@@ -117,6 +117,64 @@ def show(repos: Repos, sha: str, path: str) -> str:
     return git(repos.runner, "show", f"{sha}:{path}").stdout
 
 
+def test_fetch_retries_rate_limit_before_succeeding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[int] = []
+
+    def rate_limited_then_ok(_repo, *args, **_kwargs):
+        nonlocal attempts
+        if args[0] == "fetch":
+            attempts += 1
+            if attempts < 3:
+                raise refresh.RefreshError("HTTP 429 - rate-limited by GitHub")
+            return subprocess.CompletedProcess(["git"], 0, "", "")
+        return subprocess.CompletedProcess(["git"], 0, "fetched-sha\n", "")
+
+    monkeypatch.setattr(refresh, "_git", rate_limited_then_ok)
+    monkeypatch.setattr(refresh.time, "sleep", sleeps.append)
+
+    assert refresh._fetch(tmp_path, "upstream", "refs/heads/main") == "fetched-sha"
+    assert attempts == 3
+    assert sleeps == [30, 120]
+
+
+def test_fetch_does_not_retry_other_git_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[int] = []
+    monkeypatch.setattr(
+        refresh, "_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(refresh.RefreshError("authentication failed")),
+    )
+    monkeypatch.setattr(refresh.time, "sleep", sleeps.append)
+
+    with pytest.raises(refresh.RefreshError, match="authentication failed"):
+        refresh._fetch(tmp_path, "upstream", "refs/heads/main")
+    assert sleeps == []
+
+
+def test_fetch_escalates_rate_limit_after_backoff_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[int] = []
+
+    def rate_limited(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise refresh.RefreshError("HTTP 429 - rate-limited by GitHub")
+
+    monkeypatch.setattr(refresh, "_git", rate_limited)
+    monkeypatch.setattr(refresh.time, "sleep", sleeps.append)
+
+    with pytest.raises(refresh.RefreshError, match="HTTP 429"):
+        refresh._fetch(tmp_path, "upstream", "refs/heads/main")
+    assert attempts == 4
+    assert sleeps == [30, 120, 300]
+
+
 def test_already_current_does_not_construct_or_push(repos: Repos, monkeypatch: pytest.MonkeyPatch) -> None:
     repos.fork_change("fork.txt", "fork\n")
     monkeypatch.setattr(refresh, "_scratch_rebase", lambda *args, **kwargs: pytest.fail("scratch used"))
