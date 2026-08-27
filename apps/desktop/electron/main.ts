@@ -3850,14 +3850,16 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       })
 
       // Bridge marker: child.pid is the short-lived cmd.exe WRAPPER, not the
-      // script (see wrapHandoffForDetachedConsole). Write it anyway to cover
-      // the first moments of the hand-off — the script's step 0 overwrites it
-      // with its own live $PID, and if the script never starts the wrapper's
-      // dead pid makes the marker read as stale and self-delete (no wedge).
+      // script (see wrapHandoffForDetachedConsole). Tag that bridge so the
+      // backend gate honors it for the bounded wrapper-to-script claim gap;
+      // the script's step 0 overwrites it with its own live $PID.
       // The `hermes update` child adopts the SCRIPT's claim via
       // update_lock.py's process-ancestry rule; no mtime heuristics needed.
       if (Number.isInteger(child.pid)) {
-        writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
+        writeUpdateMarker(HERMES_HOME, child.pid, {
+          startedAt: updateStartedAt,
+          handoffBridge: true
+        })
       }
 
       rememberLog(

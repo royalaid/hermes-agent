@@ -3,8 +3,9 @@
  *
  * The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
  * duration of an `--update` run (see apps/bootstrap-installer/src-tauri/src/
- * update.rs `UpdateMarkerGuard`). The marker body is two lines: the updater's
- * pid and the unix-seconds it started.
+ * update.rs `UpdateMarkerGuard`). The marker body starts with the updater's
+ * pid and the unix-seconds it started. A Desktop-owned Windows bridge adds a
+ * third `handoff-bridge` line until windows.ps1 claims the marker itself.
  *
  * Why: if the user relaunches the desktop mid-update — the window vanished with
  * no progress and looks crashed — a fresh instance must NOT spawn its own local
@@ -28,6 +29,13 @@ import path from 'path'
 // of minutes; past this the marker is almost certainly stale (e.g. the OS
 // recycled the pid onto an unrelated process), so the gate self-heals.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
+
+// The Windows script hand-off starts through a short-lived cmd.exe wrapper.
+// Its PID can exit before windows.ps1 replaces the bridge marker with the
+// script's own PID. Keep only an explicitly tagged bridge alive across that
+// bounded gap so a relaunched Desktop cannot respawn the backend underneath
+// the updater. Ordinary dead-PID markers still self-heal immediately.
+export const UPDATE_HANDOFF_BRIDGE_GRACE_MS = 30 * 1000
 
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
@@ -54,11 +62,10 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
 /**
  * Read + interpret the marker.
  *
- * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
- * (parseable pid that is alive, within the age ceiling). Returns `null` for
- * every "no live update" case — absent, unreadable, malformed, dead pid, or
- * past the ceiling — and, when a stale marker file exists, deletes it so it
- * cannot strand future launches.
+ * Returns `{ pid, ageMs }` when an update is still running: either a parseable
+ * live pid within the age ceiling, or an explicitly tagged Windows hand-off
+ * bridge still inside its short claim grace. Returns `null` for every other
+ * case and deletes stale markers so they cannot strand future launches.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -68,10 +75,12 @@ export function readLiveUpdateMarker(
   {
     kill,
     now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS
+    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
+    handoffBridgeGraceMs = UPDATE_HANDOFF_BRIDGE_GRACE_MS
   }: {
     now?: () => number
     maxAgeMs?: number
+    handoffBridgeGraceMs?: number
     kill?: typeof process.kill
   } = {}
 ) {
@@ -84,13 +93,16 @@ export function readLiveUpdateMarker(
     return null // absent or unreadable => no live update
   }
 
-  const [pidLine, startedLine] = String(raw).split('\n')
+  const [pidLine, startedLine, kindLine] = String(raw).split('\n')
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
   const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
 
-  if (!alive || ageMs > maxAgeMs) {
+  const liveHandoffBridge =
+    (kindLine || '').trim() === 'handoff-bridge' && ageMs >= -1000 && ageMs <= handoffBridgeGraceMs
+
+  if ((!alive && !liveHandoffBridge) || ageMs > maxAgeMs) {
     try {
       fs.unlinkSync(file)
     } catch {
@@ -133,12 +145,14 @@ export function writeUpdateMarker(
     kill,
     now = Date.now,
     maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
-    startedAt
+    startedAt,
+    handoffBridge = false
   }: {
     now?: () => number
     maxAgeMs?: number
     kill?: typeof process.kill
     startedAt?: number
+    handoffBridge?: boolean
   } = {}
 ) {
   const file = markerPath(hermesHome)
@@ -153,7 +167,8 @@ export function writeUpdateMarker(
         : Math.floor(nowMs / 1000)
 
   try {
-    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n`, 'utf8')
+    const kindLine = handoffBridge ? 'handoff-bridge\n' : ''
+    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n${kindLine}`, 'utf8')
   } catch {
     // Best-effort: if we can't write the marker, proceed anyway. The
     // updater will write its own when it reaches run_update.

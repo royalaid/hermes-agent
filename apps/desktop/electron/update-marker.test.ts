@@ -6,10 +6,9 @@
  * Run with: node --test electron/update-marker.test.ts
  * (Wired into npm test:desktop:platforms in package.json.)
  *
- * Why this matters: the gate must (a) report a live update only when the
- * updater pid is alive AND the marker is fresh, (b) treat absent/malformed/
- * dead-pid/expired markers as "no live update" so a crashed updater can't
- * strand future launches, and (c) self-heal by deleting a stale marker file.
+ * Why this matters: the gate must (a) report a live update when the updater
+ * pid is alive and fresh, (b) bridge the short dead-wrapper gap before the
+ * Windows script claims the marker, and (c) self-heal every other stale marker.
  */
 
 import fs from 'fs'
@@ -23,6 +22,7 @@ import {
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
+  UPDATE_HANDOFF_BRIDGE_GRACE_MS,
   UPDATE_MARKER_MAX_AGE_MS,
   updateHandoffConflict,
   writeUpdateMarker
@@ -152,6 +152,35 @@ test('writeUpdateMarker + dead pid => self-heals on read', () => {
   const res = readLiveUpdateMarker(home, { kill: DEAD })
   assert.equal(res, null, 'a dead-pid marker from writeUpdateMarker self-heals')
   assert.ok(!fs.existsSync(markerPath(home)), 'marker file is pruned')
+})
+
+test('fresh hand-off bridge survives its dead wrapper until the script claims it', () => {
+  const home = tmpHome('write-dead-handoff-bridge')
+  const now = 1_000_000_000_000
+
+  writeUpdateMarker(home, 999999, {
+    now: () => now,
+    startedAt: Math.floor(now / 1000) - 8,
+    handoffBridge: true
+  })
+
+  const res = readLiveUpdateMarker(home, { kill: DEAD, now: () => now })
+  assert.ok(res, 'the tagged bridge must cover the wrapper-to-script claim gap')
+  assert.ok(fs.existsSync(markerPath(home)), 'the bridge marker remains for the polling gate')
+})
+
+test('dead hand-off bridge self-heals after its bounded claim grace', () => {
+  const home = tmpHome('write-expired-handoff-bridge')
+  const now = 1_000_000_000_000
+
+  writeUpdateMarker(home, 999999, {
+    now: () => now,
+    startedAt: Math.floor((now - UPDATE_HANDOFF_BRIDGE_GRACE_MS - 1000) / 1000),
+    handoffBridge: true
+  })
+
+  assert.equal(readLiveUpdateMarker(home, { kill: DEAD, now: () => now }), null)
+  assert.ok(!fs.existsSync(markerPath(home)), 'an unclaimed bridge marker is pruned after the grace')
 })
 
 // ---------------------------------------------------------------------------
