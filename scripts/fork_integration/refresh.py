@@ -87,6 +87,10 @@ def _run_checks(scratch: Path, checks: Sequence[Sequence[str]]) -> None:
             creationflags=CREATE_NO_WINDOW)
         if done.returncode:
             raise RefreshError(f"focused check failed ({' '.join(command)}): {(done.stderr or done.stdout).strip()}")
+def _rerere_autoupdated_paths(done: subprocess.CompletedProcess[str]) -> set[str]:
+    prefix, suffix = "Staged '", "' using previous resolution."
+    return {line[len(prefix):-len(suffix)] for line in f"{done.stdout}\n{done.stderr}".splitlines()
+            if line.startswith(prefix) and line.endswith(suffix)}
 def _scratch_rebase(repo: Path, published: str, upstream: str, base: str,
                     assertions: Sequence[TreeAssertion], checks: Sequence[Sequence[str]]) -> tuple[str, set[str], set[str]]:
     scratch = Path(tempfile.mkdtemp(prefix="hermes-fork-refresh-"))
@@ -107,12 +111,20 @@ def _scratch_rebase(repo: Path, published: str, upstream: str, base: str,
             if unstaged or untracked:
                 raise RefreshError(f"rebase conflict: {(done.stderr or done.stdout).strip()}")
             if staged:
-                # rerere.autoupdate can resolve a known semantic conflict and
-                # stage the result while `git rebase` still exits non-zero.
-                # Continue that proven resolution; a clean stop is the only
-                # state that represents an empty replay.
-                rerere_resolved.add(head.stdout.strip())
-                done = _git(scratch, "rebase", "--continue", check=False, timeout=1800)
+                staged_paths = set(staged.splitlines())
+                rerere_paths = _rerere_autoupdated_paths(done)
+                if not rerere_paths or not rerere_paths.issubset(staged_paths):
+                    raise RefreshError("staged rebase state lacks rerere autoupdate provenance")
+                resolved_head = head.stdout.strip()
+                continued = _git(scratch, "rebase", "--continue", check=False, timeout=1800)
+                if continued.returncode:
+                    next_head = _git(scratch, "rev-parse", "--verify", "REBASE_HEAD", check=False)
+                    if next_head.returncode or next_head.stdout.strip() == resolved_head:
+                        raise RefreshError(
+                            f"rebase continuation made no progress: {(continued.stderr or continued.stdout).strip()}"
+                        )
+                rerere_resolved.add(resolved_head)
+                done = continued
                 continue
             stopped.add(head.stdout.strip())
             done = _git(scratch, "rebase", "--skip", check=False, timeout=1800)
