@@ -400,6 +400,48 @@ def test_conflict_cleans_scratch_and_keeps_remote(repos: Repos) -> None:
     assert worktrees.count("worktree ") == 1
 
 
+def test_recorded_rerere_resolution_continues_rebase(repos: Repos, tmp_path: Path) -> None:
+    repos.fork_change("shared.txt", "fork\n")
+    published = repos.origin_head()
+    upstream = repos.upstream_change("shared.txt", "upstream\n")
+    base = repos.base
+    git(repos.runner, "config", "rerere.enabled", "true")
+    git(repos.runner, "config", "rerere.autoupdate", "true")
+
+    with pytest.raises(refresh.RefreshError, match="conflict"):
+        compose(repos, dry_run=True)
+
+    resolver = tmp_path / "resolver"
+    git(repos.runner, "worktree", "add", "--detach", str(resolver), published)
+    try:
+        stopped = git(
+            resolver,
+            "rebase",
+            "--rebase-merges",
+            "--reapply-cherry-picks",
+            "--empty=stop",
+            "--no-update-refs",
+            "--no-autostash",
+            "--onto",
+            upstream,
+            base,
+            check=False,
+        )
+        assert stopped.returncode != 0
+        assert git(resolver, "diff", "--name-only", "--diff-filter=U").stdout.strip() == "shared.txt"
+        (resolver / "shared.txt").write_text("resolved\n", encoding="utf-8")
+        git(resolver, "add", "shared.txt")
+        git(resolver, "rebase", "--continue", extra_env={"GIT_EDITOR": "true"})
+    finally:
+        git(repos.runner, "worktree", "remove", "--force", str(resolver))
+
+    result = compose(repos, dry_run=True)
+
+    assert result["status"] == "candidate_ready"
+    assert show(repos, result["candidate"], "shared.txt") == "resolved\n"
+    assert {entry["commit"]: entry["status"] for entry in result["dispositions"]}[published] == "rerere_resolved"
+
+
 def test_failed_worktree_deregistration_retains_scratch_and_primary_error(
     repos: Repos, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
