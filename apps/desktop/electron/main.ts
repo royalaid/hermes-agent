@@ -4149,6 +4149,15 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
         process.execPath
       ])
 
+      // Write the bridge BEFORE spawning the short-lived cmd.exe wrapper.
+      // PowerShell claims the marker as step 0, so no parent write may follow
+      // spawn and overwrite that live claim. The bounded tag also self-heals
+      // after a failed spawn even though this Desktop process remains alive.
+      writeUpdateMarker(HERMES_HOME, process.pid, {
+        startedAt: updateStartedAt,
+        handoffBridge: true
+      })
+
       child = spawnUpdaterProcess(wrapped.command, wrapped.args, {
         cwd: HERMES_HOME,
         env: {
@@ -4160,17 +4169,6 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
         detached: true,
         stdio: 'ignore'
       })
-
-      // Bridge marker: child.pid is the short-lived cmd.exe WRAPPER, not the
-      // script (see wrapHandoffForDetachedConsole). Write it anyway to cover
-      // the first moments of the hand-off — the script's step 0 overwrites it
-      // with its own live $PID, and if the script never starts the wrapper's
-      // dead pid makes the marker read as stale and self-delete (no wedge).
-      // The `hermes update` child adopts the SCRIPT's claim via
-      // update_lock.py's process-ancestry rule; no mtime heuristics needed.
-      if (Number.isInteger(child.pid)) {
-        writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
-      }
 
       rememberLog(
         `[updates] launched repo hand-off script: ${scriptHandoff.scriptPath} (branch ${branch}); exiting desktop to release venv shim`
@@ -4225,8 +4223,8 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // detached child for an async spawn `error` (ENOENT/EACCES) or an early
     // non-zero/signal exit. On failure, DON'T quit — the user would be left
     // with no app, no updater, and no evidence. Restart our backend and
-    // surface the error instead. The pre-written marker names the dead child
-    // pid, so readLiveUpdateMarker self-heals it; no cleanup needed.
+    // surface the error instead. A staged-updater marker self-heals with its
+    // dead child PID; a script bridge expires after its bounded claim grace.
     const dwellStartedAt = Date.now()
     const handoffOutcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
 
