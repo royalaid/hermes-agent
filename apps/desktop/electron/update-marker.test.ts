@@ -23,6 +23,7 @@ import {
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
+  UPDATE_HANDOFF_BRIDGE_GRACE_MS,
   UPDATE_MARKER_MAX_AGE_MS,
   updateHandoffConflict,
   writeUpdateMarker
@@ -34,8 +35,10 @@ function tmpHome(tag) {
   return dir
 }
 
-function writeMarker(home, pid, startedAtSec) {
-  fs.writeFileSync(markerPath(home), `${pid}\n${startedAtSec}`)
+function writeMarker(home, pid, startedAtSec, kind = '') {
+  const kindLine = kind ? `\n${kind}\n` : ''
+
+  fs.writeFileSync(markerPath(home), `${pid}\n${startedAtSec}${kindLine}`)
 }
 
 const ALIVE: typeof process.kill = () => true // injected kill that "succeeds" => pid alive
@@ -152,6 +155,59 @@ test('writeUpdateMarker + dead pid => self-heals on read', () => {
   const res = readLiveUpdateMarker(home, { kill: DEAD })
   assert.equal(res, null, 'a dead-pid marker from writeUpdateMarker self-heals')
   assert.ok(!fs.existsSync(markerPath(home)), 'marker file is pruned')
+})
+
+test('dead tagged hand-off bridge covers the wrapper-to-script claim gap', () => {
+  const home = tmpHome('dead-handoff-bridge')
+  const now = 1_000_000_000_000
+
+  writeMarker(home, 999999, Math.floor(now / 1000) - 8, 'handoff-bridge')
+
+  const res = readLiveUpdateMarker(home, { kill: DEAD, now: () => now })
+  assert.ok(res, 'the bridge must keep the backend gate closed until PowerShell claims the marker')
+  assert.ok(fs.existsSync(markerPath(home)), 'the bridge remains during the bounded claim gap')
+})
+
+test('tagged hand-off bridge expires after the claim gap even while its pid is alive', () => {
+  const home = tmpHome('expired-handoff-bridge')
+  const now = 1_000_000_000_000
+
+  writeMarker(
+    home,
+    4242,
+    Math.floor((now - UPDATE_HANDOFF_BRIDGE_GRACE_MS - 1000) / 1000),
+    'handoff-bridge'
+  )
+
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
+  assert.ok(!fs.existsSync(markerPath(home)), 'an unclaimed bridge cannot wedge later update attempts')
+})
+
+test('live updater claim replaces the pre-spawn Desktop bridge', () => {
+  const home = tmpHome('handoff-claim-order')
+  const now = 1_000_000_000_000
+  const startedAt = Math.floor(now / 1000) - 8
+
+  writeUpdateMarker(home, 1010, { now: () => now, startedAt, handoffBridge: true })
+
+  const [bridgePidLine, bridgeStartedLine, bridgeKindLine] = fs
+    .readFileSync(markerPath(home), 'utf8')
+    .split('\n')
+
+  assert.equal(Number.parseInt(bridgePidLine, 10), 1010, 'the Desktop owns the bridge')
+  assert.equal(Number.parseInt(bridgeStartedLine, 10), startedAt)
+  assert.equal(bridgeKindLine, 'handoff-bridge', 'the pre-spawn marker is explicitly bounded')
+  assert.ok(
+    readLiveUpdateMarker(home, { kill: DEAD, now: () => now }),
+    'the tagged bridge remains live inside the claim grace even after its owner exits'
+  )
+
+  writeUpdateMarker(home, 2020, { now: () => now, startedAt })
+
+  const [pidLine, startedLine, kindLine] = fs.readFileSync(markerPath(home), 'utf8').split('\n')
+  assert.equal(Number.parseInt(pidLine, 10), 2020, 'the updater becomes the live marker owner')
+  assert.equal(Number.parseInt(startedLine, 10), startedAt, 'the original acquisition time is preserved')
+  assert.equal(kindLine, '', 'the updater claim is no longer a bounded bridge')
 })
 
 // ---------------------------------------------------------------------------
