@@ -3,8 +3,9 @@
  *
  * The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
  * duration of an `--update` run (see apps/bootstrap-installer/src-tauri/src/
- * update.rs `UpdateMarkerGuard`). The marker body is two lines: the updater's
- * pid and the unix-seconds it started.
+ * update.rs `UpdateMarkerGuard`). The marker body starts with the updater's
+ * pid and the unix-seconds it started. A Desktop-owned Windows bridge adds a
+ * third `handoff-bridge` line until windows.ps1 claims the marker itself.
  *
  * Why: if the user relaunches the desktop mid-update — the window vanished with
  * no progress and looks crashed — a fresh instance must NOT spawn its own local
@@ -28,6 +29,12 @@ import path from 'path'
 // of minutes; past this the marker is almost certainly stale (e.g. the OS
 // recycled the pid onto an unrelated process), so the gate self-heals.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
+
+// The Windows script starts through a short-lived cmd.exe wrapper. Hold the
+// backend gate closed across that bounded wrapper-to-script claim gap, even
+// after the bridge owner exits. The bound applies regardless of PID liveness
+// so a failed hand-off cannot wedge retries behind the still-running Desktop.
+export const UPDATE_HANDOFF_BRIDGE_GRACE_MS = 30 * 1000
 
 export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
@@ -54,11 +61,10 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
 /**
  * Read + interpret the marker.
  *
- * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
- * (parseable pid that is alive, within the age ceiling). Returns `null` for
- * every "no live update" case — absent, unreadable, malformed, dead pid, or
- * past the ceiling — and, when a stale marker file exists, deletes it so it
- * cannot strand future launches.
+ * Returns `{ pid, ageMs }` when an update is still running: either a parseable
+ * live pid within the age ceiling, or an explicitly tagged Windows hand-off
+ * bridge inside its short claim grace. Returns `null` for every other case and
+ * deletes stale markers so they cannot strand future launches.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -84,13 +90,18 @@ export function readLiveUpdateMarker(
     return null // absent or unreadable => no live update
   }
 
-  const [pidLine, startedLine] = String(raw).split('\n')
+  const [pidLine, startedLine, kindLine] = String(raw).split('\n')
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
-  const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
+  const validPid = Number.isInteger(pid) && pid > 0
+  const handoffBridge = (kindLine || '').trim() === 'handoff-bridge'
 
-  if (!alive || ageMs > maxAgeMs) {
+  const active = handoffBridge
+    ? validPid && ageMs >= -1000 && ageMs <= UPDATE_HANDOFF_BRIDGE_GRACE_MS
+    : validPid && isPidAlive(pid, kill) && ageMs <= maxAgeMs
+
+  if (!active) {
     try {
       fs.unlinkSync(file)
     } catch {
@@ -107,24 +118,15 @@ export function readLiveUpdateMarker(
  * Write the update-in-progress marker *from the desktop* before handing off
  * to the detached updater.
  *
- * The Tauri-based hermes-setup.exe takes several seconds to initialise its
- * window and reach the Rust `run_update` entry point where it writes the
- * marker itself. During that gap the desktop's `app.quit()` teardown kills
- * the backend child, the renderer's WebSocket drops, and the renderer
- * immediately calls `ensureBackend()` → `waitForUpdateToFinish()`. Because
- * the updater hasn't written the marker yet, the gate sees no live update
- * and spawns a *new* backend — which re-locks `.pyd` files in the venv.
- * When the updater finally reaches the venv-rebuild stage it finds those
- * files locked and the update bricks.
+ * During updater startup the Desktop's backend exits and its renderer may
+ * reconnect. Without a marker, that reconnect can spawn a new backend which
+ * re-locks the venv before the updater reaches its rebuild stage.
  *
- * Fix: the desktop writes the marker itself, using the spawned updater's
- * PID, immediately after `spawn()`. The updater's `UpdateMarkerGuard` will
- * later adopt it or another hand-off stage may replace the PID. A live
- * holder's original timestamp is preserved across those transfers so retries
- * cannot keep resetting the 20-minute stale ceiling. When the updater finishes
- * it deletes the marker as before.
- * If the updater never starts (spawn failure) the marker still contains a
- * real PID, so `readLiveUpdateMarker` will self-heal once that PID exits.
+ * Staged updaters receive a marker with their spawned PID. The repo-owned
+ * Windows script instead receives a tagged marker with the Desktop PID before
+ * `cmd start`; the tag keeps the gate closed for the bounded claim gap, then
+ * windows.ps1 replaces it with its own PID. Transfers preserve the original
+ * timestamp so retries cannot reset the 20-minute stale ceiling.
  */
 export function writeUpdateMarker(
   hermesHome,
@@ -133,12 +135,14 @@ export function writeUpdateMarker(
     kill,
     now = Date.now,
     maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
-    startedAt
+    startedAt,
+    handoffBridge = false
   }: {
     now?: () => number
     maxAgeMs?: number
     kill?: typeof process.kill
     startedAt?: number
+    handoffBridge?: boolean
   } = {}
 ) {
   const file = markerPath(hermesHome)
@@ -153,7 +157,8 @@ export function writeUpdateMarker(
         : Math.floor(nowMs / 1000)
 
   try {
-    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n`, 'utf8')
+    const kindLine = handoffBridge ? 'handoff-bridge\n' : ''
+    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n${kindLine}`, 'utf8')
   } catch {
     // Best-effort: if we can't write the marker, proceed anyway. The
     // updater will write its own when it reaches run_update.
