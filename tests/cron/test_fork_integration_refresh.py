@@ -400,7 +400,7 @@ def test_conflict_cleans_scratch_and_keeps_remote(repos: Repos) -> None:
     assert worktrees.count("worktree ") == 1
 
 
-def test_recorded_rerere_resolution_continues_rebase(repos: Repos, tmp_path: Path) -> None:
+def record_rerere_resolution(repos: Repos, tmp_path: Path) -> tuple[str, str]:
     repos.fork_change("shared.txt", "fork\n")
     published = repos.origin_head()
     upstream = repos.upstream_change("shared.txt", "upstream\n")
@@ -434,12 +434,58 @@ def test_recorded_rerere_resolution_continues_rebase(repos: Repos, tmp_path: Pat
         git(resolver, "rebase", "--continue", extra_env={"GIT_EDITOR": "true"})
     finally:
         git(repos.runner, "worktree", "remove", "--force", str(resolver))
+    return published, upstream
+
+
+def test_recorded_rerere_resolution_continues_rebase(repos: Repos, tmp_path: Path) -> None:
+    published, _upstream = record_rerere_resolution(repos, tmp_path)
 
     result = compose(repos, dry_run=True)
 
     assert result["status"] == "candidate_ready"
     assert show(repos, result["candidate"], "shared.txt") == "resolved\n"
     assert {entry["commit"]: entry["status"] for entry in result["dispositions"]}[published] == "rerere_resolved"
+
+
+def test_staged_state_without_rerere_provenance_fails_closed(
+    repos: Repos, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repos.fork_change("shared.txt", "fork\n")
+    repos.upstream_change("shared.txt", "upstream\n")
+    original_git = refresh._git
+
+    def stage_without_rerere(repo, *args, **kwargs):
+        done = original_git(repo, *args, **kwargs)
+        if args[0] == "rebase" and "--onto" in args and done.returncode:
+            (repo / "shared.txt").write_text("unproved\n", encoding="utf-8")
+            original_git(repo, "add", "shared.txt")
+        return done
+
+    monkeypatch.setattr(refresh, "_git", stage_without_rerere)
+
+    with pytest.raises(refresh.RefreshError, match="lacks rerere autoupdate provenance"):
+        compose(repos, dry_run=True)
+
+
+def test_nonadvancing_rerere_continuation_fails_closed(
+    repos: Repos, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record_rerere_resolution(repos, tmp_path)
+    original_git = refresh._git
+    attempts = 0
+
+    def fail_continue(repo, *args, **kwargs):
+        nonlocal attempts
+        if args == ("rebase", "--continue"):
+            attempts += 1
+            return subprocess.CompletedProcess(["git"], 1, "", "forced continuation failure")
+        return original_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(refresh, "_git", fail_continue)
+
+    with pytest.raises(refresh.RefreshError, match="rebase continuation made no progress"):
+        compose(repos, dry_run=True)
+    assert attempts == 1
 
 
 def test_failed_worktree_deregistration_retains_scratch_and_primary_error(
