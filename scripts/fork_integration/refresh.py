@@ -88,9 +88,9 @@ def _run_checks(scratch: Path, checks: Sequence[Sequence[str]]) -> None:
         if done.returncode:
             raise RefreshError(f"focused check failed ({' '.join(command)}): {(done.stderr or done.stdout).strip()}")
 def _scratch_rebase(repo: Path, published: str, upstream: str, base: str,
-                    assertions: Sequence[TreeAssertion], checks: Sequence[Sequence[str]]) -> tuple[str, set[str]]:
+                    assertions: Sequence[TreeAssertion], checks: Sequence[Sequence[str]]) -> tuple[str, set[str], set[str]]:
     scratch = Path(tempfile.mkdtemp(prefix="hermes-fork-refresh-"))
-    added, candidate, stopped = False, "", set()
+    added, candidate, stopped, rerere_resolved = False, "", set(), set()
     try:
         _git(repo, "worktree", "add", "--quiet", "--detach", str(scratch), published)
         added = True
@@ -99,9 +99,21 @@ def _scratch_rebase(repo: Path, published: str, upstream: str, base: str,
         while done.returncode:
             conflicts = _git(scratch, "diff", "--name-only", "--diff-filter=U").stdout.strip()
             head = _git(scratch, "rev-parse", "--verify", "REBASE_HEAD", check=False)
-            dirty = _git(scratch, "status", "--porcelain").stdout.strip()
-            if conflicts or head.returncode or dirty:
+            if conflicts or head.returncode:
                 raise RefreshError(f"rebase conflict: {(done.stderr or done.stdout).strip()}")
+            unstaged = _git(scratch, "diff", "--name-only").stdout.strip()
+            untracked = _git(scratch, "ls-files", "--others", "--exclude-standard").stdout.strip()
+            staged = _git(scratch, "diff", "--cached", "--name-only").stdout.strip()
+            if unstaged or untracked:
+                raise RefreshError(f"rebase conflict: {(done.stderr or done.stdout).strip()}")
+            if staged:
+                # rerere.autoupdate can resolve a known semantic conflict and
+                # stage the result while `git rebase` still exits non-zero.
+                # Continue that proven resolution; a clean stop is the only
+                # state that represents an empty replay.
+                rerere_resolved.add(head.stdout.strip())
+                done = _git(scratch, "rebase", "--continue", check=False, timeout=1800)
+                continue
             stopped.add(head.stdout.strip())
             done = _git(scratch, "rebase", "--skip", check=False, timeout=1800)
         candidate = _git(scratch, "rev-parse", "HEAD").stdout.strip()
@@ -119,7 +131,7 @@ def _scratch_rebase(repo: Path, published: str, upstream: str, base: str,
             shutil.rmtree(scratch)
         if cleanup_error:
             raise RefreshError(f"{primary_error}; scratch cleanup failed: {cleanup_error}" if primary_error else f"scratch cleanup failed: {cleanup_error}") from primary_error
-    return candidate, stopped
+    return candidate, stopped, rerere_resolved
 def _push_with_lease(repo: Path, remote: str, ref: str, captured: str, candidate: str) -> bool:
     current = _remote_head(repo, remote, ref)
     if current == candidate: return False
@@ -164,17 +176,18 @@ def compose(repo: str | Path, *, upstream_remote: str = "upstream", published_re
     non_merges = [sha for sha in commits if sha not in merge_set]
     before = _cherry(repo, upstream, published, base)
     if set(before) != set(non_merges): raise RefreshError("captured non-merge range lacks stable patch dispositions")
-    candidate, stopped = _scratch_rebase(repo, published, upstream, base, assertions, checks)
+    candidate, stopped, rerere_resolved = _scratch_rebase(repo, published, upstream, base, assertions, checks)
     after = _cherry(repo, candidate, published, base)
     failed, represented = [sha for sha in non_merges if after.get(sha) != "-"], {}
     kill_merge = next((sha for sha in merges if subjects[sha] == KILL_ALL_MERGE), None)
     kill_side = parents[kill_merge][1] if kill_merge else None
     if kill_side in failed: represented[kill_side] = kill_merge
-    failed = [sha for sha in failed if sha not in represented]
+    failed = [sha for sha in failed if sha not in represented and sha not in rerere_resolved]
     if failed: raise RefreshError(f"fork changes missing from candidate: {', '.join(failed)}")
     result["candidate"] = candidate
     dispositions = {sha: {"commit": sha, "status": "represented_by_merge_assertion" if sha in represented
-        else "empty" if sha in stopped else "replayed", "represented_by": represented.get(sha),
+        else "rerere_resolved" if sha in rerere_resolved else "empty" if sha in stopped else "replayed",
+        "represented_by": represented.get(sha),
         "preexisting_patch": before[sha] == "-"} for sha in non_merges}
     result["dispositions"] = [{"commit": sha, "status": "characterized_merge_assertion",
         "assertion_count": len(resolved[sha])} if sha in merge_set else dispositions[sha] for sha in commits]
