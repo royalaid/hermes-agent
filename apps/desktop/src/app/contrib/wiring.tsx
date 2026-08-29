@@ -72,10 +72,7 @@ import {
   $selectedStoredSessionId,
   $sessionResumeRequest,
   $sessions,
-  forgetSessionOwnerHintsForSession,
-  requestSessionResume,
   sessionMatchesStoredId,
-  sessionOwnerRouteFromRow,
   sessionPinId,
   setAwaitingResponse,
   setBusy,
@@ -153,6 +150,7 @@ import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
 import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { createSessionRpcDispatcher } from './session-rpc-dispatcher'
+import { openSidebarSession } from './sidebar-session-open'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
 
@@ -1007,22 +1005,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     // against whichever cached row is found first — the user clicks a row
     // previewing profile A and the resume dials profile B. Pin the row's own
     // (connection, profile) as the resume owner before navigating; untagged
-    // rows (single-profile installs and the legacy primary-SSH path) keep the
-    // ambient/id-only path. Clear any stale explicit hint first: older builds
-    // incorrectly persisted those rows as `local`, which made a remote session
-    // click switch to the Mac backend and fail with "session not found".
-    onResumeSession: (sessionId, session) => {
-      const ownerRoute = sessionOwnerRouteFromRow(session)
-
-      if (ownerRoute) {
-        requestSessionResume(sessionId, ownerRoute)
-      } else {
-        forgetSessionOwnerHintsForSession(sessionId)
-        requestSessionResume(sessionId)
-      }
-
-      openSession(sessionId, navigate)
-    },
+    // rows (single-profile installs, legacy pages) keep the id-only path.
+    onResumeSession: (sessionId, session) => openSidebarSession(sessionId, session, navigate),
     onRetryResume: sessionId => void resumeSession(sessionId, true),
     onSteer: steerPrompt,
     onSubmit: submitText,
