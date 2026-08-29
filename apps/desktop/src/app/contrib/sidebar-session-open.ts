@@ -1,6 +1,7 @@
 import type { SessionInfo } from '@/hermes'
 import { requestSessionResume } from '@/store/session'
 import { type SessionOwnerRoute, sessionOwnerRouteFromRow } from '@/store/session-request-router'
+import { prepareSessionOwnerRetarget } from '@/store/session-states'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
 
 import { openSession, type OpenSessionNavigate } from '../open-session'
@@ -18,11 +19,12 @@ export function openSidebarSession(sessionId: string, session: SessionInfo | und
       ? { connectionId: 'local', mode: 'local', profile: rowProfile, targetProfile: rowProfile }
       : undefined)
 
+  const intent = $sidebarSessionsOpenInNewTab.get() ? 'tab' : 'main'
+
   if (ownerRoute) {
+    prepareSessionOwnerRetarget(sessionId, ownerRoute, intent === 'main')
     requestSessionResume(sessionId, ownerRoute)
   }
-
-  const intent = $sidebarSessionsOpenInNewTab.get() ? 'tab' : 'main'
 
   openSession(
     sessionId,
