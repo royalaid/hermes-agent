@@ -1121,18 +1121,19 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
   rememberBotChatScope(storedSessionId, scope.workspaceMode === 'bots')
 
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+  const sameMode = (tile?.workspaceMode ?? 'sessions') === scope.workspaceMode
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  // Sessions-mode re-opens (sidebar click on an already-tiled session) pass no
+  // Same-mode re-opens (sidebar click on an already-tiled session) pass no
   // route; that is absence of information, not a revocation — keep the exact
   // owner the tile was opened with (a branch child's parent connection) so a
-  // plain re-open can't unpin the owning socket. Bot scopes stay authoritative
-  // both ways: they always name their route explicitly.
-  const ownerRoute = scope.workspaceMode === 'bots' ? scope.ownerRoute : (scope.ownerRoute ?? tile?.ownerRoute)
+  // plain re-open can't unpin the owning socket. A scope that names its route
+  // (bot scopes always do) stays authoritative.
+  const ownerRoute = sameMode && !scope.ownerRoute ? tile?.ownerRoute : scope.ownerRoute
   const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
 
   if (
     !tile ||
-    ((tile.workspaceMode ?? 'sessions') === scope.workspaceMode &&
+    (sameMode &&
       tile.workspaceOwnerKey === workspaceOwnerKey &&
       tile.ownerRoute?.connectionId === ownerRoute?.connectionId &&
       tile.ownerRoute?.profile === ownerRoute?.profile &&
