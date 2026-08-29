@@ -63,9 +63,9 @@ describe('SessionsSettings unarchive', () => {
 
 
 describe('SessionsSettings sidebar tab preference', () => {
-  it('shows a false-by-default toggle and updates the atom when toggled', async () => {
+  it('shows the tab-first default and lets the user switch to opening in main', async () => {
     window.localStorage.clear()
-    $sidebarSessionsOpenInNewTab.set(false)
+    $sidebarSessionsOpenInNewTab.set(true)
     vi.mocked(listAllProfileSessions).mockResolvedValue({ sessions: [], total: 0 } as never)
     render(
       <MemoryRouter>
@@ -74,8 +74,8 @@ describe('SessionsSettings sidebar tab preference', () => {
     )
 
     const toggle = await screen.findByRole('switch', { name: en.settings.sessions.sidebarOpenInNewTabTitle })
-    expect(toggle.getAttribute('data-state')).toBe('unchecked')
+    expect(toggle.getAttribute('data-state')).toBe('checked')
     fireEvent.click(toggle)
-    expect($sidebarSessionsOpenInNewTab.get()).toBe(true)
+    expect($sidebarSessionsOpenInNewTab.get()).toBe(false)
   })
 })
