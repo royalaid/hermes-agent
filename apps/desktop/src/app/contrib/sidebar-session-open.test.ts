@@ -37,24 +37,48 @@ describe('openSidebarSession', () => {
 
     expect(mocks.requestSessionResume).toHaveBeenNthCalledWith(1, 'shared-id', {
       connectionId: 'connection-a',
-      profile: 'profile-a',
-      targetProfile: 'profile-a'
+      profile: 'profile-a'
     })
     expect(mocks.requestSessionResume).toHaveBeenNthCalledWith(2, 'shared-id', {
       connectionId: 'connection-b',
-      profile: 'profile-b',
-      targetProfile: 'profile-b'
+      profile: 'profile-b'
     })
-    expect(mocks.openSession).toHaveBeenNthCalledWith(1, 'shared-id', navigate, 'tab')
-    expect(mocks.openSession).toHaveBeenNthCalledWith(2, 'shared-id', navigate, 'tab')
+    expect(mocks.openSession).toHaveBeenNthCalledWith(1, 'shared-id', navigate, 'tab', {
+      ownerRoute: { connectionId: 'connection-a', profile: 'profile-a' },
+      workspaceMode: 'sessions'
+    })
+    expect(mocks.openSession).toHaveBeenNthCalledWith(2, 'shared-id', navigate, 'tab', {
+      ownerRoute: { connectionId: 'connection-b', profile: 'profile-b' },
+      workspaceMode: 'sessions'
+    })
   })
 
-  it('uses in-place intent when the persisted preference selects the main tab', () => {
+  it('uses explicit main intent when the persisted preference selects the main tab', () => {
     $sidebarSessionsOpenInNewTab.set(false)
 
     openSidebarSession('shared-id', session('profile-a', 'connection-a'), navigate)
 
     expect(mocks.requestSessionResume).toHaveBeenCalledOnce()
-    expect(mocks.openSession).toHaveBeenCalledWith('shared-id', navigate, 'in-place')
+    expect(mocks.openSession).toHaveBeenCalledWith('shared-id', navigate, 'main', {
+      ownerRoute: { connectionId: 'connection-a', profile: 'profile-a' },
+      workspaceMode: 'sessions'
+    })
+  })
+
+  it('keeps the local fallback route for a profiled row without a connection tag', () => {
+    openSidebarSession('shared-id', session('profile-a', ''), navigate)
+
+    const ownerRoute = {
+      connectionId: 'local',
+      mode: 'local' as const,
+      profile: 'profile-a',
+      targetProfile: 'profile-a'
+    }
+
+    expect(mocks.requestSessionResume).toHaveBeenCalledWith('shared-id', ownerRoute)
+    expect(mocks.openSession).toHaveBeenCalledWith('shared-id', navigate, 'tab', {
+      ownerRoute,
+      workspaceMode: 'sessions'
+    })
   })
 })
