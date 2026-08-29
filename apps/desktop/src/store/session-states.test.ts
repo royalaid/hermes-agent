@@ -419,6 +419,13 @@ describe('SessionTile workspace scope', () => {
       expect.objectContaining({ dir: 'right', storedSessionId: 'bot-chat', workspaceMode: 'sessions' })
     ])
     expect($sessionTiles.get()[0]).not.toHaveProperty('workspaceOwnerKey', scope.workspaceOwnerKey)
+  it('keeps an exact Sessions owner when a later same-mode open has no route', () => {
+    const ownerRoute = { connectionId: 'source-b', profile: 'profile-b' }
+
+    openSessionTile('chat', 'center', undefined, undefined, { ownerRoute, workspaceMode: 'sessions' })
+
+    expect(setSessionTileWorkspaceScope('chat', { workspaceMode: 'sessions' })).toBe(false)
+    expect($sessionTiles.get()[0]?.ownerRoute).toEqual(ownerRoute)
   })
 
   it('preserves workspace scope while dropping a stale runtime binding', () => {
