@@ -1121,13 +1121,14 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
   rememberBotChatScope(storedSessionId, scope.workspaceMode === 'bots')
 
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+  const sameMode = (tile?.workspaceMode ?? 'sessions') === scope.workspaceMode
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  const ownerRoute = scope.workspaceMode === 'bots' ? scope.ownerRoute : undefined
+  const ownerRoute = sameMode && !scope.ownerRoute ? tile?.ownerRoute : scope.ownerRoute
   const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
 
   if (
     !tile ||
-    ((tile.workspaceMode ?? 'sessions') === scope.workspaceMode &&
+    (sameMode &&
       tile.workspaceOwnerKey === workspaceOwnerKey &&
       tile.ownerRoute?.connectionId === ownerRoute?.connectionId &&
       tile.ownerRoute?.profile === ownerRoute?.profile &&
@@ -1386,7 +1387,7 @@ export function openSessionTile(
         anchor: dock,
         before,
         dir,
-        ownerRoute: workspaceScope.workspaceMode === 'bots' ? workspaceScope.ownerRoute : undefined,
+        ownerRoute: workspaceScope.ownerRoute,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,
