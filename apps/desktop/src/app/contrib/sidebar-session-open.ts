@@ -1,5 +1,6 @@
 import type { SessionInfo } from '@/hermes'
 import { requestSessionResume } from '@/store/session'
+import { type SessionOwnerRoute, sessionOwnerRouteFromRow } from '@/store/session-request-router'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
 
 import { openSession, type OpenSessionNavigate } from '../open-session'
@@ -11,14 +12,22 @@ import { openSession, type OpenSessionNavigate } from '../open-session'
 export function openSidebarSession(sessionId: string, session: SessionInfo | undefined, navigate: OpenSessionNavigate): void {
   const rowProfile = session?.profile?.trim()
 
-  if (rowProfile) {
-    requestSessionResume(sessionId, {
-      connectionId: session?.connection_id?.trim() || 'local',
-      ...(session?.connection_id?.trim() ? {} : { mode: 'local' as const }),
-      profile: rowProfile,
-      targetProfile: rowProfile
-    })
+  const ownerRoute: SessionOwnerRoute | undefined =
+    sessionOwnerRouteFromRow(session) ??
+    (rowProfile
+      ? { connectionId: 'local', mode: 'local', profile: rowProfile, targetProfile: rowProfile }
+      : undefined)
+
+  if (ownerRoute) {
+    requestSessionResume(sessionId, ownerRoute)
   }
 
-  openSession(sessionId, navigate, $sidebarSessionsOpenInNewTab.get() ? 'tab' : 'in-place')
+  const intent = $sidebarSessionsOpenInNewTab.get() ? 'tab' : 'main'
+
+  openSession(
+    sessionId,
+    navigate,
+    intent,
+    ownerRoute ? { ownerRoute, workspaceMode: 'sessions' } : { workspaceMode: 'sessions' }
+  )
 }
