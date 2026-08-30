@@ -123,6 +123,35 @@ describe('useSessionStateCache — source-qualified runtime binding', () => {
     expect($sessionStates.get()).not.toHaveProperty('runtime-a')
   })
 
+  it('rejects a source target mismatch even when the Desktop route name matches', () => {
+    let cache!: Cache
+
+    const canonicalRoute = {
+      connectionId: 'source-a',
+      profile: 'desktop-alias',
+      targetProfile: 'backend-a'
+    }
+
+    const mismatchedSource = {
+      connectionId: 'source-a',
+      profile: 'desktop-alias',
+      targetProfile: 'backend-b'
+    }
+
+    const binding = normalizeSessionBinding({ ownerRoute: canonicalRoute, storedSessionId: 'shared-id' })!
+
+    claimSessionBinding(binding)
+    render(<Harness activeSessionId="runtime-a" onReady={value => (cache = value)} selectedStoredSessionId="shared-id" />)
+
+    act(() => {
+      cache.updateSessionState('runtime-wrong-target', state => ({ ...state, busy: true }), 'shared-id', mismatchedSource)
+    })
+
+    expect(cache.runtimeIdByStoredSessionIdRef.current.has('shared-id')).toBe(false)
+    expect(cache.sessionStateByRuntimeIdRef.current.has('runtime-wrong-target')).toBe(false)
+    expect(runtimeForExactSessionBinding(binding)).toBeNull()
+  })
+
   it('keeps legacy untagged single-source binding when no exact owner conflicts', () => {
     let cache!: Cache
     render(<Harness activeSessionId="runtime-legacy" onReady={value => (cache = value)} selectedStoredSessionId="legacy-id" />)
