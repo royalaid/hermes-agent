@@ -3,10 +3,51 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from tools.registry import registry
+
+
+_PORTABLE_ASSERTIONS = {
+    "file_exists": "exists",
+    "test_result": "passes",
+    "command_exit": "exit=0",
+    "url_status": "status=2xx",
+}
+_ARTIFACT_HASH_ASSERTION = re.compile(r"sha256=[0-9a-fA-F]{64}\Z")
+
+
+def _validate_acceptance_evidence(
+    condition: str,
+    evidence: Optional[List[Dict[str, str]]],
+) -> List[Dict[str, str]]:
+    if evidence is None:
+        return []
+    if not isinstance(evidence, list):
+        raise ValueError("acceptance_evidence must be an array")
+
+    validated: List[Dict[str, str]] = []
+    for entry in evidence:
+        if not isinstance(entry, dict) or set(entry) != {"kind", "locator", "assertion"}:
+            raise ValueError("each acceptance evidence entry requires only kind, locator, and assertion")
+        kind = entry.get("kind")
+        locator = entry.get("locator")
+        assertion = entry.get("assertion")
+        if not all(isinstance(value, str) and value.strip() for value in (kind, locator, assertion)):
+            raise ValueError("acceptance evidence fields must be nonblank strings")
+        expected = _PORTABLE_ASSERTIONS.get(kind)
+        if kind == "artifact_hash":
+            assertion_valid = bool(_ARTIFACT_HASH_ASSERTION.fullmatch(assertion))
+        else:
+            assertion_valid = expected is not None and assertion == expected
+        if not assertion_valid:
+            raise ValueError("unsupported acceptance evidence kind or assertion")
+        if locator not in condition or assertion not in condition:
+            raise ValueError("goal condition must contain the evidence locator and assertion")
+        validated.append({"kind": kind, "locator": locator, "assertion": assertion})
+    return validated
 
 
 def _error(code: str, message: str, *, session_id: str = "") -> str:
@@ -82,6 +123,7 @@ def goal_control_tool(
     action: str,
     condition: Optional[str] = None,
     max_turns: Optional[int] = None,
+    acceptance_evidence: Optional[List[Dict[str, str]]] = None,
     session_id: Optional[str] = None,
     requested_session_id: Optional[str] = None,
 ) -> str:
@@ -175,7 +217,21 @@ def goal_control_tool(
             if action == "update":
                 intended = manager.update(text, max_turns=max_turns)
             else:
-                intended = manager.set(text, max_turns=max_turns)
+                try:
+                    validated_evidence = _validate_acceptance_evidence(
+                        text, acceptance_evidence
+                    )
+                except ValueError as exc:
+                    return _error(
+                        "invalid_acceptance_evidence",
+                        str(exc),
+                        session_id=caller_session_id,
+                    )
+                intended = manager.set(
+                    text,
+                    max_turns=max_turns,
+                    acceptance_evidence=validated_evidence,
+                )
         elif action == "pause":
             if before is not None and before.status in {"done", "cleared"}:
                 return _error(
@@ -238,6 +294,9 @@ def goal_control_tool(
                 "active": state_payload["active"],
                 "condition": state_payload["condition"],
                 "observed_via": "goal_control",
+                "acceptance_evidence": (
+                    list(persisted.acceptance_evidence) if persisted is not None else []
+                ),
             },
         },
         ensure_ascii=False,
@@ -273,6 +332,20 @@ GOAL_CONTROL_SCHEMA = {
                     "configured goal budget; update may only decrease it."
                 ),
             },
+            "acceptance_evidence": {
+                "type": "array",
+                "description": "Structured criteria named verbatim in the goal condition.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "locator": {"type": "string", "minLength": 1},
+                        "assertion": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["kind", "locator", "assertion"],
+                    "additionalProperties": False,
+                },
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -285,6 +358,7 @@ def _handle_goal_control(args: Dict[str, Any], **kwargs: Any) -> str:
         action=args.get("action", "status"),
         condition=args.get("condition"),
         max_turns=args.get("max_turns"),
+        acceptance_evidence=args.get("acceptance_evidence"),
         session_id=kwargs.get("session_id"),
         # The schema intentionally omits session_id. Preserve this explicit
         # guard because not every provider enforces additionalProperties.

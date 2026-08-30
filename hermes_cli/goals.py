@@ -445,6 +445,10 @@ class GoalState:
     waiting_on_delegations: int = 0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
+    # Structured acceptance criteria supplied through model goal control.
+    # Persist them with the goal so a later status call can return the exact
+    # authoritative readback rather than reconstructing evidence in prose.
+    acceptance_evidence: List[Dict[str, str]] = field(default_factory=list)
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
@@ -474,6 +478,11 @@ class GoalState:
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_reason=data.get("waiting_reason"),
+            acceptance_evidence=[
+                {str(key): str(value) for key, value in item.items()}
+                for item in (data.get("acceptance_evidence") or [])
+                if isinstance(item, dict)
+            ],
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
@@ -1282,13 +1291,21 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(
+        self,
+        goal: str,
+        *,
+        max_turns: Optional[int] = None,
+        contract: Optional[GoalContract] = None,
+        acceptance_evidence: Optional[List[Dict[str, str]]] = None,
+    ) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
+            acceptance_evidence=list(acceptance_evidence or []),
             contract=contract if contract is not None else GoalContract(),
         )
         return self._save()
