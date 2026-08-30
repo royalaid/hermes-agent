@@ -119,24 +119,93 @@ function nativeCodexReasoningParts(value: unknown, reasoningText: string, timest
   if (!Array.isArray(value)) {
     return []
   }
+
   const parts: ChatMessagePart[] = []
   const textGroups: string[] = []
-  value.forEach((rawItem, itemIndex) => {
-    if (!rawItem || typeof rawItem !== 'object') return
+
+  for (const rawItem of value) {
+    if (!rawItem || typeof rawItem !== 'object') {return []}
     const item = rawItem as { id?: unknown; type?: unknown; summary?: unknown }
-    if (item.type !== 'reasoning' || !Array.isArray(item.summary)) return
-    const itemId = typeof item.id === 'string' && item.id ? item.id : `native-reasoning:${itemIndex}`
+
+    if (item.type !== 'reasoning') {continue}
+
+    if (typeof item.id !== 'string' || !item.id || !Array.isArray(item.summary) || !item.summary.length) {return []}
+    const itemId = item.id
     const itemTexts: string[] = []
-    item.summary.forEach((rawSummary, summaryIndex) => {
-      if (!rawSummary || typeof rawSummary !== 'object') return
+
+    for (const [summaryIndex, rawSummary] of item.summary.entries()) {
+      if (!rawSummary || typeof rawSummary !== 'object') {return []}
       const summary = rawSummary as { type?: unknown; text?: unknown }
-      if (summary.type !== 'summary_text' || typeof summary.text !== 'string' || !summary.text) return
+
+      if (summary.type !== 'summary_text' || typeof summary.text !== 'string' || !summary.text) {return []}
       itemTexts.push(summary.text)
       parts.push(reasoningPart(summary.text, timestamp, `${itemId}:summary:${summaryIndex}`))
-    })
-    if (itemTexts.length) textGroups.push(itemTexts.join('\n'))
-  })
-  return textGroups.join('\n\n').trim() === reasoningText.trim() ? parts : []
+    }
+
+    if (itemTexts.length) {textGroups.push(itemTexts.join('\n'))}
+  }
+
+  return textGroups.join('\n\n') === reasoningText ? parts : []
+}
+
+function nativeCodexDisplay(value: unknown, reasoningText: string): {
+  accepted: boolean
+  commentary: Array<{ id: string; text: string }>
+  reasoningItems: unknown[]
+  reasoningRemainder: string
+} {
+  const fallback = { accepted: false, commentary: [], reasoningItems: [], reasoningRemainder: reasoningText }
+
+  if (!Array.isArray(value)) {return fallback}
+  const commentary: Array<{ id: string; text: string }> = []
+  const reasoningItems: unknown[] = []
+
+  for (const rawItem of value) {
+    if (!rawItem || typeof rawItem !== 'object') {return fallback}
+    const item = rawItem as { content?: unknown; id?: unknown; phase?: unknown; role?: unknown; summary?: unknown; type?: unknown }
+
+    if (item.type === 'reasoning') {
+      if (typeof item.id !== 'string' || !item.id || !Array.isArray(item.summary) || !item.summary.length) {return fallback}
+
+      for (const rawSummary of item.summary) {
+        if (!rawSummary || typeof rawSummary !== 'object') {return fallback}
+        const summary = rawSummary as { text?: unknown; type?: unknown }
+
+        if (summary.type !== 'summary_text' || typeof summary.text !== 'string' || !summary.text) {return fallback}
+      }
+
+      reasoningItems.push(item)
+
+      continue
+    }
+
+    if (item.type !== 'message' || item.role !== 'assistant' || typeof item.id !== 'string' || !item.id) {return fallback}
+
+    if (!['analysis', 'commentary', 'final', 'final_answer'].includes(String(item.phase))) {return fallback}
+
+    if (!Array.isArray(item.content) || !item.content.length) {return fallback}
+    const chunks: string[] = []
+
+    for (const rawPart of item.content) {
+      if (!rawPart || typeof rawPart !== 'object') {return fallback}
+      const part = rawPart as { text?: unknown; type?: unknown }
+
+      if (part.type !== 'output_text' || typeof part.text !== 'string' || !part.text) {return fallback}
+      chunks.push(part.text)
+    }
+
+    if (item.phase === 'commentary') {commentary.push({ id: item.id, text: chunks.join('') })}
+  }
+
+  if (!commentary.length) {return { accepted: true, commentary, reasoningItems, reasoningRemainder: reasoningText }}
+  const flattened = commentary.map(item => item.text).join('\n\n')
+
+  if (reasoningText === flattened) {return { accepted: true, commentary, reasoningItems, reasoningRemainder: '' }}
+  const suffix = `\n\n${flattened}`
+
+  if (!reasoningText.endsWith(suffix)) {return fallback}
+
+  return { accepted: true, commentary, reasoningItems, reasoningRemainder: reasoningText.slice(0, -suffix.length) }
 }
 
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
@@ -249,16 +318,27 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.reasoning_content ||
       (typeof message.reasoning_details === 'string' ? message.reasoning_details : '')
 
+    const codexDisplay = nativeCodexDisplay(message.codex_display_items, reasoning)
+
     const structuredReasoningParts = nativeCodexReasoningParts(
-      message.codex_reasoning_items,
-      reasoning,
+      codexDisplay.accepted ? codexDisplay.reasoningItems : message.codex_reasoning_items,
+      codexDisplay.reasoningRemainder,
       message.timestamp
     )
 
     if (structuredReasoningParts.length && message.role === 'assistant') {
       parts.push(...structuredReasoningParts)
-    } else if (reasoning && message.role === 'assistant') {
-      parts.push(reasoningPart(reasoning, message.timestamp))
+    } else if (codexDisplay.reasoningRemainder && message.role === 'assistant') {
+      parts.push(reasoningPart(codexDisplay.reasoningRemainder, message.timestamp))
+    }
+
+    if (message.role === 'assistant') {
+      parts.push(...codexDisplay.commentary.map(item => assistantTextPart(item.text, message.timestamp)))
+      codexDisplay.commentary.forEach((item, index) => {
+        const part = parts.at(parts.length - codexDisplay.commentary.length + index)
+
+        if (part) {part.sourceId = item.id}
+      })
     }
 
     if (displayContent) {
