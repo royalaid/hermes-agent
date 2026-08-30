@@ -22,6 +22,12 @@ import {
   setTurnStartedAt
 } from '@/store/session'
 import {
+  _resetSessionBindingsForTests,
+  claimSessionBinding,
+  normalizeSessionBinding,
+  runtimeForExactSessionBinding
+} from '@/store/session-binding'
+import {
   $sessionStates,
   clearAllSessionStates,
   reconcileBusyStatesOnReconnect,
@@ -84,6 +90,48 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     expect($activeSessionStoredIdRotation.get()).toBeNull()
     expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
     expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-A-next')).toBe('runtime-A')
+  })
+})
+
+describe('useSessionStateCache — source-qualified runtime binding', () => {
+  afterEach(() => {
+    cleanup()
+    _resetSessionBindingsForTests()
+  })
+
+  it('refuses to relabel a late owner-A runtime after owner B claimed the stored id', () => {
+    let cache!: Cache
+    const routeA = { connectionId: 'source-a', profile: 'profile-a', targetProfile: 'profile-a' }
+    const routeB = { connectionId: 'source-b', profile: 'profile-b', targetProfile: 'profile-b' }
+    const bindingB = normalizeSessionBinding({ ownerRoute: routeB, storedSessionId: 'shared-id' })!
+
+    claimSessionBinding(bindingB)
+    render(<Harness activeSessionId="runtime-b" onReady={value => (cache = value)} selectedStoredSessionId="shared-id" />)
+
+    act(() => {
+      cache.updateSessionState('runtime-b', state => ({ ...state }), 'shared-id', routeB)
+      cache.updateSessionState('runtime-a', state => ({ ...state, busy: true }), 'shared-id', routeA)
+    })
+
+    expect(cache.runtimeIdByStoredSessionIdRef.current.get('shared-id')).toBe('runtime-b')
+    expect(runtimeForExactSessionBinding(bindingB)).toBe('runtime-b')
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-b')).toMatchObject({
+      storedSessionId: 'shared-id',
+      busy: false
+    })
+    expect(cache.sessionStateByRuntimeIdRef.current.get('runtime-a')).toBeUndefined()
+    expect($sessionStates.get()).not.toHaveProperty('runtime-a')
+  })
+
+  it('keeps legacy untagged single-source binding when no exact owner conflicts', () => {
+    let cache!: Cache
+    render(<Harness activeSessionId="runtime-legacy" onReady={value => (cache = value)} selectedStoredSessionId="legacy-id" />)
+
+    act(() => {
+      cache.updateSessionState('runtime-legacy', state => ({ ...state }), 'legacy-id')
+    })
+
+    expect(cache.runtimeIdByStoredSessionIdRef.current.get('legacy-id')).toBe('runtime-legacy')
   })
 })
 

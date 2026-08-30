@@ -127,6 +127,10 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
 export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, explicitSid, isActiveEvent, occurredAt, fromActiveSource } = ctx
 
+  const sourceOwner = event.connectionId
+    ? { connectionId: event.connectionId, profile: event.profile?.trim() || 'default' }
+    : undefined
+
   const {
     activeGatewayProfile,
     activeSessionIdRef,
@@ -259,7 +263,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
           branch: statePatch.branch ?? state.branch,
           cwd: statePatch.cwd ?? state.cwd
         }),
-        payload?.stored_session_id || undefined
+        payload?.stored_session_id || undefined,
+        sourceOwner
       )
     }
 
@@ -376,7 +381,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             turnLive: false
           }
         },
-        payload?.stored_session_id || undefined
+        payload?.stored_session_id || undefined,
+        sourceOwner
       )
 
       if (recoveredIncompleteTurn) {

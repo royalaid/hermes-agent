@@ -1,4 +1,9 @@
-import { isGatewayReauthRequired, JsonRpcGatewayError, resolveGatewayWsUrl } from '@hermes/shared'
+import {
+  type GatewayWsUrlResult,
+  isGatewayReauthRequired,
+  JsonRpcGatewayError,
+  resolveGatewayWsUrl
+} from '@hermes/shared'
 import { useEffect, useRef } from 'react'
 
 import { shouldApplyPostBootProgressError } from '@/components/boot-failure-reauth'
@@ -64,6 +69,7 @@ import {
   setCurrentCwd,
   setSessionsLoading
 } from '@/store/session'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import {
   $attentionSessionIds,
   $sessionOwnerHoldRevision,
@@ -76,8 +82,46 @@ import {
   recordSessionEventScope,
   resetTileRuntimeBindings
 } from '@/store/session-states'
-import { windowProfileOverride } from '@/store/windows'
+import { secondarySessionOwnerRoute, windowProfileOverride } from '@/store/windows'
 import type { RpcEvent } from '@/types/hermes'
+
+interface GatewayBootDesktop {
+  getConnection: (profile?: null | string) => Promise<HermesConnection>
+  getConnectionFor?: (payload: { connectionId?: null | string; profile?: null | string }) => Promise<HermesConnection>
+  getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
+  getGatewayWsUrlFor?: (payload: {
+    connectionId?: null | string
+    profile?: null | string
+  }) => Promise<GatewayWsUrlResult>
+}
+
+/** Resolve the backend that owns this renderer. Secondary session windows carry
+ * their source route in the query string; the legacy profile override remains
+ * the fallback for HUD and older ID-only windows. */
+export function resolveWindowGatewayConnection(
+  desktop: GatewayBootDesktop,
+  ownerRoute: SessionOwnerRoute | undefined = secondarySessionOwnerRoute(),
+  profileOverride: null | string = windowProfileOverride()
+): Promise<HermesConnection> {
+  if (ownerRoute && desktop.getConnectionFor) {
+    return desktop.getConnectionFor({ connectionId: ownerRoute.connectionId, profile: ownerRoute.profile })
+  }
+
+  return desktop.getConnection(profileOverride ?? undefined)
+}
+
+export function resolveWindowGatewayWsUrl(
+  desktop: GatewayBootDesktop,
+  connection: HermesConnection,
+  ownerRoute: SessionOwnerRoute | undefined = secondarySessionOwnerRoute()
+): Promise<string> {
+  const getGatewayWsUrl: GatewayBootDesktop['getGatewayWsUrl'] =
+    ownerRoute && desktop.getGatewayWsUrlFor
+      ? async () => desktop.getGatewayWsUrlFor!({ connectionId: ownerRoute.connectionId, profile: ownerRoute.profile })
+      : profile => desktop.getGatewayWsUrl(profile)
+
+  return resolveGatewayWsUrl({ getGatewayWsUrl }, connection)
+}
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
 
@@ -323,7 +367,7 @@ export function useGatewayBoot({
         // this primary socket at a secondary profile's backend after a live swap.
         // Secondaries reconnect via reconnectSecondaryGateways().
         const conn = await withTimeout(
-          desktop.getConnection(),
+          resolveWindowGatewayConnection(desktop),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out reconnecting to Hermes backend'
         )
@@ -350,7 +394,7 @@ export function useGatewayBoot({
         // this reconnect loop. For local/token gateways the URL carries a
         // long-lived token and the re-mint is a cheap no-op.
         const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
+          resolveWindowGatewayWsUrl(desktop, conn),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out re-minting the gateway WebSocket URL'
         )
@@ -605,7 +649,7 @@ export function useGatewayBoot({
         // shared backend-boot budget rather than the reconnect budget because
         // ensureBackend may cold-spawn a pooled helper backend here.
         const conn = await withTimeout(
-          desktop.getConnection(windowProfileOverride() ?? undefined),
+          resolveWindowGatewayConnection(desktop),
           BACKEND_BOOT_WAIT_TIMEOUT_MS,
           'Timed out reconnecting to Hermes backend'
         )
@@ -620,7 +664,7 @@ export function useGatewayBoot({
         // Bounded for the same reason as attemptReconnect() (#93454): a wedged
         // ticket mint would otherwise hang the gateway switch forever.
         const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
+          resolveWindowGatewayWsUrl(desktop, conn),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out re-minting the gateway WebSocket URL'
         )
@@ -977,7 +1021,7 @@ export function useGatewayBoot({
         // rides out a full backend cold spawn, so it gets the shared 45s
         // backend-boot budget, not the 20s reconnect budget.
         const conn = await withTimeout(
-          desktop.getConnection(windowProfileOverride() ?? undefined),
+          resolveWindowGatewayConnection(desktop),
           BACKEND_BOOT_WAIT_TIMEOUT_MS,
           'Timed out connecting to Hermes backend'
         )
@@ -1015,7 +1059,7 @@ export function useGatewayBoot({
         // path (#93454) so a wedged mint fails into boot retry instead of
         // hanging "Starting Hermes…" forever.
         const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
+          resolveWindowGatewayWsUrl(desktop, conn),
           RECONNECT_ATTEMPT_TIMEOUT_MS,
           'Timed out minting the gateway WebSocket URL'
         )

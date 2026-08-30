@@ -787,18 +787,7 @@ function parseTileList(value: unknown): StoredTile[] {
             anchor: typeof raw.anchor === 'string' ? raw.anchor : undefined,
             before: typeof raw.before === 'string' || raw.before === null ? raw.before : undefined,
             dir: raw.dir,
-            ownerRoute:
-              binding?.ownerRoute ??
-              (raw.ownerRoute && typeof raw.ownerRoute.profile === 'string'
-                ? {
-                    connectionId: raw.ownerRoute.connectionId,
-                    mode: raw.ownerRoute.mode,
-                    profile: raw.ownerRoute.profile,
-                    ...(typeof raw.ownerRoute.targetProfile === 'string'
-                      ? { targetProfile: raw.ownerRoute.targetProfile }
-                      : {})
-                  }
-                : undefined),
+            ownerRoute: binding?.ownerRoute,
             storedSessionId: raw.storedSessionId,
             workspaceMode: raw.workspaceMode === 'bots' ? 'bots' : 'sessions',
             workspaceOwnerKey:
