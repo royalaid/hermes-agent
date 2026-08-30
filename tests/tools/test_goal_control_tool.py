@@ -25,6 +25,35 @@ def _call(action: str, *, session_id: str, **kwargs):
     return json.loads(raw)
 
 
+def test_status_returns_a_session_scoped_goal_readback_receipt(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    _call("set", session_id="session-current", condition="Run checks", max_turns=3)
+
+    raw = handle_function_call(
+        "goal_control",
+        {"action": "status"},
+        session_id="session-current",
+        tool_call_id="call-status-1",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+        skip_tool_execution_middleware=True,
+    )
+    result = json.loads(raw)
+
+    receipt = result["goal_readback"]
+    receipt_prefix = "goal_control:session-current:"
+    receipt_id = receipt.pop("receipt_id")
+    assert receipt_id.startswith(receipt_prefix)
+    assert receipt_id[len(receipt_prefix):]
+    assert receipt == {
+        "kind": "goal-status-readback",
+        "session_id": "session-current",
+        "active": True,
+        "condition": "Run checks",
+        "observed_via": "goal_control",
+    }
+
+
 def _home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
