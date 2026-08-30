@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   _resetSessionBindingsForTests,
+  acceptsSessionRuntimeSource,
   bindingsEqual,
   bindRuntimeToSession,
   claimSessionBinding,
@@ -138,6 +139,29 @@ describe('session binding', () => {
     expect(bindRuntimeToSession(exactB, 'runtime-b', generationB)).toBe(true)
     expect(runtimeForExactSessionBinding(exactA)).toBeNull()
     expect(runtimeForExactSessionBinding(exactB)).toBe('runtime-b')
+  })
+
+  it('admits a tagged backend target and rejects a different target behind the same Desktop route', () => {
+    const exact = normalizeSessionBinding({
+      storedSessionId: 'shared-id',
+      ownerRoute: { connectionId: 'source-a', profile: 'desktop-alias', targetProfile: 'backend-a' }
+    })!
+
+    claimSessionBinding(exact)
+
+    expect(
+      acceptsSessionRuntimeSource('shared-id', 'runtime-a', {
+        connectionId: 'source-a',
+        profile: 'backend-a'
+      })
+    ).toBe(true)
+    expect(
+      acceptsSessionRuntimeSource('shared-id', 'runtime-b', {
+        connectionId: 'source-a',
+        profile: 'desktop-alias',
+        targetProfile: 'backend-b'
+      })
+    ).toBe(false)
   })
 
   it('persists exact main authority by remembered-navigation scope and validates the restored id', () => {

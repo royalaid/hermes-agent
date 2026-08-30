@@ -152,7 +152,8 @@ export function useSessionStateCache({
       ? normalizeSessionBinding({
           ownerRoute: {
             ...sourceOwner,
-            targetProfile: canonical?.ownerRoute.targetProfile ?? sourceOwner.targetProfile ?? sourceOwner.profile
+            profile: canonical?.ownerRoute.profile ?? sourceOwner.profile,
+            targetProfile: sourceOwner.targetProfile ?? sourceOwner.profile
           },
           storedSessionId
         })
