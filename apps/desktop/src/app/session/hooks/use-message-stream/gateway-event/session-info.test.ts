@@ -350,4 +350,38 @@ describe('handleSessionInfoEvent workspace ownership', () => {
 
     expect(next).toBe(original)
   })
+
+  it("does not let owner A's stale rebuilt-runtime info capture owner B's main pane", () => {
+    const ownerB = normalizeSessionBinding({
+      ownerRoute: { connectionId: 'source-b', profile: 'default' },
+      storedSessionId: 'shared-id'
+    })!
+
+    claimSessionBinding(ownerB)
+    bindRuntimeToSession(ownerB, 'runtime-b')
+    setActiveSessionId('runtime-b')
+    $selectedStoredSessionId.set('shared-id')
+    setCurrentCwd('/repo/b')
+
+    const ctx = sessionInfoEvent({
+      activeSessionId: 'runtime-b',
+      connectionId: 'source-a',
+      cwd: '/repo/a',
+      explicitSid: 'runtime-a-rebuilt',
+      storedSessionId: 'shared-id'
+    })
+
+    ctx.deps.sessionStateByRuntimeIdRef.current.set('runtime-b', {
+      ...createClientSessionState('shared-id'),
+      awaitingResponse: false,
+      busy: false,
+      streamId: null
+    })
+
+    handleSessionInfoEvent(ctx)
+
+    expect($activeSessionId.get()).toBe('runtime-b')
+    expect(ctx.deps.activeSessionIdRef.current).toBe('runtime-b')
+    expect($currentCwd.get()).toBe('/repo/b')
+  })
 })
