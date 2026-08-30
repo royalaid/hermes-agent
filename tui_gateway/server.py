@@ -8301,6 +8301,9 @@ def _agent_cbs(sid: str) -> dict:
             sid,
             {"text": text, **({"verbose": True} if _session_verbose(sid) else {})},
         ),
+        "reasoning_event_callback": lambda phase, item_id, text="": _emit(
+            f"reasoning.{phase}", sid, {"reasoning_id": item_id, "text": text}
+        ),
         "status_callback": lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
         ),
