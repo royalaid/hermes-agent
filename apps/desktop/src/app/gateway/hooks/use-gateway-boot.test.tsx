@@ -1,7 +1,7 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { DesktopConnectionsRegistry } from '@/global'
+import type { DesktopConnectionsRegistry, HermesConnection } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $desktopBoot } from '@/store/boot'
 import {
@@ -45,7 +45,12 @@ import { $sessionTiles, $workingSessionIds, clearAllSessionStates, publishSessio
 import { deferred } from '../../../test/deferred'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
-import { primaryRuntimeConnectionId, useGatewayBoot } from './use-gateway-boot'
+import {
+  primaryRuntimeConnectionId,
+  resolveWindowGatewayConnection,
+  resolveWindowGatewayWsUrl,
+  useGatewayBoot
+} from './use-gateway-boot'
 
 vi.mock(import('@/store/notifications'), async importOriginal => ({
   ...(await importOriginal()),
@@ -78,6 +83,44 @@ describe('primaryRuntimeConnectionId', () => {
 
   it('returns null for an unknown remote identity so the caller falls back to live-connection scoping', () => {
     expect(primaryRuntimeConnectionId({ mode: 'remote' })).toBeNull()
+  })
+})
+
+describe('secondary window gateway owner routing', () => {
+  it('uses the exact connection route for both connection and fresh WS URL resolution', async () => {
+    const ownerRoute = { connectionId: 'coder-remote', profile: 'coder', targetProfile: 'coder' }
+
+    const desktop = {
+      getConnection: vi.fn(async () => primaryConn as HermesConnection),
+      getConnectionFor: vi.fn(async () => coderConn as HermesConnection),
+      getGatewayWsUrl: vi.fn(async () => primaryConn.wsUrl),
+      getGatewayWsUrlFor: vi.fn(async () => coderConn.wsUrl)
+    }
+
+    const connection = await resolveWindowGatewayConnection(desktop, ownerRoute, 'default')
+    const wsUrl = await resolveWindowGatewayWsUrl(desktop, connection, ownerRoute)
+
+    expect(desktop.getConnectionFor).toHaveBeenCalledWith({ connectionId: 'coder-remote', profile: 'coder' })
+    expect(desktop.getConnection).not.toHaveBeenCalled()
+    expect(desktop.getGatewayWsUrlFor).toHaveBeenCalledWith({ connectionId: 'coder-remote', profile: 'coder' })
+    expect(desktop.getGatewayWsUrl).not.toHaveBeenCalled()
+    expect(wsUrl).toBe(coderConn.wsUrl)
+  })
+
+  it('keeps legacy profile resolution when no exact owner route is available', async () => {
+    const desktop = {
+      getConnection: vi.fn(
+        async (profile?: null | string) => (profile === 'coder' ? coderConn : primaryConn) as HermesConnection
+      ),
+      getGatewayWsUrl: vi.fn(async () => coderConn.wsUrl)
+    }
+
+    const connection = await resolveWindowGatewayConnection(desktop, undefined, 'coder')
+    const wsUrl = await resolveWindowGatewayWsUrl(desktop, connection, undefined)
+
+    expect(desktop.getConnection).toHaveBeenCalledWith('coder')
+    expect(desktop.getGatewayWsUrl).toHaveBeenCalledWith('coder')
+    expect(wsUrl).toBe(coderConn.wsUrl)
   })
 })
 

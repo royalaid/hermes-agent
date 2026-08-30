@@ -49,6 +49,20 @@ describe('openSidebarSession', () => {
     )
   })
 
+  it('lets a modifier window gesture override the plain-click preference without losing the row owner', () => {
+    $sidebarSessionsOpenInNewTab.set(false)
+    openSidebarSession('shared-id', session('profile-b', 'connection-b'), navigate, 'window')
+
+    expect(openExactSidebarSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        binding: expect.objectContaining({
+          ownerRoute: expect.objectContaining({ connectionId: 'connection-b', profile: 'profile-b' })
+        }),
+        placement: 'window'
+      })
+    )
+  })
+
   it('fails closed when the row has no exact owner source', () => {
     openSidebarSession('shared-id', session('', ''), navigate)
 
