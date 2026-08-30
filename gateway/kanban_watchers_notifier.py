@@ -7,6 +7,7 @@ per-subscription delivery (``_KanbanNotification``) live here.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -95,17 +96,46 @@ def _platform_names(mapping: Any) -> set[str]:
     return {getattr(platform, "value", str(platform)).lower() for platform in mapping}
 
 
+def _kanban_db_file_signature(db_path: Path) -> Optional[tuple[tuple[Any, ...], ...]]:
+    """Return a cheap, fail-open signature for a board's SQLite files."""
+    signature: list[tuple[Any, ...]] = []
+    for suffix in ("", "-wal", "-shm"):
+        path = db_path if not suffix else Path(f"{db_path}{suffix}")
+        try:
+            stat_result = os.stat(path)
+        except FileNotFoundError:
+            signature.append(("missing",))
+            continue
+        except OSError:
+            return None
+        signature.append((
+            "present",
+            getattr(stat_result, "st_dev", 0),
+            getattr(stat_result, "st_ino", 0),
+            getattr(stat_result, "st_size", 0),
+            getattr(stat_result, "st_mtime_ns", 0),
+            getattr(stat_result, "st_ctime_ns", 0),
+        ))
+    return tuple(signature)
+
+
 # --- Collection (runs in a worker thread) ---
 
 
 class _Collector:
     """One tick's claim state: which profiles/platforms this gateway serves and the GC gate."""
 
-    def __init__(self, runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool, gc_retention_days: int) -> None:
+    def __init__(
+        self, runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool,
+        gc_retention_days: int, poll_cache: Optional[dict[str, tuple[Any, Any]]] = None,
+        file_signature: Callable[[Path], Optional[tuple[tuple[Any, ...], ...]]] = _kanban_db_file_signature,
+    ) -> None:
         self.kb = kb
         self.notifier_profile = notifier_profile
         self.gc_due = gc_due
         self.gc_retention_days = gc_retention_days
+        self.poll_cache = poll_cache if poll_cache is not None else {}
+        self.file_signature = file_signature
         self.deliveries: list[dict] = []
         self.include_unowned = runner._owns_kanban_dispatcher_lock()
         self.profile_adapters = getattr(runner, "_profile_adapters", {})
@@ -118,6 +148,11 @@ class _Collector:
         # secondary-profile sub here would lose it.
         self.active_platforms = _platform_names(runner.adapters).union(
             *(_platform_names(m) for m in self.profile_adapters.values()))
+        self.poll_context = (
+            tuple(sorted(self.notifier_profiles)),
+            bool(self.include_unowned),
+            tuple(sorted(self.active_platforms)),
+        )
 
     def collect(self) -> list[dict]:
         if not self.active_platforms:
@@ -131,14 +166,31 @@ class _Collector:
             slug = board_meta.get("slug") or kb.DEFAULT_BOARD
             db_path = board_meta.get("db_path")
             try:
-                resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(kb.kanban_db_path(slug).resolve())
+                db_path_obj = Path(db_path).expanduser() if db_path else kb.kanban_db_path(slug)
+                resolved_db_path = str(db_path_obj.resolve())
             except Exception:
+                db_path_obj = Path(str(db_path or slug))
                 resolved_db_path = f"slug:{slug}"
             if resolved_db_path in seen_db_paths:
                 logger.debug("kanban notifier: skipping duplicate board slug %s for DB %s", slug, resolved_db_path)
                 continue
             seen_db_paths.add(resolved_db_path)
-            self.collect_board(slug)
+            try:
+                before_signature = self.file_signature(db_path_obj)
+            except Exception:
+                before_signature = None
+            if before_signature is not None and self.poll_cache.get(resolved_db_path) == (
+                before_signature, self.poll_context,
+            ):
+                logger.debug("kanban notifier: board %s unchanged; skipping database query", slug)
+                continue
+            if self.collect_board(slug) and before_signature is not None:
+                try:
+                    after_signature = self.file_signature(db_path_obj)
+                except Exception:
+                    after_signature = None
+                if after_signature == before_signature:
+                    self.poll_cache[resolved_db_path] = (before_signature, self.poll_context)
         return self.deliveries
 
     def _board_has_subs(self, slug: str) -> bool:
@@ -156,15 +208,17 @@ class _Collector:
                          slug, sorted(self.notifier_profiles))
         return count != 0
 
-    def _gc_stale_subs(self, conn: Any, slug: str) -> None:
+    def _gc_stale_subs(self, conn: Any, slug: str) -> bool:
         """Best-effort stale-sub sweep: a failed sweep never blocks delivery; the next hourly gate retries."""
         try:
             _purged = _kbn().purge_stale_done_notify_subs(conn, max_age_days=self.gc_retention_days)
             if _purged:
                 logger.info("kanban notifier: purged %d stale done/blocked-task subscription(s) on board %s (retention %dd)",
                             _purged, slug, self.gc_retention_days)
+            return True
         except Exception as _gc_exc:
             logger.debug("kanban notifier: stale-sub GC failed for board %s: %s", slug, _gc_exc)
+            return False
 
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
         """Claim one subscription's unseen events; None when skipped or nothing new."""
@@ -189,23 +243,29 @@ class _Collector:
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
 
-    def collect_board(self, slug: str) -> None:
-        """Claim events on one board, appending delivery dicts to ``deliveries``."""
+    def collect_board(self, slug: str) -> bool:
+        """Claim events on one board; return whether the query was cache-safe."""
         if not self._board_has_subs(slug):
-            return
+            return True
         kb = self.kb
         try:
             conn = _kbc().connect(board=slug)
         except Exception as exc:
             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
-            return
+            return False
+        board_query_ok = True
         try:
             if self.gc_due:
-                self._gc_stale_subs(conn, slug)
+                board_query_ok = self._gc_stale_subs(conn, slug)
             # No explicit init_db(): connect() already runs the migration once per
             # process, and init_db() would re-run it on a second connection racing
             # the first.
-            subs = _kbn().list_notify_subs(conn, notifier_profiles=self.notifier_profiles, include_unowned=self.include_unowned)
+            try:
+                subs = _kbn().list_notify_subs(
+                    conn, notifier_profiles=self.notifier_profiles, include_unowned=self.include_unowned)
+            except Exception as query_exc:
+                logger.warning("kanban notifier: subscription query for board %s failed: %s", slug, query_exc)
+                return False
             if not subs:
                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
             for sub in subs:
@@ -215,13 +275,19 @@ class _Collector:
                         self.deliveries.append(claimed)
                 except Exception as sub_exc:
                     # One bad subscription must not block the rest of the tick.
+                    board_query_ok = False
                     logger.warning("kanban notifier: subscription for %s on board %s failed: %s",
                                    sub.get("task_id"), slug, sub_exc)
         finally:
             conn.close()
+        return board_query_ok
 
 
-def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool, gc_retention_days: int) -> list[dict]:
+def _notifier_collect(
+    runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool,
+    gc_retention_days: int, poll_cache: Optional[dict[str, tuple[Any, Any]]] = None,
+    file_signature: Callable[[Path], Optional[tuple[tuple[Any, ...], ...]]] = _kanban_db_file_signature,
+) -> list[dict]:
     """Claim unseen terminal events for every owned subscription on every board.
 
     Each gateway polls only subscriptions owned by profiles whose adapters it
@@ -230,6 +296,7 @@ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], 
     """
     return _Collector(
         runner, kb, notifier_profile=notifier_profile, gc_due=gc_due, gc_retention_days=gc_retention_days,
+        poll_cache=poll_cache, file_signature=file_signature,
     ).collect()
 
 
