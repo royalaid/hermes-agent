@@ -161,6 +161,16 @@ describe('openSession', () => {
     expect(navigate).not.toHaveBeenCalled()
   })
 
+  it('focuses a newly created tab after the pane mirror adopts it', () => {
+    focusOpenSession.mockReturnValueOnce(null).mockReturnValueOnce('tile')
+
+    openSession('s1', navigate, 'tab')
+
+    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
+    expect(focusOpenSession).toHaveBeenCalledTimes(2)
+    expect(focusOpenSession).toHaveBeenNthCalledWith(2, 's1', { workspaceMode: 'sessions' })
+  })
+
   it('threads an exact Bot owner into a new session tile', () => {
     const scope = { workspaceMode: 'bots' as const, workspaceOwnerKey: 'connection-a::default' }
     focusOpenSession.mockReturnValue(null)
