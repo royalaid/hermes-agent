@@ -94,9 +94,6 @@ export function openSession(
   // already on screen (open tile, or the main session) would otherwise return
   // at focusOpenSession and never clear its unread dot.
   markSessionRead(storedSessionId)
-  setSessionTileWorkspaceScope(storedSessionId, workspaceScope)
-  const botWorkspaceScope = workspaceScope.workspaceMode === 'bots' ? workspaceScope : undefined
-  const routedWorkspaceScope = workspaceScope.ownerRoute ? workspaceScope : botWorkspaceScope
 
   let resolved: OpenSessionIntent = intent
 
@@ -114,6 +111,10 @@ export function openSession(
     // No pop-out support → treat like a new tab.
     resolved = 'tab'
   }
+
+  setSessionTileWorkspaceScope(storedSessionId, workspaceScope)
+  const botWorkspaceScope = workspaceScope.workspaceMode === 'bots' ? workspaceScope : undefined
+  const routedWorkspaceScope = workspaceScope.ownerRoute ? workspaceScope : botWorkspaceScope
 
   if (resolved === 'main') {
     // Canonical relationship chats explicitly own the main workspace. Route
