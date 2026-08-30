@@ -115,7 +115,14 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext, sourceOwner?:
     return false
   }
 
-  if (!acceptsSessionRuntimeSource(payload.stored_session_id, explicitSid, sourceOwner)) {
+  if (
+    !acceptsSessionRuntimeSource(
+      payload.stored_session_id,
+      explicitSid,
+      sourceOwner,
+      !sourceOwner && ctx.fromActiveSource()
+    )
+  ) {
     return false
   }
 
