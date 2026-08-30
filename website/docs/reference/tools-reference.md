@@ -274,6 +274,14 @@ that switch — like `tour`, it runs in answer to the conversation rather than a
 idle. It does share the cooldown, so a tip from Hermes also buys the user six
 hours of quiet from the rotation.
 
+## `goal` toolset
+
+`goal_control` lets the model manage the persisted standing goal for its current session. It can set, update, inspect, pause, resume, or clear that goal. The tool rejects cross-session requests, verifies every mutation by reading the state back from persistence, and returns a session-scoped `goal_readback` receipt. The `/goal` slash command remains the human-facing control path.
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `goal_control` | Manage the active session's persisted standing goal and return an authoritative read-back receipt. | — |
+
 ## `todo` toolset
 
 | Tool | Description | Requires environment |
