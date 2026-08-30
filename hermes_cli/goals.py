@@ -673,6 +673,17 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
 
+def goal_state_payload(state: Optional[GoalState]) -> Dict[str, Any]:
+    """Project persisted goal identity for model and live UI consumers."""
+    if state is None:
+        return {"exists": False, "status": None, "condition": None}
+    return {
+        "exists": True,
+        "status": str(state.status or "") or None,
+        "condition": state.goal,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Persistence (SessionDB state_meta)
 # ──────────────────────────────────────────────────────────────────────
