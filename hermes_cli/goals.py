@@ -1104,11 +1104,12 @@ def save_goal(session_id: str, state: GoalState) -> None:
 
 def clear_goal(session_id: str) -> None:
     """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
-    state = load_goal(session_id)
-    if state is None:
-        return
-    state.status = "cleared"
-    save_goal(session_id, state)
+    with goal_state_transaction(session_id):
+        state = load_goal_authoritative(session_id)
+        if state is None:
+            return
+        state.status = "cleared"
+        save_goal(session_id, state)
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
@@ -1129,16 +1130,21 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_goal(old_session_id)
-        if state is None or getattr(state, "status", None) == "cleared":
-            return False
-        # Don't clobber a goal already set on the child (e.g. a resumed
-        # lineage that re-established its own goal).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
+        first_session, second_session = sorted((old_session_id, new_session_id))
+        with goal_state_transaction(first_session):
+            with goal_state_transaction(second_session):
+                state = load_goal_authoritative(old_session_id)
+                if state is None or getattr(state, "status", None) == "cleared":
+                    return False
+                # Don't clobber a goal already set on the child (e.g. a resumed
+                # lineage that re-established its own goal).
+                if load_goal_authoritative(new_session_id) is not None:
+                    return False
+                child_state = GoalState.from_json(state.to_json())
+                save_goal(new_session_id, child_state)
+                # Archive the parent's row so it isn't double-counted as active.
+                state.status = "cleared"
+                save_goal(old_session_id, state)
         logger.debug(
             "GoalManager: migrated goal %s -> %s (%s)",
             old_session_id, new_session_id, reason or "rotation",
