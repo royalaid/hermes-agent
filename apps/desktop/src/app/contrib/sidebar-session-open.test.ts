@@ -4,9 +4,13 @@ import type { SessionInfo } from '@/hermes'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
 
 const openExactSidebarSession = vi.fn()
+const openSession = vi.fn()
 
 vi.mock('./exact-sidebar-session', () => ({
   openExactSidebarSession: (...args: unknown[]) => openExactSidebarSession(...args)
+}))
+vi.mock('../open-session', () => ({
+  openSession: (...args: unknown[]) => openSession(...args)
 }))
 
 import { openSidebarSession } from './sidebar-session-open'
@@ -38,6 +42,7 @@ describe('openSidebarSession', () => {
       navigate,
       placement: 'tab'
     })
+    expect(openSession).not.toHaveBeenCalled()
   })
 
   it('passes explicit main placement for the persisted override', () => {
@@ -47,6 +52,7 @@ describe('openSidebarSession', () => {
     expect(openExactSidebarSession).toHaveBeenCalledWith(
       expect.objectContaining({ placement: 'main' })
     )
+    expect(openSession).not.toHaveBeenCalled()
   })
 
   it('lets a modifier window gesture override the plain-click preference without losing the row owner', () => {
@@ -61,11 +67,37 @@ describe('openSidebarSession', () => {
         placement: 'window'
       })
     )
+    expect(openSession).not.toHaveBeenCalled()
   })
 
-  it('fails closed when the row has no exact owner source', () => {
-    openSidebarSession('shared-id', session('', ''), navigate)
+  it('opens a profile-only row by id with default tab placement', () => {
+    openSidebarSession('shared-id', session('remote-profile', ''), navigate)
 
+    expect(openSession).toHaveBeenCalledOnce()
+    expect(openSession).toHaveBeenCalledWith('shared-id', navigate, 'tab')
+    expect(openExactSidebarSession).not.toHaveBeenCalled()
+  })
+
+  it('opens an ownerless server-search row by id', () => {
+    openSidebarSession('server-only-id', { id: 'server-only-id' } as SessionInfo, navigate)
+
+    expect(openSession).toHaveBeenCalledWith('server-only-id', navigate, 'tab')
+    expect(openExactSidebarSession).not.toHaveBeenCalled()
+  })
+
+  it('preserves the main preference for a generic fallback', () => {
+    $sidebarSessionsOpenInNewTab.set(false)
+
+    openSidebarSession('shared-id', session('remote-profile', ''), navigate)
+
+    expect(openSession).toHaveBeenCalledWith('shared-id', navigate, 'main')
+    expect(openExactSidebarSession).not.toHaveBeenCalled()
+  })
+
+  it('preserves explicit window intent for a generic fallback', () => {
+    openSidebarSession('server-only-id', { id: 'server-only-id' } as SessionInfo, navigate, 'window')
+
+    expect(openSession).toHaveBeenCalledWith('server-only-id', navigate, 'window')
     expect(openExactSidebarSession).not.toHaveBeenCalled()
   })
 })
