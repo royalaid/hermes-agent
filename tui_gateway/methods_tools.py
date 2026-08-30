@@ -827,7 +827,7 @@ def _(rid, params: dict) -> dict:
         if not session:
             return _err(rid, 4001, "no active session")
         try:
-            from hermes_cli.goals import GoalManager
+            from hermes_cli.goals import GoalManager, GoalPersistenceError
         except Exception as exc:
             return _err(rid, 5030, f"goals unavailable: {exc}")
 
@@ -844,13 +844,23 @@ def _(rid, params: dict) -> dict:
 
         lower = arg.strip().lower()
         if not arg.strip() or lower == "status":
-            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+            try:
+                status = mgr.status_line()
+            except GoalPersistenceError as exc:
+                return _err(rid, 5031, f"goal status unavailable: {exc}")
+            return _ok(rid, {"type": "exec", "output": status})
         if lower == "pause":
-            state = mgr.pause(reason="user-paused")
+            try:
+                state = mgr.pause(reason="user-paused")
+            except GoalPersistenceError as exc:
+                return _err(rid, 5031, f"goal update failed: {exc}")
             out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
             return _ok(rid, {"type": "exec", "output": out})
         if lower == "resume":
-            state = mgr.resume()
+            try:
+                state = mgr.resume()
+            except GoalPersistenceError as exc:
+                return _err(rid, 5031, f"goal update failed: {exc}")
             if state is None:
                 return _ok(rid, {"type": "exec", "output": "No goal to resume."})
             # Resume must restart work, not just flip persisted state
@@ -875,7 +885,10 @@ def _(rid, params: dict) -> dict:
             )
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
-            mgr.clear()
+            try:
+                mgr.clear()
+            except GoalPersistenceError as exc:
+                return _err(rid, 5031, f"goal update failed: {exc}")
             return _ok(
                 rid,
                 {
@@ -887,6 +900,8 @@ def _(rid, params: dict) -> dict:
         # Otherwise — treat the remaining text as the new goal.
         try:
             state = mgr.set(arg)
+        except GoalPersistenceError as exc:
+            return _err(rid, 5031, f"goal update failed: {exc}")
         except ValueError as exc:
             return _err(rid, 4004, f"invalid goal: {exc}")
 
