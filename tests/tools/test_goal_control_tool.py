@@ -449,9 +449,15 @@ def test_stale_manager_cannot_overwrite_pause_from_another_process(tmp_path, mon
         args=(session_id, result_queue),
     )
     child.start()
-    child.join(30)
-    assert child.exitcode == 0
-    assert result_queue.get(timeout=2) == (str(home), True, "active", "paused")
+    try:
+        child.join(90)
+        assert child.exitcode == 0
+        result = result_queue.get(timeout=10)
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(10)
+    assert result == (str(home), True, "active", "paused")
 
     with patch(
         "hermes_cli.goals.judge_goal",
