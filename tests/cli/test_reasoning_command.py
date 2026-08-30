@@ -596,6 +596,31 @@ class TestReasoningDeltasFiredFlag(unittest.TestCase):
 
         self.assertEqual(captured, ["Let me merge the PR."])
 
+    def test_native_codex_summary_entries_keep_separate_reasoning_ids(self):
+        agent = self._make_agent()
+        structured = []
+        agent.reasoning_event_callback = lambda phase, item_id, text="": structured.append((phase, item_id, text))
+        msg = SimpleNamespace(
+            content="Done.", tool_calls=None,
+            reasoning_content="Inspecting\nChecking\n\nVerifying",
+            reasoning=None, reasoning_details=None,
+            codex_reasoning_items=[
+                {"type": "reasoning", "id": "rs_live", "summary": [
+                    {"type": "summary_text", "text": "Inspecting"},
+                    {"type": "summary_text", "text": "Checking"},
+                ]},
+                {"type": "reasoning", "id": "rs_verify", "summary": [
+                    {"type": "summary_text", "text": "Verifying"}
+                ]},
+            ],
+        )
+        agent._build_assistant_message(msg, "stop")
+        self.assertEqual(structured, [
+            ("start", "rs_live:summary:0", ""), ("delta", "rs_live:summary:0", "Inspecting"), ("end", "rs_live:summary:0", ""),
+            ("start", "rs_live:summary:1", ""), ("delta", "rs_live:summary:1", "Checking"), ("end", "rs_live:summary:1", ""),
+            ("start", "rs_verify:summary:0", ""), ("delta", "rs_verify:summary:0", "Verifying"), ("end", "rs_verify:summary:0", ""),
+        ])
+
 
 class TestReasoningShownThisTurnFlag(unittest.TestCase):
     """Post-response reasoning display should be suppressed when reasoning
