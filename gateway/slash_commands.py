@@ -2747,16 +2747,29 @@ class GatewaySlashCommandsMixin:
         mgr, session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")
+        from hermes_cli.goals import GoalPersistenceError
+
+        persistence_failure = "Goal update failed; persisted state is unchanged."
 
         if not args or lower == "status":
-            return mgr.status_line()
+            try:
+                return mgr.status_line()
+            except GoalPersistenceError as exc:
+                return f"Goal status unavailable: {exc}"
 
         # /goal show → print the active goal's completion contract
         if lower == "show":
-            return f"{mgr.status_line()}\n{mgr.render_contract()}"
+            try:
+                status = mgr.status_line()
+            except GoalPersistenceError as exc:
+                return f"Goal status unavailable: {exc}"
+            return f"{status}\n{mgr.render_contract()}"
 
         if lower == "pause":
-            state = mgr.pause(reason="user-paused")
+            try:
+                state = mgr.pause(reason="user-paused")
+            except GoalPersistenceError:
+                return persistence_failure
             if state is None:
                 return t("gateway.goal.no_goal_set")
             try:
@@ -2769,7 +2782,10 @@ class GatewaySlashCommandsMixin:
             return t("gateway.goal.paused", goal=state.goal)
 
         if lower == "resume":
-            state = mgr.resume()
+            try:
+                state = mgr.resume()
+            except GoalPersistenceError:
+                return persistence_failure
             if state is None:
                 return t("gateway.goal.no_resume")
             # Resume must restart work, not just flip persisted state
@@ -2797,7 +2813,10 @@ class GatewaySlashCommandsMixin:
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
-            mgr.clear()
+            try:
+                mgr.clear()
+            except GoalPersistenceError:
+                return persistence_failure
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
@@ -2827,7 +2846,11 @@ class GatewaySlashCommandsMixin:
 
         # /goal unwait — clear the wait barrier.
         if lower == "unwait":
-            if mgr.stop_waiting():
+            try:
+                cleared = mgr.stop_waiting()
+            except GoalPersistenceError:
+                return persistence_failure
+            if cleared:
                 return "▶ Wait barrier cleared — goal loop resumes."
             return "No wait barrier set."
 
@@ -2895,6 +2918,8 @@ class GatewaySlashCommandsMixin:
         # Otherwise — treat the remaining text as the new goal.
         try:
             state = mgr.set(args, contract=contract)
+        except GoalPersistenceError:
+            return persistence_failure
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
