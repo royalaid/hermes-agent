@@ -91,6 +91,12 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import {
+  bindRuntimeToSession,
+  claimSessionBinding,
+  normalizeSessionBinding,
+  runtimeForExactSessionBinding
+} from '@/store/session-binding'
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
   beginSessionMutation,
@@ -872,6 +878,25 @@ export function useSessionActions({
       resumeRequestRef.current = requestId
       const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
+      const ownerRoute = capturedOwner || getSessionOwnerHint(storedSessionId)
+
+      let requestedBinding = ownerRoute
+        ? normalizeSessionBinding({ ownerRoute, storedSessionId })
+        : null
+
+      if (!requestedBinding && runtimeIdByStoredSessionIdRef.current.has(storedSessionId)) {
+        requestedBinding = normalizeSessionBinding({
+          ownerRoute: {
+            connectionId: 'local',
+            mode: 'local',
+            profile: 'default',
+            targetProfile: 'default'
+          },
+          storedSessionId
+        })
+      }
+
+      let bindingGeneration = requestedBinding ? claimSessionBinding(requestedBinding) : null
 
       const isCurrentResume = () =>
         resumeRequestRef.current === requestId && selectedStoredSessionIdRef.current === storedSessionId
@@ -923,8 +948,18 @@ export function useSessionActions({
       // mismatch the mapping is cross-wired: purge both sides and report a miss
       // so the caller falls through to a full resume that rebinds a correct id.
       const takeWarmCache = (): { runtimeId: string; state: ClientSessionState } | null => {
+        if (!requestedBinding) {
+          return null
+        }
+
         const runtimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
-        const state = runtimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
+
+        if (runtimeId && bindingGeneration !== null) {
+          bindRuntimeToSession(requestedBinding, runtimeId, bindingGeneration)
+        }
+
+        const exactRuntimeId = runtimeForExactSessionBinding(requestedBinding)
+        const state = runtimeId && runtimeId === exactRuntimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
 
         if (!runtimeId || !state) {
           return null
@@ -958,7 +993,6 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
-      const ownerRoute = capturedOwner || getSessionOwnerHint(storedSessionId)
       // A connection switch clears/reloads the session rows before this path
       // runs, so an untagged row belongs to the connection that supplied the
       // current list. Capture that source before the async metadata lookup. If
@@ -992,6 +1026,21 @@ export function useSessionActions({
               profile: sessionProfile || 'default'
             }
           : sessionProfile)
+
+      if (!requestedBinding && sessionOwner) {
+        const resolvedOwnerRoute =
+          typeof sessionOwner === 'string'
+            ? {
+                connectionId: 'local',
+                mode: 'local' as const,
+                profile: sessionOwner,
+                targetProfile: sessionOwner
+              }
+            : sessionOwner
+
+        requestedBinding = normalizeSessionBinding({ ownerRoute: resolvedOwnerRoute, storedSessionId })
+        bindingGeneration = requestedBinding ? claimSessionBinding(requestedBinding) : null
+      }
 
       // All-profiles / plugin navigation must not steal chrome API-home:
       // dial the owning backend without moving $activeGatewayProfile.
@@ -1734,6 +1783,14 @@ export function useSessionActions({
           setResumeFailedSessionId(storedSessionId)
           resumedRunning = false
 
+          return
+        }
+
+        if (
+          requestedBinding &&
+          bindingGeneration !== null &&
+          !bindRuntimeToSession(requestedBinding, resumed.session_id, bindingGeneration)
+        ) {
           return
         }
 

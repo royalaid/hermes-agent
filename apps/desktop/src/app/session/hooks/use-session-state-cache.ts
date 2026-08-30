@@ -10,6 +10,7 @@ import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $activeSessionId,
   $messages,
+  getSessionOwnerHint,
   setActiveSessionStoredIdRotation,
   setCurrentFastMode,
   setCurrentModel,
@@ -20,7 +21,14 @@ import {
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
-import { $sessionStates, $sessionTiles, publishSessionState, releaseSessionTranscript } from '@/store/session-states'
+import { bindRuntimeToSession, invalidateSessionRuntimeBinding, normalizeSessionBinding } from '@/store/session-binding'
+import {
+  $sessionStates,
+  $sessionTiles,
+  publishSessionState,
+  releaseSessionTranscript,
+  sessionTileOwnerRoute
+} from '@/store/session-states'
 
 import type { ClientSessionState } from '../../types'
 import { SessionStateCache } from '../session-state-cache'
@@ -126,6 +134,16 @@ export function useSessionStateCache({
   }
 
   const sessionStateCache = sessionStateByRuntimeIdRef.current
+
+  const bindKnownRuntime = useCallback((storedSessionId: string, runtimeId: string) => {
+    const ownerRoute = sessionTileOwnerRoute(storedSessionId) ?? getSessionOwnerHint(storedSessionId)
+    const binding = ownerRoute ? normalizeSessionBinding({ ownerRoute, storedSessionId }) : null
+
+    if (binding) {
+      bindRuntimeToSession(binding, runtimeId)
+    }
+  }, [])
+
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
   const transcriptViewGateByRuntimeIdRef = useRef(new Map<string, symbol>())
@@ -160,6 +178,7 @@ export function useSessionStateCache({
           // tracks compression without needing a dummy state write.
           if (existing.storedSessionId && existing.storedSessionId !== storedSessionId) {
             runtimeIdByStoredSessionIdRef.current.delete(existing.storedSessionId)
+            invalidateSessionRuntimeBinding(existing.storedSessionId)
 
             // A rotation event needs a real next id — a null/cleared stored id
             // is a detach, not a rotation the route-follow effect should chase.
@@ -174,6 +193,7 @@ export function useSessionStateCache({
 
           if (storedSessionId) {
             runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+            bindKnownRuntime(storedSessionId, sessionId)
           }
 
           sessionStateCache.set(sessionId, updated)
@@ -186,13 +206,14 @@ export function useSessionStateCache({
 
       if (storedSessionId) {
         runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+        bindKnownRuntime(storedSessionId, sessionId)
       }
 
       sessionStateCache.set(sessionId, created)
 
       return created
     },
-    [sessionStateCache]
+    [bindKnownRuntime, sessionStateCache]
   )
 
   const resetViewSync = useCallback(() => {
