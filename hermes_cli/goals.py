@@ -594,6 +594,10 @@ class GoalState:
     waiting_until: float = 0.0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
+    # Structured acceptance criteria supplied through model goal control.
+    # Persist them with the goal so a later status call can return the exact
+    # authoritative readback rather than reconstructing evidence in prose.
+    acceptance_evidence: List[Dict[str, str]] = field(default_factory=list)
     # Optional structured completion contract (outcome / verification /
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
@@ -656,6 +660,11 @@ class GoalState:
             waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
+            acceptance_evidence=[
+                {str(key): str(value) for key, value in item.items()}
+                for item in (data.get("acceptance_evidence") or [])
+                if isinstance(item, dict)
+            ],
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
                 GoalGate.from_dict(g)
@@ -1798,6 +1807,7 @@ class GoalManager:
         *,
         max_turns: Optional[int] = None,
         contract: Optional[GoalContract] = None,
+        acceptance_evidence: Optional[List[Dict[str, str]]] = None,
         expected_raw: object = _UNBOUND_GOAL_SNAPSHOT,
     ) -> GoalState:
         self._require_snapshot(expected_raw)
@@ -1811,6 +1821,7 @@ class GoalManager:
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             created_at=time.time(),
             last_turn_at=0.0,
+            acceptance_evidence=list(acceptance_evidence or []),
             contract=contract if contract is not None else GoalContract(),
         )
         self._state = state
@@ -1823,6 +1834,7 @@ class GoalManager:
         goal: str,
         *,
         max_turns: Optional[int] = None,
+        acceptance_evidence: Optional[List[Dict[str, str]]] = None,
         expected_raw: object = _UNBOUND_GOAL_SNAPSHOT,
     ) -> Optional[GoalState]:
         """Update goal text/budget without changing lifecycle progress."""
@@ -1835,6 +1847,8 @@ class GoalManager:
         self._state.goal = goal
         if max_turns is not None:
             self._state.max_turns = int(max_turns)
+        if acceptance_evidence is not None:
+            self._state.acceptance_evidence = list(acceptance_evidence)
         self._persist(self._state)
         return self._state
 
