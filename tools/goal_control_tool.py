@@ -280,7 +280,11 @@ def goal_control_tool(
         )
 
     state_payload = _state_payload(persisted)
-    receipt_token = uuid.uuid4().hex
+    receipt_token = (
+        persisted.receipt_token
+        if persisted is not None and persisted.receipt_token is not None
+        else uuid.uuid4().hex
+    )
     return json.dumps(
         {
             "success": True,
