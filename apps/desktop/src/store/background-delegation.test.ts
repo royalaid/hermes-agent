@@ -1,7 +1,7 @@
+import { atom } from 'nanostores'
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { $backgroundResume } from './background-delegation'
-import { $activeSessionId, $busy } from './session'
+import { backgroundResumeForSession } from './background-delegation'
 import { $subagentsBySession, type SubagentProgress, type SubagentStreamEntry } from './subagents'
 
 const sub = (over: Partial<SubagentProgress> = {}): SubagentProgress => ({
@@ -20,11 +20,14 @@ const sub = (over: Partial<SubagentProgress> = {}): SubagentProgress => ({
 })
 
 const stream = (text: string): SubagentStreamEntry => ({ at: 0, kind: 'progress', text })
+const $runtimeId = atom<null | string>('s1')
+const $surfaceBusy = atom(false)
+const $backgroundResume = backgroundResumeForSession($runtimeId, $surfaceBusy)
 
 describe('$backgroundResume', () => {
   beforeEach(() => {
-    $busy.set(false)
-    $activeSessionId.set('s1')
+    $surfaceBusy.set(false)
+    $runtimeId.set('s1')
     $subagentsBySession.set({})
   })
 
@@ -45,8 +48,18 @@ describe('$backgroundResume', () => {
 
   it('is null while a turn is busy (the turn owns the main loader)', () => {
     $subagentsBySession.set({ s1: [sub({ id: 'a' })] })
-    $busy.set(true)
+    $surfaceBusy.set(true)
     expect($backgroundResume.get()).toBeNull()
+  })
+
+  it('scopes simultaneous surfaces to their own runtime id and busy state', () => {
+    const $owner = backgroundResumeForSession(atom<null | string>('s1'), atom(false))
+    const $other = backgroundResumeForSession(atom<null | string>('s2'), atom(false))
+
+    $subagentsBySession.set({ s1: [sub({ id: 'owner-child', stream: [stream('Owner activity')] })] })
+
+    expect($owner.get()).toEqual({ activity: 'Owner activity', count: 1 })
+    expect($other.get()).toBeNull()
   })
 
   it('is null when only terminal children or other sessions have work', () => {
@@ -59,7 +72,7 @@ describe('$backgroundResume', () => {
 
   it('is null when there is no active session', () => {
     $subagentsBySession.set({ s1: [sub({ id: 'a' })] })
-    $activeSessionId.set(null)
+    $runtimeId.set(null)
     expect($backgroundResume.get()).toBeNull()
   })
 })
