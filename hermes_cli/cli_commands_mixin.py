@@ -3062,16 +3062,31 @@ class CLICommandsMixin:
             _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
             return
 
+        from hermes_cli.goals import GoalPersistenceError
+
+        def _persistence_failed(exc: Exception) -> None:
+            _cprint(f"  Goal update failed; persisted state is unchanged: {exc}")
+
         lower = arg.lower()
 
         # Bare /goal or /goal status → show current state
         if not arg or lower == "status":
-            _cprint(f"  {mgr.status_line()}")
+            try:
+                status = mgr.status_line()
+            except GoalPersistenceError as exc:
+                _cprint(f"  Goal status unavailable: {exc}")
+                return
+            _cprint(f"  {status}")
             return
 
         # /goal show → print the active goal's completion contract
         if lower == "show":
-            _cprint(f"  {mgr.status_line()}")
+            try:
+                status = mgr.status_line()
+            except GoalPersistenceError as exc:
+                _cprint(f"  Goal status unavailable: {exc}")
+                return
+            _cprint(f"  {status}")
             _cprint(f"  {mgr.render_contract()}")
             return
 
@@ -3089,7 +3104,11 @@ class CLICommandsMixin:
             return
 
         if lower == "pause":
-            state = mgr.pause(reason="user-paused")
+            try:
+                state = mgr.pause(reason="user-paused")
+            except GoalPersistenceError as exc:
+                _persistence_failed(exc)
+                return
             if state is None:
                 _cprint(f"  {_DIM}No goal set.{_RST}")
             else:
@@ -3097,7 +3116,11 @@ class CLICommandsMixin:
             return
 
         if lower == "resume":
-            state = mgr.resume()
+            try:
+                state = mgr.resume()
+            except GoalPersistenceError as exc:
+                _persistence_failed(exc)
+                return
             if state is None:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:
@@ -3124,7 +3147,11 @@ class CLICommandsMixin:
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
-            mgr.clear()
+            try:
+                mgr.clear()
+            except GoalPersistenceError as exc:
+                _persistence_failed(exc)
+                return
             if had:
                 _cprint("  ✓ Goal cleared.")
             else:
@@ -3157,7 +3184,12 @@ class CLICommandsMixin:
 
         # /goal unwait — drop the wait barrier and resume normal looping.
         if lower == "unwait":
-            if mgr.stop_waiting():
+            try:
+                cleared = mgr.stop_waiting()
+            except GoalPersistenceError as exc:
+                _persistence_failed(exc)
+                return
+            if cleared:
                 _cprint("  ▶ Wait barrier cleared — goal loop resumes.")
             else:
                 _cprint(f"  {_DIM}No wait barrier set.{_RST}")
@@ -3216,6 +3248,9 @@ class CLICommandsMixin:
         goal_text = headline or arg
         try:
             state = mgr.set(goal_text, contract=contract if not contract.is_empty() else None)
+        except GoalPersistenceError as exc:
+            _persistence_failed(exc)
+            return
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
@@ -3243,7 +3278,7 @@ class CLICommandsMixin:
         set it as the active goal. Falls back to a bare goal if the aux model
         can't produce a contract."""
         from cli import _DIM, _RST, _cprint
-        from hermes_cli.goals import draft_contract
+        from hermes_cli.goals import GoalPersistenceError, draft_contract
 
         mgr = self._get_goal_manager()
         if mgr is None:
@@ -3260,6 +3295,9 @@ class CLICommandsMixin:
 
         try:
             state = mgr.set(objective, contract=contract)
+        except GoalPersistenceError as exc:
+            _cprint(f"  Goal update failed; persisted state is unchanged: {exc}")
+            return
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
