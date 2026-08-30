@@ -166,29 +166,39 @@ test.describe('sidebar scroll containment', () => {
     await expect.poll(async () => (await scrollMetrics(firstToolSwitch)).scrollTop).toBeGreaterThan(0)
 
     await page.getByRole('button', { name: /^MCP/ }).click()
-    await page.getByRole('button', { name: 'Catalog', exact: true }).click()
-    const serversTab = page.getByRole('button', { name: 'Servers', exact: true })
-    await serversTab.waitFor({ state: 'visible' })
+    const catalogHeading = page.getByText('Catalog', { exact: true }).last()
+    await catalogHeading.waitFor({ state: 'visible' })
 
-    const mcpLayout = await serversTab.evaluate(element => {
+    const mcpLayout = await catalogHeading.evaluate(element => {
       const pane = element.closest<HTMLElement>('[data-pane-content]')
-      const list = element.parentElement?.nextElementSibling as HTMLElement | null
+      let list: HTMLElement | null = element.parentElement
 
-      if (!pane?.parentElement || !list) {
+      while (list && !['auto', 'scroll'].includes(getComputedStyle(list).overflowY)) {
+        list = list.parentElement
+      }
+
+      if (!pane || !list) {
         throw new Error('MCP pane geometry is incomplete')
       }
 
+      const listRect = list.getBoundingClientRect()
+      const paneRect = pane.getBoundingClientRect()
+
       return {
+        listBottom: listRect.bottom,
         listClientHeight: list.clientHeight,
         listOverflowY: getComputedStyle(list).overflowY,
+        listTop: listRect.top,
+        paneBottom: paneRect.bottom,
         paneClientHeight: pane.clientHeight,
-        paneLayerClientHeight: pane.parentElement.clientHeight
+        paneTop: paneRect.top
       }
     })
 
-    expect(mcpLayout.paneClientHeight).toBe(mcpLayout.paneLayerClientHeight)
     expect(mcpLayout.listOverflowY).toBe('auto')
     expect(mcpLayout.listClientHeight).toBeGreaterThan(0)
     expect(mcpLayout.listClientHeight).toBeLessThanOrEqual(mcpLayout.paneClientHeight)
+    expect(mcpLayout.listTop).toBeGreaterThanOrEqual(mcpLayout.paneTop)
+    expect(mcpLayout.listBottom).toBeLessThanOrEqual(mcpLayout.paneBottom)
   })
 })
