@@ -240,6 +240,7 @@ describe('openSession', () => {
 
     openSession('s1', navigate, 'window', { ownerRoute, workspaceMode: 'sessions' })
     expect(openSessionInNewWindow).toHaveBeenCalledWith('s1', { ownerRoute })
+    expect(setSessionTileWorkspaceScope).not.toHaveBeenCalled()
     expect(openSessionTile).not.toHaveBeenCalled()
   })
 

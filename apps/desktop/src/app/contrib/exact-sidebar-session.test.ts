@@ -12,8 +12,10 @@ import {
 } from '@/store/session-binding'
 import type { SessionTile } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
+import type * as WindowsStore from '@/store/windows'
 
 const mocks = vi.hoisted(() => ({
+  canOpenSessionWindow: vi.fn(() => true),
   dropSessionState: vi.fn(),
   openSession: vi.fn(),
   patchSessionTile: vi.fn(),
@@ -26,6 +28,10 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('../open-session', () => ({ openSession: (...args: unknown[]) => mocks.openSession(...args) }))
+vi.mock('@/store/windows', async importOriginal => ({
+  ...(await importOriginal<typeof WindowsStore>()),
+  canOpenSessionWindow: () => mocks.canOpenSessionWindow()
+}))
 vi.mock('@/store/session', async importOriginal => ({
   ...(await importOriginal<typeof SessionStore>()),
   requestSessionResume: (...args: unknown[]) => mocks.requestSessionResume(...args),
@@ -54,6 +60,7 @@ describe('openExactSidebarSession', () => {
   beforeEach(() => {
     localStorage.clear()
     vi.clearAllMocks()
+    mocks.canOpenSessionWindow.mockReturnValue(true)
     _resetSessionBindingsForTests()
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
@@ -101,6 +108,24 @@ describe('openExactSidebarSession', () => {
     })
     expect(mocks.openSession).toHaveBeenCalledOnce()
     expect(mocks.requestSessionResume).not.toHaveBeenCalled()
+  })
+
+  it('opens a colliding owner in a window without retargeting the existing in-app tile', () => {
+    const bindingA = normalizeSessionBinding({ storedSessionId: 'shared-id', ownerRoute: routeA })!
+    const bindingB = normalizeSessionBinding({ storedSessionId: 'shared-id', ownerRoute: routeB })!
+
+    $sessionTiles.set([{ storedSessionId: 'shared-id', ownerRoute: routeA, runtimeId: 'runtime-a' }])
+    bindRuntimeToSession(bindingA, 'runtime-a')
+
+    expect(openExactSidebarSession({ binding: bindingB, navigate, placement: 'window' })).toBe('created-cold')
+    expect(runtimeForExactSessionBinding(bindingA)).toBe('runtime-a')
+    expect(runtimeForExactSessionBinding(bindingB)).toBeNull()
+    expect(mocks.dropSessionState).not.toHaveBeenCalled()
+    expect(mocks.patchSessionTile).not.toHaveBeenCalled()
+    expect(mocks.openSession).toHaveBeenCalledWith('shared-id', navigate, 'window', {
+      ownerRoute: bindingB.ownerRoute,
+      workspaceMode: 'sessions'
+    })
   })
 
   it('releases a competing same-id main surface before cold-opening the clicked owner in a tab', () => {
