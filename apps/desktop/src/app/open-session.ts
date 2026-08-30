@@ -164,6 +164,11 @@ export function openSession(
       openSessionTile(storedSessionId, 'center')
     }
 
+    // Tile publication synchronously drives the pane mirror, but a brand-new
+    // pane was not present for the pre-create focus probe above. Front it after
+    // adoption so a plain sidebar click never leaves an unrelated tab active.
+    focusOpenSession(storedSessionId, workspaceScope)
+
     return
   }
 
