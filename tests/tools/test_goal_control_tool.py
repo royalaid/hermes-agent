@@ -47,6 +47,20 @@ def _pause_goal_in_child_process(session_id: str, result_queue) -> None:
     )
 
 
+def _pause_goal_while_evaluation_runs(session_id: str, result_queue) -> None:
+    """Pause from another process and report whether it completed promptly."""
+    from hermes_cli import goals as child_goals
+
+    child_goals._DB_CACHE.clear()
+    started = time.monotonic()
+    try:
+        child_goals.GoalManager(session_id).pause(reason="operator-paused")
+        state = child_goals.load_goal_authoritative(session_id)
+        result_queue.put((state.status if state else None, time.monotonic() - started, None))
+    except Exception as exc:
+        result_queue.put((None, time.monotonic() - started, str(exc)))
+
+
 def _clear_goal_in_child_process(session_id: str, ready, proceed, result_queue) -> None:
     """Clear through the exported persistence helper in another process."""
     from hermes_cli.goals import clear_goal, load_goal_authoritative
@@ -514,8 +528,8 @@ def test_clear_from_another_process_wins_race_with_active_judge(tmp_path, monkey
         child.start()
         assert ready.get(timeout=30) is True
         proceed.set()
-        # Without a process lock in clear_goal(), the child writes cleared
-        # during this window and the retained manager then revives active state.
+        # Clear must complete during the judge call. The evaluator then sees
+        # the rotated receipt token and discards its stale continuation.
         time.sleep(1)
         return ("continue", "keep going", False, None, False)
 
@@ -532,7 +546,113 @@ def test_clear_from_another_process_wins_race_with_active_judge(tmp_path, monkey
             child.terminate()
             child.join(10)
 
-    assert decision["verdict"] == "continue"
+    assert decision["verdict"] == "inactive"
+    assert decision["should_continue"] is False
+    assert decision["reason"] == "goal changed during evaluation"
+    persisted = goals.load_goal_authoritative(session_id)
+    assert persisted is not None
+    assert persisted.status == "cleared"
+
+
+def test_pause_from_another_process_completes_while_judge_is_blocked(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-cross-process-pause-during-judge"
+    manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
+    manager.set("Keep going")
+
+    judge_started = threading.Event()
+    release_judge = threading.Event()
+
+    def blocked_judge(*_args, **_kwargs):
+        judge_started.set()
+        assert release_judge.wait(15), "test did not release the blocked judge"
+        return ("continue", "keep going", False, None, False)
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    evaluating = threading.Thread(
+        target=manager.evaluate_after_turn,
+        args=("work completed this turn",),
+        daemon=True,
+    )
+    child = context.Process(
+        target=_pause_goal_while_evaluation_runs,
+        args=(session_id, result_queue),
+    )
+
+    with patch("hermes_cli.goals.judge_goal", side_effect=blocked_judge):
+        evaluating.start()
+        assert judge_started.wait(3), "goal judge did not start"
+        child.start()
+        try:
+            try:
+                status, elapsed, error = result_queue.get(timeout=10)
+            except queue.Empty:
+                pytest.fail("operator pause blocked behind the slow goal judge")
+        finally:
+            release_judge.set()
+            evaluating.join(20)
+            child.join(20)
+            if child.is_alive():
+                child.terminate()
+                child.join(10)
+
+    assert child.exitcode == 0
+    assert error is None
+    assert status == "paused"
+    assert elapsed < 3
+    persisted = goals.load_goal_authoritative(session_id)
+    assert persisted is not None
+    assert persisted.status == "paused"
+
+
+def test_clear_from_another_process_survives_blocked_gate_result(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-cross-process-clear-during-gate"
+    manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
+    manager.set("Keep going")
+    manager.add_gate("blocked gate")
+
+    gate_started = threading.Event()
+    release_gate = threading.Event()
+
+    def blocked_gate(*_args, **_kwargs):
+        gate_started.set()
+        assert release_gate.wait(15), "test did not release the blocked gate"
+        return (False, 1, "still failing")
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    proceed = context.Event()
+    result_queue = context.Queue()
+    decisions = []
+    evaluating = threading.Thread(
+        target=lambda: decisions.append(manager.evaluate_after_turn("work completed this turn")),
+        daemon=True,
+    )
+    child = context.Process(
+        target=_clear_goal_in_child_process,
+        args=(session_id, ready, proceed, result_queue),
+    )
+
+    with patch("hermes_cli.goals.run_gate", side_effect=blocked_gate):
+        evaluating.start()
+        assert gate_started.wait(3), "goal gate did not start"
+        child.start()
+        assert ready.get(timeout=10) is True
+        proceed.set()
+        try:
+            assert result_queue.get(timeout=10) == "cleared"
+        finally:
+            release_gate.set()
+            evaluating.join(20)
+            child.join(20)
+            if child.is_alive():
+                child.terminate()
+                child.join(10)
+
+    assert child.exitcode == 0
+    assert decisions[0]["verdict"] == "inactive"
     persisted = goals.load_goal_authoritative(session_id)
     assert persisted is not None
     assert persisted.status == "cleared"
