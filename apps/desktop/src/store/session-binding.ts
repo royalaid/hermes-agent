@@ -228,7 +228,7 @@ export function acceptsSessionRuntimeSource(
 
   if (sourceOwner) {
     const sourceConnectionId = sourceOwner.connectionId.trim()
-    const sourceProfile = sourceOwner.profile.trim() || 'default'
+    const sourceTargetProfile = normalizedProfile(sourceOwner.targetProfile ?? sourceOwner.profile)
 
     if (!sourceConnectionId || !sourceOwner.profile) {
       return false
@@ -237,7 +237,7 @@ export function acceptsSessionRuntimeSource(
     return (
       !current ||
       (current.binding.ownerRoute.connectionId === sourceConnectionId &&
-        current.binding.ownerRoute.profile === sourceProfile)
+        current.binding.ownerRoute.targetProfile === sourceTargetProfile)
     )
   }
 
