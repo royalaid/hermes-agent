@@ -306,10 +306,8 @@ export function useSessionTileDelegate({
             ? { connectionId: owner.connectionId, profile: owner.targetProfile || owner.profile }
             : owner
 
-        const prefetchPromise = getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
-
         if (existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
-          const prefetch = await prefetchPromise
+          const prefetch = await getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
 
           if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
             const delegate = sessionTileDelegate()
@@ -374,18 +372,6 @@ export function useSessionTileDelegate({
           return delegate.resumeTile(storedSessionId, options)
         }
 
-        const prefetch = await prefetchPromise
-
-        if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
-          const delegate = sessionTileDelegate()
-
-          if (!delegate) {
-            throw new Error('session binding changed while resume was in flight')
-          }
-
-          return delegate.resumeTile(storedSessionId, options)
-        }
-
         if (outcome.mode === 'read-only') {
           const readOnlyId = readOnlyRuntimeIdFor(storedSessionId)
 
@@ -422,6 +408,16 @@ export function useSessionTileDelegate({
 
         const info = resumed?.info
         const prefetch = await getLatestSessionMessages(storedSessionId, restScope)
+
+        if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
+          const delegate = sessionTileDelegate()
+
+          if (!delegate) {
+            throw new Error('session binding changed while resume was in flight')
+          }
+
+          return delegate.resumeTile(storedSessionId, options)
+        }
 
         updateSessionState(
           runtimeId,
