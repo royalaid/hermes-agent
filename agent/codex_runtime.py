@@ -522,6 +522,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # item/started and consumed on item/completed so duration is correct
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    active_reasoning_item_id: str | None = None
 
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
@@ -623,6 +624,14 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        item_id = params.get("itemId") or params.get("item_id") or active_reasoning_item_id
+        structured = getattr(agent, "reasoning_event_callback", None)
+        if isinstance(item_id, str) and item_id and structured is not None:
+            try:
+                structured("delta", item_id, text)
+                return
+            except Exception:
+                logger.debug("reasoning_event_callback raised", exc_info=True)
         fn = getattr(agent, "_fire_reasoning_delta", None)
         if fn is None:
             return
@@ -630,6 +639,21 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             fn(text)
         except Exception:
             logger.debug("_fire_reasoning_delta raised", exc_info=True)
+
+    def _fire_reasoning_item_event(event: str, item: dict) -> None:
+        nonlocal active_reasoning_item_id
+        item_id = item.get("id")
+        callback = getattr(agent, "reasoning_event_callback", None)
+        if not isinstance(item_id, str) or not item_id or callback is None:
+            return
+        try:
+            callback(event, item_id, "")
+            if event == "start":
+                active_reasoning_item_id = item_id
+            elif event == "end" and active_reasoning_item_id == item_id:
+                active_reasoning_item_id = None
+        except Exception:
+            logger.debug("reasoning_event_callback raised", exc_info=True)
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
@@ -667,6 +691,12 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(item, dict):
             return
         item_type = item.get("type") or ""
+        if item_type == "reasoning":
+            if method == "item/started":
+                _fire_reasoning_item_event("start", item)
+            elif method == "item/completed":
+                _fire_reasoning_item_event("end", item)
+            return
         if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
             _fire_tool_started(item)
             return
@@ -1060,6 +1090,7 @@ def _consume_codex_event_stream(
     model: str,
     on_text_delta=None,
     on_reasoning_delta=None,
+    on_reasoning_event=None,
     on_commentary_message=None,
     on_first_delta=None,
     on_event=None,
@@ -1265,6 +1296,48 @@ def _consume_codex_event_stream(
                     pending["arguments"] = str(done_args)
                 continue
             # other function_call frames fall through — function_call items still get added on output_item.done
+
+        if event_type in {"response.reasoning_summary_part.added", "response.reasoning_summary_part.done"}:
+            item_id = _event_field(event, "item_id")
+            summary_index = _event_field(event, "summary_index")
+            if (on_reasoning_event is not None and isinstance(item_id, str) and item_id
+                    and isinstance(summary_index, int) and not isinstance(summary_index, bool) and summary_index >= 0):
+                try:
+                    on_reasoning_event(
+                        "start" if event_type.endswith(".added") else "end",
+                        f"{item_id}:summary:{summary_index}",
+                        "",
+                    )
+                except Exception:
+                    logger.debug("Codex stream on_reasoning_event raised", exc_info=True)
+            continue
+
+        if event_type == "response.reasoning_summary_text.delta":
+            reasoning_text = _event_field(event, "delta", "")
+            item_id = _event_field(event, "item_id")
+            summary_index = _event_field(event, "summary_index")
+            structured = (on_reasoning_event is not None and isinstance(item_id, str) and item_id
+                          and isinstance(summary_index, int) and not isinstance(summary_index, bool) and summary_index >= 0)
+            if reasoning_text and structured:
+                try:
+                    on_reasoning_event("delta", f"{item_id}:summary:{summary_index}", reasoning_text)
+                    continue
+                except Exception:
+                    logger.debug("Codex stream on_reasoning_event raised", exc_info=True)
+            if reasoning_text and on_reasoning_delta is not None:
+                if (
+                    summary_index is not None
+                    and active_summary_index is not None
+                    and summary_index != active_summary_index
+                ):
+                    reasoning_text = f"\n\n{reasoning_text}"
+                if summary_index is not None:
+                    active_summary_index = summary_index
+                try:
+                    on_reasoning_delta(reasoning_text)
+                except Exception:
+                    logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
+            continue
 
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
@@ -1729,6 +1802,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     model=api_kwargs.get("model"),
                     on_text_delta=_on_text_delta,
                     on_reasoning_delta=_on_reasoning_delta,
+                    on_reasoning_event=getattr(agent, "reasoning_event_callback", None),
                     on_commentary_message=(
                         _on_commentary_message
                         if (
