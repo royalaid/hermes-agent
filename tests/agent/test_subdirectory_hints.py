@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent.search_policy import SEARCH_PRUNE_DIR_NAMES
 from agent.subdirectory_hints import SubdirectoryHintTracker
 
 
@@ -245,7 +246,7 @@ class TestExcludedDirectories:
 
     @pytest.mark.parametrize(
         "excluded",
-        ["backups", "node_modules", ".git", "venv", "site-packages", ".Trash", "vendor"],
+        sorted(SEARCH_PRUNE_DIR_NAMES),
     )
     def test_excluded_directory_skipped(self, tmp_path, excluded):
         target = tmp_path / excluded / "snapshot"
