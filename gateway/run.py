@@ -23531,7 +23531,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queue and takes priority naturally.
         """
         try:
-            from hermes_cli.goals import GoalManager
+            from hermes_cli.goals import (
+                GoalManager,
+                GoalPersistenceError,
+                load_goal_snapshot_authoritative,
+            )
         except Exception as exc:
             logger.debug("goal continuation: goals module unavailable: %s", exc)
             return
@@ -23548,7 +23552,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # read and silently end the goal loop.
         await self._warm_goals_session_db("goal continuation")
 
-        mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+        try:
+            state, persisted_raw = load_goal_snapshot_authoritative(sid)
+        except GoalPersistenceError as exc:
+            notice = f"Goal status unavailable: {exc}"
+            logger.warning("goal continuation: %s", notice)
+            if source is not None:
+                await self._defer_goal_status_notice_after_delivery(source, notice)
+            return
+
+        mgr = GoalManager.from_authoritative_snapshot(
+            session_id=sid,
+            state=state,
+            persisted_raw=persisted_raw,
+            default_max_turns=max_turns,
+        )
         if not mgr.is_active():
             return
 
