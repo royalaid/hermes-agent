@@ -19,10 +19,12 @@ import { openFolderAsProject } from '@/store/projects'
 import {
   getRememberedRoute,
   getRememberedSessionId,
+  requestSessionResume,
   sessionBelongsToProfile,
   setRememberedRoute,
   setRememberedSessionId
 } from '@/store/session'
+import { clearMainSessionBinding, getMainSessionBinding } from '@/store/session-binding'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
 import { isBrowserWindow, isHudWindow, isSecondaryWindow } from '@/store/windows'
@@ -128,6 +130,14 @@ export function useDesktopIntegrations({
           !isOverlayView(appViewForPath(route)) &&
           (!routeSession || sessionBelongsToProfile(sessions, routeSession, activeProfile))
         ) {
+          if (routeSession) {
+            const binding = getMainSessionBinding(routeSession, activeProfile)
+
+            if (binding) {
+              requestSessionResume(routeSession, binding.ownerRoute)
+            }
+          }
+
           navigate(route, { replace: true })
 
           return
@@ -140,6 +150,12 @@ export function useDesktopIntegrations({
         }
 
         if (last && sessionBelongsToProfile(sessions, last, activeProfile)) {
+          const binding = getMainSessionBinding(last, activeProfile)
+
+          if (binding) {
+            requestSessionResume(last, binding.ownerRoute)
+          }
+
           navigate(sessionRoute(last), { replace: true })
 
           return
@@ -162,6 +178,10 @@ export function useDesktopIntegrations({
       setRememberedRoute(locationPathname, activeProfile)
     } else if (!routedSessionId && !isOverlayView(appViewForPath(locationPathname))) {
       setRememberedRoute(locationPathname, activeProfile)
+
+      if (locationPathname === NEW_CHAT_ROUTE) {
+        clearMainSessionBinding(activeProfile)
+      }
     }
   }, [activeProfile, locationPathname, navigate, profileReady, routedSessionId, sessions])
 
