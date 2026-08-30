@@ -546,7 +546,11 @@ _GOAL_FILE_LOCK_LOCAL = threading.local()
 _GOAL_FILE_LOCK_TIMEOUT_S = 5.0
 
 
-class ConcurrentGoalStateChange(RuntimeError):
+class GoalPersistenceError(RuntimeError):
+    """Canonical failure for an authoritative goal read or publication."""
+
+
+class ConcurrentGoalStateChange(GoalPersistenceError):
     """The persisted goal changed after its authoritative snapshot was read."""
 
 
@@ -847,17 +851,17 @@ def load_goal_snapshot_authoritative(
         raise ValueError("session identity is required")
     db = _get_session_db()
     if db is None:
-        raise RuntimeError("session goal storage is unavailable")
+        raise GoalPersistenceError("session goal storage is unavailable")
     try:
         raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
-        raise RuntimeError("persisted goal read failed") from exc
+        raise GoalPersistenceError("persisted goal read failed") from exc
     if not raw:
         return None, raw
     try:
         return GoalState.from_json(raw), raw
     except Exception as exc:
-        raise RuntimeError("persisted goal state is invalid") from exc
+        raise GoalPersistenceError("persisted goal state is invalid") from exc
 
 
 def load_goal_authoritative(session_id: str) -> Optional[GoalState]:
