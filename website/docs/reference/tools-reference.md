@@ -279,6 +279,14 @@ to use. Like every schema change, that lands on the next session — a running
 conversation keeps the toolset it started with, and the app declines the call in
 the meantime.
 
+## `goal` toolset
+
+`goal_control` lets the model manage the persisted standing goal for its current session. It can set, update, inspect, pause, resume, or clear that goal. The tool rejects cross-session requests, verifies every mutation by reading the state back from persistence, and returns a session-scoped `goal_readback` receipt. The `/goal` slash command remains the human-facing control path.
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `goal_control` | Manage the active session's persisted standing goal and return an authoritative read-back receipt. | — |
+
 ## `todo` toolset
 
 | Tool | Description | Requires environment |
