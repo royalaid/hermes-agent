@@ -3,51 +3,9 @@
 from __future__ import annotations
 
 import json
-import re
-import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from tools.registry import registry
-
-
-_PORTABLE_ASSERTIONS = {
-    "file_exists": "exists",
-    "test_result": "passes",
-    "command_exit": "exit=0",
-    "url_status": "status=2xx",
-}
-_ARTIFACT_HASH_ASSERTION = re.compile(r"sha256=[0-9a-fA-F]{64}\Z")
-
-
-def _validate_acceptance_evidence(
-    condition: str,
-    evidence: Optional[List[Dict[str, str]]],
-) -> List[Dict[str, str]]:
-    if evidence is None:
-        return []
-    if not isinstance(evidence, list):
-        raise ValueError("acceptance_evidence must be an array")
-
-    validated: List[Dict[str, str]] = []
-    for entry in evidence:
-        if not isinstance(entry, dict) or set(entry) != {"kind", "locator", "assertion"}:
-            raise ValueError("each acceptance evidence entry requires only kind, locator, and assertion")
-        kind = entry.get("kind")
-        locator = entry.get("locator")
-        assertion = entry.get("assertion")
-        if not all(isinstance(value, str) and value.strip() for value in (kind, locator, assertion)):
-            raise ValueError("acceptance evidence fields must be nonblank strings")
-        expected = _PORTABLE_ASSERTIONS.get(kind)
-        if kind == "artifact_hash":
-            assertion_valid = bool(_ARTIFACT_HASH_ASSERTION.fullmatch(assertion))
-        else:
-            assertion_valid = expected is not None and assertion == expected
-        if not assertion_valid:
-            raise ValueError("unsupported acceptance evidence kind or assertion")
-        if locator not in condition or assertion not in condition:
-            raise ValueError("goal condition must contain the evidence locator and assertion")
-        validated.append({"kind": kind, "locator": locator, "assertion": assertion})
-    return validated
 
 
 def _error(code: str, message: str, *, session_id: str = "") -> str:
@@ -61,12 +19,14 @@ def _error(code: str, message: str, *, session_id: str = "") -> str:
     )
 
 
-def _state_payload(state: Optional[Any], goal: Dict[str, Any]) -> Dict[str, Any]:
+def _state_payload(state: Optional[Any]) -> Dict[str, Any]:
     if state is None:
         return {
-            **goal,
+            "exists": False,
             "active": False,
             "paused": False,
+            "status": None,
+            "condition": None,
             "turns_used": None,
             "max_turns": None,
             "revision": None,
@@ -74,7 +34,7 @@ def _state_payload(state: Optional[Any], goal: Dict[str, Any]) -> Dict[str, Any]
             "error_reason": None,
         }
 
-    status = goal["status"]
+    status = str(state.status or "") or None
     has_judge_error = status != "cleared" and bool(
         state.consecutive_parse_failures
         or state.consecutive_transport_failures
@@ -84,14 +44,14 @@ def _state_payload(state: Optional[Any], goal: Dict[str, Any]) -> Dict[str, Any]
     if stop_reason is None and status in {"done", "cleared"}:
         stop_reason = state.last_reason
     return {
-        **goal,
+        "exists": True,
         "active": status == "active",
         "paused": status == "paused",
+        "status": status,
+        "condition": state.goal,
         "turns_used": state.turns_used,
         "max_turns": state.max_turns,
-        # GoalState has no optimistic revision field today. Keep this explicit
-        # so callers do not mistake timestamps or turn counts for a revision.
-        "revision": None,
+        "revision": state.revision,
         "stop_reason": stop_reason,
         "error_reason": state.last_reason if has_judge_error else None,
     }
@@ -119,7 +79,6 @@ def goal_control_tool(
     action: str,
     condition: Optional[str] = None,
     max_turns: Optional[int] = None,
-    acceptance_evidence: Optional[List[Dict[str, str]]] = None,
     session_id: Optional[str] = None,
     requested_session_id: Optional[str] = None,
 ) -> str:
@@ -144,10 +103,9 @@ def goal_control_tool(
 
     try:
         from hermes_cli.goals import (
-            ConcurrentGoalStateChange,
+            GoalConflictError,
             GoalManager,
-            goal_state_payload,
-            load_goal_authoritative,
+            GoalPostconditionError,
             load_goal_snapshot_authoritative,
         )
 
@@ -163,6 +121,7 @@ def goal_control_tool(
         )
 
         intended = before
+        expected_after_raw = before_raw
         if action in {"set", "update"}:
             text = (condition or "").strip()
             if not text:
@@ -212,59 +171,69 @@ def goal_control_tool(
                     session_id=caller_session_id,
                 )
             if action == "update":
-                intended = manager.update(text, max_turns=max_turns)
-            else:
-                try:
-                    validated_evidence = _validate_acceptance_evidence(
-                        text, acceptance_evidence
-                    )
-                except ValueError as exc:
-                    return _error(
-                        "invalid_acceptance_evidence",
-                        str(exc),
-                        session_id=caller_session_id,
-                    )
-                intended = manager.set(
-                    text,
-                    max_turns=max_turns,
-                    acceptance_evidence=validated_evidence,
+                intended = manager.update(
+                    text, max_turns=max_turns, expected_raw=before_raw
                 )
+            else:
+                intended = manager.set(
+                    text, max_turns=max_turns, expected_raw=before_raw
+                )
+            expected_after_raw = intended.to_json() if intended else None
         elif action == "pause":
-            if before is not None and before.status in {"done", "cleared"}:
+            if before is None or before.status != "active":
                 return _error(
                     "invalid_transition",
-                    "a terminal goal cannot be paused",
+                    "only an active goal can be paused",
                     session_id=caller_session_id,
                 )
-            if before is not None and before.status != "paused":
-                intended = manager.pause(reason="model-paused")
+            intended = manager.pause(
+                reason="model-paused", expected_raw=before_raw
+            )
+            expected_after_raw = intended.to_json() if intended else None
         elif action == "resume":
-            if before is None or before.status not in {"active", "paused"}:
+            if before is None or before.status != "paused":
                 return _error(
                     "invalid_transition",
                     "only a paused goal can be resumed",
                     session_id=caller_session_id,
                 )
-            if before.status == "paused":
-                intended = manager.resume(reset_budget=False)
+            intended = manager.resume(
+                reset_budget=False, expected_raw=before_raw
+            )
+            expected_after_raw = intended.to_json() if intended else None
         elif action == "clear":
             if before is not None and before.status != "cleared":
-                intended = manager.clear(reason="model-cleared")
-
-        persisted = load_goal_authoritative(caller_session_id)
-        if action != "status":
-            intended_json = intended.to_json() if intended is not None else None
-            persisted_json = persisted.to_json() if persisted is not None else None
-            if intended_json != persisted_json:
-                return _error(
-                    "persistence_verification_failed",
-                    "persisted goal state does not match the requested action",
-                    session_id=caller_session_id,
+                intended = manager.clear(
+                    reason="model-cleared", expected_raw=before_raw
                 )
-    except ConcurrentGoalStateChange:
+                expected_after_raw = intended.to_json() if intended else None
+
+        persisted, persisted_raw = load_goal_snapshot_authoritative(
+            caller_session_id
+        )
+        if action != "status" and persisted_raw != expected_after_raw:
+            code = (
+                "transition_conflict"
+                if action in {"pause", "resume"}
+                else "mutation_conflict"
+            )
+            return _error(
+                code,
+                "persisted goal state does not match the requested action",
+                session_id=caller_session_id,
+            )
+    except GoalConflictError:
+        code = "transition_conflict" if action in {"pause", "resume"} else "mutation_conflict"
         return _error(
-            "concurrent_state_change",
+            code,
             "persisted goal changed while applying the requested action",
+            session_id=caller_session_id,
+        )
+    except GoalPostconditionError:
+        code = "transition_conflict" if action in {"pause", "resume"} else "mutation_conflict"
+        return _error(
+            code,
+            "persisted goal state could not be verified after mutation",
             session_id=caller_session_id,
         )
     except (TypeError, ValueError) as exc:
@@ -276,31 +245,12 @@ def goal_control_tool(
             session_id=caller_session_id,
         )
 
-    goal_payload = goal_state_payload(persisted)
-    state_payload = _state_payload(persisted, goal_payload)
-    receipt_token = (
-        persisted.receipt_token
-        if persisted is not None and persisted.receipt_token is not None
-        else uuid.uuid4().hex
-    )
     return json.dumps(
         {
             "success": True,
             "session_id": caller_session_id,
             "action": action,
-            "state": state_payload,
-            "goal_readback": {
-                "kind": "goal-status-readback",
-                "receipt_id": f"goal_control:{caller_session_id}:{receipt_token}",
-                "session_id": caller_session_id,
-                "active": state_payload["active"],
-                "condition": state_payload["condition"],
-                "goal": goal_payload,
-                "observed_via": "goal_control",
-                "acceptance_evidence": (
-                    list(persisted.acceptance_evidence) if persisted is not None else []
-                ),
-            },
+            "state": _state_payload(persisted),
         },
         ensure_ascii=False,
     )
@@ -335,20 +285,6 @@ GOAL_CONTROL_SCHEMA = {
                     "configured goal budget; update may only decrease it."
                 ),
             },
-            "acceptance_evidence": {
-                "type": "array",
-                "description": "Structured criteria named verbatim in the goal condition.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string"},
-                        "locator": {"type": "string", "minLength": 1},
-                        "assertion": {"type": "string", "minLength": 1},
-                    },
-                    "required": ["kind", "locator", "assertion"],
-                    "additionalProperties": False,
-                },
-            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -361,7 +297,6 @@ def _handle_goal_control(args: Dict[str, Any], **kwargs: Any) -> str:
         action=args.get("action", "status"),
         condition=args.get("condition"),
         max_turns=args.get("max_turns"),
-        acceptance_evidence=args.get("acceptance_evidence"),
         session_id=kwargs.get("session_id"),
         # The schema intentionally omits session_id. Preserve this explicit
         # guard because not every provider enforces additionalProperties.

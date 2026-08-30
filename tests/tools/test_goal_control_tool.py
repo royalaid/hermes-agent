@@ -2,8 +2,6 @@
 
 import asyncio
 import json
-import multiprocessing
-import os
 import queue
 import threading
 import time
@@ -27,172 +25,10 @@ def _call(action: str, *, session_id: str, **kwargs):
     return json.loads(raw)
 
 
-def _pause_goal_in_child_process(session_id: str, result_queue) -> None:
-    """Pause through a fresh interpreter process sharing HERMES_HOME."""
-    from hermes_cli import goals as child_goals
-    from hermes_constants import get_hermes_home
-
-    child_goals._DB_CACHE.clear()
-    before = child_goals.load_goal_authoritative(session_id)
-    child_goals.GoalManager(session_id).pause(reason="operator-paused")
-    after = child_goals.load_goal_authoritative(session_id)
-    resolved_home = get_hermes_home()
-    result_queue.put(
-        (
-            str(resolved_home),
-            (resolved_home / "state.db").exists(),
-            before.status if before else None,
-            after.status if after else None,
-        )
-    )
-
-
-def _pause_goal_while_evaluation_runs(session_id: str, result_queue) -> None:
-    """Pause from another process and report whether it completed promptly."""
-    from hermes_cli import goals as child_goals
-
-    child_goals._DB_CACHE.clear()
-    started = time.monotonic()
-    try:
-        child_goals.GoalManager(session_id).pause(reason="operator-paused")
-        state = child_goals.load_goal_authoritative(session_id)
-        result_queue.put((state.status if state else None, time.monotonic() - started, None))
-    except Exception as exc:
-        result_queue.put((None, time.monotonic() - started, str(exc)))
-
-
-def _clear_goal_in_child_process(session_id: str, ready, proceed, result_queue) -> None:
-    """Clear through the exported persistence helper in another process."""
-    from hermes_cli.goals import clear_goal, load_goal_authoritative
-
-    ready.put(True)
-    assert proceed.wait(10)
-    clear_goal(session_id)
-    state = load_goal_authoritative(session_id)
-    result_queue.put(state.status if state is not None else None)
-
-
-def _hold_goal_lock_in_child_process(session_id: str, ready, release) -> None:
-    """Hold one real cross-process session lock until the parent releases it."""
-    from hermes_cli.goals import goal_state_transaction
-
-    with goal_state_transaction(session_id):
-        ready.put(True)
-        assert release.wait(30)
-
-
-def test_status_returns_a_session_scoped_goal_readback_receipt(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-    _call(
-        "set",
-        session_id="session-current",
-        condition="Continue until report.json exists",
-        max_turns=3,
-        acceptance_evidence=[
-            {
-                "kind": "file_exists",
-                "locator": "report.json",
-                "assertion": "exists",
-            }
-        ],
-    )
-
-    raw = handle_function_call(
-        "goal_control",
-        {"action": "status"},
-        session_id="session-current",
-        tool_call_id="call-status-1",
-        skip_pre_tool_call_hook=True,
-        skip_tool_request_middleware=True,
-        skip_tool_execution_middleware=True,
-    )
-    result = json.loads(raw)
-
-    receipt = result["goal_readback"]
-    receipt_prefix = "goal_control:session-current:"
-    receipt_id = receipt.pop("receipt_id")
-    assert receipt_id.startswith(receipt_prefix)
-    assert receipt_id[len(receipt_prefix):]
-    assert receipt == {
-        "kind": "goal-status-readback",
-        "session_id": "session-current",
-        "active": True,
-        "condition": "Continue until report.json exists",
-        "goal": {
-            "exists": True,
-            "status": "active",
-            "condition": "Continue until report.json exists",
-        },
-        "observed_via": "goal_control",
-        "acceptance_evidence": [
-            {
-                "kind": "file_exists",
-                "locator": "report.json",
-                "assertion": "exists",
-            }
-        ],
-    }
-
-
-def test_unchanged_goal_status_reuses_persisted_receipt_token(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-    set_result = _call("set", session_id="session-current", condition="Keep going")
-    status_result = _call("status", session_id="session-current")
-
-    set_id = set_result["goal_readback"]["receipt_id"]
-    assert status_result["goal_readback"]["receipt_id"] == set_id
-    persisted = goals.load_goal_authoritative("session-current")
-    assert persisted is not None
-    assert persisted.receipt_token == set_id.rsplit(":", 1)[1]
-
-
-@pytest.mark.parametrize(
-    "condition,evidence",
-    [
-        (
-            "Continue until report.json exists",
-            [{"kind": "invented", "locator": "report.json", "assertion": "exists"}],
-        ),
-        (
-            "Continue until report.json exists",
-            [{"kind": "file_exists", "locator": "report.json", "assertion": "passes"}],
-        ),
-        (
-            "Continue until report.json exists",
-            [{"kind": "file_exists", "locator": "", "assertion": "exists"}],
-        ),
-        (
-            "Continue until the run completes",
-            [{"kind": "file_exists", "locator": "report.json", "assertion": "exists"}],
-        ),
-    ],
-)
-def test_set_rejects_invalid_acceptance_evidence(
-    tmp_path, monkeypatch, condition, evidence
-):
-    _home(tmp_path, monkeypatch)
-
-    result = _call(
-        "set",
-        session_id="session-current",
-        condition=condition,
-        acceptance_evidence=evidence,
-    )
-
-    assert result["success"] is False
-    assert result["error"]["code"] == "invalid_acceptance_evidence"
-    assert goals.load_goal("session-current") is None
-
-
 def _home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    import hermes_constants
-    import hermes_state
-
-    monkeypatch.setattr(hermes_constants, "get_hermes_home_override", lambda: str(home))
-    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
     goals._DB_CACHE.clear()
     goals._DB_BOOTSTRAP_INFLIGHT.clear()
     goals._GOAL_GENERATIONS.clear()
@@ -219,7 +55,7 @@ def test_set_returns_authoritative_persisted_current_session_state(tmp_path, mon
         "condition": "Run the focused checks",
         "turns_used": 0,
         "max_turns": 7,
-        "revision": None,
+        "revision": 1,
         "stop_reason": None,
         "error_reason": None,
     }
@@ -239,19 +75,6 @@ def test_goal_control_is_exposed_on_the_core_model_surface(tmp_path, monkeypatch
 
     names = {item["function"]["name"] for item in definitions}
     assert "goal_control" in names
-
-
-def test_goal_control_can_be_enabled_as_a_narrow_toolset(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-
-    definitions = get_tool_definitions(
-        enabled_toolsets=["goal"],
-        quiet_mode=True,
-        skip_tool_search_assembly=True,
-    )
-
-    names = {item["function"]["name"] for item in definitions}
-    assert names == {"goal_control"}
 
 
 def test_set_uses_configured_goal_budget_when_omitted(tmp_path, monkeypatch):
@@ -334,21 +157,25 @@ def test_cross_session_argument_is_rejected_without_mutation(tmp_path, monkeypat
     assert goals.load_goal("session-other") is None
 
 
-def test_pause_resume_clear_and_repeats_return_persisted_state(tmp_path, monkeypatch):
+def test_pause_resume_and_clear_return_persisted_state(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     _call("set", session_id="session-current", condition="Keep going", max_turns=4)
 
-    for _ in range(2):
-        paused = _call("pause", session_id="session-current")
-        assert paused["success"] is True
-        assert paused["state"]["paused"] is True
-        assert paused["state"]["stop_reason"] == "model-paused"
+    paused = _call("pause", session_id="session-current")
+    assert paused["success"] is True
+    assert paused["state"]["paused"] is True
+    assert paused["state"]["stop_reason"] == "model-paused"
+    assert _call("pause", session_id="session-current")["error"]["code"] == (
+        "invalid_transition"
+    )
 
-    for _ in range(2):
-        resumed = _call("resume", session_id="session-current")
-        assert resumed["success"] is True
-        assert resumed["state"]["active"] is True
-        assert resumed["state"]["turns_used"] == 0
+    resumed = _call("resume", session_id="session-current")
+    assert resumed["success"] is True
+    assert resumed["state"]["active"] is True
+    assert resumed["state"]["turns_used"] == 0
+    assert _call("resume", session_id="session-current")["error"]["code"] == (
+        "invalid_transition"
+    )
 
     for _ in range(2):
         cleared = _call("clear", session_id="session-current")
@@ -450,259 +277,6 @@ def test_model_pause_updates_cached_cli_lifecycle_manager(tmp_path, monkeypatch)
     assert cli._pending_input.empty()
     assert cli._goal_manager.state.status == "paused"
     assert goals.load_goal(session_id).status == "paused"
-
-
-def test_stale_manager_refreshes_inside_the_mutation_lock(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-    session_id = "session-refresh-race"
-    controller = goals.GoalManager(session_id=session_id, default_max_turns=4)
-    controller.set("Keep going")
-    stale_manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
-
-    controller.pause(reason="model-paused")
-
-    def _unexpected_judge(*_args, **_kwargs):
-        raise AssertionError("a stale active goal reached the judge")
-
-    monkeypatch.setattr(goals, "judge_goal", _unexpected_judge)
-    decision = stale_manager.evaluate_after_turn("work completed this turn")
-
-    assert decision["verdict"] == "inactive"
-    assert decision["status"] == "paused"
-    assert stale_manager.state is not None
-    assert stale_manager.state.status == "paused"
-
-
-def test_stale_manager_cannot_overwrite_pause_from_another_process(tmp_path, monkeypatch):
-    home = _home(tmp_path, monkeypatch)
-    session_id = "session-cross-process-pause"
-    stale_manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
-    stale_manager.set("Keep going")
-    assert goals.load_goal_authoritative(session_id).status == "active"
-    assert (home / "state.db").exists()
-
-    context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue()
-    child = context.Process(
-        target=_pause_goal_in_child_process,
-        args=(session_id, result_queue),
-    )
-    child.start()
-    try:
-        child.join(90)
-        assert child.exitcode == 0
-        result = result_queue.get(timeout=10)
-    finally:
-        if child.is_alive():
-            child.terminate()
-            child.join(10)
-    assert result == (str(home), True, "active", "paused")
-
-    with patch(
-        "hermes_cli.goals.judge_goal",
-        return_value=("continue", "keep going", False, None, False),
-    ):
-        decision = stale_manager.evaluate_after_turn("work completed this turn")
-
-    persisted = goals.load_goal_authoritative(session_id)
-    assert decision["verdict"] == "inactive"
-    assert decision["status"] == "paused"
-    assert persisted is not None
-    assert persisted.status == "paused"
-    assert persisted.turns_used == 0
-
-
-def test_clear_from_another_process_wins_race_with_active_judge(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-    session_id = "session-cross-process-clear"
-    manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
-    manager.set("Keep going")
-
-    context = multiprocessing.get_context("spawn")
-    ready = context.Queue()
-    proceed = context.Event()
-    result_queue = context.Queue()
-    child_holder = {}
-
-    def judge_while_child_clears(*_args, **_kwargs):
-        child = context.Process(
-            target=_clear_goal_in_child_process,
-            args=(session_id, ready, proceed, result_queue),
-        )
-        child_holder["process"] = child
-        child.start()
-        assert ready.get(timeout=30) is True
-        proceed.set()
-        # Clear must complete during the judge call. The evaluator then sees
-        # the rotated receipt token and discards its stale continuation.
-        time.sleep(1)
-        return ("continue", "keep going", False, None, False)
-
-    with patch("hermes_cli.goals.judge_goal", side_effect=judge_while_child_clears):
-        decision = manager.evaluate_after_turn("work completed this turn")
-
-    child = child_holder["process"]
-    try:
-        child.join(90)
-        assert child.exitcode == 0
-        assert result_queue.get(timeout=10) == "cleared"
-    finally:
-        if child.is_alive():
-            child.terminate()
-            child.join(10)
-
-    assert decision["verdict"] == "inactive"
-    assert decision["should_continue"] is False
-    assert decision["reason"] == "goal changed during evaluation"
-    persisted = goals.load_goal_authoritative(session_id)
-    assert persisted is not None
-    assert persisted.status == "cleared"
-
-
-def test_pause_from_another_process_completes_while_judge_is_blocked(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-    session_id = "session-cross-process-pause-during-judge"
-    manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
-    manager.set("Keep going")
-
-    judge_started = threading.Event()
-    release_judge = threading.Event()
-
-    def blocked_judge(*_args, **_kwargs):
-        judge_started.set()
-        assert release_judge.wait(15), "test did not release the blocked judge"
-        return ("continue", "keep going", False, None, False)
-
-    context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue()
-    evaluating = threading.Thread(
-        target=manager.evaluate_after_turn,
-        args=("work completed this turn",),
-        daemon=True,
-    )
-    child = context.Process(
-        target=_pause_goal_while_evaluation_runs,
-        args=(session_id, result_queue),
-    )
-
-    with patch("hermes_cli.goals.judge_goal", side_effect=blocked_judge):
-        evaluating.start()
-        assert judge_started.wait(3), "goal judge did not start"
-        child.start()
-        try:
-            try:
-                status, elapsed, error = result_queue.get(timeout=10)
-            except queue.Empty:
-                pytest.fail("operator pause blocked behind the slow goal judge")
-        finally:
-            release_judge.set()
-            evaluating.join(20)
-            child.join(20)
-            if child.is_alive():
-                child.terminate()
-                child.join(10)
-
-    assert child.exitcode == 0
-    assert error is None
-    assert status == "paused"
-    assert elapsed < 3
-    persisted = goals.load_goal_authoritative(session_id)
-    assert persisted is not None
-    assert persisted.status == "paused"
-
-
-def test_clear_from_another_process_survives_blocked_gate_result(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-    session_id = "session-cross-process-clear-during-gate"
-    manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
-    manager.set("Keep going")
-    manager.add_gate("blocked gate")
-
-    gate_started = threading.Event()
-    release_gate = threading.Event()
-
-    def blocked_gate(*_args, **_kwargs):
-        gate_started.set()
-        assert release_gate.wait(15), "test did not release the blocked gate"
-        return (False, 1, "still failing")
-
-    context = multiprocessing.get_context("spawn")
-    ready = context.Queue()
-    proceed = context.Event()
-    result_queue = context.Queue()
-    decisions = []
-    evaluating = threading.Thread(
-        target=lambda: decisions.append(manager.evaluate_after_turn("work completed this turn")),
-        daemon=True,
-    )
-    child = context.Process(
-        target=_clear_goal_in_child_process,
-        args=(session_id, ready, proceed, result_queue),
-    )
-
-    with patch("hermes_cli.goals.run_gate", side_effect=blocked_gate):
-        evaluating.start()
-        assert gate_started.wait(3), "goal gate did not start"
-        child.start()
-        assert ready.get(timeout=10) is True
-        proceed.set()
-        try:
-            assert result_queue.get(timeout=10) == "cleared"
-        finally:
-            release_gate.set()
-            evaluating.join(20)
-            child.join(20)
-            if child.is_alive():
-                child.terminate()
-                child.join(10)
-
-    assert child.exitcode == 0
-    assert decisions[0]["verdict"] == "inactive"
-    persisted = goals.load_goal_authoritative(session_id)
-    assert persisted is not None
-    assert persisted.status == "cleared"
-
-
-def test_migration_waits_for_cross_process_child_session_lock(tmp_path, monkeypatch):
-    _home(tmp_path, monkeypatch)
-    parent_session = "migration-parent"
-    child_session = "migration-child"
-    goals.GoalManager(parent_session).set("Keep migrating")
-
-    context = multiprocessing.get_context("spawn")
-    ready = context.Queue()
-    release = context.Event()
-    child = context.Process(
-        target=_hold_goal_lock_in_child_process,
-        args=(child_session, ready, release),
-    )
-    child.start()
-    assert ready.get(timeout=30) is True
-
-    result = {}
-    migration = threading.Thread(
-        target=lambda: result.setdefault(
-            "migrated",
-            goals.migrate_goal_to_session(parent_session, child_session),
-        )
-    )
-    migration.start()
-    time.sleep(0.5)
-    try:
-        assert migration.is_alive(), "migration bypassed the child-session process lock"
-    finally:
-        release.set()
-        migration.join(30)
-        child.join(30)
-        if child.is_alive():
-            child.terminate()
-            child.join(10)
-
-    assert not migration.is_alive()
-    assert child.exitcode == 0
-    assert result["migrated"] is True
-    migrated = goals.load_goal_authoritative(child_session)
-    assert migrated is not None and migrated.goal == "Keep migrating"
 
 
 def test_resume_does_not_reactivate_cleared_goal(tmp_path, monkeypatch):
@@ -911,7 +485,7 @@ def test_pause_does_not_resurrect_concurrently_cleared_goal(tmp_path, monkeypatc
     result = _call("pause", session_id="session-current")
 
     assert result["success"] is False
-    assert result["error"]["code"] == "concurrent_state_change"
+    assert result["error"]["code"] == "transition_conflict"
     assert goals.load_goal("session-current").to_json() == cleared.to_json()
 
 
@@ -944,7 +518,7 @@ def test_set_does_not_overwrite_concurrently_created_goal(tmp_path, monkeypatch)
     )
 
     assert result["success"] is False
-    assert result["error"]["code"] == "concurrent_state_change"
+    assert result["error"]["code"] == "mutation_conflict"
     assert goals.load_goal("session-current").to_json() == winner.to_json()
 
 
@@ -963,7 +537,7 @@ def test_failed_persistence_never_returns_success(tmp_path, monkeypatch):
     result = _call("set", session_id="session-current", condition="Must persist")
 
     assert result["success"] is False
-    assert result["error"]["code"] == "persistence_verification_failed"
+    assert result["error"]["code"] == "mutation_conflict"
 
 
 def test_dropped_budget_update_is_not_mistaken_for_success(tmp_path, monkeypatch):
@@ -991,7 +565,141 @@ def test_dropped_budget_update_is_not_mistaken_for_success(tmp_path, monkeypatch
     )
 
     assert result["success"] is False
-    assert result["error"]["code"] == "persistence_verification_failed"
+    assert result["error"]["code"] == "mutation_conflict"
+
+
+@pytest.mark.parametrize("action", ["set", "update", "pause", "resume", "clear"])
+def test_acknowledged_mutation_requires_exact_persisted_readback(
+    tmp_path, monkeypatch, action
+):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-current"
+    if action in {"update", "pause", "clear", "resume"}:
+        _call("set", session_id=session_id, condition="Original", max_turns=9)
+    if action == "resume":
+        _call("pause", session_id=session_id)
+
+    db = goals._get_session_db()
+    real_cas = db.compare_and_set_meta
+    drifted = False
+
+    def commit_then_drift(key, expected, replacement):
+        nonlocal drifted
+        committed = real_cas(key, expected, replacement)
+        if committed and not drifted:
+            drifted = True
+            independent = goals.GoalState.from_json(replacement)
+            independent.revision += 1
+            independent.last_reason = "independent post-write drift"
+            assert real_cas(key, replacement, independent.to_json()) is True
+        return committed
+
+    monkeypatch.setattr(db, "compare_and_set_meta", commit_then_drift)
+    kwargs = {"condition": "Updated", "max_turns": 2} if action in {"set", "update"} else {}
+    result = _call(action, session_id=session_id, **kwargs)
+
+    assert result["success"] is False
+    expected_code = (
+        "transition_conflict" if action in {"pause", "resume"} else "mutation_conflict"
+    )
+    assert result["error"]["code"] == expected_code
+    persisted = goals.load_goal_authoritative(session_id)
+    assert persisted.last_reason == "independent post-write drift"
+
+
+def test_update_cas_conflict_does_not_resurrect_concurrently_cleared_goal(
+    tmp_path, monkeypatch
+):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-current"
+    _call("set", session_id=session_id, condition="Original", max_turns=9)
+    db = goals._get_session_db()
+    real_cas = db.compare_and_set_meta
+    competed = False
+
+    def clear_before_first_candidate(key, expected, replacement):
+        nonlocal competed
+        if not competed:
+            competed = True
+            current = goals.GoalState.from_json(db.get_meta(key))
+            current.status = "cleared"
+            current.revision += 1
+            current.last_reason = "independent clear"
+            assert real_cas(key, expected, current.to_json()) is True
+        return real_cas(key, expected, replacement)
+
+    monkeypatch.setattr(db, "compare_and_set_meta", clear_before_first_candidate)
+    result = _call(
+        "update",
+        session_id=session_id,
+        condition="Must not resurrect",
+        max_turns=2,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "mutation_conflict"
+    persisted = goals.load_goal_authoritative(session_id)
+    assert persisted.status == "cleared"
+    assert persisted.last_reason == "independent clear"
+
+
+@pytest.mark.parametrize("action", ["pause", "resume"])
+def test_pause_resume_is_bound_to_the_initial_authoritative_snapshot(
+    tmp_path, monkeypatch, action
+):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-current"
+    _call("set", session_id=session_id, condition="Original", max_turns=9)
+    if action == "resume":
+        _call("pause", session_id=session_id)
+
+    original_transition = getattr(goals.GoalManager, action)
+
+    def replace_before_transition(self, *args, **kwargs):
+        replacement = goals.GoalManager(session_id)
+        replacement.set("Independent replacement", max_turns=7)
+        if action == "resume":
+            replacement.pause("independent pause")
+        return original_transition(self, *args, **kwargs)
+
+    monkeypatch.setattr(goals.GoalManager, action, replace_before_transition)
+    result = _call(action, session_id=session_id)
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "transition_conflict"
+    persisted = goals.load_goal_authoritative(session_id)
+    assert persisted.goal == "Independent replacement"
+    assert persisted.status == ("paused" if action == "resume" else "active")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("goal", "   "),
+        ("status", "unknown"),
+        ("revision", -1),
+        ("turns_used", -1),
+        ("max_turns", 0),
+        ("consecutive_transport_failures", -1),
+        ("consecutive_parse_failures", -1),
+    ],
+)
+def test_semantically_invalid_persisted_goal_is_rejected(
+    tmp_path, monkeypatch, field, value
+):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-current"
+    payload = json.loads(goals.GoalState(goal="Valid goal").to_json())
+    payload[field] = value
+    goals._get_session_db().set_meta(
+        goals._meta_key(session_id), json.dumps(payload)
+    )
+
+    with pytest.raises(goals.GoalPersistenceError):
+        goals.load_goal_authoritative(session_id)
+    result = _call("status", session_id=session_id)
+    assert result["success"] is False
+    assert result["error"]["code"] == "persistence_unavailable"
 
 
 def test_slow_initialization_fails_closed_instead_of_claiming_success(
