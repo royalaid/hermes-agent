@@ -24,7 +24,11 @@ from gateway.kanban_watchers_common import (
     _to_thread_process_service,
     logger,
 )
-from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
+from gateway.kanban_watchers_notifier import (
+    _KanbanNotification,
+    _kanban_db_file_signature,
+    _notifier_collect,
+)
 from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
@@ -79,6 +83,7 @@ class GatewayKanbanWatchersMixin:
         self._kanban_sub_fail_counts = sub_fail_counts
         notifier_profile = getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name()
         self._kanban_notifier_profile = notifier_profile
+        poll_cache: dict[str, tuple[Any, Any]] = {}
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -99,6 +104,7 @@ class GatewayKanbanWatchersMixin:
                 deliveries = await asyncio.to_thread(
                     _notifier_collect, self, _kb,
                     notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
+                    poll_cache=poll_cache, file_signature=_kanban_db_file_signature,
                 )
                 for d in deliveries:
                     await _KanbanNotification(
