@@ -10,6 +10,7 @@ import {
   runtimeForExactSessionBinding,
   setMainSessionBinding
 } from '@/store/session-binding'
+import type { SessionTile } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
 
 const mocks = vi.hoisted(() => ({
@@ -20,7 +21,8 @@ const mocks = vi.hoisted(() => ({
   setActiveSessionId: vi.fn(),
   setAwaitingResponse: vi.fn(),
   setBusy: vi.fn(),
-  setMessages: vi.fn()
+  setMessages: vi.fn(),
+  setSelectedStoredSessionId: vi.fn()
 }))
 
 vi.mock('../open-session', () => ({ openSession: (...args: unknown[]) => mocks.openSession(...args) }))
@@ -30,7 +32,8 @@ vi.mock('@/store/session', async importOriginal => ({
   setActiveSessionId: (...args: unknown[]) => mocks.setActiveSessionId(...args),
   setAwaitingResponse: (...args: unknown[]) => mocks.setAwaitingResponse(...args),
   setBusy: (...args: unknown[]) => mocks.setBusy(...args),
-  setMessages: (...args: unknown[]) => mocks.setMessages(...args)
+  setMessages: (...args: unknown[]) => mocks.setMessages(...args),
+  setSelectedStoredSessionId: (...args: unknown[]) => mocks.setSelectedStoredSessionId(...args)
 }))
 vi.mock('@/store/session-states', async importOriginal => ({
   ...(await importOriginal<typeof SessionStatesStore>()),
@@ -100,6 +103,24 @@ describe('openExactSidebarSession', () => {
     expect(mocks.requestSessionResume).not.toHaveBeenCalled()
   })
 
+  it('releases a competing same-id main surface before cold-opening the clicked owner in a tab', () => {
+    const bindingA = normalizeSessionBinding({ storedSessionId: 'shared-id', ownerRoute: routeA })!
+    const bindingB = normalizeSessionBinding({ storedSessionId: 'shared-id', ownerRoute: routeB })!
+    const generation = claimSessionBinding(bindingA)
+
+    setMainSessionBinding(bindingA, $activeGatewayProfile.get())
+    $selectedStoredSessionId.set('shared-id')
+    $activeSessionId.set('runtime-a')
+    bindRuntimeToSession(bindingA, 'runtime-a', generation)
+
+    expect(openExactSidebarSession({ binding: bindingB, navigate, placement: 'tab' })).toBe('rebound-cold')
+    expect(mocks.setSelectedStoredSessionId).toHaveBeenCalledWith(null)
+    expect(mocks.openSession).toHaveBeenCalledWith('shared-id', navigate, 'tab', {
+      ownerRoute: bindingB.ownerRoute,
+      workspaceMode: 'sessions'
+    })
+  })
+
   it('fences a late A completion after the same-id surface is rebound to B', () => {
     const bindingA = normalizeSessionBinding({ storedSessionId: 'shared-id', ownerRoute: routeA })!
     const bindingB = normalizeSessionBinding({ storedSessionId: 'shared-id', ownerRoute: routeB })!
@@ -114,6 +135,25 @@ describe('openExactSidebarSession', () => {
     expect(bindRuntimeToSession(bindingB, 'runtime-b')).toBe(true)
     expect(runtimeForExactSessionBinding(bindingA)).toBeNull()
     expect(runtimeForExactSessionBinding(bindingB)).toBe('runtime-b')
+  })
+
+  it('clears stale state from a legacy tile whose owner cannot be resolved before cold-opening B', () => {
+    const binding = normalizeSessionBinding({ storedSessionId: 'shared-id', ownerRoute: routeB })!
+    $sessionTiles.set([
+      {
+        storedSessionId: 'shared-id',
+        ownerRoute: { profile: 'legacy-only' } as unknown as SessionTile['ownerRoute'],
+        runtimeId: 'runtime-legacy'
+      }
+    ])
+
+    expect(openExactSidebarSession({ binding, navigate, placement: 'tab' })).toBe('rebound-cold')
+    expect(mocks.dropSessionState).toHaveBeenCalledWith('runtime-legacy')
+    expect(mocks.patchSessionTile).toHaveBeenCalledWith('shared-id', {
+      error: undefined,
+      ownerRoute: binding.ownerRoute,
+      runtimeId: undefined
+    })
   })
 
   it('commits main ownership and explicitly cold-resumes through the clicked owner', () => {

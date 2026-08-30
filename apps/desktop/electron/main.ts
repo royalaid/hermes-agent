@@ -346,8 +346,10 @@ import {
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  normalizeSessionWindowOwnerRoute,
   SESSION_WINDOW_MIN_HEIGHT,
-  SESSION_WINDOW_MIN_WIDTH
+  SESSION_WINDOW_MIN_WIDTH,
+  type SessionWindowOwnerRoute
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
@@ -13127,7 +13129,7 @@ function focusWindow(win) {
   win.focus()
 }
 
-function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
+function spawnSecondaryWindow({ sessionId, ownerRoute, watch }: { sessionId?: string; ownerRoute?: unknown; watch?: boolean } = {}) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -13189,6 +13191,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     win,
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
+      ownerRoute,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
       watch
     }),
@@ -13199,8 +13202,11 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 }
 
 // Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId, { watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, watch }))
+function createSessionWindow(
+  sessionId,
+  { ownerRoute, watch = false }: { ownerRoute?: SessionWindowOwnerRoute; watch?: boolean } = {}
+) {
+  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ ownerRoute, sessionId, watch }), ownerRoute)
 }
 
 // Popped-out in-app Browser: same webview + address bar as a docked Browser
@@ -14687,7 +14693,10 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
     return { ok: false, error: 'invalid-session-id' }
   }
 
-  createSessionWindow(sessionId.trim(), { watch: opts?.watch === true })
+  createSessionWindow(sessionId.trim(), {
+    ownerRoute: normalizeSessionWindowOwnerRoute(opts?.ownerRoute),
+    watch: opts?.watch === true
+  })
 
   return { ok: true }
 })

@@ -1,4 +1,5 @@
 import { notifyError } from './notifications'
+import type { SessionOwnerRoute } from './session-request-router'
 
 // Window flag set by the Electron main process when it opens a standalone
 // session window (see electron/main.ts buildSessionWindowUrl). It rides in the
@@ -25,6 +26,20 @@ export function isSecondaryWindow(): boolean {
   secondaryWindowCache = result
 
   return result
+}
+
+export function secondarySessionOwnerRoute(search = window.location.search): SessionOwnerRoute | undefined {
+  const params = new URLSearchParams(search)
+  const connectionId = params.get('ownerConnectionId')?.trim()
+  const profile = params.get('ownerProfile')?.trim()
+
+  if (!connectionId || !profile) {
+    return undefined
+  }
+
+  const targetProfile = params.get('ownerTargetProfile')?.trim()
+
+  return { connectionId, profile, ...(targetProfile ? { targetProfile } : {}) }
 }
 
 let watchWindowCache: boolean | null = null
@@ -189,7 +204,10 @@ async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage:
 // Open (or focus) a standalone OS window for a single chat session. No-ops
 // gracefully outside Electron so callers can wire it unconditionally.
 // `watch: true` opens a spectator window (lazy resume, live-mirror stream).
-export async function openSessionInNewWindow(sessionId: string, opts?: { watch?: boolean }): Promise<void> {
+export async function openSessionInNewWindow(
+  sessionId: string,
+  opts?: { ownerRoute?: SessionOwnerRoute; watch?: boolean }
+): Promise<void> {
   if (!sessionId || !canOpenSessionWindow()) {
     return
   }
