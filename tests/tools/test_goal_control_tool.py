@@ -118,6 +118,11 @@ def test_status_returns_a_session_scoped_goal_readback_receipt(tmp_path, monkeyp
         "session_id": "session-current",
         "active": True,
         "condition": "Continue until report.json exists",
+        "goal": {
+            "exists": True,
+            "status": "active",
+            "condition": "Continue until report.json exists",
+        },
         "observed_via": "goal_control",
         "acceptance_evidence": [
             {

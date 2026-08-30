@@ -12983,6 +12983,17 @@ def _plan_goal_compression_recovery(
     )
 
 
+def _goal_status_payload(session_id: str, text: str) -> dict:
+    """Build a live update from the same persisted projection as the tool."""
+    from hermes_cli.goals import goal_state_payload, load_goal_authoritative
+
+    return {
+        "kind": "goal",
+        "text": text,
+        "goal": goal_state_payload(load_goal_authoritative(session_id)),
+    }
+
+
 # Captured at import time. Several _run_prompt_submit tests monkeypatch
 # threading.Thread with a stub that runs the target synchronously to keep the
 # turn deterministic. This ticker's loop only exits once the caller sets `stop`
@@ -13739,7 +13750,10 @@ def _run_prompt_submit(
                     _emit(
                         "status.update",
                         sid,
-                        {"kind": "goal", "text": recovery_notice},
+                        _goal_status_payload(
+                            session.get("session_key") or sid,
+                            recovery_notice,
+                        ),
                     )
                 if recovery_prompt:
                     goal_followup = recovery_prompt
@@ -13785,7 +13799,7 @@ def _run_prompt_submit(
                                 _emit(
                                     "status.update",
                                     sid,
-                                    {"kind": "goal", "text": verdict_msg},
+                                    _goal_status_payload(sid_key, verdict_msg),
                                 )
                             if decision.get("should_continue"):
                                 cont_prompt = decision.get("continuation_prompt") or ""

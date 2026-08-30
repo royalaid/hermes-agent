@@ -11,6 +11,7 @@ uses to render a system line and fire the kickoff prompt.
 from __future__ import annotations
 
 import importlib
+import json
 import threading
 import types
 from pathlib import Path
@@ -411,6 +412,74 @@ def test_exhaustion_without_active_goal_keeps_error_only_behavior(server):
     assert prompt is None
     assert notice is None
     assert server._GOAL_COMPRESSION_RECOVERY_ATTEMPTS not in session
+
+
+def test_model_goal_control_event_projects_exact_persisted_condition(
+    server, turn_env, monkeypatch
+):
+    """Model-set goals must reach Desktop as structured session-scoped truth.
+
+    ``goal_control`` persists the exact condition without passing through the
+    slash-command notice that normally seeds the Desktop goal title. The first
+    live projection is therefore the post-turn judge event. Its prose describes
+    progress, not the goal, so the event must also carry the authoritative
+    persisted readback for this session.
+    """
+    from hermes_cli.goals import GoalManager, load_goal_authoritative
+    from tools.goal_control_tool import goal_control_tool
+
+    session_key = "goal-control-projection"
+    condition = "Ship the exact backend-to-Desktop projection"
+    model_receipt = {}
+
+    def run_conversation(_message, **_kwargs):
+        model_receipt.update(
+            json.loads(
+                goal_control_tool(
+                    action="set",
+                    condition=condition,
+                    session_id=session_key,
+                )
+            )["goal_readback"]
+        )
+        return {"final_response": "Goal persisted."}
+
+    monkeypatch.setattr(
+        GoalManager,
+        "evaluate_after_turn",
+        lambda self, response, **kwargs: {
+            "message": "↻ Continuing toward goal (1/20): more work remains",
+            "should_continue": False,
+        },
+    )
+    agent = types.SimpleNamespace(
+        session_id=session_key,
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+    )
+    session = _turn_session(agent, session_key)
+
+    server._run_prompt_submit("rid", "desktop-runtime", session, "set a goal")
+
+    persisted = load_goal_authoritative(session_key)
+    assert persisted is not None
+    assert persisted.goal == condition
+
+    goal_events = [
+        (sid, payload)
+        for event, sid, payload in turn_env
+        if event == "status.update" and payload.get("kind") == "goal"
+    ]
+    assert len(goal_events) == 1
+    sid, payload = goal_events[0]
+    assert sid == "desktop-runtime"
+    expected_goal = {
+        "exists": True,
+        "status": "active",
+        "condition": condition,
+    }
+    assert model_receipt["goal"] == expected_goal
+    assert payload["goal"] == expected_goal
 
 
 def test_new_goal_does_not_inherit_previous_goal_recovery_attempt(server):
