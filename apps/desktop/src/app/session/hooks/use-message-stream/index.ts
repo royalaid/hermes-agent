@@ -58,6 +58,7 @@ interface QueuedStreamDelta {
   occurredAt: number
   text: string
   type: 'assistant' | 'reasoning'
+  sourceId?: string
 }
 
 // Date.now() alone can collide when an interim seal and the next segment's
@@ -223,7 +224,7 @@ export function useMessageStream({
             (next, delta) =>
               delta.type === 'assistant'
                 ? dedupeGeneratedImageEchoesInParts(appendAssistantTextPart(next, delta.text, delta.occurredAt))
-                : appendReasoningPart(next, delta.text, delta.occurredAt),
+                : appendReasoningPart(next, delta.text, delta.occurredAt, delta.sourceId),
             parts
           )
 
@@ -330,7 +331,7 @@ export function useMessageStream({
   }, [flushQueuedDeltas])
 
   const queueDelta = useCallback(
-    (sessionId: string, key: 'assistant' | 'reasoning', delta: string, occurredAt = Date.now() / 1000) => {
+    (sessionId: string, key: 'assistant' | 'reasoning', delta: string, occurredAt = Date.now() / 1000, sourceId?: string) => {
       if (!delta) {
         return
       }
@@ -338,10 +339,10 @@ export function useMessageStream({
       const queued = queuedDeltasRef.current.get(sessionId) ?? []
       const tail = queued.at(-1)
 
-      if (tail?.type === key) {
+      if (tail?.type === key && tail.sourceId === sourceId) {
         tail.text += delta
       } else {
-        queued.push({ occurredAt, text: delta, type: key })
+        queued.push({ occurredAt, text: delta, type: key, ...(sourceId ? { sourceId } : {}) })
       }
 
       queuedDeltasRef.current.set(sessionId, queued)
@@ -409,13 +410,13 @@ export function useMessageStream({
   )
 
   const appendReasoningDelta = useCallback(
-    (sessionId: string, delta: string, replace = false, occurredAt = Date.now() / 1000) => {
+    (sessionId: string, delta: string, replace = false, occurredAt = Date.now() / 1000, sourceId?: string) => {
       if (!delta) {
         return
       }
 
       if (!replace) {
-        queueDelta(sessionId, 'reasoning', delta, occurredAt)
+        queueDelta(sessionId, 'reasoning', delta, occurredAt, sourceId)
 
         return
       }
@@ -430,12 +431,12 @@ export function useMessageStream({
           }
 
           if (replace) {
-            return [...parts.filter(part => part.type !== 'reasoning'), reasoningPart(delta, occurredAt)]
+            return [...parts.filter(part => part.type !== 'reasoning'), reasoningPart(delta, occurredAt, sourceId)]
           }
 
-          return appendReasoningPart(parts, delta, occurredAt)
+          return appendReasoningPart(parts, delta, occurredAt, sourceId)
         },
-        () => [reasoningPart(delta, occurredAt)],
+        () => [reasoningPart(delta, occurredAt, sourceId)],
         {},
         occurredAt
       )
@@ -858,6 +859,29 @@ export function useMessageStream({
     [updateSessionState]
   )
 
+  const completeReasoningSource = useCallback(
+    (sessionId: string, sourceId: string, completedAt = Date.now() / 1000) => {
+      if (!sourceId) {return}
+      flushQueuedDeltas(sessionId)
+      updateSessionState(sessionId, state => ({
+        ...state,
+        messages: state.messages.map(message =>
+          message.id !== state.streamId
+            ? message
+            : {
+                ...message,
+                parts: message.parts.map(part =>
+                  part.type === 'reasoning' && part.sourceId === sourceId && part.completedAt === undefined
+                    ? { ...part, completedAt }
+                    : part
+                )
+              }
+        )
+      }))
+    },
+    [flushQueuedDeltas, updateSessionState]
+  )
+
   const handleGatewayEvent = useGatewayEventHandler({
     activeGatewayProfile,
     appendAssistantDelta,
@@ -866,6 +890,7 @@ export function useMessageStream({
     compactedTurnRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
+    completeReasoningSource,
     completeAssistantMessage,
     failAssistantMessage,
     flushQueuedDeltas,
