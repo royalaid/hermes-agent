@@ -2,8 +2,6 @@ import * as path from 'node:path'
 
 import { type TestInfo } from '@playwright/test'
 
-import { expect, test, type ElectronApplication, type Page } from './test'
-
 import {
   buildAppEnv,
   createSandbox,
@@ -11,12 +9,14 @@ import {
   type Sandbox,
   waitForAppReady,
   writeEnvFile,
-  writeMockProviderConfig,
+  writeMockProviderConfig
 } from './fixtures'
-import { MOCK_REPLY, startMockServer, type MockServer, type MockServerOptions } from './mock-server'
+import { MOCK_REPLY, type MockServer, type MockServerOptions, startMockServer } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
+import { type ElectronApplication, expect, type Page, test } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
+const ACTIVE_SURFACE = '[data-composer-target]:not([data-pane-hidden] [data-composer-target])'
 const SESSION_TITLE = 'E2E large persisted session'
 const EXPECTED_TEXT = 'E2E persisted user message 52'
 // The oldest seeded turn (HISTORY_TURNS[0]). The transcript first paints only
@@ -26,9 +26,10 @@ const EXPECTED_TEXT = 'E2E persisted user message 52'
 // oldest row means the baseline reflects the fully-mounted transcript.
 const OLDEST_SEEDED_TEXT = 'E2E persisted user message 0: audit the compatibility matrix'
 const BACKGROUND_PROMPT = 'E2E background inference must remain attached across resume'
+
 const HISTORY_TURNS = Array.from(
   { length: 27 },
-  (_, index) => `E2E persisted user message ${index * 2}: audit the compatibility matrix`,
+  (_, index) => `E2E persisted user message ${index * 2}: audit the compatibility matrix`
 )
 
 interface SeededFixture {
@@ -52,6 +53,7 @@ async function setupSeededDesktop(mockServer?: MockServerOptions): Promise<Seede
   writeEnvFile(sandbox.hermesHome)
 
   const builder = await RealSessionBuilder.start(sandbox.hermesHome)
+
   try {
     await builder.createSession({ title: SESSION_TITLE, turns: HISTORY_TURNS })
   } finally {
@@ -70,7 +72,7 @@ async function setupSeededDesktop(mockServer?: MockServerOptions): Promise<Seede
       await app.close().catch(() => undefined)
       await mock.close()
       sandbox.cleanup()
-    },
+    }
   }
 }
 
@@ -78,57 +80,59 @@ function sessionRow(page: Page) {
   return page.locator('[data-slot="sidebar"] button').filter({ hasText: SESSION_TITLE }).first()
 }
 
+function activeSurface(page: Page) {
+  return page.locator(ACTIVE_SURFACE).last()
+}
+
+function activeTranscript(page: Page) {
+  return activeSurface(page).locator('[data-slot="aui_thread-viewport"]')
+}
+
 async function openSeededSession(page: Page): Promise<void> {
   const row = sessionRow(page)
   await row.waitFor({ state: 'visible', timeout: 60_000 })
   await row.click()
-  await page.waitForFunction(
-    expected => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-    EXPECTED_TEXT,
-    { timeout: 30_000 },
-  )
+  await expect(activeTranscript(page)).toContainText(EXPECTED_TEXT, { timeout: 30_000 })
 }
 
 async function openNewSession(page: Page): Promise<void> {
   const button = page.locator('[data-slot="sidebar"] button').filter({ hasText: 'New session' }).first()
   await button.waitFor({ state: 'visible', timeout: 10_000 })
   await button.click()
-  await page.waitForFunction(
-    expected => !(document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-    EXPECTED_TEXT,
-    { timeout: 15_000 },
-  )
+  await expect(activeTranscript(page)).not.toContainText(EXPECTED_TEXT, { timeout: 15_000 })
 }
 
 async function submitPrompt(page: Page, prompt: string): Promise<void> {
-  const composer = page.locator('[contenteditable="true"]').first()
+  const composer = activeSurface(page).locator('[contenteditable="true"]').first()
   await composer.waitFor({ state: 'visible', timeout: 15_000 })
   await composer.click()
   await composer.type(prompt, { delay: 2 })
   await page.keyboard.press('Enter')
-  await page.waitForFunction(
-    expected => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-    prompt,
-    { timeout: 15_000 },
-  )
+  await expect(activeTranscript(page)).toContainText(prompt, { timeout: 15_000 })
 }
 
 async function startPaintObserver(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
+  await activeTranscript(page).evaluate(viewport => {
     const state = { bursts: 0, timeline: [] as Array<{ mutations: number; time: number }> }
+
     ;(window as Window & { __largeSessionPaints?: typeof state }).__largeSessionPaints = state
-    if (!viewport) return
 
     let additions = 0
     let flushTimer: ReturnType<typeof setTimeout> | undefined
     new MutationObserver(records => {
       additions += records.reduce(
         (count, record) => count + (record.type === 'childList' && record.addedNodes.length > 0 ? 1 : 0),
-        0,
+        0
       )
-      if (additions === 0) return
-      if (flushTimer) clearTimeout(flushTimer)
+
+      if (additions === 0) {
+        return
+      }
+
+      if (flushTimer) {
+        clearTimeout(flushTimer)
+      }
+
       flushTimer = setTimeout(() => {
         state.bursts += 1
         state.timeline.push({ mutations: additions, time: Date.now() })
@@ -139,8 +143,12 @@ async function startPaintObserver(page: Page): Promise<void> {
 }
 
 async function paintState(page: Page): Promise<PaintState> {
-  const state = await page.evaluate(() => (window as Window & { __largeSessionPaints?: PaintState }).__largeSessionPaints)
+  const state = await page.evaluate(
+    () => (window as Window & { __largeSessionPaints?: PaintState }).__largeSessionPaints
+  )
+
   expect(state, 'paint observer should attach to the thread viewport').toBeDefined()
+
   return state!
 }
 
@@ -158,32 +166,31 @@ async function assertComposerInsideViewport(page: Page): Promise<void> {
       surfaceFound: surfaceRect !== null,
       top: composerRect.top,
       viewportBottom: Math.min(window.innerHeight, surfaceRect?.bottom ?? window.innerHeight),
-      viewportTop: Math.max(0, surfaceRect?.top ?? 0),
+      viewportTop: Math.max(0, surfaceRect?.top ?? 0)
     }
   })
 
   expect(layout.surfaceFound, 'the active composer should belong to a chat surface').toBe(true)
   expect(layout.height, `composer should have non-zero height: ${JSON.stringify(layout)}`).toBeGreaterThan(0)
   expect(layout.top, `composer should start inside the viewport: ${JSON.stringify(layout)}`).toBeGreaterThanOrEqual(
-    layout.viewportTop,
+    layout.viewportTop
   )
   expect(layout.bottom, `composer should end inside the viewport: ${JSON.stringify(layout)}`).toBeLessThanOrEqual(
-    layout.viewportBottom,
+    layout.viewportBottom
   )
 }
 
 async function textNodeOccurrences(page: Page, expected: string): Promise<number> {
-  return page.evaluate(text => {
-    const viewport = document.querySelector('[data-slot="aui_thread-viewport"]')
-    if (!viewport) return 0
-
+  return activeTranscript(page).evaluate((viewport, text) => {
     const walker = document.createTreeWalker(viewport, NodeFilter.SHOW_TEXT)
     let count = 0
+
     while (walker.nextNode()) {
       if (walker.currentNode.textContent?.includes(text)) {
         count += 1
       }
     }
+
     return count
   }, expected)
 }
@@ -223,6 +230,7 @@ test.describe('large session resume', () => {
     await assertComposerInsideViewport(fixture.page)
   })
 
+  // eslint-disable-next-line no-empty-pattern -- Playwright requires destructured fixtures.
   test('cold resume of an unchanged session has one user row and bounded transcript paints', async ({}, testInfo) => {
     fixture = await setupSeededDesktop()
     await waitForAppReady(fixture, 120_000)
@@ -231,6 +239,7 @@ test.describe('large session resume', () => {
     await assertUnchangedResume(fixture.page, testInfo)
   })
 
+  // eslint-disable-next-line no-empty-pattern -- Playwright requires destructured fixtures.
   test('fast resume of an unchanged session has one user row and bounded transcript paints', async ({}, testInfo) => {
     // Known RED: a rapid warm resume rebuilds the transcript three times
     // (28 → 53 → 53 DOM additions) instead of the two-paint budget. Keep the
@@ -247,6 +256,7 @@ test.describe('large session resume', () => {
   })
 
   for (const resumeKind of ['fast', 'cold'] as const) {
+    // eslint-disable-next-line no-empty-pattern -- Playwright requires destructured fixtures.
     test(`${resumeKind} resume keeps background inference attached without duplicate messages`, async ({}, testInfo) => {
       fixture = await setupSeededDesktop({ holdFirstStreamForPrompt: BACKGROUND_PROMPT })
       await waitForAppReady(fixture, 120_000)
@@ -257,11 +267,7 @@ test.describe('large session resume', () => {
       // mount before taking the baseline so it reflects the full transcript —
       // otherwise a clipped baseline makes the backfilled rows look like
       // duplicates of the completed reply.
-      await fixture.page.waitForFunction(
-        expected => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-        OLDEST_SEEDED_TEXT,
-        { timeout: 30_000 },
-      )
+      await expect(activeTranscript(fixture.page)).toContainText(OLDEST_SEEDED_TEXT, { timeout: 30_000 })
       const initialMockReplyCount = await textNodeOccurrences(fixture.page, MOCK_REPLY)
       await submitPrompt(fixture.page, BACKGROUND_PROMPT)
       await fixture.mock.waitForHeldStream()
@@ -273,18 +279,20 @@ test.describe('large session resume', () => {
 
       await openSeededSession(fixture.page)
       fixture.mock.releaseHeldStream()
-      await fixture.page.waitForFunction(
-        expected => (document.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
-        MOCK_REPLY,
-        { timeout: 60_000 },
-      )
+      await expect(activeTranscript(fixture.page)).toContainText(MOCK_REPLY, { timeout: 60_000 })
       await fixture.page.waitForTimeout(300)
-      await fixture.page.screenshot({ path: testInfo.outputPath(`${resumeKind}-background-inference-resume.png`), fullPage: false })
+      await fixture.page.screenshot({
+        path: testInfo.outputPath(`${resumeKind}-background-inference-resume.png`),
+        fullPage: false
+      })
 
-      expect(await textNodeOccurrences(fixture.page, BACKGROUND_PROMPT), 'the running user prompt should appear once').toBe(1)
+      expect(
+        await textNodeOccurrences(fixture.page, BACKGROUND_PROMPT),
+        'the running user prompt should appear once'
+      ).toBe(1)
       expect(
         await textNodeOccurrences(fixture.page, MOCK_REPLY),
-        'the completed assistant reply should add exactly one transcript row',
+        'the completed assistant reply should add exactly one transcript row'
       ).toBe(initialMockReplyCount + 1)
     })
   }
