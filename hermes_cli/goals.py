@@ -40,6 +40,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -598,6 +599,9 @@ class GoalState:
     # Persist them with the goal so a later status call can return the exact
     # authoritative readback rather than reconstructing evidence in prose.
     acceptance_evidence: List[Dict[str, str]] = field(default_factory=list)
+    # Opaque state identity returned by model-callable readbacks. It is
+    # generated only by canonical persistence and rotates on each mutation.
+    receipt_token: Optional[str] = None
     # Optional structured completion contract (outcome / verification /
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
@@ -665,6 +669,11 @@ class GoalState:
                 for item in (data.get("acceptance_evidence") or [])
                 if isinstance(item, dict)
             ],
+            receipt_token=(
+                str(data["receipt_token"])
+                if re.fullmatch(r"[0-9a-f]{32}", str(data.get("receipt_token") or ""))
+                else None
+            ),
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
                 GoalGate.from_dict(g)
@@ -1026,6 +1035,7 @@ def _publish_goal_state(
         GoalState.from_json(expected_raw).revision if expected_raw is not None else 0
     )
     candidate.revision = expected_revision + 1
+    candidate.receipt_token = uuid.uuid4().hex
     replacement = candidate.to_json()
     try:
         committed = db.compare_and_set_meta(
@@ -1049,6 +1059,7 @@ def _publish_goal_state(
     if persisted_raw != replacement:
         raise GoalPostconditionError("persisted goal state changed after publication")
     state.revision = candidate.revision
+    state.receipt_token = candidate.receipt_token
     return replacement
 
 
