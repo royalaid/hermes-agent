@@ -241,11 +241,10 @@ export function acceptsSessionRuntimeSource(
     )
   }
 
-  // An untagged legacy event can establish the first owner when no competing
-  // binding exists. Once an owner is authoritative, only that exact runtime
-  // may continue using the legacy path; the active-runtime hint is retained
-  // for callers that need to prove the primary case explicitly.
-  return current ? current.runtimeId === runtime : legacyActive || !current
+  // An untagged legacy event can establish the first owner, continue on the
+  // bound runtime, or replace it when the caller proves this is the active
+  // primary source. Tagged events remain governed by the exact-owner branch.
+  return legacyActive || !current || current.runtimeId === runtime
 }
 
 export function invalidateSessionRuntimeBinding(storedSessionId: string): null | string {
