@@ -1,12 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { createClientSessionState } from '@/lib/chat-runtime'
 import {
+  $activeSessionId,
   $currentCwd,
   $selectedStoredSessionId,
   $workspaceCwdOwner,
   releaseWorkspaceCwdOwner,
+  setActiveSessionId,
   setCurrentCwd
 } from '@/store/session'
+import {
+  _resetSessionBindingsForTests,
+  bindRuntimeToSession,
+  claimSessionBinding,
+  normalizeSessionBinding
+} from '@/store/session-binding'
 
 import { handleSessionInfoEvent } from './session-info'
 import type { GatewayEventContext } from './types'
@@ -56,12 +65,16 @@ function sessionInfoEvent({
 
 describe('handleSessionInfoEvent workspace ownership', () => {
   beforeEach(() => {
+    _resetSessionBindingsForTests()
+    setActiveSessionId(null)
     $selectedStoredSessionId.set(null)
     $workspaceCwdOwner.set(null)
     setCurrentCwd('')
   })
 
   afterEach(() => {
+    _resetSessionBindingsForTests()
+    setActiveSessionId(null)
     $selectedStoredSessionId.set(null)
     $workspaceCwdOwner.set(null)
     setCurrentCwd('')
@@ -125,5 +138,39 @@ describe('handleSessionInfoEvent workspace ownership', () => {
       'shared-id',
       { connectionId: 'source-a', profile: 'default' }
     )
+  })
+
+  it("does not let owner A's stale rebuilt-runtime info capture owner B's main pane", () => {
+    const ownerB = normalizeSessionBinding({
+      ownerRoute: { connectionId: 'source-b', profile: 'default' },
+      storedSessionId: 'shared-id'
+    })!
+
+    claimSessionBinding(ownerB)
+    bindRuntimeToSession(ownerB, 'runtime-b')
+    setActiveSessionId('runtime-b')
+    $selectedStoredSessionId.set('shared-id')
+    setCurrentCwd('/repo/b')
+
+    const ctx = sessionInfoEvent({
+      activeSessionId: 'runtime-b',
+      connectionId: 'source-a',
+      cwd: '/repo/a',
+      explicitSid: 'runtime-a-rebuilt',
+      storedSessionId: 'shared-id'
+    })
+
+    ctx.deps.sessionStateByRuntimeIdRef.current.set('runtime-b', {
+      ...createClientSessionState('shared-id'),
+      awaitingResponse: false,
+      busy: false,
+      streamId: null
+    })
+
+    handleSessionInfoEvent(ctx)
+
+    expect($activeSessionId.get()).toBe('runtime-b')
+    expect(ctx.deps.activeSessionIdRef.current).toBe('runtime-b')
+    expect($currentCwd.get()).toBe('/repo/b')
   })
 })

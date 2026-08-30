@@ -25,6 +25,8 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import { acceptsSessionRuntimeSource } from '@/store/session-binding'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import { reportInstallMethodWarning } from '@/store/updates'
 
 import { finalizeInterruptedMessages } from '../../use-prompt-actions/rewind'
@@ -92,7 +94,7 @@ function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined
  * keeping the durable selection untouched. A live turn on the old runtime
  * (overlap window during a manual switch) refuses the adoption.
  */
-function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
+function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext, sourceOwner?: SessionOwnerRoute): boolean {
   const { deps, explicitSid, isActiveEvent, payload } = ctx
 
   if (!explicitSid || isActiveEvent || typeof payload?.stored_session_id !== 'string') {
@@ -105,6 +107,10 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
   // persisted, so it always names one; an unnamed payload has no lineage to
   // match and must not capture the pane's active runtime id.
   if (!selected || !sessionInfoDescribesSelectedSession(payload.stored_session_id, false)) {
+    return false
+  }
+
+  if (!acceptsSessionRuntimeSource(payload.stored_session_id, explicitSid, sourceOwner)) {
     return false
   }
 
@@ -148,7 +154,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // whether this event is the rebuilt runtime announcing itself for the
     // conversation already on screen — if so, re-bind the pane so every
     // subsequent isActiveEvent gate keeps matching (#93942 scenario B).
-    const rebound = maybeRebindPaneToRebuiltRuntime(ctx)
+    const rebound = maybeRebindPaneToRebuiltRuntime(ctx, sourceOwner)
 
     // Apply session-scoped fields when the event targets the active
     // session, OR when it's a global broadcast and we have no session.
