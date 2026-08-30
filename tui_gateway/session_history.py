@@ -192,6 +192,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if role not in _HISTORY_ROLES or m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
+        from agent.codex_display_projection import project_codex_display_items
+        codex_display_items = project_codex_display_items(m) if role == "assistant" else None
         if _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):
@@ -216,7 +218,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             continue
         # Assistant detail sidecars can carry the only visible reply or reasoning after resume/reload.
         has_assistant_detail = role == "assistant" and any(m.get(key) for key in _HISTORY_ASSISTANT_DETAIL_KEYS)
-        if not content_text.strip() and not has_assistant_detail:
+        if not content_text.strip() and not has_assistant_detail and not codex_display_items:
             continue
         msg = {"role": role, "text": content_text}
         # Authoring time (Unix seconds) for display.timestamps; display-only.
@@ -233,6 +235,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             msg.update(text=invocation, display_kind="skill_invocation")
         if role == "assistant":
             msg.update((key, m[key]) for key in _HISTORY_ASSISTANT_DETAIL_KEYS if m.get(key) is not None)
+            if codex_display_items:
+                msg["codex_display_items"] = codex_display_items
         # Display-only timeline metadata (model switches, delegation events).
         display_kind = m.get("display_kind") or _legacy_display_kind(role, content_text)
         if display_kind:
