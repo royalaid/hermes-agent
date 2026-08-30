@@ -47,6 +47,26 @@ def _pause_goal_in_child_process(session_id: str, result_queue) -> None:
     )
 
 
+def _clear_goal_in_child_process(session_id: str, ready, proceed, result_queue) -> None:
+    """Clear through the exported persistence helper in another process."""
+    from hermes_cli.goals import clear_goal, load_goal_authoritative
+
+    ready.put(True)
+    assert proceed.wait(10)
+    clear_goal(session_id)
+    state = load_goal_authoritative(session_id)
+    result_queue.put(state.status if state is not None else None)
+
+
+def _hold_goal_lock_in_child_process(session_id: str, ready, release) -> None:
+    """Hold one real cross-process session lock until the parent releases it."""
+    from hermes_cli.goals import goal_state_transaction
+
+    with goal_state_transaction(session_id):
+        ready.put(True)
+        assert release.wait(30)
+
+
 def test_status_returns_a_session_scoped_goal_readback_receipt(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     _call(
@@ -471,6 +491,93 @@ def test_stale_manager_cannot_overwrite_pause_from_another_process(tmp_path, mon
     assert persisted is not None
     assert persisted.status == "paused"
     assert persisted.turns_used == 0
+
+
+def test_clear_from_another_process_wins_race_with_active_judge(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-cross-process-clear"
+    manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
+    manager.set("Keep going")
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    proceed = context.Event()
+    result_queue = context.Queue()
+    child_holder = {}
+
+    def judge_while_child_clears(*_args, **_kwargs):
+        child = context.Process(
+            target=_clear_goal_in_child_process,
+            args=(session_id, ready, proceed, result_queue),
+        )
+        child_holder["process"] = child
+        child.start()
+        assert ready.get(timeout=30) is True
+        proceed.set()
+        # Without a process lock in clear_goal(), the child writes cleared
+        # during this window and the retained manager then revives active state.
+        time.sleep(1)
+        return ("continue", "keep going", False, None, False)
+
+    with patch("hermes_cli.goals.judge_goal", side_effect=judge_while_child_clears):
+        decision = manager.evaluate_after_turn("work completed this turn")
+
+    child = child_holder["process"]
+    try:
+        child.join(90)
+        assert child.exitcode == 0
+        assert result_queue.get(timeout=10) == "cleared"
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(10)
+
+    assert decision["verdict"] == "continue"
+    persisted = goals.load_goal_authoritative(session_id)
+    assert persisted is not None
+    assert persisted.status == "cleared"
+
+
+def test_migration_waits_for_cross_process_child_session_lock(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    parent_session = "migration-parent"
+    child_session = "migration-child"
+    goals.GoalManager(parent_session).set("Keep migrating")
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    release = context.Event()
+    child = context.Process(
+        target=_hold_goal_lock_in_child_process,
+        args=(child_session, ready, release),
+    )
+    child.start()
+    assert ready.get(timeout=30) is True
+
+    result = {}
+    migration = threading.Thread(
+        target=lambda: result.setdefault(
+            "migrated",
+            goals.migrate_goal_to_session(parent_session, child_session),
+        )
+    )
+    migration.start()
+    time.sleep(0.5)
+    try:
+        assert migration.is_alive(), "migration bypassed the child-session process lock"
+    finally:
+        release.set()
+        migration.join(30)
+        child.join(30)
+        if child.is_alive():
+            child.terminate()
+            child.join(10)
+
+    assert not migration.is_alive()
+    assert child.exitcode == 0
+    assert result["migrated"] is True
+    migrated = goals.load_goal_authoritative(child_session)
+    assert migrated is not None and migrated.goal == "Keep migrating"
 
 
 def test_resume_does_not_reactivate_cleared_goal(tmp_path, monkeypatch):
