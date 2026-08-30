@@ -6,7 +6,7 @@ import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { flashPetActivity, setPetActivity } from '@/store/pet'
 import { recordPreviewArtifact, reofferPreviewArtifact } from '@/store/preview-status'
 import { $sessionStates, storedSessionIdForRuntimeId } from '@/store/session-states'
-import { pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
+import { promoteDelegateFallbackOwnership, pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
 import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
 import { restoreSessionTodosFromSnapshot } from '@/store/todos'
@@ -162,15 +162,21 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
 
   if (SUBAGENT_EVENT_TYPES.has(event.type)) {
     if (sessionId && payload && !sessionInterrupted(sessionId)) {
-      if (!nativeSubagentSessionsRef.current.has(sessionId)) {
+      const creationCapable = event.type === 'subagent.spawn_requested' || event.type === 'subagent.start'
+
+      const ownedPayload = creationCapable
+        ? promoteDelegateFallbackOwnership(sessionId, payload as Record<string, unknown>)
+        : (payload as Record<string, unknown>)
+
+      if (creationCapable && !nativeSubagentSessionsRef.current.has(sessionId)) {
         pruneDelegateFallbackSubagents(sessionId)
       }
 
       nativeSubagentSessionsRef.current.add(sessionId)
       upsertSubagent(
         sessionId,
-        payload as Record<string, unknown>,
-        event.type === 'subagent.spawn_requested' || event.type === 'subagent.start',
+        ownedPayload,
+        creationCapable,
         event.type
       )
     }
