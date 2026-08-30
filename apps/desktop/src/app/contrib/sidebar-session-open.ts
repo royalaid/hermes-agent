@@ -1,35 +1,31 @@
 import type { SessionInfo } from '@/hermes'
-import { requestSessionResume } from '@/store/session'
-import { type SessionOwnerRoute, sessionOwnerRouteFromRow } from '@/store/session-request-router'
-import { prepareSessionOwnerRetarget } from '@/store/session-states'
+import { normalizeSessionBinding } from '@/store/session-binding'
+import { sessionOwnerRouteFromRow } from '@/store/session-request-router'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
 
-import { openSession, type OpenSessionNavigate } from '../open-session'
+import type { OpenSessionNavigate } from '../open-session'
 
-/**
- * Resume the exact sidebar row the user selected, preserving its profile and
- * connection identity before applying the sidebar's navigation policy.
- */
+import { openExactSidebarSession } from './exact-sidebar-session'
+
+/** Ordinary sidebar rows enter the owner-aware binding model once. */
 export function openSidebarSession(sessionId: string, session: SessionInfo | undefined, navigate: OpenSessionNavigate): void {
   const rowProfile = session?.profile?.trim()
 
-  const ownerRoute: SessionOwnerRoute | undefined =
+  const ownerRoute =
     sessionOwnerRouteFromRow(session) ??
     (rowProfile
-      ? { connectionId: 'local', mode: 'local', profile: rowProfile, targetProfile: rowProfile }
+      ? { connectionId: 'local', mode: 'local' as const, profile: rowProfile, targetProfile: rowProfile }
       : undefined)
 
-  const intent = $sidebarSessionsOpenInNewTab.get() ? 'tab' : 'main'
+  const binding = ownerRoute ? normalizeSessionBinding({ ownerRoute, storedSessionId: sessionId }) : null
 
-  if (ownerRoute) {
-    prepareSessionOwnerRetarget(sessionId, ownerRoute, intent === 'main')
-    requestSessionResume(sessionId, ownerRoute)
+  if (!binding) {
+    return
   }
 
-  openSession(
-    sessionId,
+  openExactSidebarSession({
+    binding,
     navigate,
-    intent,
-    ownerRoute ? { ownerRoute, workspaceMode: 'sessions' } : { workspaceMode: 'sessions' }
-  )
+    placement: $sidebarSessionsOpenInNewTab.get() ? 'tab' : 'main'
+  })
 }

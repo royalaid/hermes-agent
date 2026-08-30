@@ -3,22 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionInfo } from '@/hermes'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
 
-const mocks = vi.hoisted(() => ({
-  openSession: vi.fn(),
-  prepareSessionOwnerRetarget: vi.fn(),
-  requestSessionResume: vi.fn()
-}))
+const openExactSidebarSession = vi.fn()
 
-vi.mock('@/store/session', () => ({
-  requestSessionResume: (...args: unknown[]) => mocks.requestSessionResume(...args)
-}))
-
-vi.mock('../open-session', () => ({
-  openSession: (...args: unknown[]) => mocks.openSession(...args)
-}))
-
-vi.mock('@/store/session-states', () => ({
-  prepareSessionOwnerRetarget: (...args: unknown[]) => mocks.prepareSessionOwnerRetarget(...args)
+vi.mock('./exact-sidebar-session', () => ({
+  openExactSidebarSession: (...args: unknown[]) => openExactSidebarSession(...args)
 }))
 
 import { openSidebarSession } from './sidebar-session-open'
@@ -30,78 +18,40 @@ const session = (profile: string, connectionId: string): SessionInfo =>
 
 describe('openSidebarSession', () => {
   beforeEach(() => {
-    mocks.openSession.mockReset()
-    mocks.prepareSessionOwnerRetarget.mockReset()
-    mocks.requestSessionResume.mockReset()
-    navigate.mockReset()
+    vi.clearAllMocks()
     $sidebarSessionsOpenInNewTab.set(true)
   })
 
-  it('uses tab intent by default while routing identical stored ids through the clicked row owner', () => {
-    openSidebarSession('shared-id', session('profile-a', 'connection-a'), navigate)
-    openSidebarSession('shared-id', session('profile-b', 'connection-b'), navigate)
+  it('makes one coordinator call with the clicked exact binding and default tab placement', () => {
+    openSidebarSession(' shared-id ', session('profile-b', 'connection-b'), navigate)
 
-    expect(mocks.requestSessionResume).toHaveBeenNthCalledWith(1, 'shared-id', {
-      connectionId: 'connection-a',
-      profile: 'profile-a'
-    })
-    expect(mocks.requestSessionResume).toHaveBeenNthCalledWith(2, 'shared-id', {
-      connectionId: 'connection-b',
-      profile: 'profile-b'
-    })
-    expect(mocks.prepareSessionOwnerRetarget).toHaveBeenNthCalledWith(
-      1,
-      'shared-id',
-      { connectionId: 'connection-a', profile: 'profile-a' },
-      false
-    )
-    expect(mocks.prepareSessionOwnerRetarget).toHaveBeenNthCalledWith(
-      2,
-      'shared-id',
-      { connectionId: 'connection-b', profile: 'profile-b' },
-      false
-    )
-    expect(mocks.openSession).toHaveBeenNthCalledWith(1, 'shared-id', navigate, 'tab', {
-      ownerRoute: { connectionId: 'connection-a', profile: 'profile-a' },
-      workspaceMode: 'sessions'
-    })
-    expect(mocks.openSession).toHaveBeenNthCalledWith(2, 'shared-id', navigate, 'tab', {
-      ownerRoute: { connectionId: 'connection-b', profile: 'profile-b' },
-      workspaceMode: 'sessions'
+    expect(openExactSidebarSession).toHaveBeenCalledOnce()
+    expect(openExactSidebarSession).toHaveBeenCalledWith({
+      binding: {
+        storedSessionId: 'shared-id',
+        ownerRoute: {
+          connectionId: 'connection-b',
+          profile: 'profile-b',
+          targetProfile: 'profile-b'
+        }
+      },
+      navigate,
+      placement: 'tab'
     })
   })
 
-  it('uses explicit main intent when the persisted preference selects the main tab', () => {
+  it('passes explicit main placement for the persisted override', () => {
     $sidebarSessionsOpenInNewTab.set(false)
-
     openSidebarSession('shared-id', session('profile-a', 'connection-a'), navigate)
 
-    expect(mocks.requestSessionResume).toHaveBeenCalledOnce()
-    expect(mocks.prepareSessionOwnerRetarget).toHaveBeenCalledWith(
-      'shared-id',
-      { connectionId: 'connection-a', profile: 'profile-a' },
-      true
+    expect(openExactSidebarSession).toHaveBeenCalledWith(
+      expect.objectContaining({ placement: 'main' })
     )
-    expect(mocks.openSession).toHaveBeenCalledWith('shared-id', navigate, 'main', {
-      ownerRoute: { connectionId: 'connection-a', profile: 'profile-a' },
-      workspaceMode: 'sessions'
-    })
   })
 
-  it('keeps the local fallback route for a profiled row without a connection tag', () => {
-    openSidebarSession('shared-id', session('profile-a', ''), navigate)
+  it('fails closed when the row has no exact owner source', () => {
+    openSidebarSession('shared-id', session('', ''), navigate)
 
-    const ownerRoute = {
-      connectionId: 'local',
-      mode: 'local' as const,
-      profile: 'profile-a',
-      targetProfile: 'profile-a'
-    }
-
-    expect(mocks.requestSessionResume).toHaveBeenCalledWith('shared-id', ownerRoute)
-    expect(mocks.openSession).toHaveBeenCalledWith('shared-id', navigate, 'tab', {
-      ownerRoute,
-      workspaceMode: 'sessions'
-    })
+    expect(openExactSidebarSession).not.toHaveBeenCalled()
   })
 })

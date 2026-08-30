@@ -15,9 +15,23 @@ import {
   resumeWithStoredTranscriptFallback
 } from '@/store/read-only-transcript'
 import { knownSessionOwner, ownerLookupSessionRows } from '@/store/session'
+import {
+  bindRuntimeToSession,
+  claimSessionBinding,
+  invalidateSessionRuntimeBinding,
+  normalizeSessionBinding,
+  runtimeForExactSessionBinding,
+  sessionBindingOwnsGeneration,
+  setSessionBindingRuntimeAdapter
+} from '@/store/session-binding'
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
-import { publishSessionState, sessionTileOwnerRoute, setSessionTileDelegate } from '@/store/session-states'
+import {
+  publishSessionState,
+  sessionTileDelegate,
+  sessionTileOwnerRoute,
+  setSessionTileDelegate
+} from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
@@ -46,6 +60,15 @@ function mergeTileTranscript(
   const persisted = graftRefreshedTailOntoBackfill(prefetched, previous)
 
   return reconcileResumeMessages(persisted, previous)
+}
+
+function bindingForOwner(storedSessionId: string, owner: SessionOwnerScope) {
+  const ownerRoute =
+    typeof owner === 'string'
+      ? { connectionId: 'local', mode: 'local' as const, profile: owner, targetProfile: owner }
+      : owner
+
+  return ownerRoute ? normalizeSessionBinding({ ownerRoute, storedSessionId }) : null
 }
 
 interface SessionTileDelegateParams {
@@ -103,6 +126,12 @@ export function useSessionTileDelegate({
 
       if (storedId) {
         runtimeIdByStoredSessionIdRef.current.set(storedId, recoveredId)
+        const ownerRoute = sessionTileOwnerRoute(storedId)
+        const binding = ownerRoute ? normalizeSessionBinding({ ownerRoute, storedSessionId: storedId }) : null
+
+        if (binding) {
+          bindRuntimeToSession(binding, recoveredId)
+        }
       }
     }
 
@@ -129,6 +158,19 @@ export function useSessionTileDelegate({
       return requestForSessionProfile<T>(owner, requestGateway, method, params, timeoutMs)
     }
 
+    setSessionBindingRuntimeAdapter({
+      detach: storedSessionId => {
+        const runtimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId) ?? null
+        runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+
+        if (runtimeId) {
+          sessionStateByRuntimeIdRef.current.delete(runtimeId)
+        }
+
+        return runtimeId
+      }
+    })
+
     setSessionTileDelegate({
       archiveSession: async storedSessionId => {
         await archiveSession(storedSessionId)
@@ -151,19 +193,9 @@ export function useSessionTileDelegate({
         for (const storedSessionId of runtimeIdByStoredSessionIdRef.current.keys()) {
           if (!preserveStoredSessionIds?.has(storedSessionId)) {
             runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+            invalidateSessionRuntimeBinding(storedSessionId)
           }
         }
-      },
-      invalidateRuntimeBinding: storedSessionId => {
-        const runtimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId) ?? null
-
-        runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
-
-        if (runtimeId) {
-          sessionStateByRuntimeIdRef.current.delete(runtimeId)
-        }
-
-        return runtimeId
       },
       // Reconnect reconcile (#93059): retire an orphaned runtime's busy claim
       // through updateSessionState so the cache, focused view, busyRef and
@@ -214,7 +246,29 @@ export function useSessionTileDelegate({
         )
       },
       resumeTile: async (storedSessionId, options) => {
-        const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+        const ownerRoute = sessionTileOwnerRoute(storedSessionId)
+        const mappedRuntime = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+        let owner: SessionOwnerScope = ownerRoute ?? knownSessionOwner(ownerLookupSessionRows(), storedSessionId)
+        let binding = bindingForOwner(storedSessionId, owner)
+
+        if (mappedRuntime && !binding) {
+          owner = await ownerForStoredSession(storedSessionId)
+          binding = bindingForOwner(storedSessionId, owner)
+
+          // Pre-binding caches from older renderer revisions carried only the
+          // stored/runtime pair. Such entries could only have come from the
+          // legacy local default socket; adopt that exact owner once so existing
+          // warm tabs survive the in-memory schema upgrade.
+          binding ??= bindingForOwner(storedSessionId, 'default')
+        }
+
+        const bindingGeneration = binding ? claimSessionBinding(binding) : null
+
+        if (binding && mappedRuntime) {
+          bindRuntimeToSession(binding, mappedRuntime, bindingGeneration ?? undefined)
+        }
+
+        const existing = binding && runtimeForExactSessionBinding(binding) === mappedRuntime ? mappedRuntime : undefined
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
         const refreshTranscript = options?.refreshTranscript === true
 
@@ -245,7 +299,7 @@ export function useSessionTileDelegate({
         // reading messages) without a profile lets the gateway fall back to the
         // launch-profile DB and fork the conversation into the wrong profile —
         // the same cross-profile bleed the recovery resumes had (#67603).
-        const owner = await ownerForStoredSession(storedSessionId)
+        owner ??= await ownerForStoredSession(storedSessionId)
 
         const restScope =
           owner && typeof owner === 'object'
@@ -297,6 +351,16 @@ export function useSessionTileDelegate({
           }
         )
 
+        if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
+          const delegate = sessionTileDelegate()
+
+          if (!delegate) {
+            throw new Error('session binding changed while resume was in flight')
+          }
+
+          return delegate.resumeTile(storedSessionId, options)
+        }
+
         if (outcome.mode === 'read-only') {
           const readOnlyId = readOnlyRuntimeIdFor(storedSessionId)
 
@@ -316,6 +380,10 @@ export function useSessionTileDelegate({
             title: translateNow('desktop.readOnlyTranscriptTitle'),
             message: translateNow('desktop.readOnlyTranscriptBody')
           })
+
+          if (binding) {
+            bindRuntimeToSession(binding, readOnlyId, bindingGeneration ?? undefined)
+          }
 
           return readOnlyId
         }
@@ -345,6 +413,10 @@ export function useSessionTileDelegate({
           }),
           storedSessionId
         )
+
+        if (binding) {
+          bindRuntimeToSession(binding, runtimeId, bindingGeneration ?? undefined)
+        }
 
         return runtimeId
       },
