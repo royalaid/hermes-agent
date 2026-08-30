@@ -2,6 +2,7 @@ import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
 import type { PoolLimits } from '../electron/pool-limits'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
@@ -64,7 +65,7 @@ declare global {
       // a running subagent's session.
       openSessionWindow: (
         sessionId: string,
-        opts?: { profile?: null | string; watch?: boolean }
+        opts?: { ownerRoute?: SessionOwnerRoute; profile?: null | string; watch?: boolean }
       ) => Promise<{ ok: boolean; error?: string }>
       // Resume this session in the user's own terminal emulator (`hermes --tui
       // --resume <id>`) — the external terminal, not the in-app pane.

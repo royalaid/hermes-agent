@@ -637,6 +637,29 @@ describe('dropTilesForProfile', () => {
     $selectedStoredSessionId.set(null)
     $sessionTiles.set([])
   })
+  it('normalizes a connectionless legacy persisted route to the safe legacy owner representation', async () => {
+    window.localStorage.setItem(
+      TILES_KEY,
+      JSON.stringify({
+        default: [
+          {
+            storedSessionId: 'legacy-session',
+            ownerRoute: { profile: 'legacy-profile' },
+            workspaceMode: 'sessions'
+          }
+        ]
+      })
+    )
+    vi.resetModules()
+    mod = await import('@/store/session-states')
+    const profile = await import('@/store/profile')
+    profile.$activeGatewayProfile.set('default')
+
+    expect(mod.$sessionTiles.get()).toEqual([
+      expect.objectContaining({ storedSessionId: 'legacy-session', ownerRoute: undefined })
+    ])
+  })
+
   it("drops the deleted profile's persisted session tiles from memory and storage", () => {
     activeGatewayProfile.set('worker')
     mod.openSessionTile('worker-session-1')
