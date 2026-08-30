@@ -202,6 +202,52 @@ export function runtimeForExactSessionBinding(binding: SessionBinding): string |
   return record && bindingsEqual(record.binding, normalized) ? record.runtimeId : null
 }
 
+export function currentSessionBinding(storedSessionId: string): SessionBinding | null {
+  return runtimeBindings.get(storedSessionId.trim())?.binding ?? null
+}
+
+/** Admit an asynchronous runtime event only when its source still owns the
+ * stored id. Tagged events are authoritative for their connection/profile;
+ * untagged events are accepted only for the already-bound runtime or the
+ * explicitly active legacy runtime. Callers must check this before mutating
+ * any stored-id keyed cache. */
+export function acceptsSessionRuntimeSource(
+  storedSessionId: string,
+  runtimeId: string,
+  sourceOwner?: SessionOwnerRoute,
+  legacyActive = false
+): boolean {
+  const id = storedSessionId.trim()
+  const runtime = runtimeId.trim()
+
+  if (!id || !runtime) {
+    return false
+  }
+
+  const current = runtimeBindings.get(id)
+
+  if (sourceOwner) {
+    const sourceConnectionId = sourceOwner.connectionId.trim()
+    const sourceProfile = sourceOwner.profile.trim() || 'default'
+
+    if (!sourceConnectionId || !sourceOwner.profile) {
+      return false
+    }
+
+    return (
+      !current ||
+      (current.binding.ownerRoute.connectionId === sourceConnectionId &&
+        current.binding.ownerRoute.profile === sourceProfile)
+    )
+  }
+
+  // An untagged legacy event can establish the first owner when no competing
+  // binding exists. Once an owner is authoritative, only that exact runtime
+  // may continue using the legacy path; the active-runtime hint is retained
+  // for callers that need to prove the primary case explicitly.
+  return current ? current.runtimeId === runtime : legacyActive || !current
+}
+
 export function invalidateSessionRuntimeBinding(storedSessionId: string): null | string {
   const id = storedSessionId.trim()
   const record = runtimeBindings.get(id)

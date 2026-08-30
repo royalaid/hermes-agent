@@ -370,8 +370,10 @@ import {
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  normalizeSessionWindowOwnerRoute,
   SESSION_WINDOW_MIN_HEIGHT,
-  SESSION_WINDOW_MIN_WIDTH
+  SESSION_WINDOW_MIN_WIDTH,
+  type SessionWindowOwnerRoute
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
@@ -13497,9 +13499,10 @@ function focusWindow(win) {
 
 function spawnSecondaryWindow({
   sessionId,
+  ownerRoute,
   profile,
   watch
-}: { sessionId?: string; profile?: null | string; watch?: boolean } = {}) {
+}: { sessionId?: string; ownerRoute?: unknown; profile?: null | string; watch?: boolean } = {}) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -13561,6 +13564,7 @@ function spawnSecondaryWindow({
     win,
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
+      ownerRoute,
       profile,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
       watch
@@ -13572,8 +13576,15 @@ function spawnSecondaryWindow({
 }
 
 // Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId, { profile = null, watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, profile, watch }))
+function createSessionWindow(
+  sessionId,
+  { ownerRoute, profile = null, watch = false }: { ownerRoute?: SessionWindowOwnerRoute; profile?: null | string; watch?: boolean } = {}
+) {
+  return sessionWindows.openOrFocus(
+    sessionId,
+    () => spawnSecondaryWindow({ ownerRoute, profile, sessionId, watch }),
+    ownerRoute
+  )
 }
 
 // Popped-out in-app Browser: same webview + address bar as a docked Browser
@@ -15133,6 +15144,7 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   }
 
   createSessionWindow(sessionId.trim(), {
+    ownerRoute: normalizeSessionWindowOwnerRoute(opts?.ownerRoute),
     profile: typeof opts?.profile === 'string' ? opts.profile : null,
     watch: opts?.watch === true
   })
