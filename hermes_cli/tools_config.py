@@ -112,6 +112,7 @@ CONFIGURABLE_TOOLSETS = [
     ("stt",             "🎙️ Speech-to-Text",           "voice transcription (gateway voice messages + voice mode)"),
     ("skills",          "📚 Skills",                    "list, view, manage"),
     ("todo",            "📋 Task Planning",             "todo"),
+    ("goal",            "🎯 Goal Control",              "inspect and manage the current session goal"),
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
@@ -2605,7 +2606,7 @@ def _exempt_explicit_platform_native(
 #: it: an enabled toolset still ships zero schemas when its check fails — the
 #: same split Home Assistant uses. Probing a remote service from this path
 #: would put a network call on every CLI start, gateway session and cron tick.
-_RECENTLY_SHIPPED_TOOLSETS: frozenset = frozenset()
+_RECENTLY_SHIPPED_TOOLSETS: frozenset = frozenset({"goal"})
 
 
 def _enable_recently_shipped_toolsets(
