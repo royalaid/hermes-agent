@@ -3,7 +3,7 @@ import { normalizeSessionBinding } from '@/store/session-binding'
 import { sessionOwnerRouteFromRow } from '@/store/session-request-router'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
 
-import type { OpenSessionIntent, OpenSessionNavigate } from '../open-session'
+import { openSession, type OpenSessionIntent, type OpenSessionNavigate } from '../open-session'
 
 import { openExactSidebarSession } from './exact-sidebar-session'
 
@@ -14,23 +14,15 @@ export function openSidebarSession(
   navigate: OpenSessionNavigate,
   intent?: Extract<OpenSessionIntent, 'tab' | 'window'>
 ): void {
-  const rowProfile = session?.profile?.trim()
-
-  const ownerRoute =
-    sessionOwnerRouteFromRow(session) ??
-    (rowProfile
-      ? { connectionId: 'local', mode: 'local' as const, profile: rowProfile, targetProfile: rowProfile }
-      : undefined)
-
+  const ownerRoute = sessionOwnerRouteFromRow(session)
   const binding = ownerRoute ? normalizeSessionBinding({ ownerRoute, storedSessionId: sessionId }) : null
+  const placement = intent ?? ($sidebarSessionsOpenInNewTab.get() ? 'tab' : 'main')
 
   if (!binding) {
+    openSession(sessionId, navigate, placement)
+
     return
   }
 
-  openExactSidebarSession({
-    binding,
-    navigate,
-    placement: intent ?? ($sidebarSessionsOpenInNewTab.get() ? 'tab' : 'main')
-  })
+  openExactSidebarSession({ binding, navigate, placement })
 }
