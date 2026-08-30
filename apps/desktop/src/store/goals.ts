@@ -13,6 +13,12 @@ export interface SessionGoal {
   updatedAt: number
 }
 
+export interface PersistedGoalPayload {
+  condition?: unknown
+  exists?: unknown
+  status?: unknown
+}
+
 export const $goalsBySession = atom<Record<string, SessionGoal>>({})
 
 const DONE_LINGER_MS = 8_000
@@ -158,6 +164,46 @@ export function applyGoalStatusText(sid: string, text: string, opts?: { hydrate?
 
     setSessionGoal(sid, next)
   }
+}
+
+export function applyGoalStatusUpdate(sid: string, text: string, goal?: PersistedGoalPayload | null) {
+  if (!goal || typeof goal.exists !== 'boolean') {
+    applyGoalStatusText(sid, text)
+
+    return
+  }
+
+  if (!goal.exists || goal.status === 'cleared') {
+    clearSessionGoal(sid)
+
+    return
+  }
+
+  if (typeof goal.condition !== 'string' || !goal.condition.trim()) {
+    applyGoalStatusText(sid, text)
+
+    return
+  }
+
+  const parsed = nextGoalFromText(text, $goalsBySession.get()[sid])
+  let status: GoalStatus
+
+  if (goal.status === 'active') {
+    status = parsed && parsed.status === 'waiting' ? 'waiting' : 'active'
+  } else if (goal.status === 'paused' || goal.status === 'done' || goal.status === 'waiting') {
+    status = goal.status
+  } else {
+    applyGoalStatusText(sid, text)
+
+    return
+  }
+
+  setSessionGoal(sid, {
+    ...(parsed && parsed.detail ? { detail: parsed.detail } : {}),
+    status,
+    title: goal.condition,
+    updatedAt: Date.now()
+  })
 }
 
 export async function refreshSessionGoal(sid: string): Promise<void> {
