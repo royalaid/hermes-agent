@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import multiprocessing
+import os
 import queue
 import threading
 import time
@@ -23,6 +25,26 @@ def _call(action: str, *, session_id: str, **kwargs):
         skip_tool_execution_middleware=True,
     )
     return json.loads(raw)
+
+
+def _pause_goal_in_child_process(session_id: str, result_queue) -> None:
+    """Pause through a fresh interpreter process sharing HERMES_HOME."""
+    from hermes_cli import goals as child_goals
+    from hermes_constants import get_hermes_home
+
+    child_goals._DB_CACHE.clear()
+    before = child_goals.load_goal_authoritative(session_id)
+    child_goals.GoalManager(session_id).pause(reason="operator-paused")
+    after = child_goals.load_goal_authoritative(session_id)
+    resolved_home = get_hermes_home()
+    result_queue.put(
+        (
+            str(resolved_home),
+            (resolved_home / "state.db").exists(),
+            before.status if before else None,
+            after.status if after else None,
+        )
+    )
 
 
 def test_status_returns_a_session_scoped_goal_readback_receipt(tmp_path, monkeypatch):
@@ -73,6 +95,18 @@ def test_status_returns_a_session_scoped_goal_readback_receipt(tmp_path, monkeyp
     }
 
 
+def test_unchanged_goal_status_reuses_persisted_receipt_token(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    set_result = _call("set", session_id="session-current", condition="Keep going")
+    status_result = _call("status", session_id="session-current")
+
+    set_id = set_result["goal_readback"]["receipt_id"]
+    assert status_result["goal_readback"]["receipt_id"] == set_id
+    persisted = goals.load_goal_authoritative("session-current")
+    assert persisted is not None
+    assert persisted.receipt_token == set_id.rsplit(":", 1)[1]
+
+
 @pytest.mark.parametrize(
     "condition,evidence",
     [
@@ -115,6 +149,11 @@ def _home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    import hermes_state
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home_override", lambda: str(home))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
     goals._DB_CACHE.clear()
     goals._DB_BOOTSTRAP_INFLIGHT.clear()
     goals._GOAL_GENERATIONS.clear()
@@ -372,6 +411,60 @@ def test_model_pause_updates_cached_cli_lifecycle_manager(tmp_path, monkeypatch)
     assert cli._pending_input.empty()
     assert cli._goal_manager.state.status == "paused"
     assert goals.load_goal(session_id).status == "paused"
+
+
+def test_stale_manager_refreshes_inside_the_mutation_lock(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    session_id = "session-refresh-race"
+    controller = goals.GoalManager(session_id=session_id, default_max_turns=4)
+    controller.set("Keep going")
+    stale_manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
+
+    controller.pause(reason="model-paused")
+
+    def _unexpected_judge(*_args, **_kwargs):
+        raise AssertionError("a stale active goal reached the judge")
+
+    monkeypatch.setattr(goals, "judge_goal", _unexpected_judge)
+    decision = stale_manager.evaluate_after_turn("work completed this turn")
+
+    assert decision["verdict"] == "inactive"
+    assert decision["status"] == "paused"
+    assert stale_manager.state is not None
+    assert stale_manager.state.status == "paused"
+
+
+def test_stale_manager_cannot_overwrite_pause_from_another_process(tmp_path, monkeypatch):
+    home = _home(tmp_path, monkeypatch)
+    session_id = "session-cross-process-pause"
+    stale_manager = goals.GoalManager(session_id=session_id, default_max_turns=4)
+    stale_manager.set("Keep going")
+    assert goals.load_goal_authoritative(session_id).status == "active"
+    assert (home / "state.db").exists()
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    child = context.Process(
+        target=_pause_goal_in_child_process,
+        args=(session_id, result_queue),
+    )
+    child.start()
+    child.join(30)
+    assert child.exitcode == 0
+    assert result_queue.get(timeout=2) == (str(home), True, "active", "paused")
+
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "keep going", False, None, False),
+    ):
+        decision = stale_manager.evaluate_after_turn("work completed this turn")
+
+    persisted = goals.load_goal_authoritative(session_id)
+    assert decision["verdict"] == "inactive"
+    assert decision["status"] == "paused"
+    assert persisted is not None
+    assert persisted.status == "paused"
+    assert persisted.turns_used == 0
 
 
 def test_resume_does_not_reactivate_cleared_goal(tmp_path, monkeypatch):
