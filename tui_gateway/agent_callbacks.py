@@ -94,6 +94,8 @@ def _agent_cbs(sid: str) -> dict:
         "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),
         "reasoning_callback": lambda text: _emit(
             "reasoning.delta", sid, {"text": text, **({"verbose": True} if _session_verbose(sid) else {})}),
+        "reasoning_event_callback": lambda phase, item_id, text="": _emit(
+            f"reasoning.{phase}", sid, {"reasoning_id": item_id, "text": text}),
         "status_callback": lambda kind, text=None: _status_update(sid, str(kind), None if text is None else str(text)),
         # Credits/notice spine: AgentNotice → notification.show; recovery → notification.clear.
         "notice_callback": lambda n: _emit(
