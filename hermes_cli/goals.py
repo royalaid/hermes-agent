@@ -2012,7 +2012,7 @@ class GoalManager:
             lines.append(f"- {i}. $ {g.command}{status}")
         return "\n".join(lines)
 
-    def _check_gates(self) -> Optional[Dict[str, Any]]:
+    def _check_gates(self, *, persist: bool = True) -> Optional[Dict[str, Any]]:
         """Run quality gates in order; return a decision dict on failure.
 
         Returns ``None`` when there are no gates or every gate passes —
@@ -2057,7 +2057,8 @@ class GoalManager:
                 state.paused_reason = (
                     f"quality gate exhausted {gate.attempts - 1} retries: $ {gate.command}"
                 )
-                save_goal(self.session_id, state)
+                if persist:
+                    save_goal(self.session_id, state)
                 return {
                     "status": "paused",
                     "should_continue": False,
@@ -2072,7 +2073,8 @@ class GoalManager:
                     ),
                 }
 
-            save_goal(self.session_id, state)
+            if persist:
+                save_goal(self.session_id, state)
             prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
                 goal=state.goal,
                 command=gate.command,
@@ -2093,7 +2095,8 @@ class GoalManager:
                 ),
             }
 
-        save_goal(self.session_id, state)
+        if persist:
+            save_goal(self.session_id, state)
         return None
 
     # --- /goal wait barrier -------------------------------------------
@@ -2220,7 +2223,6 @@ class GoalManager:
 
     # --- the main entry point called after every turn -----------------
 
-    @_serialized_goal_mutation
     def evaluate_after_turn(
         self,
         last_response: str,
@@ -2247,6 +2249,19 @@ class GoalManager:
           - ``reason``: str
           - ``message``: user-visible one-liner to print/send
         """
+        # Refresh under a short persisted-state transaction. Slow gate and
+        # judge calls must not hold the cross-process control lock.
+        with goal_state_transaction(self.session_id):
+            authoritative = load_goal_authoritative(self.session_id)
+            if (
+                authoritative is not None
+                and (
+                    self._state is None
+                    or authoritative.receipt_token != self._state.receipt_token
+                )
+            ):
+                self._state = authoritative
+            self._seen_generation = _goal_generation(self.session_id)
         state = self._state
         if state is None or state.status != "active":
             return {
@@ -2279,6 +2294,56 @@ class GoalManager:
                 "message": f"⏳ Goal parked — waiting on {tgt}: {reason}",
             }
 
+        # Snapshot the active goal under lock. When slow evaluation completes,
+        # its receipt token proves whether a concurrent control changed state.
+        with goal_state_transaction(self.session_id):
+            authoritative = load_goal_authoritative(self.session_id)
+            if (
+                authoritative is not None
+                and (
+                    self._state is None
+                    or authoritative.receipt_token != self._state.receipt_token
+                )
+            ):
+                self._state = authoritative
+            if self._state is None or self._state.status != "active":
+                self._seen_generation = _goal_generation(self.session_id)
+                return {
+                    "status": self._state.status if self._state else None,
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "inactive",
+                    "reason": "no active goal",
+                    "message": "",
+                }
+            state = GoalState.from_json(self._state.to_json())
+            self._state = state
+            evaluation_token = state.receipt_token
+
+        def commit_evaluation(decision: Dict[str, Any]) -> Dict[str, Any]:
+            """Persist only if no control changed the evaluated snapshot."""
+            with goal_state_transaction(self.session_id):
+                current = load_goal_authoritative(self.session_id)
+                if (
+                    current is None
+                    or current.status != "active"
+                    or current.receipt_token != evaluation_token
+                ):
+                    self._state = current
+                    self._seen_generation = _goal_generation(self.session_id)
+                    return {
+                        "status": current.status if current else None,
+                        "should_continue": False,
+                        "continuation_prompt": None,
+                        "verdict": "inactive",
+                        "reason": "goal changed during evaluation",
+                        "message": "",
+                    }
+                self._state = state
+                save_goal(self.session_id, state)
+                self._seen_generation = _goal_generation(self.session_id)
+                return decision
+
         # Count the turn that just finished.
         state.turns_used += 1
         state.last_turn_at = time.time()
@@ -2287,13 +2352,12 @@ class GoalManager:
         # deterministic evidence the goal is not done, so the judge call is
         # skipped entirely and the gate's output drives the next turn. Gate
         # continuations respect the same turn budget as judge continuations.
-        gate_decision = self._check_gates()
+        gate_decision = self._check_gates(persist=False)
         if gate_decision is not None:
             if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
                 state.status = "paused"
                 state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-                save_goal(self.session_id, state)
-                return {
+                return commit_evaluation({
                     "status": "paused",
                     "should_continue": False,
                     "continuation_prompt": None,
@@ -2304,8 +2368,8 @@ class GoalManager:
                         f"(a quality gate is still failing). "
                         "Use /goal resume to keep going, or /goal clear to stop."
                     ),
-                }
-            return gate_decision
+                })
+            return commit_evaluation(gate_decision)
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal,
@@ -2342,23 +2406,31 @@ class GoalManager:
         # exits or the deadline passes (next evaluate_after_turn falls through
         # the is_waiting() short-circuit once the barrier clears).
         if verdict == "wait" and wait_directive:
+            state.waiting_reason = (reason or "").strip() or None
+            state.waiting_since = time.time()
             if wait_directive.get("session_id"):
-                self.wait_on_session(str(wait_directive["session_id"]), reason=reason)
+                state.waiting_on_session = str(wait_directive["session_id"])
+                state.waiting_on_pid = None
+                state.waiting_until = 0.0
                 tgt = f"session {wait_directive['session_id']}"
             elif wait_directive.get("pid"):
-                self.wait_on(int(wait_directive["pid"]), reason=reason)
+                state.waiting_on_session = None
+                state.waiting_on_pid = int(wait_directive["pid"])
+                state.waiting_until = 0.0
                 tgt = f"pid {wait_directive['pid']}"
             else:
-                self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason)
+                state.waiting_on_session = None
+                state.waiting_on_pid = None
+                state.waiting_until = time.time() + int(wait_directive["seconds"])
                 tgt = f"{wait_directive['seconds']}s"
-            return {
+            return commit_evaluation({
                 "status": "active",
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "wait",
                 "reason": reason,
                 "message": f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
-            }
+            })
 
         # BLOCKED verdict: the judge ruled the goal genuinely cannot be
         # satisfied as stated (impossible, out of scope, needs user input).
@@ -2369,9 +2441,7 @@ class GoalManager:
         if verdict == "blocked":
             state.status = "paused"
             state.paused_reason = f"judged unachievable: {reason}"
-            self._touch_state(state)
-            self._persist_state(state)
-            return {
+            return commit_evaluation({
                 "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
@@ -2381,20 +2451,18 @@ class GoalManager:
                     f"🚫 Goal judged unachievable — paused: {reason} "
                     "Re-scope with /goal set, or override with /goal resume."
                 ),
-            }
+            })
 
         if verdict == "done":
             state.status = "done"
-            self._touch_state(state)
-            self._persist_state(state)
-            return {
+            return commit_evaluation({
                 "status": "done",
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "done",
                 "reason": reason,
                 "message": f"✓ Goal achieved: {reason}",
-            }
+            })
 
         # Auto-pause when the judge cannot reach the API at all N turns in a
         # row (401 auth, DNS failure, timeout).  Persistent transport failures
@@ -2407,8 +2475,7 @@ class GoalManager:
                 f"judge API unreachable {state.consecutive_transport_failures} turns in a row "
                 f"(check auxiliary.goal_judge provider/key in config.yaml)"
             )
-            save_goal(self.session_id, state)
-            return {
+            return commit_evaluation({
                 "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
@@ -2424,7 +2491,7 @@ class GoalManager:
                     "      model: deepseek-v4-flash\n"
                     "Then /goal resume to continue."
                 ),
-            }
+            })
 
         # Auto-pause when the judge model can't produce the expected JSON
         # verdict N turns in a row. Points the user at the goal_judge config
@@ -2437,8 +2504,7 @@ class GoalManager:
             state.paused_reason = (
                 f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
             )
-            save_goal(self.session_id, state)
-            return {
+            return commit_evaluation({
                 "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
@@ -2454,13 +2520,12 @@ class GoalManager:
                     "      model: google/gemini-3-flash-preview\n"
                     "Then /goal resume to continue."
                 ),
-            }
+            })
 
         if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-            save_goal(self.session_id, state)
-            return {
+            return commit_evaluation({
                 "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
@@ -2470,10 +2535,9 @@ class GoalManager:
                     f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
                     "Use /goal resume to keep going, or /goal clear to stop."
                 ),
-            }
+            })
 
-        save_goal(self.session_id, state)
-        return {
+        return commit_evaluation({
             "status": "active",
             "should_continue": True,
             "continuation_prompt": self.next_continuation_prompt(),
@@ -2482,7 +2546,7 @@ class GoalManager:
             "message": (
                 f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}"
             ),
-        }
+        })
 
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
