@@ -5,10 +5,12 @@ import {
   $activeSessionId,
   $currentCwd,
   $selectedStoredSessionId,
+  $sessions,
   $workspaceCwdOwner,
   releaseWorkspaceCwdOwner,
   setActiveSessionId,
-  setCurrentCwd
+  setCurrentCwd,
+  setSessions
 } from '@/store/session'
 import {
   _resetSessionBindingsForTests,
@@ -28,12 +30,14 @@ function sessionInfoEvent({
   connectionId,
   cwd,
   explicitSid = '',
+  profile = 'default',
   storedSessionId = ''
 }: {
   activeSessionId: null | string
   connectionId?: string
   cwd: string
   explicitSid?: string
+  profile?: string
   storedSessionId?: string
 }): GatewayEventContext {
   const sessionId = explicitSid || activeSessionId
@@ -52,7 +56,7 @@ function sessionInfoEvent({
       updateSessionState: vi.fn(state => state),
       upsertToolCall: vi.fn()
     },
-    event: { connectionId, profile: 'default', session_id: explicitSid, type: 'session.info' },
+    event: { connectionId, profile, session_id: explicitSid, type: 'session.info' },
     explicitSid,
     fromActiveSource: () => true,
     isActiveEvent: !!sessionId && sessionId === activeSessionId,
@@ -70,6 +74,7 @@ describe('handleSessionInfoEvent workspace ownership', () => {
     $selectedStoredSessionId.set(null)
     $workspaceCwdOwner.set(null)
     setCurrentCwd('')
+    setSessions([])
   })
 
   afterEach(() => {
@@ -78,6 +83,7 @@ describe('handleSessionInfoEvent workspace ownership', () => {
     $selectedStoredSessionId.set(null)
     $workspaceCwdOwner.set(null)
     setCurrentCwd('')
+    setSessions([])
   })
 
   // #55831 / the "workspace pane visible with no agent selected" report: with
@@ -174,6 +180,41 @@ describe('handleSessionInfoEvent workspace ownership', () => {
     expect($workspaceCwdOwner.get()).toBe('shared-id')
   })
 
+  it('adopts a tagged rebuilt runtime from the exact backend target behind a Desktop alias', () => {
+    const owner = normalizeSessionBinding({
+      ownerRoute: { connectionId: 'source-a', profile: 'desktop-alias', targetProfile: 'backend-a' },
+      storedSessionId: 'shared-id'
+    })!
+
+    claimSessionBinding(owner)
+    bindRuntimeToSession(owner, 'runtime-old')
+    setActiveSessionId('runtime-old')
+    $selectedStoredSessionId.set('shared-id')
+    setCurrentCwd('/repo/old')
+
+    const ctx = sessionInfoEvent({
+      activeSessionId: 'runtime-old',
+      connectionId: 'source-a',
+      cwd: '/repo/rebuilt',
+      explicitSid: 'runtime-rebuilt',
+      profile: 'backend-a',
+      storedSessionId: 'shared-id'
+    })
+
+    ctx.deps.sessionStateByRuntimeIdRef.current.set('runtime-old', {
+      ...createClientSessionState('shared-id'),
+      awaitingResponse: false,
+      busy: false,
+      streamId: null
+    })
+
+    handleSessionInfoEvent(ctx)
+
+    expect($activeSessionId.get()).toBe('runtime-rebuilt')
+    expect(ctx.deps.activeSessionIdRef.current).toBe('runtime-rebuilt')
+    expect($currentCwd.get()).toBe('/repo/rebuilt')
+  })
+
   it("does not let owner A's stale rebuilt-runtime info capture owner B's main pane", () => {
     const ownerB = normalizeSessionBinding({
       ownerRoute: { connectionId: 'source-b', profile: 'default' },
@@ -206,5 +247,30 @@ describe('handleSessionInfoEvent workspace ownership', () => {
     expect($activeSessionId.get()).toBe('runtime-b')
     expect(ctx.deps.activeSessionIdRef.current).toBe('runtime-b')
     expect($currentCwd.get()).toBe('/repo/b')
+  })
+
+  it("updates only the exact owner's row for a tagged session title", () => {
+    setSessions([
+      { connection_id: 'source-a', id: 'shared-id', profile: 'profile-a', title: 'Owner A' },
+      { connection_id: 'source-b', id: 'shared-id', profile: 'profile-b', title: 'Owner B' }
+    ] as never)
+
+    const ctx = sessionInfoEvent({
+      activeSessionId: 'runtime-b',
+      connectionId: 'source-a',
+      cwd: '',
+      explicitSid: 'runtime-a',
+      storedSessionId: 'shared-id'
+    })
+
+    ctx.event = { connectionId: 'source-a', profile: 'profile-a', session_id: 'runtime-a', type: 'session.title' }
+    ctx.payload = { session_id: 'shared-id', title: 'Updated A' }
+
+    handleSessionInfoEvent(ctx)
+
+    expect($sessions.get().map(session => [session.connection_id, session.title])).toEqual([
+      ['source-a', 'Updated A'],
+      ['source-b', 'Owner B']
+    ])
   })
 })
