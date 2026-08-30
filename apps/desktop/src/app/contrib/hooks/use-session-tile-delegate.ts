@@ -369,6 +369,16 @@ export function useSessionTileDelegate({
 
         if (existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
           const prefetch = await prefetchPromise
+
+          if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
+            const delegate = sessionTileDelegate()
+
+            if (!delegate) {
+              throw new Error('session binding changed while resume was in flight')
+            }
+
+            return delegate.resumeTile(storedSessionId, options)
+          }
           // Deltas and completion may land while REST is in flight.
           updateSessionState(
             existing,
@@ -412,6 +422,18 @@ export function useSessionTileDelegate({
             return stored
           }
         )
+
+        const prefetch = await prefetchPromise
+
+        if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
+          const delegate = sessionTileDelegate()
+
+          if (!delegate) {
+            throw new Error('session binding changed while resume was in flight')
+          }
+
+          return delegate.resumeTile(storedSessionId, options)
+        }
 
         const prefetch = await prefetchPromise
 
