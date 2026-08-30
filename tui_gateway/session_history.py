@@ -185,6 +185,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if role not in _HISTORY_ROLES or m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
+        from agent.codex_display_projection import project_codex_display_items
+        codex_display_items = project_codex_display_items(m) if role == "assistant" else None
         if _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):
@@ -196,8 +198,6 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
                     tool_call_args[tc_id] = (fn["name"], args)
-            if not content_text.strip():
-                continue
         if role == "tool":
             tc_name, tc_args = tool_call_args.get(m.get("tool_call_id") or "", (None, None))
             name = tc_name or m.get("tool_name") or "tool"
@@ -207,7 +207,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             continue
         # A reasoning-only assistant turn is kept so "Thinking…" still shows after resume/reload.
         has_reasoning = role == "assistant" and any(m.get(key) for key in _HISTORY_REASONING_KEYS)
-        if not content_text.strip() and not has_reasoning:
+        if not content_text.strip() and not has_reasoning and not codex_display_items:
             continue
         msg = {"role": role, "text": content_text}
         # Authoring time (Unix seconds) for display.timestamps; display-only.
@@ -223,7 +223,10 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if invocation:
             msg.update(text=invocation, display_kind="skill_invocation")
         if role == "assistant":
-            msg.update((key, m[key]) for key in _HISTORY_REASONING_KEYS if m.get(key) is not None)
+            msg.update((key, m[key]) for key in ("reasoning", "reasoning_content", "reasoning_details")
+                       if m.get(key) is not None)
+            if codex_display_items:
+                msg["codex_display_items"] = codex_display_items
         # Display-only timeline metadata (model switches, delegation events).
         display_kind = m.get("display_kind") or _legacy_display_kind(role, content_text)
         if display_kind:
