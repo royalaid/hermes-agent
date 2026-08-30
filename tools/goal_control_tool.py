@@ -61,14 +61,12 @@ def _error(code: str, message: str, *, session_id: str = "") -> str:
     )
 
 
-def _state_payload(state: Optional[Any]) -> Dict[str, Any]:
+def _state_payload(state: Optional[Any], goal: Dict[str, Any]) -> Dict[str, Any]:
     if state is None:
         return {
-            "exists": False,
+            **goal,
             "active": False,
             "paused": False,
-            "status": None,
-            "condition": None,
             "turns_used": None,
             "max_turns": None,
             "revision": None,
@@ -76,7 +74,7 @@ def _state_payload(state: Optional[Any]) -> Dict[str, Any]:
             "error_reason": None,
         }
 
-    status = str(state.status or "") or None
+    status = goal["status"]
     has_judge_error = status != "cleared" and bool(
         state.consecutive_parse_failures
         or state.consecutive_transport_failures
@@ -86,11 +84,9 @@ def _state_payload(state: Optional[Any]) -> Dict[str, Any]:
     if stop_reason is None and status in {"done", "cleared"}:
         stop_reason = state.last_reason
     return {
-        "exists": True,
+        **goal,
         "active": status == "active",
         "paused": status == "paused",
-        "status": status,
-        "condition": state.goal,
         "turns_used": state.turns_used,
         "max_turns": state.max_turns,
         # GoalState has no optimistic revision field today. Keep this explicit
@@ -150,6 +146,7 @@ def goal_control_tool(
         from hermes_cli.goals import (
             ConcurrentGoalStateChange,
             GoalManager,
+            goal_state_payload,
             load_goal_authoritative,
             load_goal_snapshot_authoritative,
         )
@@ -279,7 +276,8 @@ def goal_control_tool(
             session_id=caller_session_id,
         )
 
-    state_payload = _state_payload(persisted)
+    goal_payload = goal_state_payload(persisted)
+    state_payload = _state_payload(persisted, goal_payload)
     receipt_token = (
         persisted.receipt_token
         if persisted is not None and persisted.receipt_token is not None
@@ -297,6 +295,7 @@ def goal_control_tool(
                 "session_id": caller_session_id,
                 "active": state_payload["active"],
                 "condition": state_payload["condition"],
+                "goal": goal_payload,
                 "observed_via": "goal_control",
                 "acceptance_evidence": (
                     list(persisted.acceptance_evidence) if persisted is not None else []

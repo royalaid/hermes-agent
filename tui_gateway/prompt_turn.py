@@ -79,6 +79,17 @@ def _plan_goal_compression_recovery(
         "Run /compress, then /goal resume to continue.")
 
 
+def _goal_status_payload(session_id: str, text: str) -> dict:
+    """Build a live update from the same persisted projection as the tool."""
+    from hermes_cli.goals import goal_state_payload, load_goal_authoritative
+
+    return {
+        "kind": "goal",
+        "text": text,
+        "goal": goal_state_payload(load_goal_authoritative(session_id)),
+    }
+
+
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
     queued_prompt_generation: int | None) -> tuple[list[str], Any] | None:
@@ -284,7 +295,8 @@ def _goal_followup_after_turn(
         recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
             session, result, status=status, raw=raw)
         if recovery_notice:
-            _emit("status.update", sid, {"kind": "goal", "text": recovery_notice})
+            _emit("status.update", sid, _goal_status_payload(
+                session.get("session_key") or sid, recovery_notice))
         goal_followup = recovery_prompt or None
     except Exception as _goal_recovery_exc:
         _hook_failure("goal compression recovery", _goal_recovery_exc)
@@ -304,7 +316,8 @@ def _goal_followup_after_turn(
             decision = goal_mgr.evaluate_after_turn(
                 raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
             if verdict_msg := decision.get("message") or "":
-                _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
+                _emit("status.update", sid, _goal_status_payload(
+                    session.get("session_key") or sid, verdict_msg))
             if decision.get("should_continue") and (
                 cont_prompt := decision.get("continuation_prompt") or ""):
                 goal_followup = cont_prompt
