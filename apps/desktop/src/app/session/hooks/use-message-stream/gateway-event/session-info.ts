@@ -26,7 +26,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import { acceptsSessionRuntimeSource } from '@/store/session-binding'
-import type { SessionOwnerRoute } from '@/store/session-request-router'
+import { type SessionOwnerRoute, sessionOwnerRouteFromRow } from '@/store/session-request-router'
 import { reportInstallMethodWarning } from '@/store/updates'
 
 import { finalizeInterruptedMessages } from '../../use-prompt-actions/rewind'
@@ -145,7 +145,7 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext, sourceOwner?:
 export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, explicitSid, isActiveEvent, occurredAt, fromActiveSource } = ctx
 
-  const sourceOwner = event.connectionId
+  const sourceOwner: SessionOwnerRoute | undefined = event.connectionId
     ? { connectionId: event.connectionId, profile: event.profile?.trim() || 'default' }
     : undefined
 
@@ -468,7 +468,28 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     const nextTitle = typeof payload?.title === 'string' ? payload.title.trim() : ''
 
     if (storedId && nextTitle) {
-      setSessions(prev => prev.map(s => (sessionMatchesStoredId(s, storedId) ? { ...s, title: nextTitle } : s)))
+      setSessions(prev =>
+        prev.map(session => {
+          if (!sessionMatchesStoredId(session, storedId)) {
+            return session
+          }
+
+          if (sourceOwner) {
+            const rowOwner = sessionOwnerRouteFromRow(session)
+            const sourceTargetProfile = (sourceOwner.targetProfile ?? sourceOwner.profile).trim() || 'default'
+
+            if (
+              !rowOwner ||
+              rowOwner.connectionId !== sourceOwner.connectionId.trim() ||
+              rowOwner.profile !== sourceTargetProfile
+            ) {
+              return session
+            }
+          }
+
+          return { ...session, title: nextTitle }
+        })
+      )
     }
 
     return true
