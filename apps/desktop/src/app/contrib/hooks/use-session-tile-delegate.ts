@@ -306,8 +306,21 @@ export function useSessionTileDelegate({
             ? { connectionId: owner.connectionId, profile: owner.targetProfile || owner.profile }
             : owner
 
+        const prefetchPromise = getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
+
         if (existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
-          const prefetch = await getLatestSessionMessages(storedSessionId, restScope).catch(() => null)
+          const prefetch = await prefetchPromise
+
+          if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
+            const delegate = sessionTileDelegate()
+
+            if (!delegate) {
+              throw new Error('session binding changed while resume was in flight')
+            }
+
+            return delegate.resumeTile(storedSessionId, options)
+          }
+
           const merged = mergeTileTranscript(cached.messages, prefetch?.messages)
 
           if (!chatMessageArraysEquivalent(cached.messages, merged)) {
@@ -350,6 +363,18 @@ export function useSessionTileDelegate({
             return stored
           }
         )
+
+        if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
+          const delegate = sessionTileDelegate()
+
+          if (!delegate) {
+            throw new Error('session binding changed while resume was in flight')
+          }
+
+          return delegate.resumeTile(storedSessionId, options)
+        }
+
+        const prefetch = await prefetchPromise
 
         if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
           const delegate = sessionTileDelegate()
