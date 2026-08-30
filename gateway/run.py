@@ -23846,13 +23846,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # and a default-executor hop would drop them — aux-client provider
         # resolution would then read credentials unscoped and fail under
         # multiplexing (same pattern as compression in slash_commands.py).
-        decision = await self._run_in_executor_with_context(
-            lambda: mgr.evaluate_after_turn(
-                final_response or "",
-                user_initiated=True,
-                background_processes=_bg_procs,
-            ),
-        )
+        try:
+            decision = await self._run_in_executor_with_context(
+                lambda: mgr.evaluate_after_turn(
+                    final_response or "",
+                    user_initiated=True,
+                    background_processes=_bg_procs,
+                ),
+            )
+        except GoalPersistenceError as exc:
+            notice = f"Goal status unavailable: {exc}"
+            logger.warning("goal continuation: %s", notice)
+            if source is not None:
+                await self._defer_goal_status_notice_after_delivery(source, notice)
+            return
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
