@@ -27,7 +27,7 @@ import {
 import { clearMainSessionBinding, getMainSessionBinding } from '@/store/session-binding'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isBrowserWindow, isHudWindow, isSecondaryWindow } from '@/store/windows'
+import { isBrowserWindow, isHudWindow, isSecondaryWindow, secondarySessionOwnerRoute } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
@@ -92,6 +92,23 @@ export function useDesktopIntegrations({
   }, [])
 
   const restoredRef = useRef(false)
+  const secondaryOwnerResumedRef = useRef(false)
+
+  // This ref consumes a one-time secondary-window route capability; it does
+  // not mirror reactive state.
+  // eslint-disable-next-line no-restricted-syntax
+  useEffect(() => {
+    if (!profileReady || !isSecondaryWindow() || !routedSessionId || secondaryOwnerResumedRef.current) {
+      return
+    }
+
+    const ownerRoute = secondarySessionOwnerRoute()
+
+    if (ownerRoute) {
+      secondaryOwnerResumedRef.current = true
+      requestSessionResume(routedSessionId, ownerRoute)
+    }
+  }, [profileReady, routedSessionId])
 
   // Wait until boot has adopted the primary profile, then restore that profile's
   // navigation exactly once. The same effect owns subsequent writes so the

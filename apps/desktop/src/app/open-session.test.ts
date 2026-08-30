@@ -235,6 +235,14 @@ describe('openSession', () => {
     expect(openSessionTile).not.toHaveBeenCalled()
   })
 
+  it('window carries the exact owner through the popout bridge', () => {
+    const ownerRoute = { connectionId: 'source-b', profile: 'profile-b', targetProfile: 'target-b' }
+
+    openSession('s1', navigate, 'window', { ownerRoute, workspaceMode: 'sessions' })
+    expect(openSessionInNewWindow).toHaveBeenCalledWith('s1', { ownerRoute })
+    expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
   it('window pops out when the bridge supports it', () => {
     openSession('s1', navigate, 'window')
     expect(openSessionInNewWindow).toHaveBeenCalledWith('s1')
