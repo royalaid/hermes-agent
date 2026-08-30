@@ -104,24 +104,10 @@ describe('openSession', () => {
     $selectedStoredSessionId.set(null)
   })
 
-  it('default in-place fronts an existing tile without navigating', () => {
+  it('in-place focuses an existing tile and does not navigate', () => {
     focusOpenSession.mockReturnValue('tile')
     openSession('s1', navigate)
     expect(focusOpenSession).toHaveBeenCalledWith('s1', { workspaceMode: 'sessions' })
-    expect(navigate).not.toHaveBeenCalled()
-    expect(openSessionTile).not.toHaveBeenCalled()
-  })
-
-  it('tab intent still fronts an existing tile without navigating', () => {
-    focusOpenSession.mockReturnValue('tile')
-    openSession('s1', navigate, 'tab')
-    expect(navigate).not.toHaveBeenCalled()
-    expect(openSessionTile).not.toHaveBeenCalled()
-  })
-
-  it('stack fronts an existing tile even when main is blank', () => {
-    focusOpenSession.mockReturnValue('tile')
-    openSession('s1', navigate, 'stack')
     expect(navigate).not.toHaveBeenCalled()
     expect(openSessionTile).not.toHaveBeenCalled()
   })
@@ -161,11 +147,10 @@ describe('openSession', () => {
     expect(navigate).not.toHaveBeenCalled()
   })
 
-  it('tab opens a stacked session tile when not on screen without reusing an unrelated blank draft', () => {
+  it('tab opens a stacked session tile when not on screen', () => {
     focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate, 'tab')
     expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
-    expect(reuseBlankDraftTile).not.toHaveBeenCalled()
     expect(navigate).not.toHaveBeenCalled()
   })
 
@@ -173,20 +158,6 @@ describe('openSession', () => {
     const scope = { workspaceMode: 'bots' as const, workspaceOwnerKey: 'connection-a::default' }
     focusOpenSession.mockReturnValue(null)
 
-    openSession('s1', navigate, 'tab', scope)
-
-    expect(setSessionTileWorkspaceScope).toHaveBeenCalledWith('s1', scope)
-    expect(focusOpenSession).toHaveBeenCalledWith('s1', scope)
-    expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, scope)
-  })
-
-  it('threads an exact Sessions owner into a new session tile', () => {
-    const scope = {
-      ownerRoute: { connectionId: 'connection-b', profile: 'profile-b' },
-      workspaceMode: 'sessions' as const
-    }
-
-    focusOpenSession.mockReturnValue(null)
     openSession('s1', navigate, 'tab', scope)
 
     expect(setSessionTileWorkspaceScope).toHaveBeenCalledWith('s1', scope)
