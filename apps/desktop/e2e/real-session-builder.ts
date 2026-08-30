@@ -1,10 +1,57 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import * as fs from 'node:fs'
+import * as os from 'node:os'
 import * as path from 'node:path'
 import { createInterface } from 'node:readline'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
 const DEFAULT_TIMEOUT_MS = 60_000
+const CODEX_COMMENTARY_SEED_SCRIPT = path.resolve(import.meta.dirname, 'seed-codex-commentary-session.py')
+
+function resolveUv(): string {
+  if (process.platform !== 'win32') return 'uv'
+  const candidates = [
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'hermes', 'bin', 'uv.exe'),
+    path.join(os.homedir(), '.local', 'bin', 'uv.exe'),
+    path.join(os.homedir(), '.cargo', 'bin', 'uv.exe'),
+  ].filter((candidate): candidate is string => Boolean(candidate))
+  return candidates.find(candidate => fs.existsSync(candidate)) ?? 'uv'
+}
+
+const UV_BINARY = resolveUv()
+
+function resolveBackendVirtualEnv(): string | undefined {
+  if (process.env.VIRTUAL_ENV) return process.env.VIRTUAL_ENV
+  if (process.platform !== 'win32' || !process.env.LOCALAPPDATA) return undefined
+  const installedVenv = path.join(process.env.LOCALAPPDATA, 'hermes', 'hermes-agent', 'venv')
+  return fs.existsSync(path.join(installedVenv, 'Scripts', 'python.exe')) ? installedVenv : undefined
+}
+
+const BACKEND_VIRTUAL_ENV = resolveBackendVirtualEnv()
+
+export function withBackendPythonEnv(env: Record<string, string>): Record<string, string> {
+  if (!BACKEND_VIRTUAL_ENV) return env
+  const python = path.join(
+    BACKEND_VIRTUAL_ENV,
+    process.platform === 'win32' ? path.join('Scripts', 'python.exe') : path.join('bin', 'python'),
+  )
+  return {
+    ...env,
+    HERMES_DESKTOP_PYTHON: python,
+    VIRTUAL_ENV: BACKEND_VIRTUAL_ENV,
+    PATH: [path.dirname(python), env.PATH].filter(Boolean).join(path.delimiter),
+  }
+}
+
+function pythonEnv(hermesHome: string): NodeJS.ProcessEnv {
+  return withBackendPythonEnv({
+    ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => Boolean(entry[1]))),
+    HERMES_HOME: hermesHome,
+    HERMES_TUI_TOOLSETS: 'file',
+    PYTHONPATH: REPO_ROOT,
+  })
+}
 
 interface JsonRpcError {
   code?: number
@@ -71,13 +118,9 @@ export class RealSessionBuilder {
   private closed = false
 
   private constructor(hermesHome: string) {
-    this.child = spawn('uv', ['run', '--active', '--no-sync', 'python', '-m', 'tui_gateway.entry'], {
+    this.child = spawn(UV_BINARY, ['run', '--active', '--no-sync', 'python', '-m', 'tui_gateway.entry'], {
       cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        HERMES_HOME: hermesHome,
-        PYTHONPATH: REPO_ROOT,
-      },
+      env: pythonEnv(hermesHome),
       stdio: 'pipe',
     })
 
@@ -224,6 +267,35 @@ export class RealSessionBuilder {
     for (const waiter of this.eventWaiters) waiter.reject(error)
     this.eventWaiters.length = 0
   }
+}
+
+export async function seedCodexCommentarySession(hermesHome: string, sessionId: string): Promise<void> {
+  const stateDb = path.join(hermesHome, 'state.db')
+  const child = spawn(
+    UV_BINARY,
+    [
+      'run', '--active', '--no-sync', 'python', CODEX_COMMENTARY_SEED_SCRIPT,
+      '--hermes-home', hermesHome, '--state-db', stateDb, '--session-id', sessionId,
+    ],
+    { cwd: REPO_ROOT, env: pythonEnv(hermesHome), stdio: ['ignore', 'pipe', 'pipe'] },
+  )
+  const stdout: Buffer[] = []
+  const stderr: Buffer[] = []
+  child.stdout.on('data', chunk => stdout.push(Buffer.from(chunk)))
+  child.stderr.on('data', chunk => stderr.push(Buffer.from(chunk)))
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', error => reject(new Error(`Codex commentary seed failed to start: ${error.message}`)))
+    child.once('exit', (code, signal) => {
+      if (code === 0) {
+        resolve()
+        return
+      }
+      reject(new Error(
+        `Codex commentary seed exited ${signal ?? code ?? 'unknown'}:\n` +
+        `${Buffer.concat(stderr).toString('utf8')}\n${Buffer.concat(stdout).toString('utf8')}`,
+      ))
+    })
+  })
 }
 
 function readString(value: unknown, key: string): string | undefined {
