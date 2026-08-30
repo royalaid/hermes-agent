@@ -25,6 +25,7 @@ import {
   patchSessionTile,
   type SessionTile
 } from '@/store/session-states'
+import { canOpenSessionWindow } from '@/store/windows'
 
 import { openSession } from '../open-session'
 
@@ -62,6 +63,13 @@ export function openExactSidebarSession({
   }
 
   const { storedSessionId } = binding
+
+  if (placement === 'window' && canOpenSessionWindow()) {
+    openSession(storedSessionId, navigate, placement, { ownerRoute: binding.ownerRoute, workspaceMode: 'sessions' })
+
+    return 'created-cold'
+  }
+
   const tiles = $sessionTiles.get()
   const tile = tiles.find(candidate => candidate.storedSessionId === storedSessionId)
   const selectedInMain = $selectedStoredSessionId.get() === storedSessionId
