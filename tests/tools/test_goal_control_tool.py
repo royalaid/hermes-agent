@@ -106,6 +106,19 @@ def test_goal_control_is_exposed_on_the_core_model_surface(tmp_path, monkeypatch
     assert "goal_control" in names
 
 
+def test_goal_control_can_be_enabled_as_a_narrow_toolset(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+
+    definitions = get_tool_definitions(
+        enabled_toolsets=["goal"],
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+
+    names = {item["function"]["name"] for item in definitions}
+    assert names == {"goal_control"}
+
+
 def test_set_uses_configured_goal_budget_when_omitted(tmp_path, monkeypatch):
     home = _home(tmp_path, monkeypatch)
     (home / "config.yaml").write_text("goals:\n  max_turns: 11\n", encoding="utf-8")
