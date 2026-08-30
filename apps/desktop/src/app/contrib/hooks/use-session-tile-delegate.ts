@@ -27,7 +27,6 @@ import {
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
 import {
-  ,
   publishSessionState,
   sessionTileDelegate,
   sessionTileOwnerRoute,
@@ -42,6 +41,7 @@ import {
   appendLiveSessionProjection,
   chatMessageArraysEquivalent,
   overlayConcurrentMessageChanges,
+  preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
   resolveSessionOwner,
   runningProjectionStreamId
