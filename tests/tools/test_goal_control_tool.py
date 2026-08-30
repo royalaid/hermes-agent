@@ -27,7 +27,19 @@ def _call(action: str, *, session_id: str, **kwargs):
 
 def test_status_returns_a_session_scoped_goal_readback_receipt(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
-    _call("set", session_id="session-current", condition="Run checks", max_turns=3)
+    _call(
+        "set",
+        session_id="session-current",
+        condition="Continue until report.json exists",
+        max_turns=3,
+        acceptance_evidence=[
+            {
+                "kind": "file_exists",
+                "locator": "report.json",
+                "assertion": "exists",
+            }
+        ],
+    )
 
     raw = handle_function_call(
         "goal_control",
@@ -49,9 +61,54 @@ def test_status_returns_a_session_scoped_goal_readback_receipt(tmp_path, monkeyp
         "kind": "goal-status-readback",
         "session_id": "session-current",
         "active": True,
-        "condition": "Run checks",
+        "condition": "Continue until report.json exists",
         "observed_via": "goal_control",
+        "acceptance_evidence": [
+            {
+                "kind": "file_exists",
+                "locator": "report.json",
+                "assertion": "exists",
+            }
+        ],
     }
+
+
+@pytest.mark.parametrize(
+    "condition,evidence",
+    [
+        (
+            "Continue until report.json exists",
+            [{"kind": "invented", "locator": "report.json", "assertion": "exists"}],
+        ),
+        (
+            "Continue until report.json exists",
+            [{"kind": "file_exists", "locator": "report.json", "assertion": "passes"}],
+        ),
+        (
+            "Continue until report.json exists",
+            [{"kind": "file_exists", "locator": "", "assertion": "exists"}],
+        ),
+        (
+            "Continue until the run completes",
+            [{"kind": "file_exists", "locator": "report.json", "assertion": "exists"}],
+        ),
+    ],
+)
+def test_set_rejects_invalid_acceptance_evidence(
+    tmp_path, monkeypatch, condition, evidence
+):
+    _home(tmp_path, monkeypatch)
+
+    result = _call(
+        "set",
+        session_id="session-current",
+        condition=condition,
+        acceptance_evidence=evidence,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "invalid_acceptance_evidence"
+    assert goals.load_goal("session-current") is None
 
 
 def _home(tmp_path, monkeypatch):
