@@ -7,12 +7,14 @@ import {
   setActiveSessionId,
   setAwaitingResponse,
   setBusy,
-  setMessages
+  setMessages,
+  setSelectedStoredSessionId
 } from '@/store/session'
 import {
   claimSessionBinding,
   detachRuntimeForSession,
   getMainSessionBinding,
+  invalidateSessionRuntimeBinding,
   normalizeSessionBinding,
   type SessionBinding,
   setMainSessionBinding
@@ -36,7 +38,7 @@ export type ExactSidebarOpenOutcome =
 export interface ExactSidebarOpenRequest {
   binding: SessionBinding
   navigate: OpenSessionNavigate
-  placement: 'main' | 'tab'
+  placement: 'main' | 'tab' | 'window'
 }
 
 function tileBinding(tile: SessionTile | undefined): SessionBinding | null {
@@ -66,12 +68,19 @@ export function openExactSidebarSession({
   const profile = $activeGatewayProfile.get()
   const previous = tileBinding(tile) ?? (selectedInMain ? getMainSessionBinding(storedSessionId, profile) : null)
   const { detached, runtimeId } = detachRuntimeForSession(binding, previous)
-  const sameOwnerWarm = !detached && Boolean(previous && runtimeId)
+  const legacyTileOwnerUnresolved = Boolean(tile && !tileBinding(tile))
+  const legacyTileRuntimeId = legacyTileOwnerUnresolved ? tile?.runtimeId ?? null : null
+  const coldRebind = detached || legacyTileOwnerUnresolved
+  const sameOwnerWarm = !coldRebind && Boolean(previous && runtimeId)
+
+  if (legacyTileOwnerUnresolved) {
+    invalidateSessionRuntimeBinding(storedSessionId)
+  }
 
   claimSessionBinding(binding)
 
-  if (detached) {
-    for (const id of new Set([runtimeId, tile?.runtimeId, selectedInMain ? $activeSessionId.get() : null])) {
+  if (coldRebind) {
+    for (const id of new Set([runtimeId, legacyTileRuntimeId, selectedInMain ? $activeSessionId.get() : null])) {
       if (id) {
         dropSessionState(id)
       }
@@ -86,6 +95,10 @@ export function openExactSidebarSession({
       setAwaitingResponse(false)
       setBusy(false)
       setMessages([])
+
+      if (placement !== 'main') {
+        setSelectedStoredSessionId(null)
+      }
     }
   }
 
@@ -95,7 +108,7 @@ export function openExactSidebarSession({
     if (!sameOwnerWarm) {
       requestSessionResume(storedSessionId, binding.ownerRoute)
     }
-  } else if (tile && !detached && previous) {
+  } else if (placement === 'tab' && tile && !coldRebind && previous) {
     openSession(storedSessionId, navigate, 'tab', { ownerRoute: binding.ownerRoute, workspaceMode: 'sessions' })
 
     return 'focused-warm'
@@ -107,7 +120,7 @@ export function openExactSidebarSession({
     return 'focused-warm'
   }
 
-  if (detached) {
+  if (coldRebind) {
     return 'rebound-cold'
   }
 

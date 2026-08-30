@@ -18,11 +18,13 @@ import type { GatewayEventContext } from './types'
 // still carries a real cwd.
 function sessionInfoEvent({
   activeSessionId,
+  connectionId,
   cwd,
   explicitSid = '',
   storedSessionId = ''
 }: {
   activeSessionId: null | string
+  connectionId?: string
   cwd: string
   explicitSid?: string
   storedSessionId?: string
@@ -43,7 +45,7 @@ function sessionInfoEvent({
       updateSessionState: vi.fn(state => state),
       upsertToolCall: vi.fn()
     },
-    event: { profile: 'default', session_id: explicitSid, type: 'session.info' },
+    event: { connectionId, profile: 'default', session_id: explicitSid, type: 'session.info' },
     explicitSid,
     fromActiveSource: () => true,
     isActiveEvent: !!sessionId && sessionId === activeSessionId,
@@ -145,5 +147,24 @@ describe('handleSessionInfoEvent workspace ownership', () => {
     handleSessionInfoEvent(ctx)
 
     expect(next).toBe(original)
+  })
+
+  it('carries the gateway source into stored-runtime admission', () => {
+    const ctx = sessionInfoEvent({
+      activeSessionId: 'runtime-a',
+      connectionId: 'source-a',
+      cwd: '/repo/a',
+      explicitSid: 'runtime-a',
+      storedSessionId: 'shared-id'
+    })
+
+    handleSessionInfoEvent(ctx)
+
+    expect(ctx.deps.updateSessionState).toHaveBeenCalledWith(
+      'runtime-a',
+      expect.any(Function),
+      'shared-id',
+      { connectionId: 'source-a', profile: 'default' }
+    )
   })
 })

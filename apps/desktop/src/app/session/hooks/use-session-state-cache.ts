@@ -21,7 +21,16 @@ import {
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
-import { bindRuntimeToSession, invalidateSessionRuntimeBinding, normalizeSessionBinding } from '@/store/session-binding'
+import {
+  acceptsSessionRuntimeSource,
+  bindingsEqual,
+  bindRuntimeToSession,
+  currentSessionBinding,
+  invalidateSessionRuntimeBinding,
+  normalizeSessionBinding,
+  runtimeForExactSessionBinding
+} from '@/store/session-binding'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
 import {
   $sessionStates,
   $sessionTiles,
@@ -135,13 +144,36 @@ export function useSessionStateCache({
 
   const sessionStateCache = sessionStateByRuntimeIdRef.current
 
-  const bindKnownRuntime = useCallback((storedSessionId: string, runtimeId: string) => {
-    const ownerRoute = sessionTileOwnerRoute(storedSessionId) ?? getSessionOwnerHint(storedSessionId)
-    const binding = ownerRoute ? normalizeSessionBinding({ ownerRoute, storedSessionId }) : null
+  const bindKnownRuntime = useCallback((storedSessionId: string, runtimeId: string, sourceOwner?: SessionOwnerRoute) => {
+    const canonical = currentSessionBinding(storedSessionId)
+    const hintedOwner = sessionTileOwnerRoute(storedSessionId) ?? getSessionOwnerHint(storedSessionId)
+
+    const sourceBinding = sourceOwner
+      ? normalizeSessionBinding({
+          ownerRoute: {
+            ...sourceOwner,
+            targetProfile: canonical?.ownerRoute.targetProfile ?? sourceOwner.targetProfile ?? sourceOwner.profile
+          },
+          storedSessionId
+        })
+      : null
+
+    if (sourceBinding && canonical && !bindingsEqual(sourceBinding, canonical)) {
+      return false
+    }
+
+    if (!sourceOwner && canonical && runtimeForExactSessionBinding(canonical) !== runtimeId) {
+      return false
+    }
+
+    const binding =
+      canonical ?? sourceBinding ?? (hintedOwner ? normalizeSessionBinding({ ownerRoute: hintedOwner, storedSessionId }) : null)
 
     if (binding) {
       bindRuntimeToSession(binding, runtimeId)
     }
+
+    return true
   }, [])
 
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
@@ -157,7 +189,20 @@ export function useSessionStateCache({
   }, [busy, busyRef])
 
   const ensureSessionState = useCallback(
-    (sessionId: string, storedSessionId?: string | null) => {
+    (sessionId: string, storedSessionId?: string | null, sourceOwner?: SessionOwnerRoute) => {
+      if (
+        storedSessionId &&
+        sourceOwner &&
+        !acceptsSessionRuntimeSource(
+          storedSessionId,
+          sessionId,
+          sourceOwner,
+          sessionId === activeSessionIdRef.current
+        )
+      ) {
+        return createClientSessionState(storedSessionId)
+      }
+
       const existing = sessionStateCache.get(sessionId)
 
       if (existing) {
@@ -191,9 +236,8 @@ export function useSessionStateCache({
             }
           }
 
-          if (storedSessionId) {
+          if (storedSessionId && bindKnownRuntime(storedSessionId, sessionId, sourceOwner)) {
             runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
-            bindKnownRuntime(storedSessionId, sessionId)
           }
 
           sessionStateCache.set(sessionId, updated)
@@ -204,9 +248,8 @@ export function useSessionStateCache({
 
       const created = createClientSessionState(storedSessionId ?? null)
 
-      if (storedSessionId) {
+      if (storedSessionId && bindKnownRuntime(storedSessionId, sessionId, sourceOwner)) {
         runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
-        bindKnownRuntime(storedSessionId, sessionId)
       }
 
       sessionStateCache.set(sessionId, created)
@@ -362,9 +405,23 @@ export function useSessionStateCache({
     (
       sessionId: string,
       updater: (state: ClientSessionState) => ClientSessionState,
-      storedSessionId?: string | null
+      storedSessionId?: string | null,
+      sourceOwner?: SessionOwnerRoute
     ) => {
-      const previous = ensureSessionState(sessionId, storedSessionId)
+      if (
+        storedSessionId &&
+        sourceOwner &&
+        !acceptsSessionRuntimeSource(
+          storedSessionId,
+          sessionId,
+          sourceOwner,
+          sessionId === activeSessionIdRef.current
+        )
+      ) {
+        return sessionStateCache.get(sessionId) ?? createClientSessionState(storedSessionId)
+      }
+
+      const previous = ensureSessionState(sessionId, storedSessionId, sourceOwner)
       // Give the updater the raw previous state so it can return the same
       // reference when nothing changed (the caller sees a no-op). Previously
       // the param was always a fresh spread, so every call looked like a
