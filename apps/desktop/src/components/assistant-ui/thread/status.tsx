@@ -14,7 +14,7 @@ import { StatusPulse } from '@/components/ui/status-pulse'
 import { getLocalModelsStatus } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
-import { $backgroundResume } from '@/store/background-delegation'
+import { backgroundResumeForSession } from '@/store/background-delegation'
 import { sessionCompacting } from '@/store/compaction'
 import { $localModelsEnabled } from '@/store/local-models-flag'
 import { sessionAwaitingInput } from '@/store/prompts'
@@ -276,7 +276,14 @@ export const ResponseLoadingIndicator: FC = () => {
 // nothing is parked.
 export const BackgroundResumeNotice: FC = () => {
   const { t } = useI18n()
-  const resume = useStore($backgroundResume)
+  const view = useSessionView()
+
+  const $resume = useMemo(
+    () => backgroundResumeForSession(view.$runtimeId, view.$busy),
+    [view.$busy, view.$runtimeId]
+  )
+
+  const resume = useStore($resume)
 
   if (!resume) {
     return null
