@@ -553,7 +553,6 @@ class GoalState:
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
     last_turn_at: float = 0.0
-    updated_at: float = 0.0
     last_verdict: Optional[str] = None        # "done" | "continue" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
@@ -620,7 +619,6 @@ class GoalState:
             max_turns=int(data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS),
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_turn_at=float(data.get("last_turn_at", 0.0) or 0.0),
-            updated_at=float(data.get("updated_at", data.get("last_turn_at", data.get("created_at", 0.0))) or 0.0),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
@@ -667,6 +665,32 @@ def _meta_key(session_id: str) -> str:
 _DB_CACHE: Dict[str, Any] = {}
 _DB_BOOTSTRAP_LOCK = threading.Lock()
 _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
+_GOAL_GENERATION_LOCK = threading.Lock()
+_GOAL_GENERATIONS: Dict[Tuple[str, str], int] = {}
+
+
+def _goal_generation_key(session_id: str) -> Tuple[str, str]:
+    """Return the profile-scoped key for process-local goal invalidation."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home())
+    except Exception:  # pragma: no cover - defensive import fallback
+        home = ""
+    return home, session_id
+
+
+def _goal_generation(session_id: str) -> int:
+    with _GOAL_GENERATION_LOCK:
+        return _GOAL_GENERATIONS.get(_goal_generation_key(session_id), 0)
+
+
+def _bump_goal_generation(session_id: str) -> int:
+    key = _goal_generation_key(session_id)
+    with _GOAL_GENERATION_LOCK:
+        generation = _GOAL_GENERATIONS.get(key, 0) + 1
+        _GOAL_GENERATIONS[key] = generation
+        return generation
 
 # How long a loop-thread caller waits for an ALREADY-RUNNING bootstrap
 # before degrading to None. Normal SessionDB init is ~10-100ms, so a call
@@ -850,26 +874,45 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> bool:
-    """Persist a goal to SessionDB.
+def load_goal_authoritative(session_id: str) -> Optional[GoalState]:
+    """Read persisted goal state, raising when persistence is unavailable.
 
-    Returns ``True`` when the write reached SessionDB and ``False`` when the
-    DB is unavailable or rejects the write. Callers that keep live in-memory
-    goal state use this to avoid replacing newer local state with stale rows
-    on the next refresh.
+    Human-facing goal paths intentionally degrade when ``state.db`` is
+    unavailable. Model-callable control cannot treat that ambiguity as a
+    successful read-back, because an acknowledgement could otherwise claim a
+    mutation that never persisted.
     """
+    session_id = (session_id or "").strip()
     if not session_id:
-        return False
+        raise ValueError("session identity is required")
+    db = _get_session_db()
+    if db is None:
+        raise RuntimeError("session goal storage is unavailable")
+    try:
+        raw = db.get_meta(_meta_key(session_id))
+    except Exception as exc:
+        raise RuntimeError("persisted goal read failed") from exc
+    if not raw:
+        return None
+    try:
+        return GoalState.from_json(raw)
+    except Exception as exc:
+        raise RuntimeError("persisted goal state is invalid") from exc
+
+
+def save_goal(session_id: str, state: GoalState) -> None:
+    """Persist a goal to SessionDB. No-op if DB unavailable."""
+    if not session_id:
+        return
     db = _get_session_db()
     if db is None:
         _warn_dropped_write("GoalManager", "goal", session_id)
-        return False
+        return
     try:
         db.set_meta(_meta_key(session_id), state.to_json())
+        _bump_goal_generation(session_id)
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
-        return False
-    return True
 
 
 def clear_goal(session_id: str) -> None:
@@ -1437,61 +1480,41 @@ class GoalManager:
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
-        self._dirty_since: Optional[float] = None
+        self._seen_generation = _goal_generation(session_id)
+
+    def refresh_if_stale(self) -> bool:
+        """Reload after another manager persisted this session's goal.
+
+        The CLI retains a manager across turns, while model tools and gateway
+        controls may construct another manager for the same session. A cheap
+        process-local generation check keeps that retained manager from
+        continuing with, or writing back, stale state. Persistence failures
+        leave its current state intact and are retried on the next lookup.
+        """
+        target_generation = _goal_generation(self.session_id)
+        if target_generation == self._seen_generation:
+            return False
+        state = load_goal_authoritative(self.session_id)
+        self._state = state
+        self._seen_generation = target_generation
+        return True
 
     # --- introspection ------------------------------------------------
 
     @property
     def state(self) -> Optional[GoalState]:
-        return self.refresh()
-
-    def refresh(self) -> Optional[GoalState]:
-        """Reload state from SessionDB and return it.
-
-        Live CLI/gateway sessions may keep a ``GoalManager`` cached while a
-        model-callable tool updates the same session's goal through the DB.
-        Refreshing on public reads/mutations keeps those cached managers in
-        sync with externally-written goal state. Cleared audit rows are exposed
-        as ``None`` here so callers keep the long-standing "no active state"
-        semantics while ``load_goal`` still preserves the row for audit.
-        """
-        state = load_goal(self.session_id)
-        if self._dirty_since is not None:
-            if state is not None and self._state is not None and state.to_json() == self._state.to_json():
-                self._dirty_since = None
-            elif state is not None and max(state.created_at, state.last_turn_at, state.updated_at) > self._dirty_since:
-                self._dirty_since = None
-            else:
-                return None if self._state is None or self._state.status == "cleared" else self._state
-        if state is None:
-            return self._state
-        self._state = None if state.status == "cleared" else state
         return self._state
 
-    def _persist_state(self, state: GoalState) -> bool:
-        saved = save_goal(self.session_id, state)
-        self._dirty_since = None if saved else time.time()
-        return saved
-
-    @staticmethod
-    def _touch_state(state: GoalState) -> GoalState:
-        state.updated_at = time.time()
-        return state
-
     def is_active(self) -> bool:
-        self.refresh()
         return self._state is not None and self._state.status == "active"
 
     def has_goal(self) -> bool:
-        self.refresh()
         return self._state is not None and self._state.status in {"active", "paused"}
 
     def has_contract(self) -> bool:
-        self.refresh()
         return self._state is not None and self._state.has_contract()
 
     def status_line(self) -> str:
-        self.refresh()
         s = self._state
         if s is None or s.status in {"cleared",}:
             return "No active goal. Set one with /goal <text>."
@@ -1525,36 +1548,44 @@ class GoalManager:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
-        now = time.time()
         state = GoalState(
             goal=goal,
             status="active",
             turns_used=0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
-            created_at=now,
+            created_at=time.time(),
             last_turn_at=0.0,
-            updated_at=now,
             contract=contract if contract is not None else GoalContract(),
         )
         self._state = state
-        self._persist_state(state)
+        save_goal(self.session_id, state)
         return state
+
+    def update(self, goal: str, *, max_turns: Optional[int] = None) -> Optional[GoalState]:
+        """Update goal text/budget without changing its lifecycle progress."""
+        goal = (goal or "").strip()
+        if not goal:
+            raise ValueError("goal text is empty")
+        if self._state is None or self._state.status not in {"active", "paused"}:
+            return None
+        self._state.goal = goal
+        if max_turns is not None:
+            self._state.max_turns = int(max_turns)
+        save_goal(self.session_id, self._state)
+        return self._state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal.
 
         Returns the updated state, or None when there is no goal to attach to.
         """
-        self.refresh()
         if self._state is None:
             return None
         self._state.contract = contract or GoalContract()
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return self._state
 
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
-        self.refresh()
         if not self._state:
             return None
         self._state.status = "paused"
@@ -1565,12 +1596,10 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return self._state
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
-        self.refresh()
         if not self._state:
             return None
         self._state.status = "active"
@@ -1583,28 +1612,28 @@ class GoalManager:
         self._state.waiting_since = 0.0
         if reset_budget:
             self._state.turns_used = 0
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return self._state
 
-    def clear(self) -> None:
-        self.refresh()
+    def clear(self, *, reason: Optional[str] = None) -> Optional[GoalState]:
         if self._state is None:
-            return
+            return None
         self._state.status = "cleared"
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        if reason is not None:
+            self._state.paused_reason = None
+            self._state.last_reason = reason
+        cleared = self._state
+        save_goal(self.session_id, cleared)
         self._state = None
+        return cleared
 
     def mark_done(self, reason: str) -> None:
-        self.refresh()
         if not self._state:
             return
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -1620,8 +1649,7 @@ class GoalManager:
         if not text:
             raise ValueError("subgoal text is empty")
         self._state.subgoals.append(text)
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return text
 
     def remove_subgoal(self, index_1based: int) -> str:
@@ -1634,8 +1662,7 @@ class GoalManager:
                 f"index out of range (1..{len(self._state.subgoals)})"
             )
         removed = self._state.subgoals.pop(idx)
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return removed
 
     def clear_subgoals(self) -> int:
@@ -1644,13 +1671,11 @@ class GoalManager:
             raise RuntimeError("no active goal")
         prev = len(self._state.subgoals)
         self._state.subgoals = []
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return prev
 
     def render_subgoals(self) -> str:
         """Public helper for the /subgoal slash command."""
-        self.refresh()
         if self._state is None:
             return "(no active goal)"
         if not self._state.subgoals:
@@ -1817,9 +1842,6 @@ class GoalManager:
         active goal. For a process with a watch_patterns/notify_on_complete
         trigger, prefer ``wait_on_session`` so a mid-run trigger (not just
         exit) releases the barrier.
-
-        Does not refresh first: ``evaluate_after_turn`` may call this while
-        holding unpersisted turn/verdict mutations on ``self._state``.
         """
         if self._state is None or self._state.status != "active":
             raise RuntimeError("no active goal to park")
@@ -1831,8 +1853,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return self._state
 
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
@@ -1843,9 +1864,6 @@ class GoalManager:
         with ``watch_patterns`` — its pattern matches. This is the right
         barrier for a long-lived watcher/server/poller that signals mid-run
         and may never exit. Requires an active goal.
-
-        Does not refresh first — may be called mid-evaluate with unpersisted
-        local mutations that must not be clobbered by a DB reload.
         """
         if self._state is None or self._state.status != "active":
             raise RuntimeError("no active goal to park")
@@ -1857,8 +1875,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return self._state
 
     def wait_for_seconds(self, seconds: int, reason: str = "") -> GoalState:
@@ -1868,9 +1885,6 @@ class GoalManager:
         where there's no process to track (e.g. the agent is rate-limited).
         The barrier auto-clears once the deadline passes. Requires an active
         goal.
-
-        Does not refresh first — may be called mid-evaluate with unpersisted
-        local mutations that must not be clobbered by a DB reload.
         """
         if self._state is None or self._state.status != "active":
             raise RuntimeError("no active goal to park")
@@ -1882,17 +1896,12 @@ class GoalManager:
         self._state.waiting_until = time.time() + seconds
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return self._state
 
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True
-        if one was cleared.
-
-        Operates on the in-memory state without refreshing first so lazy
-        auto-clear and mid-evaluate paths keep unpersisted local mutations.
-        """
+        if one was cleared."""
         if self._state is None:
             return False
         if (
@@ -1906,8 +1915,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
-        self._touch_state(self._state)
-        self._persist_state(self._state)
+        save_goal(self.session_id, self._state)
         return True
 
     def is_waiting(self) -> bool:
@@ -1918,10 +1926,6 @@ class GoalManager:
         barrier: active until the deadline passes. Side effect: a satisfied
         barrier is cleared here (lazy auto-clear) so the next evaluation
         resumes normal judging.
-
-        Uses the in-memory state without refreshing first so tests and
-        evaluate paths can mutate barrier fields and observe auto-clear
-        without a DB reload clobbering the mutation.
         """
         s = self._state
         if s is None:
@@ -1971,7 +1975,7 @@ class GoalManager:
           - ``reason``: str
           - ``message``: user-visible one-liner to print/send
         """
-        state = self.refresh()
+        state = self._state
         if state is None or state.status != "active":
             return {
                 "status": state.status if state else None,
@@ -2086,8 +2090,7 @@ class GoalManager:
 
         if verdict == "done":
             state.status = "done"
-            self._touch_state(state)
-            self._persist_state(state)
+            save_goal(self.session_id, state)
             return {
                 "status": "done",
                 "should_continue": False,
@@ -2138,8 +2141,7 @@ class GoalManager:
             state.paused_reason = (
                 f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
             )
-            self._touch_state(state)
-            self._persist_state(state)
+            save_goal(self.session_id, state)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -2161,8 +2163,7 @@ class GoalManager:
         if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-            self._touch_state(state)
-            self._persist_state(state)
+            save_goal(self.session_id, state)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -2175,8 +2176,7 @@ class GoalManager:
                 ),
             }
 
-        self._touch_state(state)
-        self._persist_state(state)
+        save_goal(self.session_id, state)
         return {
             "status": "active",
             "should_continue": True,
@@ -2189,7 +2189,6 @@ class GoalManager:
         }
 
     def next_continuation_prompt(self) -> Optional[str]:
-        self.refresh()
         if not self._state or self._state.status != "active":
             return None
         # Contract takes priority: it carries the verification surface and
@@ -2216,7 +2215,6 @@ class GoalManager:
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""
-        self.refresh()
         if self._state is None:
             return "(no active goal)"
         if not self._state.has_contract():

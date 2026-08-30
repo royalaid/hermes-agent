@@ -13273,6 +13273,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         existing = getattr(self, "_goal_manager", None)
         if existing is not None and getattr(existing, "session_id", None) == sid:
+            refresh = getattr(existing, "refresh_if_stale", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception as exc:
+                    logging.warning("goal manager refresh failed closed: %s", exc)
+                    return None
             return existing
 
         try:
