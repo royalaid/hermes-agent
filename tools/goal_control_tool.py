@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Dict, Optional
 
 from tools.registry import registry
@@ -222,12 +223,22 @@ def goal_control_tool(
             session_id=caller_session_id,
         )
 
+    state_payload = _state_payload(persisted)
+    receipt_token = uuid.uuid4().hex
     return json.dumps(
         {
             "success": True,
             "session_id": caller_session_id,
             "action": action,
-            "state": _state_payload(persisted),
+            "state": state_payload,
+            "goal_readback": {
+                "kind": "goal-status-readback",
+                "receipt_id": f"goal_control:{caller_session_id}:{receipt_token}",
+                "session_id": caller_session_id,
+                "active": state_payload["active"],
+                "condition": state_payload["condition"],
+                "observed_via": "goal_control",
+            },
         },
         ensure_ascii=False,
     )
