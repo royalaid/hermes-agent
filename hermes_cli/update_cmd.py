@@ -34,10 +34,10 @@ import sys
 import time as _time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import get_default_hermes_root, venv_python_path
+from hermes_constants import get_default_hermes_root, venv_bin_dir, venv_python_path
 
 logger = logging.getLogger(__name__)
 
@@ -5299,7 +5299,7 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         return False, "; ".join(missing[:4])
     return True, ""
 
-def _detect_venv_python_processes(
+def _detect_venv_python_processes_legacy(
     *, exclude_pids: set[int] | None = None
 ) -> list[tuple[int, str, str]]:
     """Find live processes running from the project venv's interpreter.
@@ -5428,6 +5428,218 @@ def _detect_venv_python_processes(
         # only at display time.
         matches.append((int(pid), str(name), cmdline_raw))
     return matches
+
+_UPDATE_SHIM_FLAG_OPTIONS = frozenset({
+    "--accept-hooks", "--cli", "--dev", "--ignore-rules",
+    "--ignore-user-config", "--no-restore-cwd", "--pass-session-id",
+    "--safe-mode", "--tui", "--worktree", "--yolo", "-w",
+})
+_UPDATE_SHIM_VALUE_OPTIONS = frozenset({
+    "--in", "--model", "--oneshot", "--profile", "--provider",
+    "--reasoning", "--resume", "--skills", "--toolsets", "--usage-file",
+    "-m", "-p", "-r", "-s", "-t", "-z",
+})
+
+
+def _is_current_update_shim_argv(argv: list[str]) -> bool:
+    index = 1
+    while index < len(argv):
+        token = str(argv[index])
+        if token.casefold() == "update":
+            return True
+        if token == "--":
+            return index + 1 < len(argv) and str(argv[index + 1]).casefold() == "update"
+        if token in _UPDATE_SHIM_FLAG_OPTIONS:
+            index += 1
+            continue
+        if token in _UPDATE_SHIM_VALUE_OPTIONS:
+            if index + 1 >= len(argv):
+                return False
+            index += 2
+            continue
+        if token.startswith("--") and "=" in token:
+            option, value = token.split("=", 1)
+            if option in _UPDATE_SHIM_VALUE_OPTIONS and value:
+                index += 1
+                continue
+        return False
+    return False
+
+
+def _is_current_standalone_scanner_argv(argv: list[str], target_root: Path | str) -> bool:
+    if len(argv) != 5 or argv[1] != "-m" or argv[2] != "hermes_cli._scan_venv_blockers" or argv[3] != "--root":
+        return False
+    try:
+        return os.path.normcase(os.path.realpath(argv[4])) == os.path.normcase(os.path.realpath(target_root))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _process_basename(value: object) -> str:
+    return str(value).replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _detect_venv_python_processes(
+    *,
+    exclude_pids: set[int] | None = None,
+    root: Path | str | None = None,
+    strict: bool = False,
+    _parent_by_pid: Mapping[int, int] | None = None,
+) -> list[tuple[int, str, str]]:
+    """Find target-install holders, optionally with strict identity proof."""
+    # An explicit target root is the Desktop scanner contract and is exercised
+    # by the WSL-backed development path with Windows-shaped fixtures. The
+    # legacy no-root API remains platform-gated for normal CLI callers.
+    if root is None and not _m()._is_windows():
+        return []
+    try:
+        import psutil
+        from hermes_mcp_update_gate import is_exact_mcp_module_argv
+    except Exception as exc:
+        if strict:
+            raise RuntimeError(f"psutil is not available: {exc}") from exc
+        return []
+
+    target_root = Path(root) if root is not None else _m().PROJECT_ROOT
+    venv_dir = target_root / "venv"
+    if not venv_dir.exists() and (target_root / ".venv").exists():
+        venv_dir = target_root / ".venv"
+    try:
+        venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
+    except OSError:
+        venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
+    managed_dir = target_root / ".hermes-runtime" / "python"
+    try:
+        managed_prefix = str(managed_dir.resolve()).lower().rstrip(os.sep) + os.sep
+    except OSError:
+        managed_prefix = str(managed_dir).lower().rstrip(os.sep) + os.sep
+    try:
+        root_prefix = str(target_root.resolve()).lower().rstrip(os.sep) + os.sep
+    except OSError:
+        root_prefix = str(target_root).lower().rstrip(os.sep) + os.sep
+
+    skip = set(exclude_pids or set())
+    skip.add(os.getpid())
+    try:
+        parent = psutil.Process(os.getpid()).parent()
+        expected_hermes = venv_bin_dir(venv_dir, windows=True) / "hermes.exe"
+        expected_python = venv_python_path(venv_dir, windows=True)
+        parent_argv = [str(value) for value in (parent.cmdline() or [])]
+        parent_exe_key = os.path.normcase(os.path.realpath(str(parent.exe() or "")))
+        parent_argv0_key = os.path.normcase(os.path.realpath(parent_argv[0])) if parent_argv else ""
+        exact_hermes = parent_exe_key == os.path.normcase(os.path.realpath(expected_hermes)) and parent_argv0_key == parent_exe_key and _is_current_update_shim_argv(parent_argv)
+        exact_python = False
+        if parent_exe_key == os.path.normcase(os.path.realpath(expected_python)) and parent_argv0_key == parent_exe_key:
+            from hermes_cli._scan_venv_blockers import _hermes_cli_command
+            exact_python = _hermes_cli_command(parent_argv) == "update" or _is_current_standalone_scanner_argv(parent_argv, target_root)
+        if exact_hermes or exact_python:
+            skip.add(int(parent.pid))
+    except Exception:
+        pass
+
+    process_rows: list[dict[str, object]] = []
+    matches: list[tuple[int, str, str]] = []
+    try:
+        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
+    except Exception as exc:
+        if strict:
+            raise RuntimeError(f"process enumeration failed: {exc}") from exc
+        return []
+    for proc in proc_iter:
+        try:
+            info = proc.info
+        except Exception as exc:
+            if strict:
+                raise RuntimeError("process identity enumeration was unreadable") from exc
+            continue
+        pid = info.get("pid")
+        if pid is None:
+            if strict:
+                raise RuntimeError("process enumeration returned no PID")
+            continue
+        try:
+            numeric_pid = int(pid)
+        except (TypeError, ValueError) as exc:
+            if strict:
+                raise RuntimeError("process enumeration returned an invalid PID") from exc
+            continue
+        if numeric_pid in skip:
+            continue
+        exe = info.get("exe")
+        exe_norm = ""
+        if exe:
+            try:
+                exe_norm = str(Path(exe).resolve()).lower()
+            except (OSError, ValueError):
+                exe_norm = str(exe).lower()
+        argv = [str(value) for value in (info.get("cmdline") or [])]
+        cmdline = " ".join(argv)
+        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
+        name = str(info.get("name") or "")
+        if strict and exe is None and info.get("cmdline") is None and info.get("cwd") is None and Path(name).name.casefold() in {"python.exe", "pythonw.exe", "hermes.exe"}:
+            raise RuntimeError(f"process {numeric_pid} ({name}) identity metadata was unreadable")
+        process_rows.append({"pid": numeric_pid, "ppid": info.get("ppid"), "exe": str(exe or ""), "exe_norm": exe_norm, "name": name, "argv": argv, "cmdline": cmdline})
+        is_holder = exe_norm.startswith(venv_prefix) or exe_norm.startswith(managed_prefix)
+        if not is_holder and venv_prefix in cmdline.lower():
+            is_holder = True
+        if not is_holder and "hermes_cli.main" in cmdline.lower() and (root_prefix in cmdline.lower() or cwd_low.startswith(root_prefix)):
+            is_holder = True
+        if not is_holder and cwd_low.startswith(root_prefix) and is_exact_mcp_module_argv(argv):
+            is_holder = True
+        if is_holder:
+            matches.append((numeric_pid, name or (Path(exe).name if exe else "unreadable-process"), cmdline))
+
+    matched_pids = {pid for pid, _name, _cmdline in matches}
+    target_wrappers = {int(row["pid"]): row for row in process_rows if str(row["exe_norm"]).startswith(venv_prefix) and _process_basename(row["exe"]).casefold() in {"python.exe", "pythonw.exe"} and bool(row["argv"])}
+    if not target_wrappers:
+        return matches
+    tails = {tuple(str(value) for value in row["argv"])[1:] for row in target_wrappers.values()}
+    candidates = [row for row in process_rows if int(row["pid"]) not in matched_pids and _process_basename(row["exe"]).casefold() in {"python.exe", "pythonw.exe"} and tuple(str(value) for value in row["argv"])[1:] in tails]
+    if not candidates:
+        return matches
+    rows_by_pid = {int(row["pid"]): row for row in process_rows}
+    parent_by_pid = _parent_by_pid
+    if parent_by_pid is None and any(row["ppid"] is None for row in candidates):
+        try:
+            parent_by_pid = {int(pid): int(ppid) for pid, ppid in psutil._ppid_map().items()}
+        except Exception as exc:
+            if strict:
+                raise RuntimeError("parent process enumeration failed") from exc
+            parent_by_pid = {}
+    if parent_by_pid is not None:
+        for row in process_rows:
+            row["ppid"] = parent_by_pid.get(int(row["pid"]))
+
+    def points_to_wrapper(row: dict[str, object]) -> bool:
+        candidate_tail = tuple(str(value) for value in row["argv"])[1:]
+        current = row
+        seen: set[int] = set()
+        while True:
+            raw_parent = current["ppid"]
+            if raw_parent is None:
+                if strict:
+                    raise RuntimeError(f"process {int(current['pid'])} was absent from the parent snapshot")
+                return False
+            try:
+                ancestor = int(raw_parent)
+            except (TypeError, ValueError):
+                return False
+            if ancestor <= 0 or ancestor in seen:
+                return False
+            seen.add(ancestor)
+            wrapper = target_wrappers.get(ancestor)
+            if wrapper is not None:
+                return bool(candidate_tail and candidate_tail == tuple(str(value) for value in wrapper["argv"])[1:])
+            parent = rows_by_pid.get(ancestor)
+            if parent is None:
+                return False
+            current = parent
+
+    for row in candidates:
+        if points_to_wrapper(row):
+            matches.append((int(row["pid"]), str(row["name"]) or _process_basename(row["exe"]), str(row["cmdline"])))
+    return matches
+
 
 # Native-extension modules that pin files inside the venv once imported.  If
 # the updater process itself has any of these loaded, the dependency sync

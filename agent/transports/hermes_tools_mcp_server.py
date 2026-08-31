@@ -49,9 +49,14 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Optional
+import threading
+from typing import Any, Callable, Optional
+
+from hermes_mcp_update_gate import infer_install_root, live_quiesce_lease, marker_path
 
 logger = logging.getLogger(__name__)
+
+_UPDATE_QUIESCE_POLL_SECONDS = 1.0
 
 # JSON Schema type -> Python type mapping for signature generation
 _JSON_TO_PY = {
@@ -149,6 +154,40 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_unblock",
     "kanban_link",
 )
+
+
+def _update_quiesce_marker_path():
+    return marker_path()
+
+
+def _update_quiesce_requested() -> bool:
+    root = infer_install_root()
+    if root is None:
+        return False
+    try:
+        return live_quiesce_lease(_update_quiesce_marker_path(), install_root=root) is not None
+    except Exception:
+        logger.exception("Could not prove the update quiesce lease inactive")
+        return True
+
+
+def _watch_for_update_quiesce(
+    stop_event: threading.Event,
+    *,
+    requested: Callable[[], bool] = _update_quiesce_requested,
+    exit_process: Callable[[int], Any] = os._exit,
+    poll_seconds: float = _UPDATE_QUIESCE_POLL_SECONDS,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            quiesce = requested()
+        except Exception:
+            logger.exception("Update quiesce watcher could not read its lease")
+            quiesce = True
+        if quiesce:
+            exit_process(0)
+            return
+        stop_event.wait(max(0.0, float(poll_seconds)))
 
 
 def _build_server() -> Any:
@@ -266,9 +305,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.environ.setdefault("HERMES_QUIET", "1")
     os.environ.setdefault("HERMES_REDACT_SECRETS", "true")
 
+    if _update_quiesce_requested():
+        return 0
+
+    stop_event = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_for_update_quiesce,
+        args=(stop_event,),
+        kwargs={"requested": _update_quiesce_requested},
+        name="hermes-mcp-update-quiesce",
+        daemon=True,
+    )
+    watcher.start()
+
     try:
         server = _build_server()
     except ImportError as exc:
+        stop_event.set()
         sys.stderr.write(f"hermes-tools MCP server cannot start: {exc}\n")
         return 2
 
@@ -282,6 +335,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.exception("hermes-tools MCP server crashed")
         sys.stderr.write(f"hermes-tools MCP server error: {exc}\n")
         return 1
+    finally:
+        stop_event.set()
     return 0
 
 

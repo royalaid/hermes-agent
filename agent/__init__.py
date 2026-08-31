@@ -5,4 +5,9 @@ that were previously embedded in the 3,600-line run_agent.py. Extracting
 them makes run_agent.py focused on the AIAgent orchestrator class.
 """
 
+from hermes_mcp_update_gate import should_quiesce_mcp_bridge
+
+if should_quiesce_mcp_bridge():
+    raise SystemExit(0)
+
 from . import jiter_preload as _jiter_preload  # noqa: F401
