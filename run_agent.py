@@ -1066,6 +1066,11 @@ class AIAgent(
                         "session=%s",
                         self.session_id or "none",
                     )
+                else:
+                    # Durable carriers predate revision-bearing todo responses.
+                    # Admit one into a cold store without rolling back a newer
+                    # live revision already present on an in-place agent.
+                    last_todo_revision = 1
                 break
             if msg.get("role") != "tool":
                 continue
