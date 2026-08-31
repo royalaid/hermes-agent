@@ -249,7 +249,6 @@ class GatewayNotificationsMixin:
         Only ``MEDIA:`` directives — the explicit attachment contract — trigger post-stream uploads. See
         #20834.
         """
-        from urllib.parse import quote as _quote
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
             force_document_attachments = "[[as_document]]" in response
@@ -280,7 +279,7 @@ class GatewayNotificationsMixin:
             non_image_media = [(p, v) for p, v in media_files if not _is_photo(p, v)]
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [(Path(p).resolve().as_uri(), "") for p in image_paths]
                     await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
