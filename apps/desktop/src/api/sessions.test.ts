@@ -25,9 +25,16 @@ const hermesApi = vi.mocked(client.hermesApi)
 
 beforeEach(() => {
   vi.clearAllMocks()
-  vi.mocked(client.capabilityScoped).mockImplementation(scope =>
-    typeof scope === 'string' ? { profile: scope } : scope
-  )
+  vi.mocked(client.capabilityScoped).mockImplementation(scope => {
+    if (typeof scope === 'string') {
+      return { profile: scope }
+    }
+
+    return {
+      ...(scope?.connectionId ? { connectionId: scope.connectionId } : {}),
+      ...(scope?.profile ? { profile: scope.profile } : {})
+    }
+  })
   vi.mocked(client.getApiRequestConnection).mockReturnValue('prometheus')
 })
 
