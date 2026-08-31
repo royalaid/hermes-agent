@@ -65,10 +65,16 @@ class GatewayInboundMixin:
                     _result.get("reason"), source.platform.value if source.platform else "unknown",
                     source.chat_id or "unknown",
                 )
+                self._retire_rejected_durable_claim_event(event)
                 return None
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
+                    from gateway.goal_continuation_claims import event_claim_identity
+
+                    if event_claim_identity(event) is not None:
+                        self._retire_rejected_durable_claim_event(event)
+                        return None
                     event = dataclasses.replace(event, text=_new_text)
                 break
             if _action == "allow":
@@ -148,6 +154,7 @@ class GatewayInboundMixin:
                 "Dropping inbound message because its explicit profile route "
                 "targets an unserved profile"
             )
+            self._retire_rejected_durable_claim_event(event)
             return None
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
@@ -162,11 +169,11 @@ class GatewayInboundMixin:
             and _is_slack_ignored_channel(_config, _chat_id)
         ):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
+            self._retire_rejected_durable_claim_event(event)
             return None
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
-            and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
             self._queue_startup_restore_event(event)
@@ -188,6 +195,7 @@ class GatewayInboundMixin:
                 # No user identity (Telegram service messages, channel forwards, anonymous admin
                 # posts, sender_chat): can't be paired but may be authorized via a chat allowlist.
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                self._retire_rejected_durable_claim_event(event)
                 return None
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # DMs get a pairing code, groups are ignored. A bot cannot pair, and answering one mid-cooldown is outbound traffic.
@@ -197,6 +205,7 @@ class GatewayInboundMixin:
                 and self._get_unauthorized_dm_behavior(source.platform, profile=source.profile) == "pair"
             ):
                 await self._hm_offer_pairing_code(source)
+            self._retire_rejected_durable_claim_event(event)
             return None
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
@@ -220,7 +229,10 @@ class GatewayInboundMixin:
             if _estop_state is not None and _estop_state.persistent.update_prompt_pending:
                 return True
             # A running session covers steering plus pending clarify / tool approvals it holds.
-            if self._is_session_running(_estop_key):
+            if (
+                not self._is_goal_continuation_event(event)
+                and self._is_session_running(_estop_key)
+            ):
                 return True
             from tools import slash_confirm as _estop_confirm_mod
             if _estop_confirm_mod.get_pending(_estop_key):
@@ -249,6 +261,7 @@ class GatewayInboundMixin:
             getattr(getattr(source, "platform", None), "value", "unknown"),
             getattr(source, "chat_id", None) or "unknown",
         )
+        self._retire_rejected_durable_claim_event(event)
         return _paused_notice
 
     @staticmethod
