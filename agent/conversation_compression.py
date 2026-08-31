@@ -5123,29 +5123,57 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
+                    try:
+                        from hermes_cli.goals import prepare_goal_migration
+
+                        _goal_migration = prepare_goal_migration(
+                            old_session_id,
+                            new_session_id,
+                        )
+                    except Exception:
+                        agent._emit_warning(
+                            "Goal status unavailable during context compression. "
+                            "Compression was not committed; the current session remains "
+                            "active and any persisted goal stays bound to it."
+                        )
+                        raise
                     from agent.context_compressor import _DB_PERSISTED_MARKER
-                    agent._session_db.publish_compression_child(
-                        parent_session_id=old_session_id,
-                        child_session_id=new_session_id,
-                        source=agent.platform
-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                        model=agent.model,
-                        model_config=agent._session_init_model_config,
-                        system_prompt=new_system_prompt,
-                        messages=compressed,
-                        cwd=getattr(agent, "working_directory", None),
-                        profile_name=_profile_for_child,
-                        compression_lock_holder=_lock_holder,
-                        require_compression_lease=_lock_holder is not None,
-                        require_lease_refresh=_lock_holder is not None,
-                        lease_ttl_seconds=_lock_ttl,
-                        watermark=(
-                            _commit_watermark
-                            if _foreign_tail_ceiling is not None
-                            else None
-                        ),
-                        watermark_ceiling=_foreign_tail_ceiling,
-                    )
+                    from hermes_state import CompressionMetadataConflictError
+                    try:
+                        agent._session_db.publish_compression_child(
+                            parent_session_id=old_session_id,
+                            child_session_id=new_session_id,
+                            source=agent.platform
+                            or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                            model=agent.model,
+                            model_config=agent._session_init_model_config,
+                            system_prompt=new_system_prompt,
+                            messages=compressed,
+                            cwd=getattr(agent, "working_directory", None),
+                            profile_name=_profile_for_child,
+                            compression_lock_holder=_lock_holder,
+                            require_compression_lease=_lock_holder is not None,
+                            require_lease_refresh=_lock_holder is not None,
+                            lease_ttl_seconds=_lock_ttl,
+                            watermark=(
+                                _commit_watermark
+                                if _foreign_tail_ceiling is not None
+                                else None
+                            ),
+                            watermark_ceiling=_foreign_tail_ceiling,
+                            state_meta_changes=(
+                                list(_goal_migration.changes)
+                                if _goal_migration is not None
+                                else None
+                            ),
+                        )
+                    except CompressionMetadataConflictError:
+                        agent._emit_warning(
+                            "Goal changed during context compression. "
+                            "Compression was not committed; check /goal status "
+                            "before retrying compression."
+                        )
+                        raise
                     # For the `already_present` outcome the live-dict stamping is
                     # handled by the run_agent _compress_context wrapper's
                     # _sync_persisted_markers (it mirrors the handoff stamps back
@@ -5281,15 +5309,10 @@ def compress_context(
                         pass
                     agent._session_db_created = True
                     split_status = "rotated_committed"
-                    # Carry a persistent /goal onto the continuation session.
-                    # Compression mints a fresh child id; load_goal does a flat
-                    # per-session lookup with no parent walk, so without this an
-                    # active goal silently dies at the boundary (#33618).
-                    try:
-                        from hermes_cli.goals import migrate_goal_to_session
-                        migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
-                    except Exception as _goal_err:
-                        logger.debug("Could not migrate goal on compression: %s", _goal_err)
+                    # The goal moved in publish_compression_child's transaction.
+                    # The child session and both exact goal rows are one commit,
+                    # so an unavailable/stale goal boundary cannot publish a
+                    # goal-free continuation.
                     # Same boundary hazard for /heartbeat state — carry it too.
                     try:
                         from hermes_cli.heartbeat import migrate_heartbeat_to_session
