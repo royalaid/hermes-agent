@@ -91,6 +91,22 @@ export interface ActiveTranscriptRefreshDeps {
   ) => ClientSessionState
 }
 
+function runtimeOwnsLiveTranscript(runtimeSessionId: string): boolean {
+  const state = $sessionStates.get()[runtimeSessionId]
+
+  if (state?.busy) {
+    return true
+  }
+
+  const visibleTail = state?.messages.findLast(message => !message.hidden)
+
+  // Between an active turn completing and its accepted queued successor
+  // starting, `busy` can briefly be false. The synthetic queued row is still
+  // authoritative live state; a REST snapshot admitted in this handoff can
+  // predate that row and remove it before the next assistant stream begins.
+  return visibleTail?.role === 'user' && visibleTail.id === `user-queued-${runtimeSessionId}`
+}
+
 /**
  * Reconcile the persisted transcripts of every open WORKSPACE TILE (#93942
  * slice 1). Bot canonical chats live here — never in $sessions /
@@ -141,7 +157,7 @@ export async function reconcileTileTranscripts({
       continue
     }
 
-    if (!storedSessionId || !runtimeSessionId || busyRef.current) {
+    if (!storedSessionId || !runtimeSessionId || busyRef.current || runtimeOwnsLiveTranscript(runtimeSessionId)) {
       continue
     }
 
@@ -170,7 +186,13 @@ export async function reconcileTileTranscripts({
       // helper tests that do not exercise the live store lifecycle.
       const tileIsCurrent = (tilesOverride ?? $sessionTiles.get()).includes(tile)
 
-      if (requestId !== requestSequenceRef.current || busyRef.current || !isOwnerCurrent() || !tileIsCurrent) {
+      if (
+        requestId !== requestSequenceRef.current ||
+        busyRef.current ||
+        runtimeOwnsLiveTranscript(runtimeSessionId) ||
+        !isOwnerCurrent() ||
+        !tileIsCurrent
+      ) {
         // Tile closed or superseded mid-read — discard AND prune its
         // signature so the map doesn't grow one entry per ever-opened tile
         // for the app's lifetime (#94255 review point 3).
@@ -240,7 +262,7 @@ export async function reconcileActiveTranscript({
   const storedSessionId = selectedStoredSessionIdRef.current
   const runtimeSessionId = activeSessionIdRef.current
 
-  if (!storedSessionId || !runtimeSessionId || busyRef.current) {
+  if (!storedSessionId || !runtimeSessionId || busyRef.current || runtimeOwnsLiveTranscript(runtimeSessionId)) {
     return
   }
 
@@ -268,6 +290,7 @@ export async function reconcileActiveTranscript({
     if (
       requestId !== requestSequenceRef.current ||
       busyRef.current ||
+      runtimeOwnsLiveTranscript(runtimeSessionId) ||
       selectedStoredSessionIdRef.current !== storedSessionId ||
       activeSessionIdRef.current !== runtimeSessionId ||
       !ownerIsCurrent()
