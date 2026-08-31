@@ -1599,6 +1599,26 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
     timer.start()
 
 
+def _rebind_queued_prompts_for_transport(
+    session: dict, disconnected_transport, replacement_transport
+) -> None:
+    """Move only one disconnected viewer's queued envelopes to its successor.
+
+    Callers must not hold ``_sessions_lock`` while this helper waits for the
+    per-session history lock. Queue claims and transport rebinding therefore
+    remain serialized without creating a global/session lock-order cycle.
+    """
+    with session["history_lock"]:
+        queued_prompts = [session.get("queued_prompt")]
+        queued_prompts.extend(session.get("queued_prompts") or [])
+        for queued_prompt in queued_prompts:
+            if (
+                isinstance(queued_prompt, dict)
+                and queued_prompt.get("transport") is disconnected_transport
+            ):
+                queued_prompt["transport"] = replacement_transport
+
+
 def _close_sessions_for_transport(
     transport, *, end_reason: str = "ws_disconnect"
 ) -> tuple[int, int]:
@@ -1615,29 +1635,45 @@ def _close_sessions_for_transport(
 
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
     with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+        owned = [
+            (sid, s)
+            for sid, s in _sessions.items()
+            if s.get("transport") is transport
+            or transport in (s.get("viewers") or {})
+        ]
     reaped = 0
     detached = 0
     for sid, session in owned:
         claimed_for_teardown = None
         should_schedule_reap = False
+        queue_replacement = None
         # A session.resume fast-path rebinds its live session while holding
         # _session_resume_lock. Take that lock before re-checking the snapshot
         # so a reconnect cannot move the transport between this check and the
-        # close/detach ownership claim. Keep the slow teardown below both locks.
+        # close/detach ownership claim. Queue rebinding happens after releasing
+        # _sessions_lock; the per-session history lock still serializes it with
+        # enqueue/drain without forming a global/session lock-order cycle.
         with _session_resume_lock:
             with _sessions_lock:
                 current = _sessions.get(sid)
                 if current is not session:
                     continue
                 if current.get("transport") is not transport:
-                    # The reconnect owns this session now. Drop only the old
-                    # viewer registration; it must not affect the new owner.
+                    # The reconnect owns this session now. Retire the old
+                    # viewer and move only that viewer's queued envelopes to
+                    # the current surviving owner. A queue pinned to any other
+                    # live viewer remains with its origin (multi-window).
                     viewers = current.get("viewers")
                     if viewers:
                         viewers.pop(transport, None)
-                    continue
-                if current.get("close_on_disconnect"):
+                    replacement = current.get("transport")
+                    if (
+                        viewers
+                        and replacement in viewers
+                        and not _transport_is_dead(replacement)
+                    ):
+                        queue_replacement = replacement
+                elif current.get("close_on_disconnect"):
                     claimed_for_teardown = _pop_session_by_id(sid)
                 else:
                     # Point detached sessions at the drop sentinel (NOT real
@@ -1661,11 +1697,22 @@ def _close_sessions_for_transport(
                     ]
                     if remaining:
                         remaining.sort(key=lambda item: item[0])
-                        current["transport"] = remaining[-1][1]
+                        replacement = remaining[-1][1]
+                        current["transport"] = replacement
+                        # The disconnected transport was the active owner, so
+                        # its queued turns need the same targeted handoff as
+                        # the resume-before-disconnect branch above. Preserve
+                        # FIFO, images, generation, and envelopes owned by
+                        # other still-live viewers.
+                        queue_replacement = replacement
                     else:
                         current["transport"] = _detached_ws_transport
                         current.pop("_client_gone_interrupt_requested", None)
                         should_schedule_reap = True
+            if queue_replacement is not None:
+                _rebind_queued_prompts_for_transport(
+                    current, transport, queue_replacement
+                )
         if claimed_for_teardown is not None:
             if _teardown_popped_session(claimed_for_teardown, end_reason=end_reason):
                 reaped += 1
@@ -10747,13 +10794,37 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued or session.get("running"):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
+        queued_transport = queued.get("transport")
+        if queued_transport is not None and _transport_is_dead(queued_transport):
+            # Disconnect may select a surviving viewer just before this drain
+            # claims the envelope but finish bulk queue rebinding just after the
+            # claim removes it from queued_prompt. Revalidate the claimed owner
+            # while still under history_lock so that interleaving cannot restore
+            # or dispatch through the already-closed transport.
+            surviving_viewers = [
+                (ts, viewer_transport)
+                for viewer_transport, ts in (session.get("viewers") or {}).items()
+                if (
+                    viewer_transport is not queued_transport
+                    and not _transport_is_dead(viewer_transport)
+                )
+            ]
+            if not surviving_viewers:
+                # The sole viewer disconnected while another turn was active.
+                # Leave the envelope in place and keep the session on the
+                # detached sentinel so the orphan reaper can still recognize it.
+                # A later resume rebinds the preserved envelope to live authority.
+                return True
+            surviving_viewers.sort(key=lambda item: item[0])
+            queued_transport = surviving_viewers[-1][1]
+            queued["transport"] = queued_transport
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+        if queued_transport is not None:
+            session["transport"] = queued_transport
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
@@ -11494,6 +11565,7 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
+    cancel_orphan_reap = False
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
@@ -11506,10 +11578,19 @@ def _live_session_payload(
             # stranding it on the drop sentinel (#83716).
             viewers = session.setdefault("viewers", {})
             viewers[transport] = time.time()
-            if transport is not _detached_ws_transport:
-                # A live transport rebind means the client is back — any
-                # pending ws-orphan reap must not fire (storm killer).
-                _cancel_ws_orphan_reap(sid)
+            queued_prompts = [session.get("queued_prompt")]
+            queued_prompts.extend(session.get("queued_prompts") or [])
+            for queued_prompt in queued_prompts:
+                if (
+                    isinstance(queued_prompt, dict)
+                    and queued_prompt.get("transport") not in viewers
+                ):
+                    # A queued turn remains pinned to its originating viewer
+                    # while that viewer is live. After a renderer restart the
+                    # old viewer is gone, so route the eventual turn through
+                    # the transport that just resumed this session.
+                    queued_prompt["transport"] = transport
+            cancel_orphan_reap = transport is not _detached_ws_transport
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
@@ -11524,6 +11605,10 @@ def _live_session_payload(
             if isinstance(inflight_turn, dict) and inflight_turn.get("started_at")
             else None
         )
+    if cancel_orphan_reap:
+        # A live transport rebind means the client is back. Cancel only after
+        # releasing history_lock because the timer registry uses _sessions_lock.
+        _cancel_ws_orphan_reap(sid)
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript. Use the session's
     # profile-aware DB (not launch ``_get_db()``): app-global remote profile
