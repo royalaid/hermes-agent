@@ -2720,11 +2720,19 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
 def _live_session_payload(
     sid: str, session: dict, *, cols: int | None = None, touch: bool = False,
     transport: Transport | None = None, omit_messages: bool = False) -> dict:
+    cancel_orphan_reap = False
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
-            _rebind_live_transport(sid, session, transport)
+            session["transport"] = transport
+            viewers = session.setdefault("viewers", {})
+            viewers[transport] = time.time()
+            queued_prompts = [session.get("queued_prompt"), *(session.get("queued_prompts") or [])]
+            for queued_prompt in queued_prompts:
+                if isinstance(queued_prompt, dict) and queued_prompt.get("transport") not in viewers:
+                    queued_prompt["transport"] = transport
+            cancel_orphan_reap = transport is not _detached_ws_transport
         if touch:
             # #84417: do not re-fire the live turn's original user text from a stale server-queue
             # self-duplicate after settle.
@@ -2732,6 +2740,9 @@ def _live_session_payload(
         in_memory_history = list(session.get("display_history_prefix") or []) + list(session.get("history") or [])
         inflight, queued = _inflight_snapshot(session), _queued_prompt_snapshot(session)
         running, turn_started_at = bool(session.get("running")), _turn_started_at(session)
+    if cancel_orphan_reap:
+        # Timer registry takes _sessions_lock; avoid reversing it with history_lock.
+        _cancel_ws_orphan_reap(sid)
     # Persisted display lineage via the session's profile-aware DB (not the launch ``_get_db()``), read
     # outside the history lock (the DB has its own). ``omit_messages`` skips the read (fast path).
     if omit_messages:

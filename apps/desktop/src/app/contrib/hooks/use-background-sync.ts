@@ -89,20 +89,18 @@ export interface ActiveTranscriptRefreshDeps {
   ) => ClientSessionState
 }
 
-function tileRuntimeOwnsLiveState(runtimeId: string): boolean {
-  const state = $sessionStates.get()[runtimeId]
-
-  return Boolean(state && (state.busy || state.awaitingResponse || state.needsInput || state.turnLive))
+function runtimeOwnsLiveTranscript(runtimeSessionId: string): boolean {
+  const state = $sessionStates.get()[runtimeSessionId]
+  if (state && (state.busy || state.awaitingResponse || state.needsInput || state.turnLive)) return true
+  const visibleTail = state?.messages.findLast(message => !message.hidden)
+  return visibleTail?.role === 'user' && visibleTail.id === 'user-queued-' + runtimeSessionId
 }
 
 type TileTranscriptTarget = { ownerRoute?: SessionProfileRoute; storedSessionId: string; runtimeId?: string }
 
-/** Signature key per tile — carries the owner route so two connections/profiles
- *  sharing a stored id (or a tile re-homed to another owner) never alias. */
 function tileTranscriptSignatureKey(tile: TileTranscriptTarget): string {
   const route = tile.ownerRoute
-
-  return `tile:${route ? `${route.connectionId}:${route.targetProfile ?? route.profile}:` : ''}${tile.storedSessionId}`
+  return 'tile:' + (route ? route.connectionId + ':' + (route.targetProfile ?? route.profile) + ':' : '') + tile.storedSessionId
 }
 
 /**
@@ -160,7 +158,7 @@ export async function reconcileTileTranscripts({
       continue
     }
 
-    if (!storedSessionId || !runtimeSessionId || tileRuntimeOwnsLiveState(runtimeSessionId)) {
+    if (!storedSessionId || !runtimeSessionId || runtimeOwnsLiveTranscript(runtimeSessionId)) {
       continue
     }
 
@@ -189,7 +187,7 @@ export async function reconcileTileTranscripts({
 
       if (
         requestId !== requestSequenceRef.current ||
-        tileRuntimeOwnsLiveState(runtimeSessionId) ||
+        runtimeOwnsLiveTranscript(runtimeSessionId) ||
         !isOwnerCurrent() ||
         !(tilesOverride ?? $sessionTiles.get()).includes(tile)
       ) {
@@ -212,7 +210,7 @@ export async function reconcileTileTranscripts({
 
       if (
         requestId !== requestSequenceRef.current ||
-        tileRuntimeOwnsLiveState(runtimeSessionId) ||
+        runtimeOwnsLiveTranscript(runtimeSessionId) ||
         !isOwnerCurrent() ||
         !tileIsCurrentAfterTodoRead
       ) {
@@ -262,7 +260,7 @@ export async function reconcileActiveTranscript({
   const storedSessionId = selectedStoredSessionIdRef.current
   const runtimeSessionId = activeSessionIdRef.current
 
-  if (!storedSessionId || !runtimeSessionId || busyRef.current) {
+  if (!storedSessionId || !runtimeSessionId || busyRef.current || runtimeOwnsLiveTranscript(runtimeSessionId)) {
     return
   }
 
@@ -292,6 +290,7 @@ export async function reconcileActiveTranscript({
     if (
       requestId !== requestSequenceRef.current ||
       busyRef.current ||
+      runtimeOwnsLiveTranscript(runtimeSessionId) ||
       selectedStoredSessionIdRef.current !== storedSessionId ||
       activeSessionIdRef.current !== runtimeSessionId ||
       !ownerIsCurrent()
@@ -312,6 +311,7 @@ export async function reconcileActiveTranscript({
     if (
       requestId !== requestSequenceRef.current ||
       busyRef.current ||
+      runtimeOwnsLiveTranscript(runtimeSessionId) ||
       selectedStoredSessionIdRef.current !== storedSessionId ||
       activeSessionIdRef.current !== runtimeSessionId ||
       !ownerIsCurrent()

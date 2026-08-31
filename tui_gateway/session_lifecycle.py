@@ -570,46 +570,59 @@ def _schedule_ws_orphan_reap(
     timer.start()
 
 
+def _rebind_queued_prompts_for_transport(session: dict, disconnected_transport, replacement_transport) -> None:
+    """Move only one disconnected viewer's queued envelopes to its successor."""
+    with session["history_lock"]:
+        queued_prompts = [session.get("queued_prompt"), *(session.get("queued_prompts") or [])]
+        for queued_prompt in queued_prompts:
+            if isinstance(queued_prompt, dict) and queued_prompt.get("transport") is disconnected_transport:
+                queued_prompt["transport"] = replacement_transport
+
+
 def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect") -> tuple[int, int]:
     """Single WS-disconnect teardown entry point: reap close_on_disconnect sessions (sidecar/dashboard) immediately;
     re-point the rest at the detached transport (later emits miss the dead socket) for the grace-windowed WS-orphan
     reaper. Returns ``(reaped, detached)`` counts."""
     with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+        owned = [(sid, s) for sid, s in _sessions.items()
+                 if s.get("transport") is transport or transport in (s.get("viewers") or {})]
     reaped = detached = 0
     for sid, session in owned:
         claimed_for_teardown = None
         should_schedule_reap = False
+        queue_replacement = None
         # session.resume fast-path rebinds under _session_resume_lock: take it so a reconnect can't move the transport
         # between check and claim.
-        with _session_resume_lock, _sessions_lock:
-            current = _sessions.get(sid)
-            if current is not session:
-                continue
-            if current.get("transport") is not transport:
-                # The reconnect owns this session now; drop only the old viewer registration.
-                (current.get("viewers") or {}).pop(transport, None)
-                continue
-            if current.get("close_on_disconnect"):
-                claimed_for_teardown = _pop_session_by_id(sid)
-            else:
-                # Point at the drop sentinel (NOT real stdio) so _ws_session_is_orphaned recognizes it; standalone
-                # `hermes --tui` keeps real _stdio. UNLESS another window (pop-out viewer) still shows the session:
-                # re-bind to the most recent surviving viewer instead.
+        with _session_resume_lock:
+            with _sessions_lock:
+                current = _sessions.get(sid)
+                if current is not session:
+                    continue
                 viewers = current.get("viewers") or {}
-                # See #83716.
-                viewers.pop(transport, None)
-                live = [vt for vt, ts in sorted(viewers.items(), key=lambda kv: kv[1]) if not _transport_is_dead(vt)]
-                if live:
-                    current["transport"] = live[-1]
+                if current.get("transport") is not transport:
+                    viewers.pop(transport, None)
+                    replacement = current.get("transport")
+                    if viewers and replacement in viewers and not _transport_is_dead(replacement):
+                        queue_replacement = replacement
+                elif current.get("close_on_disconnect"):
+                    claimed_for_teardown = _pop_session_by_id(sid)
                 else:
-                    current["transport"] = _detached_ws_transport
-                    current.pop("_client_gone_interrupt_requested", None)
-                    should_schedule_reap = True
-                    # Register before releasing the detachment claim: an old disconnect
-                    # must not arm its first timer over a reconnect's newer detachment.
-                    with contextlib.suppress(Exception):
-                        _schedule_ws_orphan_reap(sid)
+                    viewers.pop(transport, None)
+                    live = [vt for vt, ts in sorted(viewers.items(), key=lambda kv: kv[1]) if not _transport_is_dead(vt)]
+                    if live:
+                        queue_replacement = live[-1]
+                        current["transport"] = queue_replacement
+                    else:
+                        current["transport"] = _detached_ws_transport
+                        current.pop("_client_gone_interrupt_requested", None)
+                        should_schedule_reap = True
+            if queue_replacement is not None:
+                _rebind_queued_prompts_for_transport(current, transport, queue_replacement)
+            elif should_schedule_reap:
+                # Register while the resume claim is still held so an old disconnect
+                # cannot arm its first timer over a reconnect's newer detachment.
+                with contextlib.suppress(Exception):
+                    _schedule_ws_orphan_reap(sid)
         if claimed_for_teardown is not None:
             reaped += _teardown_popped_session(claimed_for_teardown, end_reason=end_reason)
         elif should_schedule_reap:
