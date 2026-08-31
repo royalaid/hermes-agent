@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import array
+import hashlib
 import inspect
 import logging
 import mimetypes
@@ -142,6 +143,19 @@ from gateway.platforms.helpers import ThreadParticipationTracker
 logger = logging.getLogger(__name__)
 
 _MATRIX_VOICE_WAVEFORM_BINS = 30
+
+
+def _claimed_delivery_txn_id(
+    metadata: Optional[Dict[str, Any]], component: str
+) -> Optional[str]:
+    """Return a stable Matrix transaction ID for one durable response part."""
+    if not metadata:
+        return None
+    part_id = metadata.get("_hermes_delivery_part_id")
+    if not isinstance(part_id, str) or not re.fullmatch(r"[0-9a-f]{24}", part_id):
+        return None
+    digest = hashlib.sha256(f"{part_id}\0{component}".encode("utf-8")).hexdigest()
+    return f"hermes_{digest[:32]}"
 
 
 def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
@@ -2207,6 +2221,8 @@ class MatrixAdapter(BasePlatformAdapter):
         last_event_id = None
         for i, chunk in enumerate(chunks):
             msg_content = self._build_text_message_content(chunk)
+            txn_id = _claimed_delivery_txn_id(metadata, f"text:{i}")
+            txn_kwargs = {"txn_id": txn_id} if txn_id else {}
 
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
@@ -2216,6 +2232,7 @@ class MatrixAdapter(BasePlatformAdapter):
                         RoomID(chat_id),
                         EventType.ROOM_MESSAGE,
                         msg_content,
+                        **txn_kwargs,
                     ),
                     timeout=45,
                 )
@@ -2231,6 +2248,7 @@ class MatrixAdapter(BasePlatformAdapter):
                                 RoomID(chat_id),
                                 EventType.ROOM_MESSAGE,
                                 msg_content,
+                                **txn_kwargs,
                             ),
                             timeout=45,
                         )
@@ -2398,6 +2416,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 chat_id,
                 fallback,
                 reply_to,
+                metadata=metadata,
             )
 
         return await self._upload_and_send(
@@ -2952,10 +2971,13 @@ class MatrixAdapter(BasePlatformAdapter):
         self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
         try:
+            txn_id = _claimed_delivery_txn_id(metadata, "media")
+            txn_kwargs = {"txn_id": txn_id} if txn_id else {}
             event_id = await self._client.send_message_event(
                 RoomID(room_id),
                 EventType.ROOM_MESSAGE,
                 msg_content,
+                **txn_kwargs,
             )
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
@@ -2982,7 +3004,7 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             text = f"{caption}\n⚠️ Couldn't deliver the attachment." if caption \
                 else "⚠️ Couldn't deliver the attachment."
-            return await self.send(room_id, text, reply_to)
+            return await self.send(room_id, text, reply_to, metadata=metadata)
         try:
             file_size = p.stat().st_size
         except OSError:

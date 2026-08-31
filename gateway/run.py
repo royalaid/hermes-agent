@@ -14150,8 +14150,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         raw_content = row.get("raw_content")
         if not isinstance(raw_content, str):
             raise ValueError("claimed-result replay payload is unavailable")
-        if row.get("needs_marker"):
-            raw_content = row.get("marker", RECOVERED_MARKER) + raw_content
         event = MessageEvent(
             text="",
             source=source,
@@ -14161,6 +14159,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             goal_continuation=True,
         )
         setattr(event, "_hermes_precomputed_response", raw_content)
+        if row.get("needs_marker"):
+            setattr(
+                event,
+                "_hermes_recovery_marker",
+                row.get("marker", RECOVERED_MARKER),
+            )
         setattr(
             event,
             "_hermes_precomputed_obligation_id",
@@ -25777,6 +25781,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter_profile=getattr(adapter, "_owner_profile", None),
             )
             if not should_send:
+                return
+            claimed_part_delivery = getattr(
+                adapter, "_deliver_claimed_response_parts", None
+            )
+            if callable(claimed_part_delivery):
+                from gateway.platforms.base import BasePlatformAdapter
+
+                force_document_attachments = "[[as_document]]" in response
+                media_files = []
+                images = []
+                if deliver_media:
+                    media_files, cleaned = adapter.extract_media(response)
+                    media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                        media_files,
+                        session_key=str(
+                            getattr(source, "session_key", "")
+                            or self._session_key_for_source(source)
+                        ),
+                    )
+                    images, _ = adapter.extract_images(cleaned)
+                await claimed_part_delivery(
+                    obligation_id=delivery_obligation_id,
+                    chat_id=source.chat_id,
+                    text_content=visible_text,
+                    images=images,
+                    media_files=media_files,
+                    local_files=[],
+                    force_document_attachments=force_document_attachments,
+                    metadata=metadata,
+                    reply_to=event_message_id,
+                    text_already_delivered=text_already_delivered,
+                )
                 return
 
         try:
