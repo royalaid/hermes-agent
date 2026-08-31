@@ -3057,15 +3057,23 @@ class CLICommandsMixin:
         parts = (cmd or "").strip().split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        mgr = self._get_goal_manager()
+        from hermes_cli.goals import (
+            GoalPersistenceError,
+            goal_mutation_failure_message,
+            goal_status_failure_message,
+        )
+
+        try:
+            mgr = self._get_goal_manager()
+        except GoalPersistenceError:
+            _cprint(f"  {goal_status_failure_message()}")
+            return
         if mgr is None:
             _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
             return
 
-        from hermes_cli.goals import GoalPersistenceError
-
-        def _persistence_failed(exc: Exception) -> None:
-            _cprint(f"  Goal update failed; persisted state is unchanged: {exc}")
+        def _persistence_failed(exc: GoalPersistenceError) -> None:
+            _cprint(f"  {goal_mutation_failure_message(exc)}")
 
         lower = arg.lower()
 
@@ -3073,8 +3081,8 @@ class CLICommandsMixin:
         if not arg or lower == "status":
             try:
                 status = mgr.status_line()
-            except GoalPersistenceError as exc:
-                _cprint(f"  Goal status unavailable: {exc}")
+            except GoalPersistenceError:
+                _cprint(f"  {goal_status_failure_message()}")
                 return
             _cprint(f"  {status}")
             return
@@ -3083,8 +3091,8 @@ class CLICommandsMixin:
         if lower == "show":
             try:
                 status = mgr.status_line()
-            except GoalPersistenceError as exc:
-                _cprint(f"  Goal status unavailable: {exc}")
+            except GoalPersistenceError:
+                _cprint(f"  {goal_status_failure_message()}")
                 return
             _cprint(f"  {status}")
             _cprint(f"  {mgr.render_contract()}")
@@ -3209,6 +3217,9 @@ class CLICommandsMixin:
                 command = gate_arg[len("add"):].strip()
                 try:
                     gate = mgr.add_gate(command)
+                except GoalPersistenceError as exc:
+                    _persistence_failed(exc)
+                    return
                 except (RuntimeError, ValueError) as exc:
                     _cprint(f"  /goal gate add: {exc}")
                     return
@@ -3222,6 +3233,9 @@ class CLICommandsMixin:
                 idx_text = gate_arg.split(None, 1)[1].strip()
                 try:
                     removed = mgr.remove_gate(int(idx_text))
+                except GoalPersistenceError as exc:
+                    _persistence_failed(exc)
+                    return
                 except (RuntimeError, ValueError, IndexError) as exc:
                     _cprint(f"  /goal gate remove: {exc}")
                     return
@@ -3230,6 +3244,9 @@ class CLICommandsMixin:
             if gate_lower == "clear":
                 try:
                     prev = mgr.clear_gates()
+                except GoalPersistenceError as exc:
+                    _persistence_failed(exc)
+                    return
                 except RuntimeError as exc:
                     _cprint(f"  /goal gate clear: {exc}")
                     return
@@ -3278,9 +3295,18 @@ class CLICommandsMixin:
         set it as the active goal. Falls back to a bare goal if the aux model
         can't produce a contract."""
         from cli import _DIM, _RST, _cprint
-        from hermes_cli.goals import GoalPersistenceError, draft_contract
+        from hermes_cli.goals import (
+            GoalPersistenceError,
+            draft_contract,
+            goal_mutation_failure_message,
+            goal_status_failure_message,
+        )
 
-        mgr = self._get_goal_manager()
+        try:
+            mgr = self._get_goal_manager()
+        except GoalPersistenceError:
+            _cprint(f"  {goal_status_failure_message()}")
+            return
         if mgr is None:
             _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
             return
@@ -3296,7 +3322,7 @@ class CLICommandsMixin:
         try:
             state = mgr.set(objective, contract=contract)
         except GoalPersistenceError as exc:
-            _cprint(f"  Goal update failed; persisted state is unchanged: {exc}")
+            _cprint(f"  {goal_mutation_failure_message(exc)}")
             return
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
@@ -3371,10 +3397,19 @@ class CLICommandsMixin:
         judge call includes them.
         """
         from cli import _DIM, _RST, _cprint
+        from hermes_cli.goals import (
+            GoalPersistenceError,
+            goal_mutation_failure_message,
+            goal_status_failure_message,
+        )
         parts = (cmd or "").strip().split(None, 2)
         arg = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
 
-        mgr = self._get_goal_manager()
+        try:
+            mgr = self._get_goal_manager()
+        except GoalPersistenceError:
+            _cprint(f"  {goal_status_failure_message()}")
+            return
         if mgr is None:
             _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
             return
@@ -3404,6 +3439,9 @@ class CLICommandsMixin:
                 return
             try:
                 removed = mgr.remove_subgoal(idx)
+            except GoalPersistenceError as exc:
+                _cprint(f"  {goal_mutation_failure_message(exc)}")
+                return
             except (IndexError, RuntimeError) as exc:
                 _cprint(f"  /subgoal remove: {exc}")
                 return
@@ -3413,6 +3451,9 @@ class CLICommandsMixin:
         if verb == "clear":
             try:
                 prev = mgr.clear_subgoals()
+            except GoalPersistenceError as exc:
+                _cprint(f"  {goal_mutation_failure_message(exc)}")
+                return
             except RuntimeError as exc:
                 _cprint(f"  /subgoal clear: {exc}")
                 return
@@ -3425,6 +3466,9 @@ class CLICommandsMixin:
         # Otherwise — append the whole arg as a new subgoal.
         try:
             text = mgr.add_subgoal(arg)
+        except GoalPersistenceError as exc:
+            _cprint(f"  {goal_mutation_failure_message(exc)}")
+            return
         except (ValueError, RuntimeError) as exc:
             _cprint(f"  /subgoal: {exc}")
             return

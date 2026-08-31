@@ -13261,7 +13261,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         session split).
         """
         try:
-            from hermes_cli.goals import GoalManager
+            from hermes_cli.goals import GoalManager, GoalPersistenceError
             from hermes_cli.config import load_config
         except Exception as exc:
             logging.debug("goal manager unavailable: %s", exc)
@@ -13277,6 +13277,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if callable(refresh):
                 try:
                     refresh()
+                except GoalPersistenceError:
+                    raise
                 except Exception as exc:
                     logging.warning("goal manager refresh failed closed: %s", exc)
                     return None
@@ -13289,7 +13291,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             max_turns = 20
 
-        mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+        mgr = GoalManager.load_authoritative(
+            session_id=sid,
+            default_max_turns=max_turns,
+        )
         self._goal_manager = mgr
         return mgr
 
@@ -13598,7 +13603,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         The empty-response skip mirrors the gateway guard at
         ``_handle_message`` in ``gateway/run.py``.
         """
-        mgr = self._get_goal_manager()
+        from hermes_cli.goals import (
+            GoalPersistenceError,
+            goal_mutation_failure_message,
+            goal_status_failure_message,
+        )
+
+        try:
+            mgr = self._get_goal_manager()
+        except GoalPersistenceError:
+            _cprint(f"  {_DIM}{goal_status_failure_message()}{_RST}")
+            return
         if mgr is None or not mgr.is_active():
             return
 
@@ -13645,11 +13660,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if getattr(self, "_last_turn_interrupted", False):
             try:
                 mgr.pause(reason="user-interrupted (Ctrl+C)")
+            except GoalPersistenceError as exc:
+                logging.debug("goal pause-on-interrupt could not be verified: %s", exc)
+                _cprint(
+                    f"  {_DIM}{goal_mutation_failure_message(exc)}{_RST}"
+                )
+                return
             except Exception as exc:
                 logging.debug("goal pause-on-interrupt failed: %s", exc)
                 _cprint(
-                    f"  {_DIM}Goal pause failed; persisted state is unchanged. "
-                    f"Use /goal pause or /goal clear to retry.{_RST}"
+                    f"  {_DIM}Goal pause could not be confirmed. "
+                    f"Check /goal status before another action.{_RST}"
                 )
                 return
             _cprint(
@@ -13692,11 +13713,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             _bg_procs = None
 
-        decision = mgr.evaluate_after_turn(
-            last_response,
-            user_initiated=True,
-            background_processes=_bg_procs,
-        )
+        try:
+            decision = mgr.evaluate_after_turn(
+                last_response,
+                user_initiated=True,
+                background_processes=_bg_procs,
+            )
+        except GoalPersistenceError as exc:
+            _cprint(f"  {_DIM}{goal_mutation_failure_message(exc)}{_RST}")
+            return
         msg = decision.get("message") or ""
         if msg:
             _cprint(f"  {msg}")
