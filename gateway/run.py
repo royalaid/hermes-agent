@@ -9713,6 +9713,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             overflow.insert(0, next_queued)
         return pending_event
 
+    def _restore_dequeued_event_front(
+        self,
+        session_key: str,
+        adapter: Any,
+        event: "MessageEvent",
+    ) -> None:
+        """Restore a claimed event ahead of every event that arrived after it.
+
+        The adapter slot stays empty so its post-handler drain does not hot-loop on
+        an unavailable authority.  The next gateway turn owns the bounded retry:
+        its ordinary post-turn promotion claims this exact event again.
+        """
+        state = self._session_state(session_key)
+        queued_events = state.conversation.queued_events
+        current_slot = (
+            adapter._pending_messages.pop(session_key, None)
+            if adapter is not None and hasattr(adapter, "_pending_messages")
+            else None
+        )
+        queued_events[:] = [queued for queued in queued_events if queued is not event]
+        restored = [event]
+        if current_slot is not None and current_slot is not event:
+            restored.append(current_slot)
+        queued_events[:0] = restored
+
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
@@ -31686,6 +31711,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         try:
                             goal_still_active = self._goal_still_active_for_session(session_id)
                         except GoalPersistenceError as exc:
+                            self._restore_dequeued_event_front(
+                                session_key,
+                                adapter,
+                                pending_event,
+                            )
                             notice = f"Goal status unavailable: {exc}"
                             logger.warning("goal continuation: %s", notice)
                             # The queued branch delivered the prior response above,
