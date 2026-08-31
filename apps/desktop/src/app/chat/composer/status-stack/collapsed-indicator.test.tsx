@@ -27,6 +27,9 @@ describe('ComposerStatusStack collapsed todo indicator', () => {
   })
 
   it('shows a running indicator while the todo group is expanded', () => {
+    $sessionStates.set({
+      'session-1': { ...createClientSessionState(), busy: true, turnLive: true }
+    })
     $todosBySession.set({
       'session-1': [{ content: 'Wire the status stack', id: '1', status: 'in_progress' }]
     })
@@ -39,7 +42,7 @@ describe('ComposerStatusStack collapsed todo indicator', () => {
 
     expect(screen.getByText('Wire the status stack')).toBeTruthy()
     expect(screen.getAllByRole('status').length).toBeGreaterThan(0)
-    expect(screen.getByText('Tasks 0/1')).toBeTruthy()
+    expect(screen.getByText('Running — Tasks 0/1')).toBeTruthy()
   })
 
   it('shows a running indicator next to the collapsed todo label', () => {
