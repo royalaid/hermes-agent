@@ -285,15 +285,24 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
+        queued_transport = queued.get("transport")
+        if queued_transport is not None and _transport_is_dead(queued_transport):
+            surviving_viewers = [
+                (ts, viewer_transport)
+                for viewer_transport, ts in (session.get("viewers") or {}).items()
+                if viewer_transport is not queued_transport and not _transport_is_dead(viewer_transport)
+            ]
+            if not surviving_viewers:
+                # Preserve the envelope for a later resume; the orphan reaper still
+                # sees the detached session instead of dispatching into a dead viewer.
+                return True
+            surviving_viewers.sort(key=lambda item: item[0])
+            queued_transport = surviving_viewers[-1][1]
+            queued["transport"] = queued_transport
         _ac_set_queue(session, session.get("queued_prompts") or [])
         session["running"] = True
-        queued_transport = queued.get("transport")
-        # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
-        # ATTACHED, not rebound: a mid-turn prompt from a second client used to silence the first for the
-        # whole drained turn. A peer that disconnected while its prompt sat in the queue is skipped: the
-        # prompt still runs, only the dead pin is dropped.
-        if queued_transport is not None and not _transport_is_dead(queued_transport):
-            _attach_session_transport(session, queued_transport)
+        if queued_transport is not None:
+            session["transport"] = queued_transport
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
