@@ -1746,6 +1746,19 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class DeliveryOwnedReply(str):
+    """Final reply whose publication is already owned by the durable ledger."""
+
+    obligation_id: str
+
+    def __new__(cls, text: str, obligation_id: str):
+        if not obligation_id:
+            raise ValueError("delivery-owned reply requires an obligation id")
+        instance = super().__new__(cls, text)
+        instance.obligation_id = obligation_id
+        return instance
+
+
 def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
                                 event: MessageEvent, *, merge_text: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
@@ -3832,20 +3845,40 @@ class BasePlatformAdapter(ABC):
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable, *,
+        delivery_obligation_id: Optional[str] = None,
+        delivery_adapter: Optional["BasePlatformAdapter"] = None) -> None:
         """Send the final text on the CURRENT transport (a reconnect may have replaced
         this adapter), ledger-bracketed; the message-id owner owns the ephemeral delete."""
-        delivery_adapter = self._final_delivery_adapter(event.source)
+        delivery_adapter = delivery_adapter or self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
-        _obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        _obligation_id = delivery_obligation_id
+        if _obligation_id is None:
+            _obligation_id = await self._record_delivery_obligation(
+                event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content,
             reply_to=_reply_anchor_for_event(event), metadata=metadata)
         record_delivery(result)
         if _obligation_id is not None:
-            await self._finalize_delivery_obligation(_obligation_id, result, event, delivery_adapter)
+            if delivery_obligation_id is None:
+                await self._finalize_delivery_obligation(
+                    _obligation_id, result, event, delivery_adapter)
+            else:
+                from gateway.delivery_ledger import (
+                    mark_claimed_result_delivered,
+                    mark_claimed_result_failed,
+                )
+                marker = (
+                    mark_claimed_result_delivered
+                    if getattr(result, "success", False)
+                    else mark_claimed_result_failed
+                )
+                args = (_obligation_id,) if getattr(result, "success", False) else (
+                    _obligation_id, str(getattr(result, "error", "") or "")
+                )
+                await asyncio.to_thread(marker, *args)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(
                 event.source.chat_id, result.message_id, ephemeral_ttl)
@@ -3996,7 +4029,15 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
-            response = await self._message_handler(event)
+            _precomputed_response = getattr(event, "_hermes_precomputed_response", None)
+            if _precomputed_response is not None:
+                response = DeliveryOwnedReply(
+                    str(_precomputed_response),
+                    str(getattr(event, "_hermes_precomputed_obligation_id", "")),
+                )
+            else:
+                response = await self._message_handler(event)
+            _delivery_owned_obligation_id = getattr(response, "obligation_id", None)
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
@@ -4017,6 +4058,24 @@ class BasePlatformAdapter(ABC):
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
                     _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
+
+                _owned_delivery_adapter = None
+                if _delivery_owned_obligation_id:
+                    from gateway.delivery_ledger import prepare_claimed_result_delivery
+
+                    _owned_delivery_adapter = self._final_delivery_adapter(event.source)
+                    should_send = await asyncio.to_thread(
+                        prepare_claimed_result_delivery,
+                        _delivery_owned_obligation_id,
+                        session_key=session_key,
+                        platform=str(getattr(event.source.platform, "value", event.source.platform)),
+                        chat_id=event.source.chat_id,
+                        thread_id=getattr(event.source, "thread_id", None),
+                        content=text_content,
+                        adapter_profile=getattr(_owned_delivery_adapter, "_owner_profile", None),
+                    )
+                    if not should_send:
+                        return
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
@@ -4030,13 +4089,29 @@ class BasePlatformAdapter(ABC):
                 if not _tts_paths and _tts_requested_path is not None:
                     with contextlib.suppress(OSError):
                         os.remove(_tts_requested_path)
+                if _delivery_owned_obligation_id and _tts_caption_delivered:
+                    from gateway.delivery_ledger import mark_claimed_result_delivered
+
+                    await asyncio.to_thread(
+                        mark_claimed_result_delivered, _delivery_owned_obligation_id)
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                        is_ephemeral_response, _ephemeral_ttl, _record_delivery,
+                        delivery_obligation_id=_delivery_owned_obligation_id,
+                        delivery_adapter=_owned_delivery_adapter)
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered)
+                if (
+                    _delivery_owned_obligation_id
+                    and not text_content
+                    and (delivery_succeeded or _tts_caption_delivered)
+                ):
+                    from gateway.delivery_ledger import mark_claimed_result_delivered
+
+                    await asyncio.to_thread(
+                        mark_claimed_result_delivered, _delivery_owned_obligation_id)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
@@ -4064,6 +4139,10 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            if locals().get("_delivery_owned_obligation_id"):
+                if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                    raise
+                return
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):

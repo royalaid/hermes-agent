@@ -2062,6 +2062,7 @@ from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    DeliveryOwnedReply,
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
@@ -2074,6 +2075,10 @@ from gateway.restart import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class GoalContinuationPublicationError(RuntimeError):
+    """A completed continuation could not cross its durable publication fence."""
 
 
 def _best_effort(fn: Callable[[], Any], debug_msg: Optional[str] = None) -> Any:
@@ -2642,6 +2647,17 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     """
     _, cleaned = adapter.extract_media(response)
     return cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "").strip()
+
+
+def _durable_delivery_text_for_response(response: str, adapter: Any) -> str:
+    """Project final text without exposing attachment directives or paths."""
+    from gateway.platforms.base import _strip_media_directives
+
+    _media_files, cleaned = adapter.extract_media(response)
+    _images, text_content = adapter.extract_images(cleaned)
+    text_content = _strip_media_directives(text_content).strip()
+    _local_files, text_content = adapter.extract_local_files(text_content)
+    return text_content.strip()
 
 
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
