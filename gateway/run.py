@@ -25780,17 +25780,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Deliver a queued response using its existing publication ownership."""
         if delivery_obligation_id:
             from gateway.delivery_ledger import prepare_claimed_result_delivery
+            from gateway.platforms.base import BasePlatformAdapter
 
-            visible_text = _strip_response_attachments_for_direct_send(
-                response, adapter
+            claimed_session_key = str(
+                getattr(source, "session_key", "")
+                or self._session_key_for_source(source)
             )
+            force_document_attachments = "[[as_document]]" in response
+            media_files = []
+            images = []
+            local_files = []
+            if deliver_media:
+                visible_text = _durable_delivery_text_for_response(response, adapter)
+                media_files, cleaned = adapter.extract_media(response)
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                    media_files,
+                    session_key=claimed_session_key,
+                )
+                images, cleaned = adapter.extract_images(cleaned)
+                local_files, _ = adapter.extract_local_files(cleaned)
+                local_files = BasePlatformAdapter.filter_local_delivery_paths(
+                    local_files,
+                    session_key=claimed_session_key,
+                )
+            else:
+                visible_text = _strip_response_attachments_for_direct_send(
+                    response, adapter
+                )
             should_send = await asyncio.to_thread(
                 prepare_claimed_result_delivery,
                 delivery_obligation_id,
-                session_key=str(
-                    getattr(source, "session_key", "")
-                    or self._session_key_for_source(source)
-                ),
+                session_key=claimed_session_key,
                 platform=str(
                     getattr(source.platform, "value", source.platform)
                 ),
@@ -25805,28 +25825,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter, "_deliver_claimed_response_parts", None
             )
             if callable(claimed_part_delivery):
-                from gateway.platforms.base import BasePlatformAdapter
-
-                force_document_attachments = "[[as_document]]" in response
-                media_files = []
-                images = []
-                if deliver_media:
-                    media_files, cleaned = adapter.extract_media(response)
-                    media_files = BasePlatformAdapter.filter_media_delivery_paths(
-                        media_files,
-                        session_key=str(
-                            getattr(source, "session_key", "")
-                            or self._session_key_for_source(source)
-                        ),
-                    )
-                    images, _ = adapter.extract_images(cleaned)
                 await claimed_part_delivery(
                     obligation_id=delivery_obligation_id,
                     chat_id=source.chat_id,
                     text_content=visible_text,
                     images=images,
                     media_files=media_files,
-                    local_files=[],
+                    local_files=local_files,
                     force_document_attachments=force_document_attachments,
                     metadata=metadata,
                     reply_to=event_message_id,
