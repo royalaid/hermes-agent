@@ -357,6 +357,7 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
     'pausable_gateways',
     'pausable_gateway_processes',
     'deferred_backends',
+    'deferred_backend_evidence',
     'error'
   ]
 
@@ -628,6 +629,22 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
     if (!parseIdentityRecord(entry, 'gateway', seenPids)) {
       return { kind: 'probe-failure', error: 'pausable gateway identity is invalid' }
     }
+  }
+
+  // Diagnostic only (#98350): sanitized ledger identity for each deferred
+  // serve/dashboard backend — never argv. Shape-checked so a malformed
+  // scanner cannot smuggle a blocker past the exact-envelope contract.
+  if (
+    !Array.isArray(parsed.deferred_backend_evidence) ||
+    parsed.deferred_backend_evidence.some(
+      (entry: unknown) =>
+        typeof entry !== 'object' ||
+        entry === null ||
+        !Number.isInteger((entry as { pid?: unknown }).pid) ||
+        ((entry as { pid: number }).pid) <= 0
+    )
+  ) {
+    return { kind: 'probe-failure', error: 'deferred_backend_evidence must list sanitized backend identities' }
   }
 
   // Reject inconsistent combinations.

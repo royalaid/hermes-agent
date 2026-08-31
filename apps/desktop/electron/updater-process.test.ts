@@ -222,6 +222,7 @@ test('resolveUpdateScriptHandoff is Windows-only (POSIX updates in place)', () =
 test('resolveWindowsUpdateTransport selects the live checkout script', () => {
   const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
   const scriptPath = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
+
   const transport = resolveWindowsUpdateTransport(root, {
     isWindows: true,
     fileExists: candidate => candidate === scriptPath
@@ -271,6 +272,39 @@ test('wrapHandoffForDetachedConsole routes through cmd start with own console', 
     '-Branch',
     'main'
   ])
+})
+
+test('authenticated Windows handoff uses the absolute inbox PowerShell path', () => {
+  const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
+  const expected = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
+
+  const handoff = resolveUpdateScriptHandoff(root, {
+    isWindows: true,
+    fileExists: candidate => candidate === expected
+  })
+
+  assert.ok(handoff)
+
+  const wrapped = wrapHandoffForDetachedConsole(handoff, {
+    bridgeLeaseId: 'lease-id-1234567890',
+    branch: 'main',
+    desktopPid: 42,
+    installRoot: root,
+    relaunchExe: String.raw`C:\Hermes\Hermes.exe`
+  })
+
+  const powershell = path.join(
+    process.env.SystemRoot || 'C:\\Windows',
+    'System32',
+    'WindowsPowerShell',
+    'v1.0',
+    'powershell.exe'
+  )
+
+  assert.equal(wrapped.command, 'cmd.exe')
+  assert.equal(wrapped.args[6], powershell)
+  assert.equal(wrapped.env?.HERMES_UPDATE_HANDOFF_SCRIPT, expected)
+  assert.equal(wrapped.env?.HERMES_UPDATE_BRIDGE_LEASE_ID, 'lease-id-1234567890')
 })
 
 test('resolvePosixScriptHandoff returns the bash recipe when the script exists', () => {
