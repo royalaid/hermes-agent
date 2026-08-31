@@ -52,6 +52,565 @@ def test_enqueue_preserves_order_after_an_image_turn():
     ]
 
 
+def test_live_resume_rebinds_an_orphaned_queued_transport(monkeypatch):
+    old_transport = object()
+    new_transport = object()
+    session = _session(
+        queued_prompt={"text": "after reload", "transport": old_transport},
+        transport=server._detached_ws_transport,
+        viewers={},
+    )
+    monkeypatch.setattr(server, "_fallback_session_info", lambda _session: {})
+    monkeypatch.setattr(server, "_session_live_status", lambda _sid, _session: "working")
+
+    server._live_session_payload(
+        "sid",
+        session,
+        transport=new_transport,
+        omit_messages=True,
+    )
+
+    assert session["queued_prompt"]["transport"] is new_transport
+
+
+def test_resume_before_old_disconnect_rebinds_only_the_orphaned_queue_and_publishes_once(
+    monkeypatch,
+):
+    class _Transport:
+        def __init__(self, name):
+            self.name = name
+            self.frames = []
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    old = _Transport("old")
+    resumed = _Transport("resumed")
+    other_live_viewer = _Transport("other-live-viewer")
+    session = _session(
+        queued_prompt={"text": "queued on old", "transport": old},
+        queued_prompts=[
+            {"text": "queued on other live viewer", "transport": other_live_viewer}
+        ],
+        transport=old,
+        viewers={old: 100.0, other_live_viewer: 101.0},
+    )
+    monkeypatch.setattr(server, "_fallback_session_info", lambda _session: {})
+    monkeypatch.setattr(server, "_session_live_status", lambda _sid, _session: "working")
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+
+    def publish_queued_turn(_rid, _sid, active_session, text, **_kwargs):
+        active_session["transport"].write({"event": "message.complete", "text": text})
+        active_session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", publish_queued_turn)
+    server._sessions["sid"] = session
+    try:
+        # B resumes while A is still registered. Queue ownership must stay on A
+        # until A actually disconnects; a live originating viewer owns its work.
+        server._live_session_payload(
+            "sid",
+            session,
+            transport=resumed,
+            omit_messages=True,
+        )
+        assert session["queued_prompt"]["transport"] is old
+        assert session["queued_prompts"][0]["transport"] is other_live_viewer
+
+        reaped, detached = server._close_sessions_for_transport(old)
+
+        assert (reaped, detached) == (0, 0)
+        assert old not in session["viewers"]
+        assert session["transport"] is resumed
+        assert session["queued_prompt"]["transport"] is resumed
+        assert session["queued_prompts"][0]["transport"] is other_live_viewer
+
+        assert server._drain_queued_prompt("drain-old", "sid", session) is True
+        assert resumed.frames == [
+            {"event": "message.complete", "text": "queued on old"}
+        ]
+        assert old.frames == []
+        assert other_live_viewer.frames == []
+
+        assert server._drain_queued_prompt("drain-other", "sid", session) is True
+        assert other_live_viewer.frames == [
+            {
+                "event": "message.complete",
+                "text": "queued on other live viewer",
+            }
+        ]
+        assert len(resumed.frames) == 1
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_current_owner_disconnect_rebinds_only_its_queued_envelopes_before_fifo_drain(
+    monkeypatch,
+):
+    class _Transport:
+        def __init__(self, name):
+            self.name = name
+            self.frames = []
+            self._closed = False
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    old = _Transport("old")
+    resumed = _Transport("resumed")
+    other_live_viewer = _Transport("other-live-viewer")
+    queued_on_old_with_image = {
+        "text": "queued on old with image",
+        "transport": old,
+        "image_paths": ["/tmp/owned-by-old.png"],
+    }
+    queued_on_other = {
+        "text": "queued on other live viewer",
+        "transport": other_live_viewer,
+    }
+    queued_on_old_later = {"text": "later queued on old", "transport": old}
+    session = _session(
+        queued_prompt=queued_on_old_with_image,
+        queued_prompts=[queued_on_other, queued_on_old_later],
+        transport=old,
+        viewers={old: 100.0, other_live_viewer: 101.0, resumed: 102.0},
+        _queued_prompt_generation=7,
+    )
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    dispatched = []
+
+    def publish_queued_turn(_rid, _sid, active_session, text, **kwargs):
+        transport = active_session["transport"]
+        dispatched.append((text, transport.name, kwargs.get("image_paths")))
+        transport.write({"event": "message.complete", "text": text})
+        active_session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", publish_queued_turn)
+    server._sessions["sid"] = session
+    try:
+        old._closed = True
+        reaped, detached = server._close_sessions_for_transport(old)
+
+        assert (reaped, detached) == (0, 0)
+        assert old not in session["viewers"]
+        assert session["transport"] is resumed
+        assert session["queued_prompt"] is queued_on_old_with_image
+        assert session["queued_prompt"] == {
+            "text": "queued on old with image",
+            "transport": resumed,
+            "image_paths": ["/tmp/owned-by-old.png"],
+        }
+        assert session["queued_prompts"] == [
+            queued_on_other,
+            {"text": "later queued on old", "transport": resumed},
+        ]
+        assert queued_on_other["transport"] is other_live_viewer
+        assert session["_queued_prompt_generation"] == 7
+
+        assert server._drain_queued_prompt("drain-1", "sid", session) is True
+        assert server._drain_queued_prompt("drain-2", "sid", session) is True
+        assert server._drain_queued_prompt("drain-3", "sid", session) is True
+        assert server._drain_queued_prompt("drain-empty", "sid", session) is False
+
+        assert dispatched == [
+            ("queued on old with image", "resumed", ["/tmp/owned-by-old.png"]),
+            ("queued on other live viewer", "other-live-viewer", None),
+            ("later queued on old", "resumed", None),
+        ]
+        assert old.frames == []
+        assert resumed.frames == [
+            {"event": "message.complete", "text": "queued on old with image"},
+            {"event": "message.complete", "text": "later queued on old"},
+        ]
+        assert other_live_viewer.frames == [
+            {"event": "message.complete", "text": "queued on other live viewer"}
+        ]
+        assert list(session["viewers"]) == [other_live_viewer, resumed]
+        assert session["_queued_prompt_generation"] == 7
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_activate_and_disconnect_complete_without_cross_thread_lock_cycle(
+    monkeypatch,
+):
+    """Activation and old-transport teardown must not invert session locks."""
+
+    class _Transport:
+        def __init__(self, name):
+            self.name = name
+            self._closed = False
+
+        def write(self, _frame):
+            return True
+
+    class _LockCycleObserved(RuntimeError):
+        pass
+
+    activate_has_history = threading.Event()
+    disconnect_waiting_history = threading.Event()
+    disconnect_holds_sessions = threading.Event()
+    nested_edges = []
+    held = threading.local()
+    real_sessions_lock = server._sessions_lock
+
+    class _HistoryLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            worker = threading.current_thread().name
+            if worker == "activate-session":
+                self._lock.acquire()
+                held.history = True
+                activate_has_history.set()
+                assert disconnect_waiting_history.wait(2.0)
+                return self
+            if worker == "disconnect-transport":
+                if disconnect_holds_sessions.is_set():
+                    nested_edges.append("sessions->history")
+                disconnect_waiting_history.set()
+            self._lock.acquire()
+            held.history = True
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            held.history = False
+            self._lock.release()
+
+    class _SessionsLock:
+        def __enter__(self):
+            worker = threading.current_thread().name
+            if worker == "activate-session" and getattr(held, "history", False):
+                nested_edges.append("history->sessions")
+                if disconnect_holds_sessions.is_set():
+                    raise _LockCycleObserved(
+                        "activation waited for _sessions_lock while teardown held it "
+                        "and waited for history_lock"
+                    )
+            real_sessions_lock.acquire()
+            if worker == "disconnect-transport":
+                disconnect_holds_sessions.set()
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            if threading.current_thread().name == "disconnect-transport":
+                disconnect_holds_sessions.clear()
+            real_sessions_lock.release()
+
+    old = _Transport("old")
+    resumed = _Transport("resumed")
+    queued = {"text": "recover after reconnect", "transport": old}
+    session = _session(
+        history_lock=_HistoryLock(),
+        queued_prompt=queued,
+        transport=old,
+        viewers={old: 100.0, resumed: 101.0},
+    )
+    responses = {}
+    errors = []
+
+    monkeypatch.setattr(server, "_sessions_lock", _SessionsLock())
+    monkeypatch.setattr(server, "current_transport", lambda: resumed)
+    monkeypatch.setattr(server, "_fallback_session_info", lambda _session: {})
+    monkeypatch.setattr(server, "_session_live_status", lambda _sid, _session: "idle")
+    server._sessions["sid"] = session
+
+    def activate():
+        try:
+            responses["activate"] = server.handle_request(
+                {
+                    "id": "activate",
+                    "method": "session.activate",
+                    "params": {"session_id": "sid", "omit_messages": True},
+                }
+            )
+        except BaseException as exc:  # preserve worker failures for the parent assertion
+            errors.append(("activate", exc))
+
+    def disconnect():
+        try:
+            responses["disconnect"] = server._close_sessions_for_transport(old)
+        except BaseException as exc:  # preserve worker failures for the parent assertion
+            errors.append(("disconnect", exc))
+
+    activate_thread = threading.Thread(target=activate, name="activate-session")
+    disconnect_thread = threading.Thread(target=disconnect, name="disconnect-transport")
+    try:
+        activate_thread.start()
+        assert activate_has_history.wait(2.0)
+        disconnect_thread.start()
+        activate_thread.join(timeout=3.0)
+        disconnect_thread.join(timeout=3.0)
+
+        assert not activate_thread.is_alive()
+        assert not disconnect_thread.is_alive()
+        assert errors == []
+        assert nested_edges == []
+        assert responses["activate"]["result"]["session_id"] == "sid"
+        assert responses["disconnect"] == (0, 0)
+        assert old not in session["viewers"]
+        assert session["transport"] is resumed
+        assert queued["transport"] is resumed
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_drain_claim_during_disconnect_rebind_never_dispatches_dead_transport(
+    monkeypatch,
+):
+    """A raced queue claim must inherit the surviving viewer before dispatch."""
+
+    class _Transport:
+        def __init__(self, name):
+            self.name = name
+            self.frames = []
+            self._closed = False
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    old = _Transport("old")
+    resumed = _Transport("resumed")
+    queued = {"text": "claimed while rebinding", "transport": old}
+    session = _session(
+        queued_prompt=queued,
+        transport=old,
+        viewers={old: 100.0, resumed: 101.0},
+    )
+    teardown_ready_to_rebind = threading.Event()
+    drain_claimed = threading.Event()
+    rebind_finished = threading.Event()
+    real_rebind = server._rebind_queued_prompts_for_transport
+    responses = {}
+    errors = []
+    dispatched = []
+
+    def coordinate_rebind(*args):
+        teardown_ready_to_rebind.set()
+        assert drain_claimed.wait(2.0)
+        try:
+            return real_rebind(*args)
+        finally:
+            rebind_finished.set()
+
+    def after_drain_claim(_session):
+        drain_claimed.set()
+        assert rebind_finished.wait(2.0)
+        return False
+
+    def publish(_rid, _sid, active_session, text, **_kwargs):
+        transport = active_session["transport"]
+        dispatched.append((text, transport))
+        transport.write({"event": "message.complete", "text": text})
+        active_session["running"] = False
+
+    monkeypatch.setattr(
+        server, "_rebind_queued_prompts_for_transport", coordinate_rebind
+    )
+    monkeypatch.setattr(server, "_session_uses_compute_host", after_drain_claim)
+    monkeypatch.setattr(server, "_run_prompt_submit", publish)
+    server._sessions["sid"] = session
+
+    def disconnect():
+        try:
+            responses["disconnect"] = server._close_sessions_for_transport(old)
+        except BaseException as exc:
+            errors.append(("disconnect", exc))
+
+    def drain():
+        try:
+            responses["drain"] = server._drain_queued_prompt("drain", "sid", session)
+        except BaseException as exc:
+            errors.append(("drain", exc))
+
+    old._closed = True
+    disconnect_thread = threading.Thread(
+        target=disconnect, name="disconnect-transport"
+    )
+    drain_thread = threading.Thread(target=drain, name="drain-queued-prompt")
+    try:
+        disconnect_thread.start()
+        assert teardown_ready_to_rebind.wait(2.0)
+        drain_thread.start()
+        disconnect_thread.join(timeout=3.0)
+        drain_thread.join(timeout=3.0)
+
+        assert not disconnect_thread.is_alive()
+        assert not drain_thread.is_alive()
+        assert errors == []
+        assert responses == {"disconnect": (0, 0), "drain": True}
+        assert dispatched == [("claimed while rebinding", resumed)]
+        assert old.frames == []
+        assert resumed.frames == [
+            {"event": "message.complete", "text": "claimed while rebinding"}
+        ]
+        assert session["transport"] is resumed
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_post_turn_drain_waits_for_live_viewer_then_dispatches_once(monkeypatch):
+    """A sole-viewer disconnect must preserve queued work until live resume."""
+
+    class _Transport:
+        def __init__(self, name):
+            self.name = name
+            self._closed = False
+            self.frames = []
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return not self._closed
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    first_done = threading.Event()
+    post_turn_drain = threading.Event()
+    queued_started = threading.Event()
+    queued_done = threading.Event()
+    calls = []
+
+    class _Agent:
+        model = "test-model"
+        session_id = "session-key"
+        interim_assistant_callback = None
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            transport = server.current_transport()
+            calls.append((prompt, transport))
+            if prompt == "active turn":
+                first_started.set()
+                assert release_first.wait(2.0)
+                first_done.set()
+            else:
+                queued_started.set()
+                transport.write({"event": "message.complete", "text": prompt})
+                queued_done.set()
+            return {
+                "final_response": f"{prompt} complete",
+                "messages": list(conversation_history or [])
+                + [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": f"{prompt} complete"},
+                ],
+            }
+
+    old = _Transport("old")
+    resumed = _Transport("resumed")
+    session = _session(
+        agent=_Agent(),
+        cwd=".",
+        transport=old,
+        viewers={old: 100.0},
+    )
+    scheduled_reaps = []
+    cancelled_reaps = []
+    real_drain = server._drain_queued_prompt
+
+    def observe_post_turn_drain(*args, **kwargs):
+        try:
+            return real_drain(*args, **kwargs)
+        finally:
+            post_turn_drain.set()
+
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "record_turn_start", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_start_usage_ticker", lambda *_args: (threading.Event(), types.SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_is_successful_goal_turn", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_fallback_session_info", lambda _session: {})
+    monkeypatch.setattr(server, "_session_live_status", lambda _sid, _session: "idle")
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled_reaps.append)
+    monkeypatch.setattr(server, "_cancel_ws_orphan_reap", cancelled_reaps.append)
+    monkeypatch.setattr(server, "_drain_queued_prompt", observe_post_turn_drain)
+    server._sessions["sid"] = session
+
+    try:
+        started = server.handle_request(
+            {
+                "id": "active",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "active turn"},
+            }
+        )
+        assert started["result"]["status"] == "streaming"
+        assert first_started.wait(2.0)
+
+        queued = server._handle_busy_submit(
+            "queued", "sid", session, "queued after disconnect", old
+        )
+        queued_envelope = session["queued_prompt"]
+        assert queued["result"]["status"] == "queued"
+        assert queued_envelope["transport"] is old
+
+        old._closed = True
+        assert server._close_sessions_for_transport(old) == (0, 1)
+        assert session["transport"] is server._detached_ws_transport
+        assert scheduled_reaps == ["sid"]
+
+        release_first.set()
+        assert first_done.wait(2.0)
+        assert post_turn_drain.wait(2.0)
+        assert not queued_started.wait(0.2)
+        assert session["queued_prompt"] is queued_envelope
+        assert session["running"] is False
+        assert session["transport"] is server._detached_ws_transport
+        assert old.frames == []
+
+        transport_token = server.bind_transport(resumed)
+        try:
+            activated = server.handle_request(
+                {
+                    "id": "resume",
+                    "method": "session.activate",
+                    "params": {"session_id": "sid", "omit_messages": True},
+                }
+            )
+        finally:
+            server.reset_transport(transport_token)
+        assert activated["result"]["session_id"] == "sid"
+        assert session["queued_prompt"] is queued_envelope
+        assert queued_envelope["transport"] is resumed
+        assert session["transport"] is resumed
+        assert cancelled_reaps == ["sid"]
+
+        assert real_drain("resume-drain", "sid", session) is True
+        assert queued_done.wait(2.0)
+        assert calls == [
+            ("active turn", old),
+            ("queued after disconnect", resumed),
+        ]
+        assert resumed.frames == [
+            {"event": "message.complete", "text": "queued after disconnect"}
+        ]
+        assert old.frames == []
+        assert session.get("queued_prompt") is None
+        assert real_drain("duplicate-drain", "sid", session) is False
+    finally:
+        release_first.set()
+        queued_done.wait(0.2)
+        run_thread = session.get("_run_thread")
+        if run_thread is not None:
+            run_thread.join(timeout=2.0)
+        server._sessions.pop("sid", None)
 
 
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
