@@ -2736,11 +2736,52 @@ class GatewayTurnMixin:
         when multiplexing is off)."""
         claimed_event = turn_kwargs.get("claimed_event")
         session_key = turn_kwargs.get("session_key")
+        from gateway.goal_continuation_claims import event_claim_identity
+
+        durable_claimed_event = (
+            claimed_event is not None
+            and event_claim_identity(claimed_event) is not None
+        )
+        claimed_active_turn_token = None
+        if durable_claimed_event and session_key:
+            try:
+                token_reader = getattr(
+                    getattr(self, "session_store", None),
+                    "get_active_turn_token",
+                    None,
+                )
+                candidate_token = (
+                    token_reader(session_key) if callable(token_reader) else None
+                )
+                if isinstance(candidate_token, str) and candidate_token:
+                    claimed_active_turn_token = candidate_token
+            except Exception as exc:
+                self._restore_unacknowledged_goal_continuation_claim_event(
+                    session_key, source, claimed_event)
+                from gateway.run import GoalContinuationPublicationError
+                raise GoalContinuationPublicationError(
+                    "durable active-turn ownership is unavailable") from exc
+        turn_kwargs["durable_claimed_event"] = durable_claimed_event
+        turn_kwargs["claimed_active_turn_token"] = claimed_active_turn_token
         try:
             with self._profile_scope_for_source(source):
-                return await self._run_agent_inner(
+                result = await self._run_agent_inner(
                     message, context_prompt, history, source, session_id, **turn_kwargs
                 )
+            if (
+                durable_claimed_event
+                and session_key
+                and event_claim_identity(claimed_event) is not None
+                and "_delivery_obligation_id" not in result
+            ):
+                await self._commit_goal_continuation_result(
+                    session_key=session_key,
+                    source=source,
+                    event=claimed_event,
+                    result=result,
+                    active_turn_token=claimed_active_turn_token,
+                )
+            return result
         except BaseException:
             self._restore_unacknowledged_goal_continuation_claim_event(
                 session_key, source, claimed_event
@@ -2977,6 +3018,10 @@ class GatewayTurnMixin:
             self._thread_metadata_for_progress(
                 source, event_message_id, _progress_thread_id, _relay_prospective_thread_id,
             ),
+            # Freshness-gate stale resume_pending zombies (#46934) — but honor an explicit
+            # ``session_reset.mode: none``: the user opted out of ALL automatic resets, so an expired resume
+            # marker must fall through to a normal resume of the preserved transcript, never a silent fresh
+            # session (#61052).
             platform=source.platform,
         )
         if _native_slack_task_cards:
@@ -3543,6 +3588,7 @@ class GatewayTurnMixin:
                 logger.debug("Stream consumer wait before queued message failed: %s", e)
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
+        _owned_delivery_id = _delivery_result.get("_delivery_obligation_id")
         first_response = _delivery_result.get("final_response", "")
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
@@ -3575,13 +3621,15 @@ class GatewayTurnMixin:
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
                     deliver_media=not _delivery_result.get("failed"), stream_consumer=_sc,
-                    # The text send records a delivery-ledger obligation under this key, keyed on
-                    # the raw inbound id (the anchor above is only the reply target).
-                    session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
                     delivery_obligation_id=_owned_delivery_id,
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
+                if _owned_delivery_id:
+                    raise
+        elif _owned_delivery_id:
+            from gateway.delivery_ledger import mark_claimed_result_delivered
+            await asyncio.to_thread(mark_claimed_result_delivered, _owned_delivery_id)
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -3709,7 +3757,6 @@ class GatewayTurnMixin:
                 _restore_goal_retry_handoff()
                 return result
             next_message_id = self._reply_anchor_for_event(pending_event)
-            next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt = getattr(pending_event, "channel_prompt", None)
             next_message_type = getattr(pending_event, "message_type", None)
 
