@@ -3939,17 +3939,6 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     return cleaned.strip()
 
 
-def _durable_delivery_text_for_response(response: str, adapter: Any) -> str:
-    """Project final text without exposing attachment directives or paths."""
-    from gateway.platforms.base import _strip_media_directives
-
-    _media_files, cleaned = adapter.extract_media(response)
-    _images, text_content = adapter.extract_images(cleaned)
-    text_content = _strip_media_directives(text_content).strip()
-    _local_files, text_content = adapter.extract_local_files(text_content)
-    return text_content.strip()
-
-
 @dataclasses.dataclass(frozen=True)
 class _ClaimedResponsePartsSnapshot:
     """One bounded parse of every queued claimed-result publication part."""
@@ -3961,17 +3950,48 @@ class _ClaimedResponsePartsSnapshot:
     force_document_attachments: bool
 
 
+def _accepts_keyword(function: Any, keyword: str) -> bool:
+    """Return whether a callable explicitly accepts a claimed-plan keyword."""
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def _snapshot_queued_claimed_response_parts(
     response: str,
     adapter: Any,
 ) -> _ClaimedResponsePartsSnapshot:
     """Derive visible text and attachment intents from one parse snapshot."""
-    from gateway.platforms.base import _strip_media_directives
+    from gateway.platforms.base import BasePlatformAdapter, _strip_media_directives
 
-    media_files, cleaned = adapter.extract_media(response)
-    images, text_content = adapter.extract_images(cleaned)
+    media_extractor = getattr(adapter, "extract_media", None)
+    if not callable(media_extractor) or not _accepts_keyword(
+        media_extractor,
+        "include_unavailable",
+    ):
+        media_extractor = BasePlatformAdapter.extract_media
+    media_files, cleaned = media_extractor(
+        response,
+        include_unavailable=True,
+    )
+    image_extractor = getattr(adapter, "extract_images", None)
+    if not callable(image_extractor):
+        image_extractor = BasePlatformAdapter.extract_images
+    images, text_content = image_extractor(cleaned)
     text_content = _strip_media_directives(text_content).strip()
-    local_files, text_content = adapter.extract_local_files(
+    local_file_extractor = getattr(adapter, "extract_local_files", None)
+    if not callable(local_file_extractor) or not _accepts_keyword(
+        local_file_extractor,
+        "include_unavailable",
+    ):
+        local_file_extractor = BasePlatformAdapter.extract_local_files
+    local_files, text_content = local_file_extractor(
         text_content,
         include_unavailable=True,
     )
@@ -10211,7 +10231,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile = getattr(adapter, "_owner_profile", None) or source.profile
         claim_home = getattr(self, "_goal_continuation_claim_home", None)
         try:
-            delivery_text = _durable_delivery_text_for_response(content, adapter)
+            attachment_snapshot = _snapshot_queued_claimed_response_parts(
+                content,
+                adapter,
+            )
+            delivery_text = attachment_snapshot.visible_text
             source_payload = source.to_dict()
             source_payload["is_bot"] = bool(source.is_bot)
             source_payload["role_authorized"] = False
@@ -10257,6 +10281,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         setattr(event, "_hermes_delivery_obligation_id", obligation_id)
         result["_delivery_obligation_id"] = obligation_id
+        setattr(
+            event,
+            "_hermes_claimed_response_parts_snapshot",
+            attachment_snapshot,
+        )
         if not self._complete_goal_continuation_claim_event(
             session_key, adapter, event
         ):
@@ -26071,6 +26100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         deliver_media: bool = True,
         stream_consumer=None,
         delivery_obligation_id: Optional[str] = None,
+        attachment_snapshot: Optional[_ClaimedResponsePartsSnapshot] = None,
     ) -> None:
         """Deliver a queued response using its existing publication ownership."""
         if delivery_obligation_id:
@@ -26080,17 +26110,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(source, "session_key", "")
                 or self._session_key_for_source(source)
             )
+            snapshot = attachment_snapshot or _snapshot_queued_claimed_response_parts(
+                response,
+                adapter,
+            )
+            visible_text = snapshot.visible_text
             if deliver_media:
-                snapshot = _snapshot_queued_claimed_response_parts(response, adapter)
-                visible_text = snapshot.visible_text
                 media_files = snapshot.media_files
                 images = snapshot.images
                 local_files = snapshot.local_files
                 force_document_attachments = snapshot.force_document_attachments
             else:
-                visible_text = _strip_response_attachments_for_direct_send(
-                    response, adapter
-                )
                 media_files = []
                 images = []
                 local_files = []
@@ -33610,6 +33640,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 deliver_media=not _delivery_result.get("failed"),
                                 stream_consumer=_sc,
                                 delivery_obligation_id=_owned_delivery_id,
+                                attachment_snapshot=getattr(
+                                    claimed_event,
+                                    "_hermes_claimed_response_parts_snapshot",
+                                    None,
+                                ),
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
