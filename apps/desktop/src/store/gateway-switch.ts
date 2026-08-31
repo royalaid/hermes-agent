@@ -26,6 +26,7 @@ import {
 import { clearAllSessionControl } from '@/store/session-control'
 import { resetSessionPinMirror } from '@/store/session-pin-sync'
 import { clearAllSessionStates } from '@/store/session-states'
+import { clearAllSessionTodos, clearAllTodoContinuations } from '@/store/todos'
 import { clearTranscriptTails } from '@/store/transcript-tail-cache'
 
 // True while a connection switch is mid-flight — a Settings → Gateway apply
@@ -210,6 +211,8 @@ export function wipeSessionListsForGatewaySwitch(): void {
   // Structured goal/loop/heartbeat entries are keyed by runtime id, which the
   // next backend re-mints, so a full wipe is exact (and stale-response-safe).
   clearAllSessionControl()
+  clearAllSessionTodos()
+  clearAllTodoContinuations()
   resetLiveRuntimeTracking()
   resetLiveSync()
   $unreadFinishedSessionIds.set([])

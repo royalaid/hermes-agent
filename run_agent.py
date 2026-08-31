@@ -1025,11 +1025,42 @@ class AIAgent(
         _set_interrupt(False)
 
     def _latest_todo_response(self, history: List[Dict[str, Any]]) -> Optional[tuple]:
-        """Walk history backwards for the newest paired, size-bounded todo result → ``(todos, revision)``."""
-        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+        """Walk history backwards for the newest trusted Todo authority."""
+        from agent.message_metadata import has_persisted_todo_snapshot_provenance
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS, TodoStore
+
+        def _validated_carrier_todos(message: Dict[str, Any]):
+            metadata = message.get("display_metadata")
+            if not isinstance(metadata, dict) or "todo_snapshot" not in metadata:
+                return None
+            snapshot = metadata["todo_snapshot"]
+            if not isinstance(snapshot, dict) or set(snapshot) != {"todos"}:
+                return None
+            todos = snapshot.get("todos")
+            if not isinstance(todos, list):
+                return None
+            try:
+                encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                return None
+            if len(encoded) > MAX_TODO_RESULT_CHARS:
+                return None
+            candidate = TodoStore()
+            canonical = candidate.write(todos, merge=False)
+            return canonical if canonical == todos else None
 
         for idx in range(len(history) - 1, -1, -1):
             msg = history[idx]
+            if has_persisted_todo_snapshot_provenance(msg):
+                todos = _validated_carrier_todos(msg)
+                if todos is None:
+                    logger.warning(
+                        "Skipping invalid persisted todo carrier during hydration: session=%s",
+                        self.session_id or "none",
+                    )
+                    return None
+                # Durable carriers predate revision-bearing tool responses.
+                return todos, 1
             content = msg.get("content", "")
             if msg.get("role") != "tool" or not isinstance(content, str) or not self._tool_response_matches_todo_call(history, idx):
                 continue

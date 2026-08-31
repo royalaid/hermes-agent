@@ -171,6 +171,20 @@ _HISTORY_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details"
 _HISTORY_ROLES = frozenset({"user", "assistant", "tool", "system"})
 
 
+def _has_structured_todo_snapshot(display_metadata: Any) -> bool:
+    """Whether display metadata carries a durable TodoStore snapshot."""
+    metadata = display_metadata
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if not isinstance(metadata, dict):
+        return False
+    snapshot = metadata.get("todo_snapshot")
+    return isinstance(snapshot, dict) and isinstance(snapshot.get("todos"), list)
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -181,8 +195,24 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m is None:
             continue
         role = m.get("role")
-        # display_kind="hidden": model-facing scaffolding the "[System:" sniff does not catch.
-        if role not in _HISTORY_ROLES or m.get("display_kind") == "hidden":
+        if role not in _HISTORY_ROLES:
+            continue
+        # Preserve a hidden Todo carrier's state sidecar while suppressing its prose.
+        if m.get("display_kind") == "hidden":
+            metadata = m.get("display_metadata")
+            if _has_structured_todo_snapshot(metadata):
+                hidden = {
+                    "role": role,
+                    "text": "",
+                    "display_kind": "hidden",
+                    "display_metadata": metadata,
+                }
+                ts = m.get("timestamp")
+                if isinstance(ts, (int, float)) and ts > 0:
+                    hidden["timestamp"] = float(ts)
+                if m.get("_row_id") is not None:
+                    hidden["row_id"] = m["_row_id"]
+                messages.append(hidden)
             continue
         content_text = _coerce_message_text(m.get("content"))
         from agent.codex_display_projection import project_codex_display_items

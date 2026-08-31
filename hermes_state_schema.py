@@ -916,6 +916,15 @@ class SessionSchemaMixin:
         if current_version < 25:
             # v25: de-duplicate system prompt snapshots (old column stays a read fallback).
             self._dedupe_legacy_system_prompts(cursor)
+        if current_version < 31:
+            # v31: create only empty sparse Todo authority/progress tables during
+            # schema reconciliation. Legacy transcript traversal is resumed in
+            # fixed slices by the Todo projection; startup never scans history.
+            high_water = cursor.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                ("todo_authority_legacy_high_water", str(int(high_water))),
+            )
         fts_migrations_complete = True
         if current_version < 30 and fts5_available:
             # v29: cron sessions leave the trigram substring index (they stay in the word index);
