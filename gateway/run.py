@@ -10127,15 +10127,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return removed
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
-        """Best-effort fresh DB check before running a queued continuation."""
+        """Authoritatively recheck goal state before running a queued continuation."""
         if not session_id:
             return False
-        try:
-            from hermes_cli.goals import GoalManager
-            return GoalManager(session_id=session_id).is_active()
-        except Exception as exc:
-            logger.debug("goal continuation: active-state recheck failed: %s", exc)
-            return False
+        from hermes_cli.goals import load_goal_authoritative
+
+        state = load_goal_authoritative(session_id)
+        return state is not None and state.status == "active"
 
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
@@ -32831,12 +32829,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_type = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
-                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
-                        logger.info(
-                            "Discarding stale goal continuation for session %s — goal is no longer active",
-                            session_key or "?",
-                        )
-                        return result
+                    if self._is_goal_continuation_event(pending_event):
+                        from hermes_cli.goals import GoalPersistenceError
+
+                        try:
+                            goal_still_active = self._goal_still_active_for_session(session_id)
+                        except GoalPersistenceError as exc:
+                            notice = f"Goal status unavailable: {exc}"
+                            logger.warning("goal continuation: %s", notice)
+                            # The queued branch delivered the prior response above,
+                            # so send this status now rather than deferring it again.
+                            await self._send_goal_status_notice(next_source, notice)
+                            return result
+                        if not goal_still_active:
+                            logger.info(
+                                "Discarding stale goal continuation for session %s — goal is no longer active",
+                                session_key or "?",
+                            )
+                            return result
                     # Resolve the follow-up's session key BEFORE preparing the
                     # inbound text: _prepare_inbound_message_text buffers native
                     # image paths under the key it is given, and the recursive
