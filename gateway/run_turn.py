@@ -2203,6 +2203,7 @@ class GatewayTurnMixin:
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                claimed_event=event,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2914,8 +2915,18 @@ class GatewayTurnMixin:
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
-        with self._profile_scope_for_source(source):
-            return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+        claimed_event = turn_kwargs.get("claimed_event")
+        session_key = turn_kwargs.get("session_key")
+        try:
+            with self._profile_scope_for_source(source):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id, **turn_kwargs
+                )
+        except BaseException:
+            self._restore_unacknowledged_goal_continuation_claim_event(
+                session_key, source, claimed_event
+            )
+            raise
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""
@@ -3921,7 +3932,8 @@ class GatewayTurnMixin:
                         self._finish_goal_continuation_retry(session_key, retry)
                         goal_retry_handoff_event = None
                         return result
-                    self._finish_goal_continuation_retry(session_key, retry)
+                    if not retry.claim_id:
+                        self._finish_goal_continuation_retry(session_key, retry)
                 goal_retry_handoff_event = None
 
             followup_result = await self._run_agent(
@@ -3933,6 +3945,7 @@ class GatewayTurnMixin:
                 persist_user_message=next_persist_message,
                 persist_user_display_kind=next_display_kind,
                 persist_user_display_metadata=diagnostic_metadata(pending_event) or None,
+                claimed_event=pending_event,
             )
         except asyncio.CancelledError:
             _restore_goal_retry_handoff()
@@ -4258,16 +4271,22 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
+        claimed_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
             )
+            if claimed_event is not None and session_key:
+                self._complete_goal_continuation_claim_event(
+                    session_key, self._adapter_for_source(source), claimed_event
+                )
+            return result
 
         from run_agent import AIAgent
 
@@ -4334,6 +4353,11 @@ class GatewayTurnMixin:
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
+            if claimed_event is not None and session_key:
+                if not self._complete_goal_continuation_claim_event(
+                    session_key, adapter, claimed_event
+                ):
+                    return result
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
