@@ -9900,6 +9900,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         retries[session_key] = retry
         return retry
 
+    def _claim_goal_continuation_before_dequeue(
+        self,
+        session_key: str,
+        adapter: Any,
+        *,
+        session_id: str,
+    ) -> tuple[Optional["MessageEvent"], bool]:
+        """Claim a typed FIFO head before the drain removes volatile ownership.
+
+        Returns ``(event, False)`` after durable publication, ``(None, False)``
+        when the next FIFO member is not a continuation, and ``(None, True)``
+        when publication failed and the restored volatile head must not be
+        dequeued by the same drain pass.
+        """
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        event = (
+            pending_slot.get(session_key)
+            if isinstance(pending_slot, dict)
+            else None
+        )
+        state = self._peek_session_state(session_key)
+        queued_events = state.conversation.queued_events if state is not None else []
+        if event is None and queued_events:
+            event = queued_events[0]
+        if event is None or not self._is_goal_continuation_event(event):
+            return None, False
+
+        retry = self._claim_goal_continuation_retry(
+            session_key,
+            adapter,
+            event,
+            session_id=session_id,
+        )
+        if retry is None:
+            return None, True
+
+        # Adoption of an already-durable retry can return before the ordinary
+        # claim helper's removal block.  The durable record is authoritative at
+        # this point, so remove only this exact object from volatile ownership.
+        if isinstance(pending_slot, dict) and pending_slot.get(session_key) is event:
+            pending_slot.pop(session_key, None)
+        queued_events[:] = [queued for queued in queued_events if queued is not event]
+        return event, False
+
     def _finish_goal_continuation_retry(
         self,
         session_key: str,
@@ -32307,14 +32351,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending_event = None
             pending = None
             if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
-                # /queue overflow: after consuming the adapter's "next-up"
-                # slot, promote the next queued event into it so the
-                # recursive run's drain will see it.  This keeps the slot
-                # occupied for the full FIFO chain, which (a) preserves
-                # order, and (b) causes any mid-chain /queue to correctly
-                # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                pending_event, claim_blocked = (
+                    self._claim_goal_continuation_before_dequeue(
+                        session_key,
+                        adapter,
+                        session_id=session_id,
+                    )
+                )
+                if claim_blocked:
+                    return result
+                if pending_event is not None:
+                    # Arm restoration immediately after durable publication;
+                    # every later callback/await is inside the enclosing
+                    # finally and cannot strand exclusive ownership.
+                    goal_retry_handoff_event = pending_event
+                else:
+                    pending_event = _dequeue_pending_event(adapter, session_key)
+                    # /queue overflow: after consuming the adapter's "next-up"
+                    # slot, promote the next queued event into it so the
+                    # recursive run's drain will see it.  This keeps the slot
+                    # occupied for the full FIFO chain, which (a) preserves
+                    # order, and (b) causes any mid-chain /queue to correctly
+                    # route to overflow rather than jumping the queue.
+                    pending_event = self._promote_queued_event(
+                        session_key, adapter, pending_event
+                    )
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
