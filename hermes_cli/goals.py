@@ -736,6 +736,38 @@ class GoalPostconditionError(GoalPersistenceError):
     """A committed goal mutation could not be read back exactly."""
 
 
+class GoalMutationOutcomeUnknownError(GoalPostconditionError):
+    """A goal mutation outcome cannot be confirmed after its CAS boundary."""
+
+
+def goal_status_failure_message() -> str:
+    """Return the fixed user-facing contract for an authoritative read failure."""
+    return "Goal status unavailable: persisted goal state could not be read safely."
+
+
+def goal_mutation_failure_message(exc: GoalPersistenceError) -> str:
+    """Describe mutation uncertainty without leaking storage details or inviting retry."""
+    if isinstance(exc, GoalMutationOutcomeUnknownError):
+        return (
+            "Goal update may have committed, but persisted state could not be verified. "
+            "Do not retry blindly; check /goal status first."
+        )
+    if isinstance(exc, GoalPostconditionError):
+        return (
+            "Goal update committed, but persisted state changed before verification. "
+            "Do not retry blindly; check /goal status first."
+        )
+    if isinstance(exc, GoalConflictError):
+        return (
+            "Goal update was not applied because persisted state changed. "
+            "Check /goal status before retrying."
+        )
+    return (
+        "Goal update could not be confirmed. Do not retry blindly; "
+        "check /goal status first."
+    )
+
+
 _UNBOUND_GOAL_SNAPSHOT = object()
 
 
@@ -991,13 +1023,20 @@ def _publish_goal_state(
             _meta_key(session_id), expected_raw, replacement
         )
     except Exception as exc:
-        raise GoalPersistenceError("goal publication failed") from exc
+        # The CAS primitive owns its commit. If it raises, the caller cannot
+        # prove whether the transaction failed before commit or committed just
+        # before the exception surfaced.
+        raise GoalMutationOutcomeUnknownError(
+            "goal publication outcome could not be determined"
+        ) from exc
     if not committed:
         raise GoalConflictError("goal changed before publication")
     try:
         persisted_raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
-        raise GoalPersistenceError("persisted goal read-back failed") from exc
+        raise GoalMutationOutcomeUnknownError(
+            "persisted goal read-back failed after publication"
+        ) from exc
     if persisted_raw != replacement:
         raise GoalPostconditionError("persisted goal state changed after publication")
     state.revision = candidate.revision
@@ -1018,6 +1057,50 @@ def clear_goal(session_id: str) -> None:
     GoalManager(session_id).clear()
 
 
+@dataclass(frozen=True)
+class GoalMigrationPlan:
+    """Authoritative two-row goal migration prepared for one atomic commit."""
+
+    db: Any
+    changes: Tuple[Tuple[str, Optional[str], str], ...]
+    child_replacement: str
+    parent_replacement: str
+
+
+def prepare_goal_migration(
+    old_session_id: str, new_session_id: str
+) -> Optional[GoalMigrationPlan]:
+    """Prepare an exact goal migration or return None for verified no-goal state."""
+    if not old_session_id or not new_session_id:
+        raise ValueError("goal migration requires parent and child session IDs")
+    if old_session_id == new_session_id:
+        raise ValueError("goal migration requires distinct sessions")
+    db, old_raw, state = _load_goal_snapshot(old_session_id)
+    if state is None or getattr(state, "status", None) == "cleared":
+        return None
+    child_db, child_raw, child_state = _load_goal_snapshot(new_session_id)
+    if child_db is not db:
+        raise GoalPersistenceError("goal storage changed during migration")
+    if child_state is not None:
+        raise GoalConflictError("continuation goal already exists")
+    child = GoalState.from_json(state.to_json())
+    child.revision = 1
+    parent = GoalState.from_json(state.to_json())
+    parent.status = "cleared"
+    parent.revision = state.revision + 1
+    child_replacement = child.to_json()
+    parent_replacement = parent.to_json()
+    return GoalMigrationPlan(
+        db=db,
+        changes=(
+            (_meta_key(new_session_id), child_raw, child_replacement),
+            (_meta_key(old_session_id), old_raw, parent_replacement),
+        ),
+        child_replacement=child_replacement,
+        parent_replacement=parent_replacement,
+    )
+
+
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
     """Carry a persistent /goal from a parent session to its continuation.
 
@@ -1029,48 +1112,40 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     exists per logical conversation (avoids the "two active goals"
     hazard of a pure copy).
 
-    Returns True when a goal was migrated, False when there was nothing
-    to migrate or the DB was unavailable. Best-effort and never raises —
-    a failure here must not block compression.
+    Returns True when a goal was migrated and False only when authoritative
+    state proves that there is no goal to migrate. Persistence, validation,
+    conflict, and postcondition failures raise ``GoalPersistenceError``.
     """
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
+    plan = prepare_goal_migration(old_session_id, new_session_id)
+    if plan is None:
         return False
     try:
-        db, old_raw, state = _load_goal_snapshot(old_session_id)
-        if state is None or getattr(state, "status", None) == "cleared":
-            return False
-        child_db, child_raw, child_state = _load_goal_snapshot(new_session_id)
-        if child_db is not db or child_state is not None:
-            return False
-        child = GoalState.from_json(state.to_json())
-        child.revision = 1
-        parent = GoalState.from_json(state.to_json())
-        parent.status = "cleared"
-        parent.revision = state.revision + 1
-        child_key = _meta_key(new_session_id)
-        parent_key = _meta_key(old_session_id)
-        child_replacement = child.to_json()
-        parent_replacement = parent.to_json()
-        if not db.compare_and_set_meta_many(
-            [
-                (child_key, child_raw, child_replacement),
-                (parent_key, old_raw, parent_replacement),
-            ]
-        ):
-            return False
-        if (
-            db.get_meta(child_key) != child_replacement
-            or db.get_meta(parent_key) != parent_replacement
-        ):
-            return False
-        logger.debug(
-            "GoalManager: migrated goal %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
+        committed = plan.db.compare_and_set_meta_many(list(plan.changes))
+    except Exception as exc:
+        raise GoalMutationOutcomeUnknownError(
+            "goal migration publication outcome could not be determined"
+        ) from exc
+    if not committed:
+        raise GoalConflictError("goal changed before migration")
+    try:
+        child_raw = plan.db.get_meta(_meta_key(new_session_id))
+        parent_raw = plan.db.get_meta(_meta_key(old_session_id))
+    except Exception as exc:
+        raise GoalMutationOutcomeUnknownError(
+            "persisted goal migration read-back failed after publication"
+        ) from exc
+    if (
+        child_raw != plan.child_replacement
+        or parent_raw != plan.parent_replacement
+    ):
+        raise GoalPostconditionError(
+            "persisted goal state changed after migration publication"
         )
-        return True
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("GoalManager: goal migration failed: %s", exc)
-        return False
+    logger.debug(
+        "GoalManager: migrated goal %s -> %s (%s)",
+        old_session_id, new_session_id, reason or "rotation",
+    )
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1617,6 +1692,24 @@ class GoalManager:
         manager._db = _get_session_db()
         manager._expected_raw = persisted_raw
         manager._evaluation_mode = False
+        return manager
+
+    @classmethod
+    def load_authoritative(
+        cls,
+        session_id: str,
+        *,
+        default_max_turns: int = DEFAULT_MAX_TURNS,
+    ) -> "GoalManager":
+        """Build a manager from a fresh authoritative persistence snapshot."""
+        db, persisted_raw, state = _load_goal_snapshot(session_id)
+        manager = cls.from_authoritative_snapshot(
+            session_id,
+            state,
+            persisted_raw,
+            default_max_turns=default_max_turns,
+        )
+        manager._db = db
         return manager
 
     def _load_authoritative_snapshot(self) -> Optional[GoalState]:
@@ -2667,6 +2760,13 @@ __all__ = [
     "GoalContract",
     "GoalGate",
     "GoalManager",
+    "GoalPersistenceError",
+    "GoalConflictError",
+    "GoalPostconditionError",
+    "GoalMutationOutcomeUnknownError",
+    "GoalMigrationPlan",
+    "goal_status_failure_message",
+    "goal_mutation_failure_message",
     "parse_contract",
     "draft_contract",
     "run_gate",
@@ -2684,6 +2784,9 @@ __all__ = [
     "load_goal",
     "save_goal",
     "clear_goal",
+    "load_goal_authoritative",
+    "load_goal_snapshot_authoritative",
+    "prepare_goal_migration",
     "migrate_goal_to_session",
     "judge_goal",
     "run_kanban_goal_loop",

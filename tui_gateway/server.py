@@ -12704,7 +12704,7 @@ def _plan_goal_compression_recovery(
     except Exception:
         goal_max_turns = 20
 
-    goal_mgr = GoalManager(
+    goal_mgr = GoalManager.load_authoritative(
         session_id=sid_key,
         default_max_turns=goal_max_turns,
     )
@@ -13484,6 +13484,11 @@ def _run_prompt_submit(
                 isinstance(result, dict) and result.get("compression_exhausted")
             )
             try:
+                from hermes_cli.goals import (
+                    GoalPersistenceError,
+                    goal_status_failure_message,
+                )
+
                 recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
                     session,
                     result,
@@ -13501,6 +13506,12 @@ def _run_prompt_submit(
                     )
                 if recovery_prompt:
                     goal_followup = recovery_prompt
+            except GoalPersistenceError:
+                _emit(
+                    "status.update",
+                    sid,
+                    {"kind": "goal", "text": goal_status_failure_message()},
+                )
             except Exception as _goal_recovery_exc:
                 print(
                     f"[tui_gateway] goal compression recovery failed: "
@@ -13514,7 +13525,14 @@ def _run_prompt_submit(
                 result, status, raw
             ):
                 try:
-                    from hermes_cli.goals import GoalManager
+                    from hermes_cli.goals import (
+                        GoalConflictError,
+                        GoalManager,
+                        GoalPersistenceError,
+                        GoalPostconditionError,
+                        goal_mutation_failure_message,
+                        goal_status_failure_message,
+                    )
 
                     sid_key = session.get("session_key") or ""
                     if sid_key:
@@ -13523,7 +13541,7 @@ def _run_prompt_submit(
                             goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
                         except Exception:
                             goal_max_turns = 20
-                        goal_mgr = GoalManager(
+                        goal_mgr = GoalManager.load_authoritative(
                             session_id=sid_key,
                             default_max_turns=goal_max_turns,
                         )
@@ -13549,6 +13567,19 @@ def _run_prompt_submit(
                                 cont_prompt = decision.get("continuation_prompt") or ""
                                 if cont_prompt:
                                     goal_followup = cont_prompt
+                except GoalPersistenceError as _goal_exc:
+                    if isinstance(
+                        _goal_exc,
+                        (GoalConflictError, GoalPostconditionError),
+                    ):
+                        notice = goal_mutation_failure_message(_goal_exc)
+                    else:
+                        notice = goal_status_failure_message()
+                    _emit(
+                        "status.update",
+                        sid,
+                        {"kind": "goal", "text": notice},
+                    )
                 except Exception as _goal_exc:
                     print(
                         f"[tui_gateway] goal continuation hook failed: "
