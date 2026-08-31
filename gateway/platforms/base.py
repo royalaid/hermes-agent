@@ -1671,6 +1671,19 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class DeliveryOwnedReply(str):
+    """Final reply whose publication is already owned by the durable ledger."""
+
+    obligation_id: str
+
+    def __new__(cls, text: str, obligation_id: str):
+        if not obligation_id:
+            raise ValueError("delivery-owned reply requires an obligation id")
+        instance = super().__new__(cls, text)
+        instance.obligation_id = obligation_id
+        return instance
+
+
 def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
                                 event: MessageEvent, *, merge_text: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
