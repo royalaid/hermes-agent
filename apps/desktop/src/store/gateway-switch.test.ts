@@ -18,6 +18,13 @@ import {
   setSessionsLoading
 } from '@/store/session'
 import { $stalledSessionIds } from '@/store/session-states'
+import {
+  $todoContinuationsBySession,
+  $todosBySession,
+  applyTodoContinuationSnapshot,
+  clearAllTodoContinuations,
+  setSessionTodos
+} from '@/store/todos'
 
 import {
   $gatewaySwitching,
@@ -51,6 +58,8 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     setCronSessions([{ id: 'c1', title: 'cron', profile: 'default' } as never])
     setMessagingSessions([{ id: 'm1', title: 'tg', profile: 'default' } as never])
     $stalledSessionIds.set(['s1'])
+    setSessionTodos('s1', [{ id: 'todo-1', content: 'old backend task', status: 'in_progress' }])
+    applyTodoContinuationSnapshot('s1', { revision: 7, state: 'paused' })
     setSessionsLoading(false)
     setFreshDraftReady(false)
     $sessionsLimit.set(SIDEBAR_SESSIONS_PAGE_SIZE * 3)
@@ -62,6 +71,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     setCronSessions([])
     setMessagingSessions([])
     $stalledSessionIds.set([])
+    clearAllTodoContinuations()
     setSessionsLoading(true)
     $gatewaySwitching.set(false)
   })
@@ -74,6 +84,8 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     expect($cronSessions.get()).toEqual([])
     expect($messagingSessions.get()).toEqual([])
     expect($stalledSessionIds.get()).toEqual([])
+    expect($todoContinuationsBySession.get()).toEqual({})
+    expect($todosBySession.get()).toEqual({})
     expect($sessionsLoading.get()).toBe(true)
     expect($sessionsLimit.get()).toBe(SIDEBAR_SESSIONS_PAGE_SIZE)
     expect($freshDraftReady.get()).toBe(true)
