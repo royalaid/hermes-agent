@@ -2811,6 +2811,9 @@ class GatewaySlashCommandsMixin:
                         source=event.source,
                         message_id=None,
                         channel_prompt=None,
+                        internal=False,
+                        allow_gateway_control=False,
+                        goal_continuation=True,
                     )
                     self._enqueue_fifo(_quick_key, cont_event, adapter)
             except Exception as exc:

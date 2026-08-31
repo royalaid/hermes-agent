@@ -33,6 +33,7 @@ def _bootstrap(monkeypatch, tmp_path):
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     config = GatewayConfig()
     runner = gateway_run.GatewayRunner(config)
     runner.adapters = {}
@@ -70,7 +71,6 @@ def _bootstrap(monkeypatch, tmp_path):
     runner.session_store.has_platform_message_id.return_value = False
     runner.session_store.update_session = MagicMock()
 
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
     )
@@ -183,6 +183,50 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+
+
+@pytest.mark.asyncio
+async def test_top_level_goal_continuation_rechecks_after_intervening_await(
+    monkeypatch, tmp_path
+):
+    """A pause during preprocessing prevents a stale synthetic model turn."""
+    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    active = True
+
+    def goal_active(_session_id):
+        return active
+
+    async def pause_on_hook(*_args, **_kwargs):
+        nonlocal active
+        active = False
+
+    runner._goal_still_active_for_session = goal_active
+    runner.hooks.emit = AsyncMock(side_effect=pause_on_hook)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "stale continuation ran",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    source = _source()
+    event = MessageEvent(
+        text=CONTINUATION_PROMPT_TEMPLATE.format(goal="finish the task"),
+        source=source,
+        internal=False,
+        allow_gateway_control=False,
+        goal_continuation=True,
+    )
+
+    await runner._handle_message_with_agent(
+        event, source, "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    runner._run_agent.assert_not_awaited()
 
 
 # ── Post-stream MEDIA delivery keeps prior-turn deduplication ──────────
