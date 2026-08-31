@@ -9669,6 +9669,20 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return None
 
 
+def _has_structured_todo_snapshot(display_metadata: Any) -> bool:
+    """Whether display metadata carries a durable TodoStore snapshot."""
+    metadata = display_metadata
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if not isinstance(metadata, dict):
+        return False
+    snapshot = metadata.get("todo_snapshot")
+    return isinstance(snapshot, dict) and isinstance(snapshot.get("todos"), list)
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -9688,6 +9702,23 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # declared field too, or scaffolding reaches every surface that reads
         # this projection.
         if m.get("display_kind") == "hidden":
+            metadata = m.get("display_metadata")
+            if _has_structured_todo_snapshot(metadata):
+                # Keep the state sidecar on resume while suppressing all
+                # transcript prose. Desktop hydrates its task panel from this
+                # row before its visible-message projection drops it.
+                hidden = {
+                    "role": role,
+                    "text": "",
+                    "display_kind": "hidden",
+                    "display_metadata": metadata,
+                }
+                ts = m.get("timestamp")
+                if isinstance(ts, (int, float)) and ts > 0:
+                    hidden["timestamp"] = float(ts)
+                if m.get("_row_id") is not None:
+                    hidden["row_id"] = m["_row_id"]
+                messages.append(hidden)
             continue
         content_text = _coerce_message_text(m.get("content"))
         from agent.codex_display_projection import project_codex_display_items
