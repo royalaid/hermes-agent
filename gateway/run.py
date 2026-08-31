@@ -3925,6 +3925,40 @@ def _durable_delivery_text_for_response(response: str, adapter: Any) -> str:
     return text_content.strip()
 
 
+@dataclasses.dataclass(frozen=True)
+class _ClaimedResponsePartsSnapshot:
+    """One bounded parse of every queued claimed-result publication part."""
+
+    visible_text: str
+    images: Tuple[Tuple[str, str], ...]
+    media_files: Tuple[Tuple[str, bool], ...]
+    local_files: Tuple[str, ...]
+    force_document_attachments: bool
+
+
+def _snapshot_queued_claimed_response_parts(
+    response: str,
+    adapter: Any,
+) -> _ClaimedResponsePartsSnapshot:
+    """Derive visible text and attachment intents from one parse snapshot."""
+    from gateway.platforms.base import _strip_media_directives
+
+    media_files, cleaned = adapter.extract_media(response)
+    images, text_content = adapter.extract_images(cleaned)
+    text_content = _strip_media_directives(text_content).strip()
+    local_files, text_content = adapter.extract_local_files(
+        text_content,
+        include_unavailable=True,
+    )
+    return _ClaimedResponsePartsSnapshot(
+        visible_text=text_content.strip(),
+        images=tuple(images),
+        media_files=tuple(media_files),
+        local_files=tuple(local_files),
+        force_document_attachments="[[as_document]]" in response,
+    )
+
+
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
     """Derive the /command slug and declared frontmatter name from a SKILL.md.
 
@@ -25780,33 +25814,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Deliver a queued response using its existing publication ownership."""
         if delivery_obligation_id:
             from gateway.delivery_ledger import prepare_claimed_result_delivery
-            from gateway.platforms.base import BasePlatformAdapter
 
             claimed_session_key = str(
                 getattr(source, "session_key", "")
                 or self._session_key_for_source(source)
             )
-            force_document_attachments = "[[as_document]]" in response
-            media_files = []
-            images = []
-            local_files = []
             if deliver_media:
-                visible_text = _durable_delivery_text_for_response(response, adapter)
-                media_files, cleaned = adapter.extract_media(response)
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(
-                    media_files,
-                    session_key=claimed_session_key,
-                )
-                images, cleaned = adapter.extract_images(cleaned)
-                local_files, _ = adapter.extract_local_files(cleaned)
-                local_files = BasePlatformAdapter.filter_local_delivery_paths(
-                    local_files,
-                    session_key=claimed_session_key,
-                )
+                snapshot = _snapshot_queued_claimed_response_parts(response, adapter)
+                visible_text = snapshot.visible_text
+                media_files = snapshot.media_files
+                images = snapshot.images
+                local_files = snapshot.local_files
+                force_document_attachments = snapshot.force_document_attachments
             else:
                 visible_text = _strip_response_attachments_for_direct_send(
                     response, adapter
                 )
+                media_files = []
+                images = []
+                local_files = []
+                force_document_attachments = False
             should_send = await asyncio.to_thread(
                 prepare_claimed_result_delivery,
                 delivery_obligation_id,
@@ -25836,6 +25863,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata=metadata,
                     reply_to=event_message_id,
                     text_already_delivered=text_already_delivered,
+                    attachment_session_key=claimed_session_key,
                 )
                 return
 
