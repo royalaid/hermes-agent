@@ -180,6 +180,7 @@ import {
   resolveSessionProfile,
   resolveStoredSession,
   restoreListedSession,
+  runningProjectionStreamId,
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -906,9 +907,7 @@ export function useSessionActions({
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
       const ownerRoute = capturedOwner || getSessionOwnerHint(storedSessionId)
 
-      let requestedBinding = ownerRoute
-        ? normalizeSessionBinding({ ownerRoute, storedSessionId })
-        : null
+      let requestedBinding = ownerRoute ? normalizeSessionBinding({ ownerRoute, storedSessionId }) : null
 
       if (!requestedBinding && runtimeIdByStoredSessionIdRef.current.has(storedSessionId)) {
         requestedBinding = normalizeSessionBinding({
@@ -985,7 +984,8 @@ export function useSessionActions({
         }
 
         const exactRuntimeId = runtimeForExactSessionBinding(requestedBinding)
-        const state = runtimeId && runtimeId === exactRuntimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
+        const state =
+          runtimeId && runtimeId === exactRuntimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
 
         if (!runtimeId || !state) {
           return null
@@ -1473,33 +1473,22 @@ export function useSessionActions({
               const activatedState = updateSessionState(
                 cachedRuntimeId,
                 state => {
-                  // #95595: the reconcilers above always produce fresh
-                  // message objects, so an unconditional publish replaces the
-                  // warm-cached array with new-object equivalents and every
-                  // visible row re-normalizes + remounts (markdown re-parse +
-                  // shiki re-highlight per row, seconds of main-thread work).
-                  // Keep the existing array when the content is unchanged —
-                  // same guard the cold-resume path uses below.
                   const messages = preserveEquivalentTranscript(state.messages, visibleActivatedMessages)
-
                   return {
                     ...state,
                     messages,
+                    streamId: running
+                      ? (runningProjectionStreamId(messages, true) ?? state.streamId)
+                      : null,
                     transcriptProvenance:
                       acceptedPersistedDisplayTranscript || hasValidProvenance
                         ? (expectedProvenance ?? undefined)
                         : undefined,
                     ...(pendingClarifyProjection
-                      ? {
-                          awaitingResponse: false,
-                          sawAssistantPayload: true,
-                          streamId: pendingClarifyProjection.streamId
-                        }
+                      ? { awaitingResponse: false, sawAssistantPayload: true, streamId: pendingClarifyProjection.streamId }
                       : {}),
                     ...(clearedClarifyProjection
-                      ? {
-                          streamId: state.busy ? (clearedClarifyProjection.streamId ?? state.streamId) : null
-                        }
+                      ? { streamId: state.busy ? (clearedClarifyProjection.streamId ?? state.streamId) : null }
                       : {})
                   }
                 },
@@ -1932,6 +1921,9 @@ export function useSessionActions({
             messages: visibleMessagesForView,
             transcriptProvenance,
             busy: resumedRunning,
+            streamId: resumedRunning
+              ? (runningProjectionStreamId(visibleMessagesForView, true) ?? state.streamId)
+              : null,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.
             turnLive: state.turnLive || resumedRunning,
@@ -1958,7 +1950,11 @@ export function useSessionActions({
               : {}),
             ...(clearedClarifyProjection
               ? {
-                  streamId: resumedRunning ? (clearedClarifyProjection.streamId ?? state.streamId) : null
+                  streamId: resumedRunning
+                    ? (clearedClarifyProjection.streamId ??
+                      runningProjectionStreamId(visibleMessagesForView, true) ??
+                      state.streamId)
+                    : null
                 }
               : {})
           }),
