@@ -1908,11 +1908,15 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        _owned_id = agent_result.get("_delivery_obligation_id")
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
+            if _owned_id:
+                from gateway.delivery_ledger import mark_claimed_result_delivered
+                await asyncio.to_thread(mark_claimed_result_delivered, _owned_id)
             response = ""
 
         adapter = self._delivery_adapter_for(source)
@@ -1920,7 +1924,7 @@ class GatewayTurnMixin:
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
-        if not _streaming_tts_done and self._should_send_voice_reply(
+        if not _owned_id and not _streaming_tts_done and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
             await self._send_voice_reply(event, response)
@@ -1928,9 +1932,7 @@ class GatewayTurnMixin:
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
-            # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
-            # would upload every file a second time.
-            if response and adapter and not agent_result.get("media_already_delivered"):
+            if response and adapter:
                 await self._deliver_media_from_response(response, event, adapter)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
@@ -1942,8 +1944,14 @@ class GatewayTurnMixin:
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
                 event._streamed_final_response = str(response or "")
+            if _owned_id:
+                from gateway.delivery_ledger import mark_claimed_result_delivered
+                await asyncio.to_thread(mark_claimed_result_delivered, _owned_id)
             return None
 
+        if _owned_id:
+            from gateway.platforms.base import DeliveryOwnedReply
+            return DeliveryOwnedReply(response, _owned_id)
         return response
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
@@ -2259,6 +2267,9 @@ class GatewayTurnMixin:
             )
 
         except Exception as e:
+            from gateway.run import GoalContinuationPublicationError
+            if isinstance(e, GoalContinuationPublicationError):
+                return None
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state
@@ -2736,6 +2747,7 @@ class GatewayTurnMixin:
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
         scheduled_heartbeat: bool = False,
+        defer_result_publication: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2794,7 +2806,7 @@ class GatewayTurnMixin:
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
         _stream_consumer = (
-            None if scheduled_heartbeat
+            None if scheduled_heartbeat or defer_result_publication
             else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
         )
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
@@ -2917,11 +2929,49 @@ class GatewayTurnMixin:
         when multiplexing is off)."""
         claimed_event = turn_kwargs.get("claimed_event")
         session_key = turn_kwargs.get("session_key")
+        from gateway.goal_continuation_claims import event_claim_identity
+
+        durable_claimed_event = (
+            claimed_event is not None
+            and event_claim_identity(claimed_event) is not None
+        )
+        claimed_active_turn_token = None
+        if durable_claimed_event and session_key:
+            try:
+                token_reader = getattr(
+                    getattr(self, "session_store", None),
+                    "get_active_turn_token",
+                    None,
+                )
+                candidate_token = token_reader(session_key) if callable(token_reader) else None
+                if isinstance(candidate_token, str) and candidate_token:
+                    claimed_active_turn_token = candidate_token
+            except Exception as exc:
+                self._restore_unacknowledged_goal_continuation_claim_event(
+                    session_key, source, claimed_event)
+                from gateway.run import GoalContinuationPublicationError
+                raise GoalContinuationPublicationError(
+                    "durable active-turn ownership is unavailable") from exc
+        turn_kwargs["durable_claimed_event"] = durable_claimed_event
+        turn_kwargs["claimed_active_turn_token"] = claimed_active_turn_token
         try:
             with self._profile_scope_for_source(source):
-                return await self._run_agent_inner(
+                result = await self._run_agent_inner(
                     message, context_prompt, history, source, session_id, **turn_kwargs
                 )
+            if (
+                durable_claimed_event
+                and session_key
+                and "_delivery_obligation_id" not in result
+            ):
+                await self._commit_goal_continuation_result(
+                    session_key=session_key,
+                    source=source,
+                    event=claimed_event,
+                    result=result,
+                    active_turn_token=claimed_active_turn_token,
+                )
+            return result
         except BaseException:
             self._restore_unacknowledged_goal_continuation_claim_event(
                 session_key, source, claimed_event
@@ -2934,7 +2984,6 @@ class GatewayTurnMixin:
             _gateway_platform_value, _has_platform_display_override, _load_gateway_config,
             _platform_config_key,
         )
-        from agent.secret_scope import get_secret
         from gateway.display_config import resolve_display_setting, resolve_tool_progress
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         user_config = _load_gateway_config()
@@ -2952,10 +3001,8 @@ class GatewayTurnMixin:
                 getattr(_agent_display, _setter)(_cast(_val))
 
         # Resolve the mode and its provenance together: null inherits, tier off is not intent.
-        # A raw os.getenv here reads whichever profile's env loaded last under multiplexing
-        # (#116898); get_secret resolves through the active profile's scope instead.
         progress_mode, _tool_progress_explicit = resolve_tool_progress(
-            user_config, platform_key, get_secret("HERMES_TOOL_PROGRESS_MODE"),
+            user_config, platform_key, os.getenv("HERMES_TOOL_PROGRESS_MODE"),
         )
         # "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
@@ -3281,8 +3328,7 @@ class GatewayTurnMixin:
                 session_key or "", run_generation,
             )
             return
-        turn_state = self._session_state(session_key).turn
-        turn_state.agent, turn_state.ctx = agent_holder[0], turn_ctx
+        self._session_state(session_key).turn.agent = agent_holder[0]
         if self._draining:
             self._update_runtime_status("draining")
 
@@ -3724,6 +3770,7 @@ class GatewayTurnMixin:
                 logger.debug("Stream consumer wait before queued message failed: %s", e)
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
+        _owned_delivery_id = _delivery_result.get("_delivery_obligation_id")
         first_response = _delivery_result.get("final_response", "")
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
@@ -3736,6 +3783,10 @@ class GatewayTurnMixin:
                     session_key or "?",
                 )
                 first_response = ""
+                if _owned_delivery_id:
+                    from gateway.delivery_ledger import mark_claimed_result_delivered
+                    await asyncio.to_thread(
+                        mark_claimed_result_delivered, _owned_delivery_id)
             else:
                 logger.warning(
                     "Queued follow-up for session %s: replacing a human-turn silence marker.",
@@ -3743,8 +3794,6 @@ class GatewayTurnMixin:
                 )
                 first_response = _UNEXPECTED_SILENCE_REPLY
                 _already_streamed = False
-        # Failed turns deliver their text but never their attachments (completed-turn parity).
-        _deliver_media = not _delivery_result.get("failed")
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -3753,29 +3802,23 @@ class GatewayTurnMixin:
                 session_key or "?",
             )
             try:
-                _text_delivered = await self._deliver_queued_first_response(
+                await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
-                    deliver_media=_deliver_media, stream_consumer=_sc,
+                    deliver_media=not _delivery_result.get("failed"), stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    delivery_obligation_id=_owned_delivery_id,
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
-            else:
-                # One source of truth for "this turn's final already reached the chat": the normal
-                # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
-                # result the queued lane hands back. Every early `return result` after this point
-                # (follow-up text refused, stale goal continuation) otherwise re-sends the text the
-                # fallback just delivered — the #81052 duplicate. A REFUSED send reports False, and
-                # the completion send stays the fallback so the user is not left with nothing.
-                if _text_delivered and isinstance(result, dict):
-                    result["already_sent"] = True
-                    # The queued lane already uploaded this response's MEDIA: attachments; without
-                    # this the completion path's already_sent rescan uploads every file twice.
-                    result["media_already_delivered"] = _deliver_media
+                if _owned_delivery_id:
+                    raise
+        elif _owned_delivery_id:
+            from gateway.delivery_ledger import mark_claimed_result_delivered
+            await asyncio.to_thread(mark_claimed_result_delivered, _owned_delivery_id)
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -4325,6 +4368,8 @@ class GatewayTurnMixin:
         persist_user_display_metadata: Optional[dict] = None,
         scheduled_heartbeat: bool = False,
         claimed_event: Optional[MessageEvent] = None,
+        durable_claimed_event: bool = False,
+        claimed_active_turn_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4333,11 +4378,17 @@ class GatewayTurnMixin:
             result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
-                event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
+                event_message_id=event_message_id,
+                scheduled_heartbeat=scheduled_heartbeat,
+                defer_result_publication=durable_claimed_event,
             )
-            if claimed_event is not None and session_key:
-                self._complete_goal_continuation_claim_event(
-                    session_key, self._adapter_for_source(source), claimed_event
+            if durable_claimed_event and session_key:
+                await self._commit_goal_continuation_result(
+                    session_key=session_key,
+                    source=source,
+                    event=claimed_event,
+                    result=result,
+                    active_turn_token=claimed_active_turn_token,
                 )
             return result
 
@@ -4367,14 +4418,16 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
+            defer_result_publication=durable_claimed_event,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
-        # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
-        if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
+        # Independent quiet reasons: diagnostic wake, scheduled heartbeat, or owned publication.
+        if not (scheduled_heartbeat or turn_ctx.mute_notification_reply or durable_claimed_event):
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
+            )
             )
 
         # Progress sender drains BOTH tool-progress lines and thinking bubbles (needs_progress_queue).
@@ -4406,11 +4459,14 @@ class GatewayTurnMixin:
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            if claimed_event is not None and session_key:
-                if not self._complete_goal_continuation_claim_event(
-                    session_key, adapter, claimed_event
-                ):
-                    return result
+            if durable_claimed_event and session_key:
+                await self._commit_goal_continuation_result(
+                    session_key=session_key,
+                    source=source,
+                    event=claimed_event,
+                    result=result,
+                    active_turn_token=claimed_active_turn_token,
+                )
             pending_event, pending, claim_blocked = await self._run_agent_drain_pending(
                 result, adapter, source, session_key, session_id
             )
