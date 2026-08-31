@@ -32468,8 +32468,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if pending_event is not None:
                     # Arm restoration immediately after durable publication;
                     # every later callback/await is inside the enclosing
-                    # finally and cannot strand exclusive ownership.
+                    # finally and cannot strand exclusive ownership. Preserve
+                    # the ordinary slot/overflow topology for durable successors.
                     goal_retry_handoff_event = pending_event
+                    self._promote_queued_event(session_key, adapter, pending_event)
                 else:
                     pending_event = _dequeue_pending_event(adapter, session_key)
                     # /queue overflow: after consuming the adapter's "next-up"
