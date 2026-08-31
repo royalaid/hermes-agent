@@ -1868,8 +1868,13 @@ class MatrixAdapter(BasePlatformAdapter):
         if not p.exists():
             # file_path is host-local; never echo it into chat.
             logger.warning("[%s] upload fallback: media file not found for %s", self.name, file_path)
-            text = "⚠️ Couldn't deliver the attachment."
-            return await self.emit_media_warning(room_id, text, caption=caption, reply_to=reply_to, metadata=metadata)
+            text = "⚠️ Could not deliver the attachment."
+            warning_result = await self.emit_media_warning(
+                room_id, text, caption=caption, reply_to=reply_to, metadata=metadata
+            )
+            if _claimed_delivery_txn_id(metadata, "media"):
+                return SendResult(success=False, error="Matrix attachment source is unavailable")
+            return warning_result
         try:
             file_size = p.stat().st_size
         except OSError:
