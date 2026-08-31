@@ -25929,7 +25929,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         attachment contract — trigger post-stream uploads.
         """
         from pathlib import Path
-        from urllib.parse import quote as _quote
 
         try:
             # Capture [[as_document]] before extract_media strips it, so the
@@ -25986,7 +25985,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [(Path(p).resolve().as_uri(), "") for p in image_paths]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
@@ -31853,6 +31852,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if (
                     durable_claimed_event
                     and session_key
+                    and event_claim_identity(claimed_event) is not None
                     and "_delivery_obligation_id" not in result
                 ):
                     await self._commit_goal_continuation_result(
@@ -31889,6 +31889,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if (
                 durable_claimed_event
                 and session_key
+                and event_claim_identity(claimed_event) is not None
                 and "_delivery_obligation_id" not in result
             ):
                 await self._commit_goal_continuation_result(
