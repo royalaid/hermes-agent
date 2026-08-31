@@ -25,6 +25,7 @@ import {
 } from '@/store/session'
 import { resetSessionPinMirror } from '@/store/session-pin-sync'
 import { clearAllSessionStates } from '@/store/session-states'
+import { clearAllSessionTodos, clearAllTodoContinuations } from '@/store/todos'
 import { clearTranscriptTails } from '@/store/transcript-tail-cache'
 
 // True while a connection switch is mid-flight — a Settings → Gateway apply
@@ -206,6 +207,8 @@ export function wipeSessionListsForGatewaySwitch(): void {
   // that are still unread once the next gateway's lists load — so a profile
   // round-trip doesn't swallow green dots.
   clearAllSessionStates()
+  clearAllSessionTodos()
+  clearAllTodoContinuations()
   resetLiveRuntimeTracking()
   resetLiveSync()
   $unreadFinishedSessionIds.set([])

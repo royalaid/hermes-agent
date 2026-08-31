@@ -42,6 +42,7 @@ _TRUNCATION_MARKER = "… [truncated]"
 TODO_INJECTION_HEADER = (
     "[Your active task list was preserved across context compression]"
 )
+TODO_INJECTION_FORMAT_V2 = "[Todo carrier format: 2]"
 
 
 class TodoStore:
@@ -165,6 +166,15 @@ class TodoStore:
             "pending": "[ ]",
             "cancelled": "[~]",
         }
+        versioned = any(
+            ". " in item["id"]
+            or "\r" in item["id"]
+            or "\n" in item["id"]
+            or ". " in item["content"]
+            or "\r" in item["content"]
+            or "\n" in item["content"]
+            for item in self._items
+        )
 
         # Only inject pending/in_progress items — completed/cancelled ones
         # cause the model to re-do finished work after compression. A parent
@@ -188,17 +198,32 @@ class TodoStore:
             keep = item["status"] in active or has_active_kid
             if keep:
                 marker = markers.get(item["status"], "[?]")
-                out.append(
-                    f"{'  ' * depth}- {marker} {item['id']}. "
-                    f"{item['content']} ({item['status']})"
-                )
+                if versioned:
+                    payload = json.dumps(
+                        {
+                            "id": item["id"],
+                            "content": item["content"],
+                            "status": item["status"],
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    out.append(f"{'  ' * depth}- {marker} {payload}")
+                else:
+                    out.append(
+                        f"{'  ' * depth}- {marker} {item['id']}. "
+                        f"{item['content']} ({item['status']})"
+                    )
                 out.extend(kid_lines)
             return keep
 
         lines = [TODO_INJECTION_HEADER]
+        if versioned:
+            lines.append(TODO_INJECTION_FORMAT_V2)
+        body_start = len(lines)
         for item in roots:
             render(item, 0, lines)
-        if len(lines) == 1:
+        if len(lines) == body_start:
             return None
 
         return "\n".join(lines)

@@ -34,10 +34,8 @@ import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
 import { TipHost } from '@/components/tips'
 import { emitGatewayEvent } from '@/contrib/events'
-import { getLatestSessionMessages } from '@/hermes'
-import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { isMessagingSource } from '@/lib/session-source'
-import { latestSessionTodos } from '@/lib/todos'
 import { activateWakeIndicator } from '@/lib/wake-indicator'
 import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
@@ -78,7 +76,6 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
-import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
@@ -153,6 +150,7 @@ import { createSessionRpcDispatcher } from './session-rpc-dispatcher'
 import { openSidebarSession } from './sidebar-session-open'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
+import { hydratePostTurnStoredSession } from './wiring-todo-hydration'
 
 // Overlay views the controller mounts over the shell — lazy, load on demand.
 // The workspace-route full-page views (skills/messaging/artifacts) are the
@@ -184,6 +182,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const cronReviewSeenRef = useRef(0)
   const activeTranscriptSignatureRef = useRef(new Map<string, string>())
   const activeTranscriptRequestSequenceRef = useRef(0)
+  const postTurnHydrationRequestSequenceRef = useRef(0)
   // Stable identity for the whole callback surface (see WiringActions). Mutated
   // in place each render so memoized surfaces never re-render on churn.
   const actionsRef = useRef<WiringActions | null>(null)
@@ -386,12 +385,21 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         return
       }
 
-      const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
+      const requestId = postTurnHydrationRequestSequenceRef.current + 1
+      postTurnHydrationRequestSequenceRef.current = requestId
+      const isCurrent = () =>
+        postTurnHydrationRequestSequenceRef.current === requestId &&
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        activeSessionIdRef.current === runtimeSessionId
 
-      for (let index = 0; index < Math.max(1, attempts); index += 1) {
-        try {
-          const latest = await getLatestSessionMessages(storedSessionId, storedProfile)
-          const messages = toChatMessages(latest.messages)
+      await hydratePostTurnStoredSession({
+        attempts,
+        isCurrent,
+        publishTranscript: messages => {
+          if (!isCurrent()) {
+            return
+          }
+
           updateSessionState(
             runtimeSessionId,
             state => ({
@@ -405,24 +413,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             }),
             storedSessionId
           )
-
-          const restored = todosForHydration(latestSessionTodos(messages))
-
-          if (restored) {
-            setSessionTodos(runtimeSessionId, restored)
-          } else {
-            clearSessionTodos(runtimeSessionId)
-          }
-
-          return
-        } catch {
-          // Best-effort fallback when live stream payloads are empty.
-        }
-
-        if (index < attempts - 1) {
-          await new Promise(resolve => window.setTimeout(resolve, 250))
-        }
-      }
+        },
+        runtimeSessionId,
+        storedSessionId
+      })
     },
     [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
   )

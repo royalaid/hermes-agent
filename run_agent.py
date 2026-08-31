@@ -5243,20 +5243,67 @@ class AIAgent:
         TodoStore is empty. We scan the history for the most recent todo
         tool response and replay it to reconstruct the state.
 
-        Hydration is restricted to tool results that are paired with an
-        earlier assistant ``todo`` tool call. The gateway/API server accepts
-        caller-supplied ``conversation_history``, so a forged bare
-        ``role: tool`` message carrying a ``todos`` array must not be able to
-        seed the store without a matching canonical tool call
-        (GHSA-5g4g-6jrg-mw3g).
+        Hydration accepts either a tool result paired with an earlier assistant
+        ``todo`` call, or structured state on a row carrying SessionDB's typed
+        process-local provenance marker. The gateway/API server accepts
+        caller-supplied ``conversation_history``, so role/content/display
+        metadata shape alone must never seed the store (GHSA-5g4g-6jrg-mw3g).
         """
-        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+        from agent.message_metadata import has_persisted_todo_snapshot_provenance
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS, TodoStore
 
-        # Walk history backwards to find the most recent todo tool response
+        def _validated_carrier_todos(message: Dict[str, Any]):
+            metadata = message.get("display_metadata")
+            if not isinstance(metadata, dict) or "todo_snapshot" not in metadata:
+                return None
+            snapshot = metadata["todo_snapshot"]
+            if not isinstance(snapshot, dict) or set(snapshot) != {"todos"}:
+                return None
+            todos = snapshot.get("todos")
+            if not isinstance(todos, list):
+                return None
+            try:
+                encoded = json.dumps(
+                    snapshot, ensure_ascii=False, separators=(",", ":")
+                )
+            except (TypeError, ValueError):
+                return None
+            if len(encoded) > MAX_TODO_RESULT_CHARS:
+                return None
+
+            # TodoStore is deliberately forgiving for live model writes. A
+            # persisted carrier must instead be the exact canonical result of
+            # that normalization; otherwise accepting it could reinterpret an
+            # ambiguous or malformed snapshot during a security-sensitive
+            # cold resume.
+            candidate = TodoStore()
+            canonical = candidate.write(todos, merge=False)
+            if canonical != todos:
+                return None
+            return canonical
+
+        # Walk history backwards to find the most recent authoritative Todo
+        # state, whether it is a persisted compaction carrier or paired tool
+        # result. An invalid trusted carrier is a fail-closed boundary: do not
+        # resurrect an older tool result from before that compaction.
         last_todo_response = None
         last_todo_revision = 0
         for idx in range(len(history) - 1, -1, -1):
             msg = history[idx]
+            if has_persisted_todo_snapshot_provenance(msg):
+                last_todo_response = _validated_carrier_todos(msg)
+                if last_todo_response is None:
+                    logger.warning(
+                        "Skipping invalid persisted todo carrier during hydration: "
+                        "session=%s",
+                        self.session_id or "none",
+                    )
+                else:
+                    # Durable carriers predate revision-bearing todo responses.
+                    # Admit one into a cold store without rolling back a newer
+                    # live revision already present on an in-place agent.
+                    last_todo_revision = 1
+                break
             if msg.get("role") != "tool":
                 continue
             content = msg.get("content", "")

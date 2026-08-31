@@ -31,7 +31,13 @@ import {
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
+import {
+  destroyKeepaliveAgents,
+  downloadAgentFor,
+  jsonAgentFor,
+  readApiJsonResponseWithByteLimit,
+  withRetry
+} from './api-transport'
 import { appIconCandidates, resolveAppIcon } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
@@ -5315,7 +5321,6 @@ function fetchJson(url, token, options: any = {}) {
         const client = parsed.protocol === 'https:' ? https : http
         const agent = jsonAgentFor(parsed.protocol)
         const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
           reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
 
@@ -5342,12 +5347,12 @@ function fetchJson(url, token, options: any = {}) {
             }
           },
           res => {
-            const chunks = []
-            res.on('error', reject)
-            res.on('data', chunk => chunks.push(chunk))
-            res.on('end', () => {
-              const text = Buffer.concat(chunks).toString('utf8')
-
+            readApiJsonResponseWithByteLimit(res, {
+              method: options.method || 'GET',
+              url,
+              path: `${parsed.pathname}${parsed.search}`,
+              abort: () => req.destroy()
+            }).then(text => {
               if ((res.statusCode || 500) >= 400) {
                 reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
 
@@ -5383,7 +5388,7 @@ function fetchJson(url, token, options: any = {}) {
               } catch {
                 reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
               }
-            })
+            }, reject)
           }
         )
 
@@ -7716,7 +7721,6 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
 
     const body = serializeJsonBody(options.body)
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
     const request = electronNet.request({
       method: options.method || 'GET',
       url,
@@ -7746,15 +7750,17 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
     }, timeoutMs)
 
     request.on('response', res => {
-      const chunks = []
-      res.on('data', chunk => chunks.push(Buffer.from(chunk)))
-      res.on('end', () => {
+      readApiJsonResponseWithByteLimit(res, {
+        method: options.method || 'GET',
+        url,
+        path: `${parsed.pathname}${parsed.search}`,
+        abort: () => request.abort()
+      }).then(text => {
         if (timedOut) {
           return
         }
 
         clearTimeout(timer)
-        const text = Buffer.concat(chunks).toString('utf8')
         const statusCode = res.statusCode || 500
 
         if (statusCode >= 400) {
@@ -7785,6 +7791,13 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
         } catch {
           reject(new Error(`Invalid JSON from ${url} (status ${statusCode}): ${text.slice(0, 200)}`))
         }
+      }, error => {
+        if (timedOut) {
+          return
+        }
+
+        clearTimeout(timer)
+        reject(error)
       })
     })
     request.on('error', error => {
