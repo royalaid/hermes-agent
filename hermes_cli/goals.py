@@ -419,6 +419,7 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
 class GoalState:
     """Serializable goal state stored per session."""
     goal: str
+    revision: int = 0
     status: str = "active"          # active | paused | done | cleared
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
@@ -462,6 +463,24 @@ class GoalState:
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
 
+    def validate_persisted(self) -> "GoalState":
+        """Reject durable rows that cannot represent a valid goal state."""
+        if not isinstance(self.goal, str) or not self.goal.strip():
+            raise ValueError("goal text is empty")
+        if self.status not in {"active", "paused", "done", "cleared"}:
+            raise ValueError(f"unknown goal status: {self.status}")
+        for field_name in (
+            "revision",
+            "turns_used",
+            "consecutive_parse_failures",
+            "consecutive_transport_failures",
+        ):
+            if getattr(self, field_name) < 0:
+                raise ValueError(f"{field_name} must not be negative")
+        if self.max_turns <= 0:
+            raise ValueError("max_turns must be positive")
+        return self
+
     @classmethod
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
@@ -475,8 +494,13 @@ class GoalState:
         )
         return cls(
             goal=data.get("goal", ""),
+            revision=int(data.get("revision") or 0),
             status=data.get("status", "active"),
-            max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
+            max_turns=int(
+                data.get("max_turns", DEFAULT_MAX_TURNS)
+                if data.get("max_turns", DEFAULT_MAX_TURNS) is not None
+                else DEFAULT_MAX_TURNS
+            ),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
@@ -550,8 +574,48 @@ class GoalPersistenceError(RuntimeError):
     """Canonical failure for an authoritative goal read or publication."""
 
 
-class ConcurrentGoalStateChange(GoalPersistenceError):
+class GoalConflictError(GoalPersistenceError):
+    """The goal changed before a candidate transition could commit."""
+
+
+class GoalPostconditionError(GoalPersistenceError):
+    """A committed goal mutation could not be read back exactly."""
+
+
+class GoalMutationOutcomeUnknownError(GoalPostconditionError):
+    """A goal mutation outcome cannot be confirmed after its CAS boundary."""
+
+
+class ConcurrentGoalStateChange(GoalConflictError):
     """The persisted goal changed after its authoritative snapshot was read."""
+
+
+def goal_status_failure_message() -> str:
+    """Return the fixed user-facing contract for an authoritative read failure."""
+    return "Goal status unavailable: persisted goal state could not be read safely."
+
+
+def goal_mutation_failure_message(exc: GoalPersistenceError) -> str:
+    """Describe mutation uncertainty without leaking storage details or inviting retry."""
+    if isinstance(exc, GoalMutationOutcomeUnknownError):
+        return (
+            "Goal update may have committed, but persisted state could not be verified. "
+            "Do not retry blindly; check /goal status first."
+        )
+    if isinstance(exc, GoalPostconditionError):
+        return (
+            "Goal update committed, but persisted state changed before verification. "
+            "Do not retry blindly; check /goal status first."
+        )
+    if isinstance(exc, GoalConflictError):
+        return (
+            "Goal update was not applied because persisted state changed. "
+            "Check /goal status before retrying."
+        )
+    return (
+        "Goal update could not be confirmed. Do not retry blindly; "
+        "check /goal status first."
+    )
 
 
 def _goal_generation_key(session_id: str) -> Tuple[str, str]:
@@ -683,6 +747,12 @@ def _serialized_goal_mutation(method):
             # boundary. Nested decorated calls must keep the same state object
             # because their caller may hold a reference to it.
             if not outermost_transaction:
+                pass
+            elif self._snapshot_bound:
+                # Model-facing managers are constructed from the exact state
+                # shown to the caller. Preserve that snapshot through the CAS;
+                # refreshing here would silently authorize overwriting a goal
+                # created after the read.
                 pass
             elif method.__name__ == "set":
                 self.refresh_if_stale()
@@ -836,16 +906,9 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
-def load_goal_snapshot_authoritative(
+def _load_goal_snapshot(
     session_id: str,
-) -> Tuple[Optional[GoalState], Optional[str]]:
-    """Read persisted goal state and its exact optimistic-concurrency token.
-
-    Human-facing goal paths intentionally degrade when ``state.db`` is
-    unavailable. Model-callable control cannot treat that ambiguity as a
-    successful read-back, because an acknowledgement could otherwise claim a
-    mutation that never persisted.
-    """
+) -> Tuple[Any, Optional[str], Optional[GoalState]]:
     session_id = (session_id or "").strip()
     if not session_id:
         raise ValueError("session identity is required")
@@ -856,53 +919,82 @@ def load_goal_snapshot_authoritative(
         raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
         raise GoalPersistenceError("persisted goal read failed") from exc
-    if not raw:
-        return None, raw
+    if raw is None:
+        return db, None, None
     try:
-        return GoalState.from_json(raw), raw
+        return db, raw, GoalState.from_json(raw).validate_persisted()
     except Exception as exc:
         raise GoalPersistenceError("persisted goal state is invalid") from exc
 
 
+def load_goal_snapshot_authoritative(
+    session_id: str,
+) -> Tuple[Optional[GoalState], Optional[str]]:
+    """Read persisted goal state and its exact optimistic-concurrency token."""
+    _db, raw, state = _load_goal_snapshot(session_id)
+    return state, raw
+
+
 def load_goal_authoritative(session_id: str) -> Optional[GoalState]:
     """Read persisted goal state, raising when persistence is unavailable."""
-    state, _raw = load_goal_snapshot_authoritative(session_id)
+    _db, _raw, state = _load_goal_snapshot(session_id)
     return state
+
+
+def _publish_goal_state(
+    session_id: str,
+    db: Any,
+    expected_raw: Optional[str],
+    state: GoalState,
+) -> str:
+    candidate = GoalState.from_json(state.to_json())
+    expected_revision = (
+        GoalState.from_json(expected_raw).revision if expected_raw is not None else 0
+    )
+    candidate.revision = expected_revision + 1
+    candidate.receipt_token = uuid.uuid4().hex
+    replacement = candidate.to_json()
+    try:
+        committed = db.compare_and_set_meta(
+            _meta_key(session_id), expected_raw, replacement
+        )
+    except Exception as exc:
+        raise GoalMutationOutcomeUnknownError(
+            "goal publication outcome could not be determined"
+        ) from exc
+    if not committed:
+        raise GoalConflictError("goal changed before publication")
+    try:
+        persisted_raw = db.get_meta(_meta_key(session_id))
+    except Exception as exc:
+        raise GoalMutationOutcomeUnknownError(
+            "persisted goal read-back failed after publication"
+        ) from exc
+    if persisted_raw != replacement:
+        raise GoalPostconditionError("persisted goal state changed after publication")
+    state.revision = candidate.revision
+    state.receipt_token = candidate.receipt_token
+    _bump_goal_generation(session_id)
+    return replacement
 
 
 def save_goal_if_unchanged(
     session_id: str, state: GoalState, *, expected_raw: Optional[str]
 ) -> str:
     """Persist ``state`` only if canonical storage still matches ``expected_raw``."""
-    db = _get_session_db()
-    if db is None:
-        raise RuntimeError("session goal storage is unavailable")
-    state.receipt_token = uuid.uuid4().hex
-    raw = state.to_json()
-    try:
-        saved = db.compare_and_set_meta(_meta_key(session_id), expected_raw, raw)
-    except Exception as exc:
-        raise RuntimeError("persisted goal write failed") from exc
-    if not saved:
-        raise ConcurrentGoalStateChange("persisted goal changed during mutation")
-    _bump_goal_generation(session_id)
-    return raw
+    db, authoritative_raw, _state = _load_goal_snapshot(session_id)
+    if authoritative_raw != expected_raw:
+        raise GoalConflictError("persisted goal changed during mutation")
+    return _publish_goal_state(session_id, db, expected_raw, state)
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
-    """Persist a goal to SessionDB. No-op if DB unavailable."""
-    if not session_id:
-        return
-    db = _get_session_db()
-    if db is None:
-        _warn_dropped_write("GoalManager", "goal", session_id)
-        return
-    try:
-        state.receipt_token = uuid.uuid4().hex
-        db.set_meta(_meta_key(session_id), state.to_json())
-        _bump_goal_generation(session_id)
-    except Exception as exc:
-        logger.debug("GoalManager: set_meta failed: %s", exc)
+def save_goal(session_id: str, state: GoalState) -> GoalState:
+    """Persist a caller-owned state with durable revision/CAS semantics."""
+    db, raw, current = _load_goal_snapshot(session_id)
+    if current is not None and state.revision != current.revision:
+        raise GoalConflictError("stale goal state")
+    _publish_goal_state(session_id, db, raw, state)
+    return state
 
 
 def clear_goal(session_id: str) -> None:
@@ -915,6 +1007,52 @@ def clear_goal(session_id: str) -> None:
         save_goal(session_id, state)
 
 
+@dataclass(frozen=True)
+class GoalMigrationPlan:
+    """Authoritative two-row goal migration prepared for one atomic commit."""
+
+    db: Any
+    changes: Tuple[Tuple[str, Optional[str], str], ...]
+    child_replacement: str
+    parent_replacement: str
+
+
+def prepare_goal_migration(
+    old_session_id: str, new_session_id: str
+) -> Optional[GoalMigrationPlan]:
+    """Prepare an exact goal migration or return None for verified no-goal state."""
+    if not old_session_id or not new_session_id:
+        raise ValueError("goal migration requires parent and child session IDs")
+    if old_session_id == new_session_id:
+        raise ValueError("goal migration requires distinct sessions")
+    db, old_raw, state = _load_goal_snapshot(old_session_id)
+    if state is None or state.status == "cleared":
+        return None
+    child_db, child_raw, child_state = _load_goal_snapshot(new_session_id)
+    if child_db is not db:
+        raise GoalPersistenceError("goal storage changed during migration")
+    if child_state is not None:
+        raise GoalConflictError("continuation goal already exists")
+    child = GoalState.from_json(state.to_json())
+    child.revision = 1
+    child.receipt_token = uuid.uuid4().hex
+    parent = GoalState.from_json(state.to_json())
+    parent.status = "cleared"
+    parent.revision = state.revision + 1
+    parent.receipt_token = uuid.uuid4().hex
+    child_replacement = child.to_json()
+    parent_replacement = parent.to_json()
+    return GoalMigrationPlan(
+        db=db,
+        changes=(
+            (_meta_key(new_session_id), child_raw, child_replacement),
+            (_meta_key(old_session_id), old_raw, parent_replacement),
+        ),
+        child_replacement=child_replacement,
+        parent_replacement=parent_replacement,
+    )
+
+
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
     """Carry a persistent /goal from a parent session to its continuation. Best-effort, never raises
     (a failure here must not block compression). Returns True when a goal was migrated.
@@ -925,32 +1063,33 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     so exactly one active goal row exists per logical conversation (avoids the "two active goals" hazard of
     a pure copy).
     """
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
+    plan = prepare_goal_migration(old_session_id, new_session_id)
+    if plan is None:
         return False
     try:
-        first_session, second_session = sorted((old_session_id, new_session_id))
-        with goal_state_transaction(first_session):
-            with goal_state_transaction(second_session):
-                state = load_goal_authoritative(old_session_id)
-                if state is None or getattr(state, "status", None) == "cleared":
-                    return False
-                # Don't clobber a goal already set on the child (e.g. a resumed
-                # lineage that re-established its own goal).
-                if load_goal_authoritative(new_session_id) is not None:
-                    return False
-                child_state = GoalState.from_json(state.to_json())
-                save_goal(new_session_id, child_state)
-                # Archive the parent's row so it isn't double-counted as active.
-                state.status = "cleared"
-                save_goal(old_session_id, state)
-        logger.debug(
-            "GoalManager: migrated goal %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
-        )
-        return True
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("GoalManager: goal migration failed: %s", exc)
-        return False
+        committed = plan.db.compare_and_set_meta_many(list(plan.changes))
+    except Exception as exc:
+        raise GoalMutationOutcomeUnknownError(
+            "goal migration publication outcome could not be determined"
+        ) from exc
+    if not committed:
+        raise GoalConflictError("goal changed before migration")
+    try:
+        child_raw = plan.db.get_meta(_meta_key(new_session_id))
+        parent_raw = plan.db.get_meta(_meta_key(old_session_id))
+    except Exception as exc:
+        raise GoalMutationOutcomeUnknownError(
+            "persisted goal migration read-back failed after publication"
+        ) from exc
+    if child_raw != plan.child_replacement or parent_raw != plan.parent_replacement:
+        raise GoalPostconditionError("persisted goal state changed after migration publication")
+    _bump_goal_generation(old_session_id)
+    _bump_goal_generation(new_session_id)
+    logger.debug(
+        "GoalManager: migrated goal %s -> %s (%s)",
+        old_session_id, new_session_id, reason or "rotation",
+    )
+    return True
 
 
 # ── Judge ─────────────────────────────────────────────────────────────
@@ -1351,6 +1490,7 @@ class GoalManager:
             else _state_snapshot
         )
         self._expected_raw = _expected_raw
+        self._snapshot_bound = _expected_raw is not _UNCONDITIONAL_GOAL_PERSIST
         self._seen_generation = _goal_generation(session_id)
 
     @classmethod
@@ -1370,9 +1510,28 @@ class GoalManager:
             _expected_raw=persisted_raw,
         )
 
+    @classmethod
+    def load_authoritative(
+        cls,
+        session_id: str,
+        *,
+        default_max_turns: int = DEFAULT_MAX_TURNS,
+    ) -> "GoalManager":
+        """Build a manager from a fresh authoritative persistence snapshot."""
+        state, persisted_raw = load_goal_snapshot_authoritative(session_id)
+        return cls.from_authoritative_snapshot(
+            session_id,
+            state,
+            persisted_raw,
+            default_max_turns=default_max_turns,
+        )
+
     def _persist_mutation(self, state: GoalState) -> None:
         if self._expected_raw is _UNCONDITIONAL_GOAL_PERSIST:
-            save_goal(self.session_id, state)
+            db, expected_raw, _current = _load_goal_snapshot(self.session_id)
+            self._expected_raw = _publish_goal_state(
+                self.session_id, db, expected_raw, state
+            )
             return
         self._expected_raw = save_goal_if_unchanged(
             self.session_id, state, expected_raw=self._expected_raw
@@ -1388,10 +1547,15 @@ class GoalManager:
         leave its current state intact and are retried on the next lookup.
         """
         target_generation = _goal_generation(self.session_id)
-        if target_generation == self._seen_generation:
+        state, persisted_raw = load_goal_snapshot_authoritative(self.session_id)
+        if (
+            target_generation == self._seen_generation
+            and self._expected_raw is not _UNCONDITIONAL_GOAL_PERSIST
+            and persisted_raw == self._expected_raw
+        ):
             return False
-        state = load_goal_authoritative(self.session_id)
         self._state = state
+        self._expected_raw = persisted_raw
         self._seen_generation = target_generation
         return True
 
@@ -2303,6 +2467,10 @@ def run_kanban_goal_loop(
 
 __all__ = [
     "GoalState", "GoalContract", "GoalGate", "GoalManager", "parse_contract", "draft_contract", "run_gate",
+    "GoalPersistenceError", "GoalConflictError", "GoalPostconditionError",
+    "GoalMutationOutcomeUnknownError", "GoalMigrationPlan", "goal_status_failure_message",
+    "goal_mutation_failure_message", "load_goal_authoritative", "load_goal_snapshot_authoritative",
+    "prepare_goal_migration",
     "workspace_fingerprint", "CONTINUATION_PROMPT_TEMPLATE", "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE", "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE", "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
