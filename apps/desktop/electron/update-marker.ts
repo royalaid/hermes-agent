@@ -22,13 +22,49 @@
  */
 
 import fs from 'fs'
+import { randomUUID } from 'node:crypto'
 import path from 'path'
 
-// Even with a live-looking PID, never treat a marker older than this as a live
-// update. A full update (git pull + pip + desktop rebuild) is minutes, not tens
-// of minutes; past this the marker is almost certainly stale (e.g. the OS
-// recycled the pid onto an unrelated process), so the gate self-heals.
+import { getCachedWindowsProcessCreatedAt } from './windows-process-identity'
+
+// Age is an advisory diagnostic only. A full update (git pull + pip + desktop
+// rebuild) can be slow; an exact live owner remains authoritative beyond this
+// age so a second updater cannot race the first one into the same install.
 export const UPDATE_MARKER_MAX_AGE_MS = 20 * 60 * 1000
+export const UPDATE_MARKER_CLOCK_SKEW_MS = 5 * 1000
+
+export type ProcessCreateTimeProbe = (pid: number) => number | null | undefined
+export type PidIdentityStatus = 'matching' | 'stale' | 'unknown'
+export type UpdateMarkerBlockedReason = 'unreadable' | 'malformed' | 'future' | 'cleanup-race'
+
+export interface LiveUpdateMarker {
+  kind: 'live'
+  pid: number
+  startedAt: number
+  ageMs: number
+  overdue: boolean
+  bridge?: boolean
+}
+
+export interface UnreadableUpdateMarker {
+  kind: 'unreadable'
+  reason: UpdateMarkerBlockedReason
+  pid: null
+  ageMs: null
+  overdue: null
+}
+
+export type UpdateMarkerState = LiveUpdateMarker | UnreadableUpdateMarker
+
+interface PidIdentityProbeOptions {
+  kill?: typeof process.kill
+  getProcessCreatedAt?: ProcessCreateTimeProbe
+}
+
+interface UpdateMarkerReadOptions extends PidIdentityProbeOptions {
+  now?: () => number
+  maxAgeMs?: number
+}
 
 // The Windows script starts through a short-lived cmd.exe wrapper. Hold the
 // backend gate closed across that bounded wrapper-to-script claim gap, even
@@ -45,7 +81,7 @@ export function markerPath(hermesHome) {
 // EPERM => alive but owned by another user (still "alive" for our purposes).
 // Injectable `kill` keeps it unit-testable.
 export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(process)) {
-  if (!Number.isInteger(pid) || pid <= 0) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
     return false
   }
 
@@ -53,18 +89,187 @@ export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(pr
     kill(pid, 0)
 
     return true
-  } catch (err) {
-    return Boolean(err && err.code === 'EPERM')
+  } catch (err: any) {
+    return err?.code !== 'ESRCH'
   }
+}
+
+export function probePidIdentity(
+  pid: number,
+  startedAtSeconds: number,
+  { kill = process.kill.bind(process), getProcessCreatedAt }: PidIdentityProbeOptions = {}
+): PidIdentityStatus {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(startedAtSeconds) || startedAtSeconds <= 0) {
+    return 'stale'
+  }
+
+  try {
+    kill(pid, 0)
+  } catch (error: any) {
+    if (error?.code === 'ESRCH') {
+      return 'stale'
+    }
+  }
+
+  if (!getProcessCreatedAt) {
+    return 'unknown'
+  }
+
+  let createdAt: number | null | undefined
+
+  try {
+    createdAt = getProcessCreatedAt(pid)
+  } catch {
+    return 'unknown'
+  }
+
+  if (!Number.isFinite(createdAt) || Number(createdAt) <= 0) {
+    return 'unknown'
+  }
+
+  return Number(createdAt) < startedAtSeconds + 1 ? 'matching' : 'stale'
+}
+
+export function pidMatchesUpdateOwner(
+  pid: number,
+  startedAtSeconds: number,
+  options: PidIdentityProbeOptions = {}
+): boolean {
+  return probePidIdentity(pid, startedAtSeconds, options) !== 'stale'
+}
+
+function parsePositiveInteger(line: string): number | null {
+  const normalized = line.trim()
+
+  if (!/^[0-9]+$/.test(normalized)) {
+    return null
+  }
+
+  const value = Number(normalized)
+
+  return Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+function parseMarker(raw: string): { pid: number; startedAt: number; bridge: boolean } | null {
+  const lines = raw.split(/\r?\n/)
+
+  if (lines.at(-1) === '') {
+    lines.pop()
+  }
+
+  if (lines.length !== 2 && lines.length !== 3) {
+    return null
+  }
+
+  const pid = parsePositiveInteger(lines[0])
+  const startedAt = parsePositiveInteger(lines[1])
+
+  if (pid === null || startedAt === null) {
+    return null
+  }
+
+  if (lines.length === 3 && lines[2] !== 'handoff-bridge') {
+    return null
+  }
+
+  return { pid, startedAt, bridge: lines.length === 3 }
+}
+
+type RestoreResult = 'restored' | 'superseded' | 'unresolved'
+
+function restoreIsolatedMarker(file: string, tombstone: string): RestoreResult {
+  try {
+    fs.linkSync(tombstone, file)
+    fs.unlinkSync(tombstone)
+
+    return 'restored'
+  } catch (error: any) {
+    if (error?.code === 'EEXIST') {
+      try { fs.unlinkSync(tombstone) } catch { void 0 }
+
+      return 'superseded'
+    }
+  }
+
+  let payload: Buffer
+
+  try {
+    payload = fs.readFileSync(tombstone)
+  } catch {
+    return 'unresolved'
+  }
+
+  let descriptor: number | null = null
+
+  try {
+    descriptor = fs.openSync(file, 'wx', 0o600)
+    fs.writeFileSync(descriptor, payload)
+    fs.fsyncSync(descriptor)
+    fs.closeSync(descriptor)
+    descriptor = null
+
+    try { fs.unlinkSync(tombstone) } catch { void 0 }
+
+    return 'restored'
+  } catch (error: any) {
+    if (descriptor !== null) {
+      try { fs.closeSync(descriptor) } catch { void 0 }
+    }
+
+    if (error?.code === 'EEXIST') {
+      try { fs.unlinkSync(tombstone) } catch { void 0 }
+
+      return 'superseded'
+    }
+
+    return 'unresolved'
+  }
+}
+
+function recoveryArtifacts(file: string): string[] | null {
+  try {
+    return fs.readdirSync(path.dirname(file))
+      .filter(name => name.startsWith(`${path.basename(file)}.cas-`))
+      .map(name => path.join(path.dirname(file), name))
+  } catch (error: any) {
+    return error?.code === 'ENOENT' ? [] : null
+  }
+}
+
+function removeMarkerIfExact(file: string, expectedRaw: string): 'retry' | 'unresolved' {
+  const tombstone = `${file}.cas-release-${process.pid}-${randomUUID()}`
+
+  try { fs.renameSync(file, tombstone) } catch { return 'retry' }
+
+  let isolated: string | null = null
+
+  try { isolated = fs.readFileSync(tombstone, 'utf8') } catch { void 0 }
+
+  if (isolated !== expectedRaw) {
+    return restoreIsolatedMarker(file, tombstone) === 'unresolved' ? 'unresolved' : 'retry'
+  }
+
+  try {
+    fs.unlinkSync(tombstone)
+
+    return 'retry'
+  } catch {
+    return restoreIsolatedMarker(file, tombstone) === 'unresolved' ? 'unresolved' : 'retry'
+  }
+}
+
+function blockedMarker(reason: UpdateMarkerBlockedReason): UnreadableUpdateMarker {
+  return { kind: 'unreadable', reason, pid: null, ageMs: null, overdue: null }
 }
 
 /**
  * Read + interpret the marker.
  *
  * Returns `{ pid, ageMs }` when an update is still running: either a parseable
- * live pid within the age ceiling, or an explicitly tagged Windows hand-off
- * bridge inside its short claim grace. Returns `null` for every other case and
- * deletes stale markers so they cannot strand future launches.
+ * live pid, or an explicitly tagged Windows hand-off bridge inside its short
+ * claim grace. A live owner remains authoritative after the advisory age
+ * ceiling; only an authenticated stale owner is removed, so a slow update
+ * cannot race a new updater into the same install.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -73,45 +278,85 @@ export function readLiveUpdateMarker(
   hermesHome,
   {
     kill,
+    getProcessCreatedAt = kill ? undefined : getCachedWindowsProcessCreatedAt,
     now = Date.now,
     maxAgeMs = UPDATE_MARKER_MAX_AGE_MS
-  }: {
-    now?: () => number
-    maxAgeMs?: number
-    kill?: typeof process.kill
-  } = {}
-) {
+  }: UpdateMarkerReadOptions = {}
+): UpdateMarkerState | null {
   const file = markerPath(hermesHome)
-  let raw
 
-  try {
-    raw = fs.readFileSync(file, 'utf8')
-  } catch {
-    return null // absent or unreadable => no live update
-  }
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let raw: string
 
-  const [pidLine, startedLine, kindLine] = String(raw).split('\n')
-  const pid = Number.parseInt((pidLine || '').trim(), 10)
-  const startedAt = Number.parseInt((startedLine || '').trim(), 10)
-  const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
-  const validPid = Number.isInteger(pid) && pid > 0
-  const handoffBridge = (kindLine || '').trim() === 'handoff-bridge'
-
-  const active = handoffBridge
-    ? validPid && ageMs >= -1000 && ageMs <= UPDATE_HANDOFF_BRIDGE_GRACE_MS
-    : validPid && isPidAlive(pid, kill) && ageMs <= maxAgeMs
-
-  if (!active) {
     try {
-      fs.unlinkSync(file)
-    } catch {
-      void 0
+      raw = fs.readFileSync(file, 'utf8')
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') {
+        const artifacts = recoveryArtifacts(file)
+
+        if (artifacts === null) {
+          return blockedMarker('cleanup-race')
+        }
+
+        if (artifacts.length === 0) {
+          return null
+        }
+
+        const releasePrefix = `${path.basename(file)}.cas-release-`
+
+        if (artifacts.length === 1 && path.basename(artifacts[0]).startsWith(releasePrefix)) {
+          if (restoreIsolatedMarker(file, artifacts[0]) === 'unresolved') {
+            return blockedMarker('cleanup-race')
+          }
+
+          continue
+        }
+
+        return blockedMarker('cleanup-race')
+      }
+
+      return blockedMarker('unreadable')
     }
 
-    return null
+    const artifacts = recoveryArtifacts(file)
+
+    if (artifacts === null || artifacts.length > 0) {
+      return blockedMarker('cleanup-race')
+    }
+
+    const parsed = parseMarker(String(raw))
+
+    if (!parsed) {
+      return blockedMarker('malformed')
+    }
+
+    const { pid, startedAt, bridge } = parsed
+    const ageMs = now() - startedAt * 1000
+
+    if (!Number.isFinite(ageMs) || ageMs < -UPDATE_MARKER_CLOCK_SKEW_MS) {
+      return blockedMarker('future')
+    }
+
+    if (bridge && ageMs > UPDATE_HANDOFF_BRIDGE_GRACE_MS) {
+      if (removeMarkerIfExact(file, String(raw)) === 'unresolved') {
+        return blockedMarker('cleanup-race')
+      }
+
+      continue
+    }
+
+    if (probePidIdentity(pid, startedAt, { kill, getProcessCreatedAt }) === 'stale' && !bridge) {
+      if (removeMarkerIfExact(file, String(raw)) === 'unresolved') {
+        return blockedMarker('cleanup-race')
+      }
+
+      continue
+    }
+
+    return { kind: 'live', pid, startedAt, ageMs, overdue: ageMs > maxAgeMs, ...(bridge ? { bridge: true } : {}) }
   }
 
-  return { pid, ageMs }
+  return blockedMarker('cleanup-race')
 }
 
 /**
@@ -148,17 +393,17 @@ export function writeUpdateMarker(
   const file = markerPath(hermesHome)
   const nowMs = now()
   const owner = readLiveUpdateMarker(hermesHome, { kill, maxAgeMs, now: () => nowMs })
+  const liveOwner = owner?.kind === 'live' ? owner : null
 
   const acquiredAt =
     typeof startedAt === 'number' && Number.isInteger(startedAt)
       ? startedAt
-      : owner
-        ? Math.floor((nowMs - owner.ageMs) / 1000)
+      : liveOwner
+        ? Math.floor((nowMs - liveOwner.ageMs) / 1000)
         : Math.floor(nowMs / 1000)
 
   try {
-    const kindLine = handoffBridge ? 'handoff-bridge\n' : ''
-    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n${kindLine}`, 'utf8')
+    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n${handoffBridge ? 'handoff-bridge\n' : ''}`, 'utf8')
   } catch {
     // Best-effort: if we can't write the marker, proceed anyway. The
     // updater will write its own when it reaches run_update.
@@ -186,16 +431,22 @@ export function writeUpdateMarker(
  */
 export function updateHandoffConflict(
   hermesHome,
-  opts: {
-    now?: () => number
-    maxAgeMs?: number
-    kill?: typeof process.kill
-  } = {}
+  opts: UpdateMarkerReadOptions = {}
 ) {
   const owner = readLiveUpdateMarker(hermesHome, opts)
 
   if (!owner) {
     return null
+  }
+
+  if (owner.kind === 'unreadable') {
+    return {
+      pid: null,
+      ageMs: null,
+      message:
+        'Hermes found an update marker but could not verify its owner safely. ' +
+        'Wait for the current update to finish or resolve the marker permissions, then retry.'
+    }
   }
 
   const mins = Math.floor(owner.ageMs / 60_000)
