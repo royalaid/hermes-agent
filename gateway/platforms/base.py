@@ -2101,11 +2101,12 @@ MEDIA_TAG_CLEANUP_RE = re.compile(
 # reintroduce the #68773 bug class (gluing the next MEDIA: tag or trailing
 # prose into one invalid path). Instead, unknown-extension paths containing
 # spaces (``MEDIA:/data/map data.kmz``, ``C:\...\My Documents\x.log``) are
-# recovered by ``_match_extensionless_path`` (#24032): when the bare match
-# fails validation, the candidate is progressively extended forward across
-# single spaces — bounded, stopping at newline / the next ``MEDIA:`` keyword
-# — and the first extension that validates on disk wins. Validation is the
-# oracle, so prose never rides along and non-existent paths stay visible.
+# recovered by ``_match_extensionless_path`` (#24032): candidates are
+# progressively extended forward across single spaces, bounded and stopping
+# at newline / the next ``MEDIA:`` keyword. Ordinary delivery uses the first
+# candidate that validates on disk. Durable claimed-result planning instead
+# uses lexical path/prose boundaries so the same complete explicit intent is
+# snapshotted even when the file is unavailable or disappears before upload.
 MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
     r'''[`"'*_]{0,3}MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
@@ -2126,26 +2127,23 @@ def _match_extensionless_path(
 
     Tries the regex-captured path first. When that fails validation, the
     candidate is progressively extended forward across single spaces
-    (validation-gated, bounded at 8 tokens, never past a newline or a
-    subsequent ``MEDIA:`` keyword) so unknown-extension paths containing
-    spaces deliver (#24032). Returns ``(safe_path, end_offset)`` where
-    ``end_offset`` is the index in ``scan_text`` just past the matched path,
-    or ``None`` when nothing validates. Durable claimed-result planning may
-    set ``include_unavailable`` to return the bounded explicit token before
-    filesystem and policy validation; the send path validates it later.
+    (bounded at 8 tokens, never past a newline or a subsequent ``MEDIA:``
+    keyword) so unknown-extension paths containing spaces deliver (#24032).
+    Returns ``(safe_path, end_offset)`` where ``end_offset`` is the index in
+    ``scan_text`` just past the matched path, or ``None`` when nothing
+    validates. Durable claimed-result planning may set ``include_unavailable``
+    to resolve the same bounded grammar without filesystem or policy checks;
+    the send path validates it later.
     """
     raw = match.group("path")
     path = _normalize_media_tag_path(raw)
     if not path:
         return None
-    if include_unavailable:
-        # Durable claimed-result planning recognizes the bounded explicit
-        # directive grammar before consulting availability or path policy.
-        # Delivery-time validation remains authoritative and fails this part.
-        return path, match.end("path")
-    safe = validate_media_delivery_path(path)
-    if safe:
-        return safe, match.end("path")
+    quoted = len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "`\"'"
+    if not include_unavailable:
+        safe = validate_media_delivery_path(path)
+        if safe:
+            return safe, match.end("path")
     start = match.start("path")
     nl = scan_text.find("\n", start)
     limit = nl if nl != -1 else len(scan_text)
@@ -2154,6 +2152,55 @@ def _match_extensionless_path(
     if nxt != -1:
         segment = segment[:nxt]
     pos = match.end("path") - start
+    if include_unavailable:
+        # Quoting is already an explicit path boundary. For the supported bare
+        # form, extend only within the existing eight-token/newline/next-tag
+        # bound. A separator in the added token, an unsupported suffix, or a
+        # following copular prose word supplies an availability-independent
+        # end boundary. If the line itself ends first, the bounded line tail is
+        # the explicit intent. Delivery-time validation remains authoritative.
+        if quoted:
+            return path, match.end("path")
+        candidate = path
+        candidate_end = match.end("path")
+        prose_boundaries = {"is", "are", "was", "were"}
+        for _ in range(8):
+            while pos < len(segment) and segment[pos] in " \t":
+                pos += 1
+            if pos >= len(segment):
+                break
+            tok_end = pos
+            while tok_end < len(segment) and segment[tok_end] not in " \t":
+                tok_end += 1
+            token = segment[pos:tok_end]
+            if token.casefold().strip(",;:)]}") in prose_boundaries:
+                break
+            extended = _normalize_media_tag_path(segment[:tok_end])
+            if not extended:
+                break
+            candidate = extended
+            candidate_end = start + tok_end
+            lookahead = tok_end
+            while lookahead < len(segment) and segment[lookahead] in " \t":
+                lookahead += 1
+            following_end = lookahead
+            while (
+                following_end < len(segment)
+                and segment[following_end] not in " \t"
+            ):
+                following_end += 1
+            following = segment[lookahead:following_end]
+            suffix = Path(candidate.replace("\\", "/")).suffix
+            if (
+                tok_end == len(segment)
+                or "/" in token
+                or "\\" in token
+                or bool(suffix)
+                or following.casefold().strip(",;:)]}") in prose_boundaries
+            ):
+                return candidate, candidate_end
+            pos = tok_end
+        return candidate, candidate_end
     for _ in range(8):
         while pos < len(segment) and segment[pos] in " \t":
             pos += 1
