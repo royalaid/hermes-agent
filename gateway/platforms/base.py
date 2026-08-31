@@ -2511,10 +2511,15 @@ class MessageEvent:
     timestamp: datetime = field(default_factory=datetime.now)
 
     # Whether this event may resolve gateway commands or pending control
-    # prompts. Kept last to preserve positional construction compatibility.
+    # prompts. Existing positional order is stable; new optional fields append.
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    # Goal-specific provenance stamped only by trusted gateway constructors.
+    # ``internal`` is shared with plugin/process events and is therefore not
+    # sufficient on its own to authorize goal admission or queue deletion.
+    goal_continuation: bool = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
