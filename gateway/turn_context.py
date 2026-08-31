@@ -106,6 +106,7 @@ class TurnContext:
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
+    defer_result_publication: bool = False
     needs_progress_queue: bool = False
 
     # --- lazy-imported callables captured from the outer body -------------
