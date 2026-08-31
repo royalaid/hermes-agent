@@ -2183,7 +2183,12 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
 )
 
 
-def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
+def _match_extensionless_path(
+    scan_text: str,
+    match: "re.Match",
+    *,
+    include_unavailable: bool = False,
+) -> Optional[Tuple[str, int]]:
     """Resolve an extensionless MEDIA tag match to a validated on-disk path.
 
     Tries the regex-captured path first. When that fails validation, the
@@ -2192,12 +2197,19 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
     subsequent ``MEDIA:`` keyword) so unknown-extension paths containing
     spaces deliver (#24032). Returns ``(safe_path, end_offset)`` where
     ``end_offset`` is the index in ``scan_text`` just past the matched path,
-    or ``None`` when nothing validates.
+    or ``None`` when nothing validates. Durable claimed-result planning may
+    set ``include_unavailable`` to return the bounded explicit token before
+    filesystem and policy validation; the send path validates it later.
     """
     raw = match.group("path")
     path = _normalize_media_tag_path(raw)
     if not path:
         return None
+    if include_unavailable:
+        # Durable claimed-result planning recognizes the bounded explicit
+        # directive grammar before consulting availability or path policy.
+        # Delivery-time validation remains authoritative and fails this part.
+        return path, match.end("path")
     safe = validate_media_delivery_path(path)
     if safe:
         return safe, match.end("path")
@@ -5334,7 +5346,11 @@ class BasePlatformAdapter(ABC):
         return ''.join(chars)
 
     @staticmethod
-    def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
+    def extract_media(
+        content: str,
+        *,
+        include_unavailable: bool = False,
+    ) -> Tuple[List[Tuple[str, bool]], str]:
         """
         Extract MEDIA:<path> tags and [[audio_as_voice]] directives from response text.
 
@@ -5355,6 +5371,10 @@ class BasePlatformAdapter(ABC):
 
         Args:
             content: The response text to scan.
+            include_unavailable: Recognize bounded explicit extensionless or
+                unsupported-extension intents without using availability as
+                the grammar oracle. Claimed-result delivery still validates
+                each path before upload.
 
         Returns:
             Tuple of (list of (path, is_voice) pairs, cleaned content with tags removed).
@@ -5413,7 +5433,11 @@ class BasePlatformAdapter(ABC):
             path = _normalize_media_tag_path(match.group("path"))
             if not path or not _path_lacks_deliverable_extension(path):
                 continue
-            resolved = _match_extensionless_path(scan_content, match)
+            resolved = _match_extensionless_path(
+                scan_content,
+                match,
+                include_unavailable=include_unavailable,
+            )
             if resolved is None:
                 continue
             safe = resolved[0]
@@ -5438,7 +5462,11 @@ class BasePlatformAdapter(ABC):
                 path = _normalize_media_tag_path(match.group("path"))
                 if not path or not _path_lacks_deliverable_extension(path):
                     continue
-                resolved = _match_extensionless_path(masked_cleaned, match)
+                resolved = _match_extensionless_path(
+                    masked_cleaned,
+                    match,
+                    include_unavailable=include_unavailable,
+                )
                 if resolved is not None:
                     spans.append((match.start(), resolved[1]))
             if spans:
@@ -7018,36 +7046,71 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                _claimed_parts_snapshot = (
+                    getattr(
+                        event,
+                        "_hermes_claimed_response_parts_snapshot",
+                        None,
+                    )
+                    if _delivery_owned_obligation_id
+                    else None
+                )
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used
                 # by skills that produce large/lossless images (e.g. info-graph)
                 # where Telegram's sendPhoto recompression destroys legibility.
-                force_document_attachments = "[[as_document]]" in response
+                force_document_attachments = (
+                    bool(_claimed_parts_snapshot.force_document_attachments)
+                    if _claimed_parts_snapshot is not None
+                    else "[[as_document]]" in response
+                )
 
                 # Pre-extract snapshot for the #29346 recovery/invariant below.
                 _response_pre_extract = response
 
-                # Extract MEDIA:<path> tags (from TTS tool) before other processing
-                media_files, response = self.extract_media(response)
+                # Claimed results reuse the availability-independent snapshot
+                # that produced their first durable visible-text projection.
+                if _claimed_parts_snapshot is not None:
+                    media_files = list(_claimed_parts_snapshot.media_files)
+                    response = _claimed_parts_snapshot.visible_text
+                else:
+                    # Recovery rebuilds the claimed snapshot with the canonical,
+                    # availability-independent grammar. Ordinary sends keep any
+                    # adapter-specific extraction override unchanged.
+                    if _delivery_owned_obligation_id:
+                        media_files, response = BasePlatformAdapter.extract_media(
+                            response,
+                            include_unavailable=True,
+                        )
+                    else:
+                        media_files, response = self.extract_media(response)
                 if not _delivery_owned_obligation_id:
                     media_files = self.filter_media_delivery_paths(
                         media_files,
                         session_key=session_key,
                     )
 
-                # Extract image URLs and send them as native platform attachments
-                images, text_content = self.extract_images(response)
-                # Strip any remaining internal directives from message body (fixes #1561).
-                # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
-                # with an unknown extension is intentionally left in the body for
-                # extract_local_files below to pick up rather than silently dropped (#34517).
-                text_content = _strip_media_directives(text_content).strip()
+                # Extract image URLs and send them as native platform attachments.
+                if _claimed_parts_snapshot is not None:
+                    images = list(_claimed_parts_snapshot.images)
+                    text_content = _claimed_parts_snapshot.visible_text
+                else:
+                    images, text_content = self.extract_images(response)
+                    # Strip any remaining internal directives from message body (fixes #1561).
+                    # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
+                    # with an unknown extension is intentionally left in the body for
+                    # extract_local_files below to pick up rather than silently dropped (#34517).
+                    text_content = _strip_media_directives(text_content).strip()
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
-                local_files = []
-                if not is_ephemeral_response:
+                local_files = (
+                    list(_claimed_parts_snapshot.local_files)
+                    if _claimed_parts_snapshot is not None
+                    else []
+                )
+                if _claimed_parts_snapshot is None and not is_ephemeral_response:
                     # Auto-detect bare local file paths for native media delivery
                     # (helps small models that don't use MEDIA: syntax). Skip
                     # system/command notices so config paths stay visible text
