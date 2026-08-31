@@ -1567,6 +1567,10 @@ class MessageEvent:
     # May this event resolve gateway commands / control prompts? Proactive plugin events set False
     # so untrusted payload text stays conversational. Kept last for positional compat.
     allow_gateway_control: bool = True
+    # Goal-specific provenance stamped only by trusted gateway constructors.
+    # ``internal`` is shared with plugin/process events and is not sufficient
+    # on its own to authorize goal admission or queue deletion.
+    goal_continuation: bool = False
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

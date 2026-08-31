@@ -1947,6 +1947,16 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        if self._is_goal_continuation_event(event):
+            admitted = await self._wait_for_goal_continuation_admission(
+                event=event,
+                source=source,
+                session_id=session_entry.session_id,
+                session_key=session_key,
+                adapter=self._adapter_for_source(source),
+            )
+            if not admitted:
+                return
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -1970,6 +1980,16 @@ class GatewayTurnMixin:
             # (a /new may move session_entry.session_id while the old run is still unwinding).
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            if self._is_goal_continuation_event(event):
+                admitted = await self._wait_for_goal_continuation_admission(
+                    event=event,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    adapter=self._adapter_for_source(source),
+                )
+                if not admitted:
+                    return
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -3447,34 +3467,45 @@ class GatewayTurnMixin:
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
+        goal_retry_handoff_event = None
+
+        def _restore_goal_retry_handoff() -> None:
+            nonlocal goal_retry_handoff_event
+            if goal_retry_handoff_event is None:
+                return
+            retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
+            if retry is not None and retry.event is goal_retry_handoff_event:
+                if not retry.dropped:
+                    self._restore_dequeued_event_front(
+                        session_key,
+                        self._adapter_for_source(source),
+                        goal_retry_handoff_event,
+                    )
+                self._finish_goal_continuation_retry(session_key, retry)
+            goal_retry_handoff_event = None
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
             if self._is_goal_continuation_event(pending_event):
-                from hermes_cli.goals import GoalPersistenceError
-
-                try:
-                    goal_still_active = self._goal_still_active_for_session(session_id)
-                except GoalPersistenceError as exc:
-                    self._restore_dequeued_event_front(
-                        session_key,
-                        adapter,
-                        pending_event,
-                    )
-                    notice = f"Goal status unavailable: {exc}"
-                    logger.warning("goal continuation: %s", notice)
-                    # The queued branch delivered the prior response above,
-                    # so send this status now rather than deferring it again.
-                    await self._send_goal_status_notice(next_source, notice)
-                    return result
-                if not goal_still_active:
+                admitted = await self._wait_for_goal_continuation_admission(
+                    event=pending_event,
+                    source=next_source,
+                    session_id=session_id,
+                    session_key=session_key,
+                    adapter=adapter,
+                    retain_on_admit=True,
+                )
+                if not admitted:
                     logger.info(
                         "Discarding stale goal continuation for session %s — goal is no longer active",
                         session_key or "?",
                     )
                     return result
+                retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
+                if retry is not None and retry.event is pending_event:
+                    goal_retry_handoff_event = pending_event
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
             try:
@@ -3484,10 +3515,15 @@ class GatewayTurnMixin:
                     "Queued follow-up session-key resolution failed; reusing %s",
                     session_key or "?", exc_info=True,
                 )
-            next_message = await self._prepare_profile_scoped_inbound_message_text(
-                event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
-            )
+            try:
+                next_message = await self._prepare_profile_scoped_inbound_message_text(
+                    event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
+                )
+            except BaseException:
+                _restore_goal_retry_handoff()
+                raise
             if next_message is None:
+                _restore_goal_retry_handoff()
                 return result
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -3504,9 +3540,10 @@ class GatewayTurnMixin:
                 _completed_turns.discard(_pk)
 
         # Restart the typing indicator; the outer typing task may be stale.
-        if _clear_adapter:
-            with suppress(Exception):
-                await _clear_adapter.send_typing(source.chat_id, metadata=_status_thread_metadata)
+        try:
+            if _clear_adapter:
+                with suppress(Exception):
+                    await _clear_adapter.send_typing(source.chat_id, metadata=_status_thread_metadata)
 
         # Re-baseline the cached agent's message_count before recursing, else the coherence guard
         # rebuilds on OUR OWN flushed rows (the outer handler re-baselines only after the chain).
@@ -3519,7 +3556,20 @@ class GatewayTurnMixin:
         # whole _run_agent chain unwinds — too late for the in-band follow-up. Use the same (session_key,
         # session_id) the recursive call runs under so the snapshot matches exactly what the follow-up's
         # guard will consult. Fail-safe in helper.
-        await self._refresh_agent_cache_message_count(session_key, session_id)
+            await self._refresh_agent_cache_message_count(session_key, session_id)
+        except BaseException:
+            _restore_goal_retry_handoff()
+            raise
+
+        if goal_retry_handoff_event is not None:
+            retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
+            if retry is not None and retry.event is goal_retry_handoff_event:
+                if retry.dropped:
+                    self._finish_goal_continuation_retry(session_key, retry)
+                    goal_retry_handoff_event = None
+                    return result
+                self._finish_goal_continuation_retry(session_key, retry)
+            goal_retry_handoff_event = None
 
         followup_result = await self._run_agent(
             message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
