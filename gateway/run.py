@@ -3281,6 +3281,7 @@ class _GoalContinuationRetry:
     event: MessageEvent
     wake: asyncio.Event
     owner_task: Optional[asyncio.Task]
+    claim_id: Optional[str] = None
     dropped: bool = False
     initial_retry_used: bool = False
 
@@ -7637,6 +7638,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._platform_lock_takeover_on_start = False
         self._startup_restore_queue: List[MessageEvent] = []
         self._startup_restore_tasks: List[asyncio.Task] = []
+        from hermes_constants import get_hermes_home
+        self._goal_continuation_claim_home = get_hermes_home()
         # LRU cache of live SessionSources keyed by session_key. Used by
         # fallback routing paths (shutdown notifications, synthetic
         # background-process events) when the persisted origin is missing
@@ -9818,8 +9821,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         adapter: Any,
         event: "MessageEvent",
+        *,
+        session_id: Optional[str] = None,
     ) -> Optional[_GoalContinuationRetry]:
-        """Publish one retry record while the current owner retains the head."""
+        """Durably publish one retry record before retaining the queue head."""
         retries = getattr(self, "_goal_continuation_retries", None)
         if retries is None:
             retries = {}
@@ -9828,6 +9833,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         owner_task = asyncio.current_task()
         if existing is not None:
             if existing.owner_task is owner_task:
+                return existing
+            if (
+                existing.event is event
+                and (
+                    existing.owner_task is None
+                    or existing.owner_task.done()
+                )
+            ):
+                existing.owner_task = owner_task
                 return existing
             if existing.event is not event:
                 self._enqueue_fifo(session_key, event, adapter)
@@ -9838,18 +9852,93 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if adapter is not None
             else None
         )
+        state = self._session_state(session_key)
+        queued_events = state.conversation.queued_events
+        from gateway.goal_continuation_claims import (
+            event_claim_identity,
+            load_claims,
+        )
+
+        durable_identity = event_claim_identity(event)
+        if durable_identity is not None:
+            claim_id, event_id = durable_identity
+            try:
+                claims = load_claims(
+                    home=getattr(self, "_goal_continuation_claim_home", None)
+                )
+                claim = next(
+                    item
+                    for item in claims
+                    if item.session_key == session_key and item.claim_id == claim_id
+                )
+                head_identity = event_claim_identity(claim.events[0])
+                if head_identity != (claim_id, event_id):
+                    raise ValueError("durable continuation head mismatch")
+            except Exception:
+                self._restore_dequeued_event_front(session_key, adapter, event)
+                logger.warning(
+                    "goal continuation: durable claim adoption failed for session %s",
+                    session_key,
+                )
+                return None
+            if isinstance(pending_slot, dict) and pending_slot.get(session_key) is event:
+                pending_slot.pop(session_key, None)
+            queued_events[:] = [queued for queued in queued_events if queued is not event]
+            retry = _GoalContinuationRetry(
+                event=event,
+                wake=asyncio.Event(),
+                owner_task=owner_task,
+                claim_id=claim_id,
+            )
+            retries[session_key] = retry
+            return retry
+
+        durable_events: List[MessageEvent] = [event]
+        if isinstance(pending_slot, dict):
+            pending_event = pending_slot.get(session_key)
+            if pending_event is not None:
+                durable_events.append(pending_event)
+        durable_events.extend(queued_events)
+        if session_id is None:
+            store = getattr(self, "session_store", None)
+            entries = getattr(store, "_entries", {}) if store is not None else {}
+            entry = entries.get(session_key) if isinstance(entries, dict) else None
+            session_id = getattr(entry, "session_id", None)
+        if not session_id:
+            self._restore_dequeued_event_front(session_key, adapter, event)
+            logger.warning(
+                "goal continuation: durable claim unavailable for session %s",
+                session_key,
+            )
+            return None
+        try:
+            from gateway.goal_continuation_claims import publish_claim
+
+            durable_claim = publish_claim(
+                session_key,
+                session_id,
+                durable_events,
+                home=getattr(self, "_goal_continuation_claim_home", None),
+            )
+        except Exception:
+            self._restore_dequeued_event_front(session_key, adapter, event)
+            logger.warning(
+                "goal continuation: durable claim publication failed for session %s",
+                session_key,
+            )
+            return None
         if isinstance(pending_slot, dict) and pending_slot.get(session_key) is event:
             pending_slot.pop(session_key, None)
-        state = self._session_state(session_key)
-        state.conversation.queued_events[:] = [
+        queued_events[:] = [
             queued
-            for queued in state.conversation.queued_events
+            for queued in queued_events
             if queued is not event
         ]
         retry = _GoalContinuationRetry(
             event=event,
             wake=asyncio.Event(),
             owner_task=owner_task,
+            claim_id=durable_claim.claim_id,
         )
         retries[session_key] = retry
         return retry
@@ -9862,6 +9951,221 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         retries = getattr(self, "_goal_continuation_retries", None)
         if retries is not None and retries.get(session_key) is retry:
             retries.pop(session_key, None)
+
+    def _complete_goal_continuation_claim_event(
+        self,
+        session_key: str,
+        adapter: Any,
+        event: "MessageEvent",
+    ) -> bool:
+        """Acknowledge one completed durable FIFO head before its successor."""
+        from gateway.goal_continuation_claims import (
+            GoalContinuationClaimError,
+            claim_path,
+            clear_event_claim_identity,
+            complete_claim_event,
+            event_claim_identity,
+        )
+
+        identity = event_claim_identity(event)
+        if identity is None:
+            return True
+        claim_id, event_id = identity
+        retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
+        try:
+            if not complete_claim_event(
+                session_key,
+                claim_id,
+                event_id,
+                home=getattr(self, "_goal_continuation_claim_home", None),
+            ):
+                raise GoalContinuationClaimError(
+                    "durable continuation completion record is missing"
+                )
+        except Exception:
+            logger.warning(
+                "goal continuation: durable completion failed for session %s",
+                session_key,
+            )
+            self._restore_dequeued_event_front(session_key, adapter, event)
+            if retry is not None:
+                retry.event = event
+                retry.owner_task = None
+            return False
+
+        clear_event_claim_identity(event)
+        if not claim_path(
+            session_key,
+            home=getattr(self, "_goal_continuation_claim_home", None),
+        ).exists():
+            if retry is not None:
+                self._finish_goal_continuation_retry(session_key, retry)
+            return True
+
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        next_event = (
+            pending_slot.get(session_key)
+            if isinstance(pending_slot, dict)
+            else None
+        )
+        if next_event is None:
+            state = self._peek_session_state(session_key)
+            queued_events = state.conversation.queued_events if state else []
+            next_event = queued_events[0] if queued_events else None
+        next_identity = event_claim_identity(next_event) if next_event is not None else None
+        if next_identity is None or next_identity[0] != claim_id:
+            logger.warning(
+                "goal continuation: durable successor unavailable for session %s",
+                session_key,
+            )
+            return False
+        retry = _GoalContinuationRetry(
+            event=next_event,
+            wake=asyncio.Event(),
+            owner_task=asyncio.current_task(),
+            claim_id=claim_id,
+        )
+        self._goal_continuation_retries[session_key] = retry
+        return True
+
+    def _restore_unacknowledged_goal_continuation_claim_event(
+        self,
+        session_key: Optional[str],
+        source: "SessionSource",
+        event: Optional["MessageEvent"],
+    ) -> None:
+        """Re-arm a durable FIFO head if execution exits before acknowledgement."""
+        if not session_key or event is None:
+            return
+        from gateway.goal_continuation_claims import event_claim_identity
+
+        if event_claim_identity(event) is None:
+            return
+        retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
+        if retry is not None and retry.dropped:
+            return
+        adapter = self._adapter_for_source(source)
+        self._restore_dequeued_event_front(session_key, adapter, event)
+        if retry is not None:
+            self._finish_goal_continuation_retry(session_key, retry)
+
+    def _retire_rejected_durable_claim_event(self, event: "MessageEvent") -> None:
+        """Make an early policy rejection terminal before its FIFO tail drains."""
+        from gateway.goal_continuation_claims import event_claim_identity
+
+        if event_claim_identity(event) is None:
+            return
+        session_key = self._session_key_for_source(event.source)
+        retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
+        adapter = self._adapter_for_source(event.source)
+        if self._is_goal_continuation_event(event):
+            if not self._drop_goal_continuation_retry(session_key):
+                self._restore_dequeued_event_front(session_key, adapter, event)
+                raise RuntimeError(
+                    "durable continuation policy retirement is unavailable"
+                )
+            if retry is not None:
+                self._finish_goal_continuation_retry(session_key, retry)
+            return
+        if not self._complete_goal_continuation_claim_event(
+            session_key, adapter, event
+        ):
+            raise RuntimeError(
+                "durable continuation policy retirement is unavailable"
+            )
+
+    def _recover_goal_continuation_claims(self, *, schedule: bool = True) -> int:
+        """Restore strict durable claim FIFOs before startup admits new input."""
+        from gateway.goal_continuation_claims import (
+            GoalContinuationClaimError,
+            load_claims,
+        )
+
+        claims = load_claims(
+            home=getattr(self, "_goal_continuation_claim_home", None)
+        )
+        if not claims:
+            return 0
+        entries = getattr(getattr(self, "session_store", None), "_entries", {})
+        if not isinstance(entries, dict):
+            raise GoalContinuationClaimError(
+                "durable continuation session registry is unavailable"
+            )
+        retries = getattr(self, "_goal_continuation_retries", None)
+        if retries is None:
+            retries = {}
+            self._goal_continuation_retries = retries
+
+        planned: List[tuple[Any, Any]] = []
+        for claim in claims:
+            entry = entries.get(claim.session_key)
+            origin = getattr(entry, "origin", None)
+            if (
+                entry is None
+                or (
+                    not claim.session_rebind_allowed
+                    and getattr(entry, "session_id", None) != claim.session_id
+                )
+                or origin is None
+                or origin.profile != claim.profile
+                or any(
+                    event.source is None
+                    or event.source.profile != claim.profile
+                    or self._session_key_for_source(event.source)
+                    != claim.session_key
+                    for event in claim.events
+                )
+            ):
+                raise GoalContinuationClaimError(
+                    "durable continuation claim cannot bind to its session"
+                )
+            adapter = self._adapter_for_source(claim.events[0].source)
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            existing_state = self._peek_session_state(claim.session_key)
+            if (
+                adapter is None
+                or not isinstance(pending_slot, dict)
+                or claim.session_key in retries
+                or claim.session_key in pending_slot
+                or (
+                    existing_state is not None
+                    and existing_state.conversation.queued_events
+                )
+            ):
+                raise GoalContinuationClaimError(
+                    "durable continuation claim cannot bind to an empty queue"
+                )
+            planned.append((claim, adapter))
+
+        staged = 0
+        for claim, adapter in planned:
+            pending_slot = adapter._pending_messages
+            state = self._session_state(claim.session_key)
+            head, *successors = claim.events
+            retry = _GoalContinuationRetry(
+                event=head,
+                wake=asyncio.Event(),
+                owner_task=None,
+                claim_id=claim.claim_id,
+            )
+            retries[claim.session_key] = retry
+            if successors:
+                pending_slot[claim.session_key] = successors[0]
+                state.conversation.queued_events.extend(successors[1:])
+
+            if schedule:
+                setattr(head, "_hermes_startup_restore_replay", True)
+                state.turn.agent = _AGENT_PENDING_SENTINEL
+                state.turn.started_ts = time.time()
+                self._persist_active_agents()
+                task = asyncio.create_task(
+                    self._run_startup_resume_event(adapter, head, claim.session_key)
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                self._startup_restore_tasks.append(task)
+            staged += 1
+        return staged
 
     def _stage_next_queued_event(
         self,
@@ -9893,6 +10197,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
         if retry is None or retry.dropped:
             return 0
+        if retry.claim_id:
+            try:
+                from gateway.goal_continuation_claims import (
+                    clear_event_claim_identity,
+                    event_claim_identity,
+                    retire_claim,
+                )
+
+                retire_claim(
+                    session_key,
+                    retry.claim_id,
+                    home=getattr(self, "_goal_continuation_claim_home", None),
+                )
+                adapter = self._adapter_for_source(retry.event.source)
+                pending_slot = getattr(adapter, "_pending_messages", None)
+                events = [retry.event]
+                if isinstance(pending_slot, dict):
+                    pending_event = pending_slot.get(session_key)
+                    if pending_event is not None:
+                        events.append(pending_event)
+                state = self._peek_session_state(session_key)
+                if state is not None:
+                    events.extend(state.conversation.queued_events)
+                for event in events:
+                    identity = event_claim_identity(event)
+                    if (
+                        identity is not None
+                        and identity[0] == retry.claim_id
+                        and self._is_goal_continuation_event(event)
+                    ):
+                        clear_event_claim_identity(event)
+            except Exception:
+                logger.warning(
+                    "goal continuation: durable claim retirement failed for session %s",
+                    session_key,
+                )
+                return 0
         retry.dropped = True
         retry.wake.set()
         return 1
@@ -9913,17 +10254,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             active = self._goal_still_active_for_session(session_id)
             if not active:
+                retry = getattr(self, "_goal_continuation_retries", {}).get(
+                    session_key
+                )
+                if retry is not None and retry.event is event:
+                    if retry.claim_id and not self._drop_goal_continuation_retry(
+                        session_key
+                    ):
+                        self._restore_dequeued_event_front(
+                            session_key, adapter, event
+                        )
+                        return False
+                    self._finish_goal_continuation_retry(session_key, retry)
                 self._stage_next_queued_event(
                     session_key, adapter, exclude_event=event
                 )
                 return False
             if retain_on_admit:
                 return self._claim_goal_continuation_retry(
-                    session_key, adapter, event
+                    session_key, adapter, event, session_id=session_id
                 ) is not None
             return True
         except GoalPersistenceError as exc:
-            retry = self._claim_goal_continuation_retry(session_key, adapter, event)
+            retry = self._claim_goal_continuation_retry(
+                session_key, adapter, event, session_id=session_id
+            )
             if retry is None:
                 return False
             notice = f"Goal status unavailable: {exc}"
@@ -9996,12 +10351,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         retry_exc,
                     )
                     continue
-                if not active or not retain_on_admit:
-                    self._finish_goal_continuation_retry(session_key, retry)
                 if not active:
+                    if retry.claim_id and not self._drop_goal_continuation_retry(
+                        session_key
+                    ):
+                        continue
+                    self._finish_goal_continuation_retry(session_key, retry)
                     self._stage_next_queued_event(
                         session_key, adapter, exclude_event=event
                     )
+                elif not retain_on_admit and not retry.claim_id:
+                    self._finish_goal_continuation_retry(session_key, retry)
                 return active
         except BaseException:
             if not retry.dropped:
@@ -10062,10 +10422,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         preserving normal /queue and user follow-up events.
         """
         removed = self._drop_goal_continuation_retry(session_key)
+        retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
+        if retry is not None and not retry.dropped:
+            raise RuntimeError(
+                "durable goal continuation retirement is unavailable"
+            )
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
             pending_event = pending_slot.get(session_key)
             if self._is_goal_continuation_event(pending_event):
+                from gateway.goal_continuation_claims import (
+                    clear_event_claim_identity,
+                    event_claim_identity,
+                    retire_claim,
+                )
+
+                identity = event_claim_identity(pending_event)
+                if identity is not None and removed == 0:
+                    try:
+                        retire_claim(
+                            session_key,
+                            identity[0],
+                            home=getattr(
+                                self, "_goal_continuation_claim_home", None
+                            ),
+                        )
+                    except Exception:
+                        raise RuntimeError(
+                            "durable goal continuation retirement is unavailable"
+                        ) from None
+                    clear_event_claim_identity(pending_event)
                 pending_slot.pop(session_key, None)
                 removed += 1
 
@@ -10079,6 +10465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     kept.append(queued_event)
             _q_state.conversation.queued_events = kept
+        self._stage_next_queued_event(session_key, adapter)
         return removed
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
@@ -11352,11 +11739,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if retry is not None and not retry.dropped:
             # The current adapter task still owns the claimed head. Preserve
             # every actual arrival behind it, then use that arrival as one wake.
+            if (
+                self._queue_depth(session_key, adapter=adapter)
+                >= self._BUSY_QUEUE_MAX_PENDING
+            ):
+                self._queue_or_replace_pending_event(
+                    session_key, event, merge_media=False
+                )
+                return True
+            if retry.claim_id:
+                try:
+                    from gateway.goal_continuation_claims import append_claim_event
+
+                    append_claim_event(
+                        session_key,
+                        retry.claim_id,
+                        event,
+                        home=getattr(self, "_goal_continuation_claim_home", None),
+                    )
+                except Exception:
+                    logger.warning(
+                        "goal continuation: durable successor publication failed for session %s",
+                        session_key,
+                    )
+                    self._restore_dequeued_event_front(
+                        session_key, adapter, retry.event
+                    )
+                    raise RuntimeError(
+                        "durable continuation successor publication failed"
+                    ) from None
             self._queue_or_replace_pending_event(
                 session_key, event, merge_media=False
             )
             retry.wake.set()
             return True
+
+        # Cancellation may restore a durable head to the adapter before the
+        # replacement owner task starts. Keep arrivals in that same claim so
+        # the short owner-gap cannot lose or overtake them on process death.
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        pending_head = (
+            pending_slot.get(session_key)
+            if isinstance(pending_slot, dict)
+            else None
+        )
+        pending_identity = None
+        try:
+            from gateway.goal_continuation_claims import (
+                append_claim_event,
+                event_claim_identity,
+            )
+
+            pending_identity = event_claim_identity(pending_head)
+            if pending_identity is not None:
+                if (
+                    self._queue_depth(session_key, adapter=adapter)
+                    >= self._BUSY_QUEUE_MAX_PENDING
+                ):
+                    self._queue_or_replace_pending_event(
+                        session_key, event, merge_media=False
+                    )
+                    return True
+                append_claim_event(
+                    session_key,
+                    pending_identity[0],
+                    event,
+                    home=getattr(self, "_goal_continuation_claim_home", None),
+                )
+                self._queue_or_replace_pending_event(
+                    session_key, event, merge_media=False
+                )
+                return True
+        except Exception:
+            logger.warning(
+                "goal continuation: owner-gap successor publication failed for session %s",
+                session_key,
+            )
+            if pending_identity is not None:
+                raise RuntimeError(
+                    "durable continuation successor publication failed"
+                ) from None
 
         queue_state = self._peek_session_state(session_key)
         if (
@@ -14657,6 +15119,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # a session whose final response was generated but never
         # confirmed-delivered has its answer in the ledger — redelivering it
         # is strictly cheaper and more correct than re-running the whole turn.
+        recovered_claims = self._recover_goal_continuation_claims()
+        if recovered_claims:
+            logger.info(
+                "Scheduled crash-safe recovery for %d goal continuation claim(s)",
+                recovered_claims,
+            )
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -18479,6 +18947,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Dropping inbound message because its explicit profile route "
                 "targets an unserved profile"
             )
+            self._retire_rejected_durable_claim_event(event)
             return None
 
         # Internal events (e.g. background-process completion notifications)
@@ -18502,13 +18971,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Dropping Slack message from configured ignored channel %s",
                 getattr(source, "chat_id", None),
             )
+            self._retire_rejected_durable_claim_event(event)
             return None
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
-            and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
+            # Queue every fresh arrival, including internal/plugin events.  A
+            # recovered durable head must be staged before any successor can
+            # dispatch; only events explicitly marked as restore replays may
+            # pass this gate.
             self._queue_startup_restore_event(event)
             return None
 
@@ -18554,10 +19027,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
                     )
+                    self._retire_rejected_durable_claim_event(event)
                     return None
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
+                        from gateway.goal_continuation_claims import (
+                            event_claim_identity,
+                        )
+
+                        if event_claim_identity(event) is not None:
+                            self._retire_rejected_durable_claim_event(event)
+                            return None
                         event = dataclasses.replace(event, text=_new_text)
                         source = event.source
                     break
@@ -18575,6 +19056,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized_for_source(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+                self._retire_rejected_durable_claim_event(event)
                 return None
         elif not self._is_user_authorized_for_source(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
@@ -18594,11 +19076,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Cannot offer pairing code on %s: no pairing store",
                         platform_name,
                     )
+                    self._retire_rejected_durable_claim_event(event)
                     return None
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
                 if pairing_store._is_rate_limited(platform_name, source.user_id):
+                    self._retire_rejected_durable_claim_event(event)
                     return None
                 code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
@@ -18632,6 +19116,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
+            self._retire_rejected_durable_claim_event(event)
             return None
 
         # Global emergency stop (`hermes pause`): give new turns a brief
@@ -18680,7 +19165,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             and _estop_state.persistent.update_prompt_pending
                         ):
                             _estop_allow = True
-                        if not _estop_allow and self._is_session_running(_estop_key):
+                        if (
+                            not _estop_allow
+                            and not self._is_goal_continuation_event(event)
+                            and self._is_session_running(_estop_key)
+                        ):
                             # Steering / interrupting in-flight work (which
                             # also covers pending clarify + tool approvals
                             # held by the running agent).
@@ -18703,6 +19192,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         getattr(getattr(source, "platform", None), "value", "unknown"),
                         getattr(source, "chat_id", None) or "unknown",
                     )
+                    self._retire_rejected_durable_claim_event(event)
                     return _paused_notice
 
         # Intercept messages that are responses to a pending /update prompt.
@@ -22801,6 +23291,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                claimed_event=event,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -29286,12 +29777,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return
-        self._drop_goal_continuation_retry(session_key)
+        retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
+        if retry is not None and not retry.dropped:
+            if not self._drop_goal_continuation_retry(session_key):
+                raise RuntimeError(
+                    "durable goal continuation retirement is unavailable"
+                )
         # Structural clear: every conversation-scoped field resets in one
         # call — no per-attribute pop-list to drift.
         state = self._peek_session_state(session_key)
         if state is not None:
+            from gateway.goal_continuation_claims import event_claim_identity
+
+            durable_successors = [
+                event
+                for event in state.conversation.queued_events
+                if event_claim_identity(event) is not None
+            ]
             state.conversation.clear()
+            state.conversation.queued_events.extend(durable_successors)
         # Legacy plain-dict stores still registered in
         # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
         # e.g. _pending_model_notes.  SessionState-backed names resolve to
@@ -30666,6 +31170,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        claimed_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -30677,31 +31182,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         change for single-profile gateways.
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                inbound_message_id=inbound_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=message_type,
-            )
+            try:
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    inbound_message_id=inbound_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=message_type,
+                    claimed_event=claimed_event,
+                )
+            except BaseException:
+                self._restore_unacknowledged_goal_continuation_claim_event(
+                    session_key, source, claimed_event
+                )
+                raise
 
         profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                inbound_message_id=inbound_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=message_type,
+        try:
+            with _profile_runtime_scope(profile_home):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    inbound_message_id=inbound_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=message_type,
+                    claimed_event=claimed_event,
+                )
+        except BaseException:
+            self._restore_unacknowledged_goal_continuation_claim_event(
+                session_key, source, claimed_event
             )
+            raise
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -30845,6 +31364,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        claimed_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -30860,7 +31380,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            result = await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
                 history=history,
@@ -30870,6 +31390,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+            if claimed_event is not None and session_key:
+                self._complete_goal_continuation_claim_event(
+                    session_key, self._adapter_for_source(source), claimed_event
+                )
+            return result
 
         from run_agent import AIAgent
         import queue
@@ -32099,7 +32624,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
                     if callable(_mark_turn):
                         _mark_turn(session_key, run_generation)
-            
+
+            if claimed_event is not None and session_key:
+                if not self._complete_goal_continuation_claim_event(
+                    session_key, adapter, claimed_event
+                ):
+                    return result
+
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
@@ -32420,7 +32951,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             self._finish_goal_continuation_retry(session_key, retry)
                             goal_retry_handoff_event = None
                             return result
-                        self._finish_goal_continuation_retry(session_key, retry)
+                        if not retry.claim_id:
+                            self._finish_goal_continuation_retry(session_key, retry)
                     goal_retry_handoff_event = None
 
                 followup_result = await self._run_agent(
@@ -32435,6 +32967,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    claimed_event=pending_event,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

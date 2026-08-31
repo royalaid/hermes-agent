@@ -115,6 +115,16 @@ def flush_pending_to_file(
         if value is None:
             continue
         try:
+            # A goal-continuation claim owns this exact event in its typed,
+            # versioned FIFO.  Re-spooling it as an untyped pending message
+            # would duplicate or downgrade it on graceful restart.
+            try:
+                from gateway.goal_continuation_claims import event_claim_identity
+
+                if event_claim_identity(value) is not None:
+                    continue
+            except (ImportError, TypeError):
+                pass
             serialised = _serialise_value(value)
             if serialised is None:
                 continue
