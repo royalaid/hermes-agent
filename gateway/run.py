@@ -2660,6 +2660,40 @@ def _durable_delivery_text_for_response(response: str, adapter: Any) -> str:
     return text_content.strip()
 
 
+@dataclasses.dataclass(frozen=True)
+class _ClaimedResponsePartsSnapshot:
+    """One bounded parse of every queued claimed-result publication part."""
+
+    visible_text: str
+    images: Tuple[Tuple[str, str], ...]
+    media_files: Tuple[Tuple[str, bool], ...]
+    local_files: Tuple[str, ...]
+    force_document_attachments: bool
+
+
+def _snapshot_queued_claimed_response_parts(
+    response: str,
+    adapter: Any,
+) -> _ClaimedResponsePartsSnapshot:
+    """Derive visible text and attachment intents from one parse snapshot."""
+    from gateway.platforms.base import _strip_media_directives
+
+    media_files, cleaned = adapter.extract_media(response)
+    images, text_content = adapter.extract_images(cleaned)
+    text_content = _strip_media_directives(text_content).strip()
+    local_files, text_content = adapter.extract_local_files(
+        text_content,
+        include_unavailable=True,
+    )
+    return _ClaimedResponsePartsSnapshot(
+        visible_text=text_content.strip(),
+        images=tuple(images),
+        media_files=tuple(media_files),
+        local_files=tuple(local_files),
+        force_document_attachments="[[as_document]]" in response,
+    )
+
+
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
     """Derive ``(slug, declared_name)`` from a SKILL.md; ``(None, None)`` if unreadable or no ``name:``.
     Matches ``scan_skill_commands``: the slug comes from frontmatter ``name:``, NOT the directory."""
