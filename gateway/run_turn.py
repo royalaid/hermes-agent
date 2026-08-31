@@ -2962,6 +2962,7 @@ class GatewayTurnMixin:
             if (
                 durable_claimed_event
                 and session_key
+                and event_claim_identity(claimed_event) is not None
                 and "_delivery_obligation_id" not in result
             ):
                 await self._commit_goal_continuation_result(
