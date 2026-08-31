@@ -3,11 +3,26 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { ReadableAtom } from 'nanostores'
 import type * as React from 'react'
-import { memo, startTransition, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import {
+  memo,
+  startTransition,
+  Suspense,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 import { useLocation } from 'react-router'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
-import { sessionShouldHaveTranscript } from '@/app/session/hooks/use-session-actions/utils'
+import {
+  adoptLatestDuplicatePersistedRows,
+  preserveLoadedHistoryThroughCompaction,
+  sessionShouldHaveTranscript
+} from '@/app/session/hooks/use-session-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
 import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
 import { Backdrop } from '@/components/Backdrop'
@@ -20,7 +35,7 @@ import { ErrorState } from '@/components/ui/error-state'
 import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import { type HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { ChatMessage } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
@@ -187,12 +202,18 @@ interface ChatRuntimeBoundaryProps {
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
+  /** Stable lineage identity; runtime and stored tip ids can rotate during compaction. */
+  sessionKey?: string | null
   /** Route points at an unloaded session — render empty until resume swaps in
    *  the new transcript, so the previous session's messages don't linger. */
   suppressMessages: boolean
 }
 
 const NO_MESSAGES: ChatMessage[] = []
+
+function transcriptLogicalIdentity(message: ChatMessage): string {
+  return JSON.stringify([message.role, message.timestamp, chatMessageText(message), message.attachmentRefs ?? []])
+}
 
 /**
  * The view's $messages, live only while this surface is the VISIBLE tab.
@@ -262,23 +283,76 @@ function ChatRuntimeBoundary({
   onEdit,
   onReload,
   onThreadMessagesChange,
+  sessionKey,
   suppressMessages
 }: ChatRuntimeBoundaryProps) {
   const view = useSessionView()
   const runtimeId = useStore(view.$runtimeId)
   const storeMessages = useMessagesWhileVisible(view.$messages)
-  const messages = suppressMessages ? NO_MESSAGES : storeMessages
-
-  const [windowPages, setWindowPages] = useState(1)
-  const [windowSessionKey, setWindowSessionKey] = useState(runtimeId)
+  const transcriptIdentityKey = sessionKey ?? runtimeId
+  const incomingMessages = suppressMessages ? NO_MESSAGES : storeMessages
+  const deduplicatedIncomingMessages = adoptLatestDuplicatePersistedRows(incomingMessages)
   // Sticky-cut continuity across flushes (advanceTranscriptWindow). A ref, not
   // state: it is derived from `messages` and must never trigger a render.
   const windowStateRef = useRef<null | TranscriptWindowState>(null)
+  const compactionWindowFloorRef = useRef<string | null>(null)
+  const transcriptMessagesRef = useRef({
+    key: transcriptIdentityKey,
+    messages: deduplicatedIncomingMessages,
+    source: incomingMessages
+  })
+
+  if (transcriptMessagesRef.current.key !== transcriptIdentityKey || suppressMessages) {
+    transcriptMessagesRef.current = {
+      key: transcriptIdentityKey,
+      messages: deduplicatedIncomingMessages,
+      source: incomingMessages
+    }
+  } else if (transcriptMessagesRef.current.source !== incomingMessages) {
+    const previousWindowFirst = windowStateRef.current?.window.messages[0]
+    const previousMessages = transcriptMessagesRef.current.messages
+    const stableIncomingMessages = adoptLatestDuplicatePersistedRows(deduplicatedIncomingMessages, previousMessages)
+    const reconciled = preserveLoadedHistoryThroughCompaction(stableIncomingMessages, previousMessages)
+
+    if (reconciled !== stableIncomingMessages && previousWindowFirst) {
+      // The copied active rows can push a previously uncut window over its
+      // hysteresis threshold. Remember the first row the user had materialized
+      // and grow by bounded pages until that same logical row is present again.
+      compactionWindowFloorRef.current = transcriptLogicalIdentity(previousWindowFirst)
+    }
+
+    transcriptMessagesRef.current = {
+      key: transcriptIdentityKey,
+      messages: reconciled,
+      source: incomingMessages
+    }
+  }
+
+  const messages = transcriptMessagesRef.current.messages
+  const repairCompactedStore =
+    !suppressMessages && transcriptMessagesRef.current.source === storeMessages && messages !== storeMessages
+
+  useEffect(() => {
+    if (!repairCompactedStore || !runtimeId) {
+      return
+    }
+
+    const delegate = sessionTileDelegate()
+
+    if (!delegate || view.$runtimeId.get() !== runtimeId || view.$messages.get() !== storeMessages) {
+      return
+    }
+
+    delegate.updateSession(runtimeId, state => (state.messages === storeMessages ? { ...state, messages } : state))
+  }, [messages, repairCompactedStore, runtimeId, storeMessages, view])
+
+  const [windowPages, setWindowPages] = useState(1)
+  const [windowSessionKey, setWindowSessionKey] = useState(transcriptIdentityKey)
 
   // Reset the window on session swap during RENDER, so a large expand from the
   // previous chat can't leak into the next one's first paint (#55191).
-  if (windowSessionKey !== runtimeId) {
-    setWindowSessionKey(runtimeId)
+  if (windowSessionKey !== transcriptIdentityKey) {
+    setWindowSessionKey(transcriptIdentityKey)
     setWindowPages(1)
     windowStateRef.current = null
   }
@@ -290,6 +364,24 @@ function ChatRuntimeBoundary({
 
     return next.window
   }, [messages, windowPages])
+
+  const compactionWindowFloor = compactionWindowFloorRef.current
+  const compactionWindowFloorPresent =
+    compactionWindowFloor === null ||
+    windowedMessages.some(message => transcriptLogicalIdentity(message) === compactionWindowFloor)
+
+  useLayoutEffect(() => {
+    if (compactionWindowFloor === null) {
+      return
+    }
+
+    if (!compactionWindowFloorPresent && windowed) {
+      setWindowPages(pages => pages + 1)
+      return
+    }
+
+    compactionWindowFloorRef.current = null
+  }, [compactionWindowFloor, compactionWindowFloorPresent, windowed])
 
   const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages)
 
@@ -562,7 +654,8 @@ const ChatViewContent = memo(function ChatViewContent({
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
   const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
-  const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
+  const threadKey =
+    queueSessionKey || selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
     queryKey: modelOptionsQueryKey(activeGatewayProfile, activeSessionId),
@@ -676,6 +769,7 @@ const ChatViewContent = memo(function ChatViewContent({
         onEdit={onEdit}
         onReload={onReload}
         onThreadMessagesChange={onThreadMessagesChange}
+        sessionKey={threadKey}
         suppressMessages={routeSessionMismatch}
       >
         <div

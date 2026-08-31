@@ -41,6 +41,10 @@ export type MessageGroup = { id: string; weight: number } & (
   { index: number; kind: 'standalone' } | { indices: number[]; kind: 'turn' }
 )
 
+type RenderMessageGroup =
+  | (Extract<MessageGroup, { kind: 'standalone' }> & { messageId: string })
+  | (Extract<MessageGroup, { kind: 'turn' }> & { messageIds: string[] })
+
 // DOM is bounded by a render-cost budget, not a message/turn count. The
 // currency is `messagePaintWeight`: what a turn actually MOUNTS, which is what
 // the grouping decides rather than what the payload weighs. A settled run of
@@ -210,7 +214,12 @@ export function buildGroups(signature: string): MessageGroup[] {
     const message = messages[i]
 
     if (message.role !== 'user') {
-      groups.push({ id: message.id, index: message.index, kind: 'standalone', weight: message.weight })
+      groups.push({
+        id: message.id,
+        index: message.index,
+        kind: 'standalone',
+        weight: message.weight
+      })
 
       continue
     }
@@ -227,6 +236,28 @@ export function buildGroups(signature: string): MessageGroup[] {
   }
 
   return groups
+}
+
+function buildRenderGroups(signature: string): RenderMessageGroup[] {
+  const messageIdsByIndex = new Map(
+    signature.split('\n').map(row => {
+      const [index, id] = row.split(':')
+
+      return [Number(index), id] as const
+    })
+  )
+
+  return buildGroups(signature).map(group =>
+    group.kind === 'turn'
+      ? {
+          ...group,
+          messageIds: group.indices.map(index => messageIdsByIndex.get(index)!)
+        }
+      : {
+          ...group,
+          messageId: messageIdsByIndex.get(group.index)!
+        }
+  )
 }
 
 // Walk turns newest-first, summing their render weights until the budget is met;
@@ -318,7 +349,7 @@ export function liveTailStart(
 
 interface TurnRowProps {
   components: ThreadMessageComponents
-  group: MessageGroup
+  group: RenderMessageGroup
   resetKey: string
   virtualized: boolean
 }
@@ -359,12 +390,12 @@ const TurnRow = memo(function TurnRow({ components, group, resetKey, virtualized
             className="composer-human-ai-pair-container relative flex min-w-0 flex-col gap-(--conversation-turn-gap)"
             data-slot="aui_turn-pair"
           >
-            {group.indices.map(index => (
-              <ThreadPrimitive.MessageByIndex components={components} index={index} key={index} />
+            {group.messageIds.map(messageId => (
+              <ThreadPrimitive.Unstable_MessageById components={components} key={messageId} messageId={messageId} />
             ))}
           </div>
         ) : (
-          <ThreadPrimitive.MessageByIndex components={components} index={group.index} />
+          <ThreadPrimitive.Unstable_MessageById components={components} messageId={group.messageId} />
         )}
       </MessageRenderBoundary>
     </div>
@@ -398,7 +429,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // Row structure is memoized on the STRUCTURAL signature only, so streaming
   // part-appends can't churn group identity (that would defeat the rows memo
   // below on every tick). Weights are folded in separately for the budget.
-  const groups = useMemo(() => buildGroups(structuralSignature), [structuralSignature])
+  const groups = useMemo(() => buildRenderGroups(structuralSignature), [structuralSignature])
   const renderEmpty = groups.length === 0 && Boolean(emptyPlaceholder)
 
   // use-stick-to-bottom owns scrollTop (single writer): follow while locked,
@@ -436,16 +467,18 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // renders — so the heavy commit never happens.
   //
   // Two triggers, because the transcript swap arrives differently per path:
-  // a WARM switch publishes sessionKey + messages in one commit (the key
-  // branch), while a COLD switch changes sessionKey with an empty transcript
-  // and the prefetched messages land hundreds of ms later under the SAME key
-  // (the empty→non-empty branch).
+  // a WARM switch publishes identity + messages in one commit (the identity
+  // branch), while a COLD switch changes identity with an empty transcript and
+  // the prefetched messages land hundreds of ms later under the SAME identity
+  // (the empty→non-empty branch). Callers provide the lineage-root key so
+  // auto-compaction can rotate stored and runtime tip ids without resetting.
   const hasGroups = groups.length > 0
-  const [budgetSessionKey, setBudgetSessionKey] = useState(sessionKey)
+  const transcriptIdentityKey = sessionKey
+  const [budgetSessionKey, setBudgetSessionKey] = useState(transcriptIdentityKey)
   const [hadGroups, setHadGroups] = useState(hasGroups)
 
-  if (budgetSessionKey !== sessionKey) {
-    setBudgetSessionKey(sessionKey)
+  if (budgetSessionKey !== transcriptIdentityKey) {
+    setBudgetSessionKey(transcriptIdentityKey)
     setHadGroups(hasGroups)
     setRenderBudget(FIRST_PAINT_BUDGET)
   } else if (shouldClampTranscriptBudget(paneLifecycle === 'hot-hidden', renderBudget, paneBudget)) {
@@ -462,24 +495,55 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   // Where to land after a prepend, in distance-from-bottom (survives the
   // height change). Shared by "Show earlier" and the budget backfill below.
-  const restoreFromBottomRef = useRef<number | null>(null)
+  const restoreFromBottomRef = useRef<null | {
+    distanceFromBottom: number
+    groupsLength: number
+    renderBudget: number
+    trigger: 'groups' | 'render-budget'
+  }>(null)
+  const stopAnchorSettlingRef = useRef<null | (() => void)>(null)
+  const readerGeometryRef = useRef<null | {
+    distanceFromBottom: number
+    groupIds: string[]
+    groupsLength: number
+    key: string | null | undefined
+    olderAvailable: boolean
+  }>(null)
+  const readerScrollTimerRef = useRef(0)
+  const readerIntentAnchorTimerRef = useRef(0)
+  const automaticScrollTopRef = useRef<number | null>(null)
   // False from a session switch until the settle loop below parks the
   // transcript at its true bottom. While false, scrollTop is a way-point of a
   // load in progress, not a reading position anyone chose — never anchor to it.
   const loadSettledRef = useRef(false)
   // Session the settle loop last armed for, so a re-arm within the same load
   // is distinguishable from a switch to a different transcript.
-  const settleKeyRef = useRef(sessionKey)
+  const settleKeyRef = useRef(transcriptIdentityKey)
+
+  const writeAutomaticScrollTop = useCallback((node: HTMLElement, scrollTop: number) => {
+    window.clearTimeout(readerIntentAnchorTimerRef.current)
+    node.removeAttribute('data-reader-intent')
+    node.scrollTop = scrollTop
+    automaticScrollTopRef.current = node.scrollTop
+  }, [])
 
   // Record where the view should land once a prepend has grown the content,
   // measured from the BOTTOM so the added height doesn't invalidate it. Only a
   // settled load has an offset the user chose; mid-load the answer is simply
   // the bottom.
-  const anchorBeforePrepend = useCallback(() => {
-    const el = scrollRef.current
+  const anchorBeforePrepend = useCallback(
+    (trigger: 'groups' | 'render-budget' = 'render-budget') => {
+      const el = scrollRef.current
 
-    restoreFromBottomRef.current = el && loadSettledRef.current ? el.scrollHeight - el.scrollTop : 0
-  }, [scrollRef])
+      restoreFromBottomRef.current = {
+        distanceFromBottom: el && loadSettledRef.current ? el.scrollHeight - el.scrollTop : 0,
+        groupsLength: groups.length,
+        renderBudget,
+        trigger
+      }
+    },
+    [groups.length, renderBudget, scrollRef]
+  )
 
   // Backfill from FIRST_PAINT_BUDGET to the full budget after the small
   // commit painted — as a TRANSITION, so the heavy markdown + syntax
@@ -508,7 +572,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       // stranded near the TOP until use-stick-to-bottom's ResizeObserver
       // catches up a frame or two later (measured: an 11.5k px jump showing
       // ~160ms of unrelated old turns, on every session load).
-      anchorBeforePrepend()
+      anchorBeforePrepend('render-budget')
 
       // Functional max, not a plain set: an urgent "Show earlier" click can
       // land between scheduling and committing this transition, and a plain
@@ -641,14 +705,14 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useAuiEvent('thread.runStart', () => void scrollToBottom())
 
   // Reset the cap and pin to bottom on mount + every session switch (messages
-  // swap in place on a long-lived runtime, so sessionKey is the only signal).
+  // swap in place on a long-lived runtime, so transcriptIdentityKey is the signal).
   // The swap is multi-step and lays out over many frames; letting the library
   // follow re-pins every frame to a moving target — visible as ~10 scroll jumps.
   // Instead: quiet it, glue to the true bottom until the height holds steady,
   // then hand back locked. Live streaming afterward uses the normal resize follow.
   //
-  // `hasGroups` joins sessionKey as a dep because a COLD load changes the key
-  // while the transcript is still empty and publishes messages hundreds of ms
+  // `hasGroups` joins transcriptIdentityKey as a dep because a COLD load changes
+  // the identity while the transcript is still empty and publishes messages
   // later. Keyed on the switch alone the loop measured an EMPTY viewport, saw
   // a stable height in two frames, and handed back "settled" before the
   // transcript existed — so the turns painted at scrollTop 0 and only snapped
@@ -664,14 +728,14 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     }
 
     stopScroll()
-    el.scrollTop = el.scrollHeight
+    writeAutomaticScrollTop(el, el.scrollHeight)
     loadSettledRef.current = false
 
     // An anchor captured for the OUTGOING transcript must not be applied to
     // this one — a switch owns the position outright. The empty→non-empty
     // re-arm is the SAME load, whose in-flight anchor is still correct.
-    if (settleKeyRef.current !== sessionKey) {
-      settleKeyRef.current = sessionKey
+    if (settleKeyRef.current !== transcriptIdentityKey) {
+      settleKeyRef.current = transcriptIdentityKey
       restoreFromBottomRef.current = null
     }
 
@@ -690,7 +754,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
       stableFrames = height === lastHeight ? stableFrames + 1 : 0
       lastHeight = height
-      node.scrollTop = height
+      writeAutomaticScrollTop(node, height)
 
       // Most session switches are synchronous and stabilize within 2 frames;
       // the old 90-frame ceiling was for slow async image loads. Cap at 15
@@ -708,7 +772,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     let rafId = requestAnimationFrame(settle)
 
     return () => cancelAnimationFrame(rafId)
-  }, [hasGroups, scrollRef, scrollToBottom, sessionKey, stopScroll])
+  }, [hasGroups, scrollRef, scrollToBottom, stopScroll, transcriptIdentityKey, writeAutomaticScrollTop])
 
   // Prepend an older page while preserving the on-screen position. The user is
   // scrolled up (reading history) so the stick-to-bottom lock is escaped and
@@ -722,7 +786,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       return
     }
 
-    anchorBeforePrepend()
+    anchorBeforePrepend(action === 'window' ? 'groups' : 'render-budget')
     // Both paths grow the DOM budget by one pane page. Windowed rows are older
     // than the current page, so expand-without-grow paints nothing.
     setRenderBudget(budget => budget + paneBudget)
@@ -735,12 +799,236 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useLayoutEffect(() => {
     const el = scrollRef.current
 
-    if (el && restoreFromBottomRef.current != null) {
-      el.scrollTop = el.scrollHeight - restoreFromBottomRef.current
+    if (!el) {
+      return
+    }
+
+    const persistReaderGeometry = () => {
+      const current = readerGeometryRef.current
+
+      if (
+        !current ||
+        current.key !== transcriptIdentityKey ||
+        !loadSettledRef.current ||
+        stopAnchorSettlingRef.current
+      ) {
+        return
+      }
+
+      readerGeometryRef.current = {
+        ...current,
+        distanceFromBottom: el.scrollHeight - el.scrollTop
+      }
+    }
+
+    const beginReaderIntent = () => {
+      // Switch native anchoring on before the browser applies wheel/default
+      // scrolling. Off-screen content-visibility rows can resolve a different
+      // intrinsic height in that same layout pass; while following still says
+      // true, overflow-anchor:none would let the new bottom clamp consume the
+      // reader's movement before React can publish data-following=false.
+      el.setAttribute('data-reader-intent', 'true')
+      window.clearTimeout(readerIntentAnchorTimerRef.current)
+      readerIntentAnchorTimerRef.current = window.setTimeout(() => {
+        el.removeAttribute('data-reader-intent')
+      }, 2_000)
+      automaticScrollTopRef.current = null
+      window.clearTimeout(readerScrollTimerRef.current)
       restoreFromBottomRef.current = null
+      stopAnchorSettlingRef.current?.()
+      persistReaderGeometry()
+    }
+
+    const recordReaderGeometry = () => {
+      const automaticScrollTop = automaticScrollTopRef.current
+
+      automaticScrollTopRef.current = null
+      if (automaticScrollTop !== null && Math.abs(el.scrollTop - automaticScrollTop) <= 1) {
+        return
+      }
+
+      persistReaderGeometry()
+      window.clearTimeout(readerScrollTimerRef.current)
+      readerScrollTimerRef.current = window.setTimeout(persistReaderGeometry, 80)
+    }
+
+    const recordKeyboardIntent = (event: KeyboardEvent) => {
+      // Keyboard ownership follows focus. Descendant controls keep their own
+      // Space, navigation, caret, and activation semantics; only a key event
+      // targeted at the focusable transcript viewport is reader intent.
+      if (event.target !== el) {
+        return
+      }
+      if (['ArrowDown', 'ArrowUp', 'End', 'Home', 'PageDown', 'PageUp', ' '].includes(event.key)) {
+        beginReaderIntent()
+        if (event.key === ' ') {
+          // Chromium scrolls the document, not this nested transcript, for
+          // Space even when the transcript owns focus. Preserve the standard
+          // Space / Shift+Space paging contract at the keyboard-owned surface.
+          event.preventDefault()
+          el.scrollBy({
+            behavior: 'auto',
+            top: (event.shiftKey ? -1 : 1) * el.clientHeight
+          })
+        }
+      }
+    }
+
+    el.addEventListener('keydown', recordKeyboardIntent)
+    el.addEventListener('pointerdown', beginReaderIntent)
+    el.addEventListener('scroll', recordReaderGeometry, { passive: true })
+    el.addEventListener('touchstart', beginReaderIntent, { passive: true })
+    el.addEventListener('wheel', beginReaderIntent, { passive: true })
+
+    return () => {
+      window.clearTimeout(readerIntentAnchorTimerRef.current)
+      window.clearTimeout(readerScrollTimerRef.current)
+      el.removeAttribute('data-reader-intent')
+      el.removeEventListener('keydown', recordKeyboardIntent)
+      el.removeEventListener('pointerdown', beginReaderIntent)
+      el.removeEventListener('scroll', recordReaderGeometry)
+      el.removeEventListener('touchstart', beginReaderIntent)
+      el.removeEventListener('wheel', beginReaderIntent)
+    }
+  }, [scrollRef, transcriptIdentityKey])
+
+  useLayoutEffect(() => {
+    if (!isAtBottom) {
+      window.clearTimeout(readerIntentAnchorTimerRef.current)
+      scrollRef.current?.removeAttribute('data-reader-intent')
+    }
+  }, [isAtBottom, scrollRef])
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    const anchor = restoreFromBottomRef.current
+    const reachedPrependCommit =
+      anchor &&
+      (anchor.trigger === 'groups' ? groups.length !== anchor.groupsLength : renderBudget !== anchor.renderBudget)
+    const previousGeometry = readerGeometryRef.current
+    const currentGroupIndex = new Map(groups.map((group, index) => [group.id, index]))
+    const firstRetainedGroup = previousGeometry?.groupIds
+      .map((id, index) => ({ index, nextIndex: currentGroupIndex.get(id) }))
+      .find(candidate => candidate.nextIndex !== undefined)
+    const prefixInserted =
+      previousGeometry !== null &&
+      groups.length > previousGeometry.groupsLength &&
+      firstRetainedGroup?.nextIndex !== undefined &&
+      firstRetainedGroup.nextIndex > firstRetainedGroup.index
+    const paginationBoundaryRetired = previousGeometry?.olderAvailable === true && !olderAvailable
+    const automaticAnchorDistance =
+      !anchor &&
+      previousGeometry !== null &&
+      loadSettledRef.current &&
+      previousGeometry.key === transcriptIdentityKey &&
+      (prefixInserted || paginationBoundaryRetired)
+        ? previousGeometry.distanceFromBottom
+        : null
+    const distanceFromBottom = reachedPrependCommit ? anchor.distanceFromBottom : automaticAnchorDistance
+
+    if (el && distanceFromBottom !== null) {
+      stopAnchorSettlingRef.current?.()
+      if (distanceFromBottom > el.clientHeight + 1) {
+        stopScroll()
+      }
+      writeAutomaticScrollTop(el, el.scrollHeight - distanceFromBottom)
+      if (reachedPrependCommit) {
+        restoreFromBottomRef.current = null
+      }
+
+      // content-visibility can replace off-screen intrinsic placeholders over
+      // delayed layout passes after the prepend commit. Observe the content's
+      // real geometry instead of guessing a frame count; re-apply after each
+      // resize, but bound the observer and stop immediately on user/foreign
+      // scrolling or transcript replacement.
+      const restoreKey = transcriptIdentityKey
+      let lastAppliedScrollTop = el.scrollTop
+      let applyingAnchor = false
+      let frameId = 0
+      let observer: ResizeObserver | null = null
+      let timeoutId = 0
+      let stopped = false
+
+      const stopSettling = () => {
+        if (stopped) {
+          return
+        }
+        stopped = true
+        cancelAnimationFrame(frameId)
+        observer?.disconnect()
+        window.clearTimeout(timeoutId)
+        el.removeEventListener('scroll', onScroll)
+        el.removeEventListener('pointerdown', stopSettling)
+        el.removeEventListener('touchstart', stopSettling)
+        el.removeEventListener('wheel', stopSettling)
+        if (stopAnchorSettlingRef.current === stopSettling) {
+          stopAnchorSettlingRef.current = null
+        }
+      }
+
+      const onScroll = () => {
+        if (!applyingAnchor && Math.abs(el.scrollTop - lastAppliedScrollTop) > 1) {
+          stopSettling()
+        }
+      }
+
+      const settleAnchor = () => {
+        const node = scrollRef.current
+
+        if (!node || stopped || settleKeyRef.current !== restoreKey) {
+          stopSettling()
+          return
+        }
+
+        applyingAnchor = true
+        writeAutomaticScrollTop(node, node.scrollHeight - distanceFromBottom)
+        lastAppliedScrollTop = node.scrollTop
+        requestAnimationFrame(() => {
+          applyingAnchor = false
+        })
+      }
+
+      observer = new ResizeObserver(() => {
+        cancelAnimationFrame(frameId)
+        settleAnchor()
+      })
+      const content = contentRef.current
+      if (content) {
+        observer.observe(content)
+      }
+      el.addEventListener('scroll', onScroll)
+      el.addEventListener('pointerdown', stopSettling)
+      el.addEventListener('touchstart', stopSettling, { passive: true })
+      el.addEventListener('wheel', stopSettling, { passive: true })
+      frameId = requestAnimationFrame(settleAnchor)
+      timeoutId = window.setTimeout(stopSettling, 2_000)
+      stopAnchorSettlingRef.current = stopSettling
+    }
+
+    if (el) {
+      readerGeometryRef.current = {
+        distanceFromBottom: el.scrollHeight - el.scrollTop,
+        groupIds: groups.slice(0, 8).map(group => group.id),
+        groupsLength: groups.length,
+        key: transcriptIdentityKey,
+        olderAvailable
+      }
     }
     // renderBudget covers DOM pages; groups.length covers store-window expands.
-  }, [scrollRef, renderBudget, groups.length])
+  }, [
+    contentRef,
+    groups,
+    olderAvailable,
+    renderBudget,
+    scrollRef,
+    stopScroll,
+    transcriptIdentityKey,
+    writeAutomaticScrollTop
+  ])
+
+  // The settle observer intentionally survives the asynchronous groups-length
+  // commit above; only a transcript replacement or unmount owns cancellation.
+  useEffect(() => () => stopAnchorSettlingRef.current?.(), [transcriptIdentityKey])
 
   // The row array is memoized on the inputs the rows actually read. This
   // component re-renders on every isAtBottom flip — and use-stick-to-bottom
@@ -790,6 +1078,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         data-following={isAtBottom ? 'true' : 'false'}
         data-slot="aui_thread-viewport"
         ref={scrollRef as React.RefCallback<HTMLDivElement>}
+        tabIndex={0}
       >
         {renderEmpty ? (
           <div
