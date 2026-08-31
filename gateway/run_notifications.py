@@ -303,6 +303,7 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         delivery_obligation_id: Optional[str] = None,
+        attachment_snapshot: Optional[Any] = None,
     ) -> None:
         """Deliver a queued response using its existing publication ownership."""
         from gateway.run import (
@@ -317,9 +318,10 @@ class GatewayNotificationsMixin:
                 getattr(source, "session_key", "")
                 or self._session_key_for_source(source)
             )
+            snapshot = attachment_snapshot or _snapshot_queued_claimed_response_parts(
+                response, adapter)
+            visible_text = snapshot.visible_text
             if deliver_media:
-                snapshot = _snapshot_queued_claimed_response_parts(response, adapter)
-                visible_text = snapshot.visible_text
                 media_files = snapshot.media_files
                 images = snapshot.images
                 local_files = snapshot.local_files

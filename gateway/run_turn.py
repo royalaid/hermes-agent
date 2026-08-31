@@ -3502,6 +3502,11 @@ class GatewayTurnMixin:
                     text_already_delivered=_already_streamed,
                     deliver_media=not _delivery_result.get("failed"), stream_consumer=_sc,
                     delivery_obligation_id=_owned_delivery_id,
+                    attachment_snapshot=getattr(
+                        claimed_event,
+                        "_hermes_claimed_response_parts_snapshot",
+                        None,
+                    ),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)

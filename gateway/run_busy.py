@@ -433,7 +433,7 @@ class GatewayBusySessionMixin:
         from gateway import delivery_ledger
         from gateway.run import (
             GoalContinuationPublicationError,
-            _durable_delivery_text_for_response,
+            _snapshot_queued_claimed_response_parts,
         )
         from gateway.goal_continuation_claims import (
             event_claim_identity,
@@ -448,7 +448,9 @@ class GatewayBusySessionMixin:
         profile = getattr(adapter, "_owner_profile", None) or source.profile
         claim_home = getattr(self, "_goal_continuation_claim_home", None)
         try:
-            delivery_text = _durable_delivery_text_for_response(content, adapter)
+            attachment_snapshot = _snapshot_queued_claimed_response_parts(
+                content, adapter)
+            delivery_text = attachment_snapshot.visible_text
             source_payload = source.to_dict()
             source_payload["is_bot"] = bool(source.is_bot)
             source_payload["role_authorized"] = False
@@ -494,6 +496,11 @@ class GatewayBusySessionMixin:
 
         setattr(event, "_hermes_delivery_obligation_id", obligation_id)
         result["_delivery_obligation_id"] = obligation_id
+        setattr(
+            event,
+            "_hermes_claimed_response_parts_snapshot",
+            attachment_snapshot,
+        )
         if not self._complete_goal_continuation_claim_event(
             session_key, adapter, event
         ):
