@@ -419,41 +419,45 @@ class GatewayStartupMixin:
             return None
         wake = wakes[key] = asyncio.Event()
 
-        async def _redeliver_after_wait():
-            try:
-                while getattr(self, "_running", False):
-                    wake.clear()
-                    waiting = await asyncio.to_thread(pending_flood_retries)
-                    deadlines = [r["not_before"] for r in waiting
-                                 if (r["platform"], r["profile"]) == key]
-                    if not deadlines:
-                        if wake.is_set():
-                            continue
-                        return
-                    delay = flood_retry_delay(min(deadlines) - time.time())
-                    try:
-                        await asyncio.wait_for(wake.wait(), timeout=delay)
-                        continue  # A shorter sibling may now be due first.
-                    except asyncio.TimeoutError:
-                        pass
-                    if getattr(self, "_running", False):
-                        await self._redeliver_failed_obligations_for_platform(target, profile=profile)
-            finally:
-                pending.pop(key, None)
-                wakes.pop(key, None)
-
-        task = asyncio.create_task(_redeliver_after_wait(), name="flood-redelivery:%s:%s" % key)
-        pending[key] = task
-        # The gateway's ordinary shutdown drain must cancel sleeping timers too.
-        background = getattr(self, "_background_tasks", None)
-        if background is not None:
-            self._track_task_in(background, task)
-
-    async def _arm_flood_timers_for_waiting_rows(self) -> None:
-        """Recover adopted, newly refused and unsent released rows without blocking the loop."""
-        from gateway.delivery_ledger import pending_flood_retries
-        for row in await asyncio.to_thread(pending_flood_retries):
-            self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
+        source_payload = json.loads(row["source_json"])
+        if not isinstance(source_payload, dict):
+            raise ValueError("invalid claimed-result replay source")
+        source_data = dict(source_payload)
+        is_bot = source_data.pop("is_bot", False)
+        role_authorized = source_data.pop("role_authorized", False)
+        if not isinstance(is_bot, bool) or role_authorized is not False:
+            raise ValueError("invalid claimed-result replay trust state")
+        source = SessionSource.from_dict(source_data)
+        source.is_bot = is_bot
+        source.role_authorized = False
+        if (
+            source.platform.value != row["platform"]
+            or str(source.chat_id) != str(row["chat_id"])
+            or (str(source.thread_id) if source.thread_id else None)
+            != (str(row["thread_id"]) if row.get("thread_id") else None)
+            or (source.profile or "default") != (row.get("profile") or "default")
+        ):
+            raise ValueError("claimed-result replay route mismatch")
+        raw_content = row.get("raw_content")
+        if not isinstance(raw_content, str):
+            raise ValueError("claimed-result replay payload is unavailable")
+        event = MessageEvent(
+            text="",
+            source=source,
+            message_id=row.get("message_ref"),
+            internal=True,
+            allow_gateway_control=False,
+            goal_continuation=True,
+        )
+        setattr(event, "_hermes_precomputed_response", raw_content)
+        if row.get("needs_marker"):
+            setattr(
+                event,
+                "_hermes_recovery_marker",
+                row.get("marker", RECOVERED_MARKER),
+            )
+        setattr(event, "_hermes_precomputed_obligation_id", row["obligation_id"])
+        return event
 
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
