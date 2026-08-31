@@ -5470,7 +5470,11 @@ class BasePlatformAdapter(ABC):
         return cleaned.rstrip()
 
     @staticmethod
-    def extract_local_files(content: str) -> Tuple[List[str], str]:
+    def extract_local_files(
+        content: str,
+        *,
+        include_unavailable: bool = False,
+    ) -> Tuple[List[str], str]:
         """
         Detect bare local file paths in response text for native delivery.
 
@@ -5489,6 +5493,12 @@ class BasePlatformAdapter(ABC):
 
         Paths inside fenced code blocks (``` ... ```) and inline code
         (`...`) are ignored so that code samples are never mutilated.
+
+        ``include_unavailable`` is reserved for durable claimed-result
+        planning. It snapshots every syntactically intended bare attachment
+        even when the path is currently unavailable or unsafe, so the part can
+        be manifested and failed rather than disappearing after text cleanup.
+        Ordinary delivery retains the existing file-exists filter.
 
         Returns:
             Tuple of (list of expanded file paths, cleaned text with the
@@ -5522,7 +5532,7 @@ class BasePlatformAdapter(ABC):
                 continue
             raw = match.group(0)
             expanded = os.path.expanduser(raw)
-            if os.path.isfile(expanded):
+            if include_unavailable or os.path.isfile(expanded):
                 found.append((raw, expanded))
             else:
                 # The reply mentions a deliverable-looking path that does not
@@ -6689,6 +6699,7 @@ class BasePlatformAdapter(ABC):
         reply_to: Optional[str],
         recovery_marker: str = "",
         text_already_delivered: bool = False,
+        attachment_session_key: Optional[str] = None,
     ) -> None:
         """Publish one complete claim-owned response through durable parts."""
         from gateway.claimed_result_publication import (
@@ -6732,7 +6743,8 @@ class BasePlatformAdapter(ABC):
                     {
                         "kind": "image",
                         "identity": media_path,
-                        "payload": Path(media_path).resolve().as_uri(),
+                        "payload": media_path,
+                        "local_path": media_path,
                         "alt_text": "",
                     }
                 )
@@ -6744,12 +6756,18 @@ class BasePlatformAdapter(ABC):
                         "kind": "voice",
                         "identity": f"{media_path}\0{int(is_voice)}",
                         "payload": media_path,
+                        "local_path": media_path,
                         "is_voice": is_voice,
                     }
                 )
             elif ext in video_exts:
                 descriptors.append(
-                    {"kind": "video", "identity": media_path, "payload": media_path}
+                    {
+                        "kind": "video",
+                        "identity": media_path,
+                        "payload": media_path,
+                        "local_path": media_path,
+                    }
                 )
             else:
                 descriptors.append(
@@ -6757,6 +6775,7 @@ class BasePlatformAdapter(ABC):
                         "kind": "document",
                         "identity": media_path,
                         "payload": media_path,
+                        "local_path": media_path,
                     }
                 )
 
@@ -6767,13 +6786,19 @@ class BasePlatformAdapter(ABC):
                     {
                         "kind": "image",
                         "identity": file_path,
-                        "payload": Path(file_path).resolve().as_uri(),
+                        "payload": file_path,
+                        "local_path": file_path,
                         "alt_text": "",
                     }
                 )
             elif ext in video_exts:
                 descriptors.append(
-                    {"kind": "video", "identity": file_path, "payload": file_path}
+                    {
+                        "kind": "video",
+                        "identity": file_path,
+                        "payload": file_path,
+                        "local_path": file_path,
+                    }
                 )
             else:
                 descriptors.append(
@@ -6781,6 +6806,7 @@ class BasePlatformAdapter(ABC):
                         "kind": "document",
                         "identity": file_path,
                         "payload": file_path,
+                        "local_path": file_path,
                     }
                 )
 
@@ -6835,6 +6861,21 @@ class BasePlatformAdapter(ABC):
             async def _send_part(item=descriptor):
                 kind = item["kind"]
                 payload = item["payload"]
+                local_path = item.get("local_path")
+                if local_path is not None and attachment_session_key is not None:
+                    safe_path = self.validate_media_delivery_path(
+                        local_path,
+                        session_key=attachment_session_key,
+                    )
+                    if safe_path is None:
+                        raise FileNotFoundError(
+                            "claimed continuation attachment is unavailable"
+                        )
+                    payload = (
+                        Path(safe_path).resolve().as_uri()
+                        if kind == "image"
+                        else safe_path
+                    )
                 if kind == "text":
                     return await self._send_with_retry(
                         chat_id=chat_id,
@@ -6989,7 +7030,11 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
+                if not _delivery_owned_obligation_id:
+                    media_files = self.filter_media_delivery_paths(
+                        media_files,
+                        session_key=session_key,
+                    )
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
@@ -7007,33 +7052,44 @@ class BasePlatformAdapter(ABC):
                     # (helps small models that don't use MEDIA: syntax). Skip
                     # system/command notices so config paths stay visible text
                     # instead of becoming native uploads.
-                    local_files, text_content = self.extract_local_files(text_content)
-                    local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
-                    # Do NOT load the full SQLite transcript for ordinary text or
-                    # explicit MEDIA tags.  History is needed only for bare local
-                    # paths auto-detected above.  Run that synchronous DB/decode
-                    # work off the platform event loop so a slow state.db read
-                    # cannot block Discord heartbeats and trigger the liveness
-                    # watchdog.  On lookup failure the helper returns None and we
-                    # fail open by delivering the candidate file.
-                    _history_media_paths = None
-                    if local_files:
-                        _history_media_paths = (
-                            await self._bounded_history_media_paths_for_session(
-                                session_key
-                            )
+                    local_files, text_content = self.extract_local_files(
+                        text_content,
+                        include_unavailable=bool(_delivery_owned_obligation_id),
+                    )
+                    if not _delivery_owned_obligation_id:
+                        local_files = self.filter_local_delivery_paths(
+                            local_files,
+                            session_key=session_key,
                         )
-                    if _history_media_paths:
-                        _suppressed = [p for p in local_files if p in _history_media_paths]
-                        if _suppressed:
-                            # Log the suppression (#73771) — silent drops here
-                            # cost operators hours of log-diving.
-                            logger.info(
-                                "[%s] Suppressing %d bare local file path(s) already "
-                                "delivered in this session: %s",
-                                self.name, len(_suppressed), _suppressed,
+                        # Do NOT load the full SQLite transcript for ordinary text or
+                        # explicit MEDIA tags.  History is needed only for bare local
+                        # paths auto-detected above.  Run that synchronous DB/decode
+                        # work off the platform event loop so a slow state.db read
+                        # cannot block Discord heartbeats and trigger the liveness
+                        # watchdog.  On lookup failure the helper returns None and we
+                        # fail open by delivering the candidate file.
+                        _history_media_paths = None
+                        if local_files:
+                            _history_media_paths = (
+                                await self._bounded_history_media_paths_for_session(
+                                    session_key
+                                )
                             )
-                        local_files = [p for p in local_files if p not in _history_media_paths]
+                        if _history_media_paths:
+                            _suppressed = [
+                                p for p in local_files if p in _history_media_paths
+                            ]
+                            if _suppressed:
+                                # Log the suppression (#73771) — silent drops here
+                                # cost operators hours of log-diving.
+                                logger.info(
+                                    "[%s] Suppressing %d bare local file path(s) already "
+                                    "delivered in this session: %s",
+                                    self.name, len(_suppressed), _suppressed,
+                                )
+                            local_files = [
+                                p for p in local_files if p not in _history_media_paths
+                            ]
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
@@ -7159,6 +7215,7 @@ class BasePlatformAdapter(ABC):
                         recovery_marker=str(
                             getattr(event, "_hermes_recovery_marker", "") or ""
                         ),
+                        attachment_session_key=session_key,
                     )
                     delivery_attempted = True
                     delivery_succeeded = True
