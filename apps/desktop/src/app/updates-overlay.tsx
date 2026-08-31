@@ -14,7 +14,13 @@ import {
 import { ErrorIcon, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { Progress } from '@/components/ui/progress'
-import type { DesktopUpdateBlocker, DesktopUpdateCommit, DesktopUpdateStage, DesktopUpdateStatus } from '@/global'
+import type {
+  DesktopUpdateBlocker,
+  DesktopUpdateCommit,
+  DesktopUpdateElevationHolder,
+  DesktopUpdateStage,
+  DesktopUpdateStatus
+} from '@/global'
 import { useI18n } from '@/i18n'
 import { buildCommitChangelog, type CommitGroup } from '@/lib/commit-changelog'
 import { AlertCircle, Check, Copy, Terminal } from '@/lib/icons'
@@ -81,6 +87,7 @@ export function UpdatesOverlay() {
             : 'idle'
 
   const updateBlockers = !isBackend && apply.error === 'venv-blocked' && apply.blockers?.length ? apply.blockers : null
+  const elevationHolders = !isBackend && apply.elevationHolders?.length ? apply.elevationHolders : null
 
   const handleClose = (next: boolean) => {
     if (phase === 'applying') {
@@ -128,7 +135,13 @@ export function UpdatesOverlay() {
         ) : null}
 
         {phase === 'error' && !updateBlockers ? (
-          <ErrorView message={apply.message} onDismiss={() => handleClose(false)} onRetry={handleInstall} />
+          <ErrorView
+            elevationHolders={elevationHolders}
+            message={apply.message}
+            onDismiss={() => handleClose(false)}
+            onRetry={handleInstall}
+            onRetryElevated={() => void applyUpdates({ forceUpdateElevated: true })}
+          />
         ) : null}
 
         {phase === 'idle' && (
@@ -530,7 +543,19 @@ export function BlockerView({
   )
 }
 
-function ErrorView({ message, onDismiss, onRetry }: { message: string; onDismiss: () => void; onRetry: () => void }) {
+function ErrorView({
+  elevationHolders,
+  message,
+  onDismiss,
+  onRetry,
+  onRetryElevated
+}: {
+  elevationHolders?: readonly DesktopUpdateElevationHolder[] | null
+  message: string
+  onDismiss: () => void
+  onRetry: () => void
+  onRetryElevated: () => void
+}) {
   const { t } = useI18n()
   const u = t.updates
 
@@ -538,12 +563,30 @@ function ErrorView({ message, onDismiss, onRetry }: { message: string; onDismiss
     <ErrorState
       className="px-6 pb-6 pt-7 pr-8"
       description={
-        <DialogDescription className="max-w-prose text-center text-sm leading-5 text-muted-foreground">
-          {message || u.errorBody}
-        </DialogDescription>
+        <div className="grid gap-3">
+          <DialogDescription className="max-w-prose text-center text-sm leading-5 text-muted-foreground">
+            {message || u.errorBody}
+          </DialogDescription>
+          {elevationHolders?.length ? (
+            <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-left text-xs text-muted-foreground">
+              <div className="font-medium text-foreground">Administrator permission is required to release:</div>
+              {elevationHolders.map(holder => (
+                <div className="mt-1 font-mono" key={`${holder.pid}:${holder.createdAt ?? ''}`}>
+                  PID {holder.pid} · {holder.name}
+                  {holder.resource ? ` · ${holder.resource}` : ''}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
       }
       title={<DialogTitle className="text-center text-xl font-semibold tracking-tight">{u.errorTitle}</DialogTitle>}
     >
+      {elevationHolders?.length ? (
+        <Button className="font-semibold" onClick={onRetryElevated} size="lg">
+          Retry as Administrator
+        </Button>
+      ) : null}
       <Button className="font-semibold" onClick={onRetry} size="lg">
         {u.tryAgain}
       </Button>
