@@ -34,6 +34,27 @@ export interface UpdateGateDeps {
   isUpdateInFlight: () => boolean
 }
 
+/** One process-local mutex shared by normal update and bootstrap recovery. */
+export class UpdateInFlightTransaction {
+  private active = false
+
+  readonly isActive = (): boolean => this.active
+
+  async run<T>(operation: () => T | Promise<T>): Promise<T> {
+    if (this.active) {
+      throw new Error('An update is already in progress.')
+    }
+
+    this.active = true
+
+    try {
+      return await operation()
+    } finally {
+      this.active = false
+    }
+  }
+}
+
 /** Why the gate is closed right now, or null when it is open. */
 export function updateGateReason(deps: UpdateGateDeps): UpdateGateReason {
   if (deps.hasLiveMarker()) {
@@ -92,4 +113,33 @@ export async function waitForUpdateClearance(
   }
 
   return reason ? 'timeout' : 'finished'
+}
+
+/** Keep local backend startup parked across bounded UI wait windows. */
+export async function waitForLocalBackendClearance(
+  deps: UpdateGateDeps,
+  options: WaitForUpdateClearanceOptions & {
+    onStillBlocked?: (reason: Exclude<UpdateGateReason, null>) => void | Promise<void>
+  }
+): Promise<'clear' | 'finished'> {
+  let waited = false
+
+  while (true) {
+    const outcome = await waitForUpdateClearance(deps, options)
+
+    if (outcome === 'clear') {
+      return waited ? 'finished' : 'clear'
+    }
+
+    if (outcome === 'finished') {
+      return 'finished'
+    }
+
+    waited = true
+    const reason = updateGateReason(deps)
+
+    if (reason) {
+      await options.onStillBlocked?.(reason)
+    }
+  }
 }
