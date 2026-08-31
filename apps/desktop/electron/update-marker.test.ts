@@ -7,9 +7,8 @@
  * (Wired into npm test:desktop:platforms in package.json.)
  *
  * Why this matters: the gate must (a) report a live update only when the
- * updater pid is alive AND the marker is fresh, (b) treat absent/malformed/
- * dead-pid/expired markers as "no live update" so a crashed updater can't
- * strand future launches, and (c) self-heal by deleting a stale marker file.
+ * updater pid identity is proven alive, (b) keep malformed/unreadable and
+ * overdue claims blocking, and (c) self-heal only a proven-dead exact claim.
  */
 
 import fs from 'fs'
@@ -73,20 +72,21 @@ test('dead pid => no live update and marker is pruned', () => {
   assert.ok(!fs.existsSync(markerPath(home)), 'a dead-pid marker self-heals (deleted)')
 })
 
-test('expired marker (past age ceiling) => no live update and pruned', () => {
+test('expired marker remains live but is marked overdue', () => {
   const home = tmpHome('expired')
   const now = 1_000_000_000_000
   writeMarker(home, 4242, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  // Even though the pid is "alive", the marker is too old to trust.
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
-  assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
+  const result = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+  assert.equal(result?.kind, 'live')
+  assert.equal(result?.overdue, true)
+  assert.ok(fs.existsSync(markerPath(home)), 'an overdue live owner remains authoritative')
 })
 
-test('malformed marker => no live update and pruned', () => {
+test('malformed marker is unreadable and remains blocking', () => {
   const home = tmpHome('malformed')
   fs.writeFileSync(markerPath(home), 'not-a-pid\nnonsense')
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
-  assert.ok(!fs.existsSync(markerPath(home)))
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE })?.kind, 'unreadable')
+  assert.ok(fs.existsSync(markerPath(home)))
 })
 
 test('isPidAlive: own pid is alive, impossible pid is dead', () => {
@@ -242,11 +242,11 @@ test('a dead-pid marker does not block a hand-off (self-heals)', () => {
   assert.equal(updateHandoffConflict(home, { kill: DEAD }), null)
 })
 
-test('an expired marker does not block a hand-off (self-heals)', () => {
+test('an expired live marker still blocks a hand-off', () => {
   const home = tmpHome('conflict-expired')
   const now = 1_000_000_000_000
   writeMarker(home, 1010, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  assert.equal(updateHandoffConflict(home, { kill: ALIVE, now: () => now }), null)
+  assert.ok(updateHandoffConflict(home, { kill: ALIVE, now: () => now }))
 })
 
 test('minutes-scale elapsed time is formatted as "Nm Ss"', () => {

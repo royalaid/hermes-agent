@@ -1,14 +1,18 @@
 """Tests for hermes_cli/_scan_venv_blockers.py.
 
 Tests call the real production functions (``main``, ``_redact_sensitive_cmdline``).
-The detector is patched directly so no real process table interaction occurs.
+Most patch the detector directly; one Windows-only regression exercises the
+real process table using only subprocesses owned by that test.
 """
 
 from __future__ import annotations
 
 import builtins
 import json
+import os
+import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -16,8 +20,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import agent.redact as redact_module
+import hermes_cli._scan_venv_blockers as scanner
 from hermes_cli._scan_venv_blockers import (
     _classify_local_preview_args,
+    _hermes_cli_command,
     _is_pausable_gateway,
     _probe_fail_json,
     _redact_sensitive_cmdline,
@@ -31,9 +37,691 @@ from hermes_cli._scan_venv_blockers import (
 # ---------------------------------------------------------------------------
 
 
+def test_main_invalid_arguments_emit_one_fail_closed_json_document(capsys) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main([])
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 1
+    assert len(captured.out.splitlines()) == 1
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["blocked"] is True
+    assert payload["reason"] == "invalid_arguments"
+    assert payload["error"]["code"] == "invalid_arguments"
+    assert "--root" in captured.err
+
+
+def test_main_probe_exception_emits_one_fail_closed_json_document(
+    monkeypatch, capsys
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.setattr(
+        scanner,
+        "scan_venv_blockers",
+        lambda _root: (_ for _ in ()).throw(PermissionError("probe denied")),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main(["--root", str(root)])
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 1
+    assert len(captured.out.splitlines()) == 1
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["blocked"] is True
+    assert payload["reason"] == "probe_failed"
+    assert payload["error"] == {
+        "code": "probe_failed",
+        "message": "probe denied",
+    }
+    assert captured.err.strip() == "probe denied"
+
+
 def _psutil_fake() -> dict:
     """Return a sys.modules dict entry that makes psutil appear available."""
-    return {"psutil": types.SimpleNamespace(Process=lambda *a: MagicMock())}
+    return {
+        "psutil": types.SimpleNamespace(
+            Process=lambda *a: MagicMock(),
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        )
+    }
+
+
+def _detector_proc(pid, exe, name, cmdline=None, cwd="", *, ppid=None, parents=()):
+    proc = MagicMock()
+    proc.info = {
+        "pid": pid,
+        "ppid": ppid,
+        "exe": exe,
+        "name": name,
+        "cmdline": cmdline or [],
+        "cwd": cwd,
+    }
+    proc.parents.return_value = list(parents)
+    proc.parent.return_value = parents[0] if parents else None
+    proc.ppid.return_value = ppid or 0
+    proc.exe.return_value = exe
+    proc.cmdline.return_value = list(cmdline or [])
+    return proc
+
+
+def _detector_ancestor(pid: int, exe: Path, argv: list[str]):
+    return types.SimpleNamespace(
+        pid=pid,
+        exe=lambda: str(exe),
+        cmdline=lambda: list(argv),
+    )
+
+
+def test_strict_detector_excludes_only_self_and_keeps_venv_parent_candidate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    venv_python = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter(
+            [
+                _detector_proc(os.getpid(), venv_python, "python.exe"),
+                _detector_proc(555, venv_python, "python.exe"),
+            ]
+        )
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == [(555, "python.exe", "")]
+
+
+def test_strict_detector_excludes_exact_immediate_hermes_console_shim(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    shim = tmp_path / "venv" / "Scripts" / "hermes.exe"
+    parent = types.SimpleNamespace(
+        pid=555,
+        exe=lambda: str(shim),
+        cmdline=lambda: [str(shim), "update", "--preflight"],
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(555, str(shim), "hermes.exe", [str(shim), "update"])]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == []
+
+
+def test_strict_detector_excludes_exact_immediate_python_venv_trampoline(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    argv = [
+        str(python),
+        "-m",
+        "hermes_cli.main",
+        "update",
+        "--preflight",
+        "--json",
+    ]
+    parent = types.SimpleNamespace(
+        pid=556,
+        exe=lambda: str(python),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(556, str(python), "python.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == []
+
+
+def test_strict_detector_excludes_exact_immediate_standalone_scanner_trampoline(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    argv = [
+        str(python),
+        "-m",
+        "hermes_cli._scan_venv_blockers",
+        "--root",
+        str(tmp_path),
+    ]
+    parent = types.SimpleNamespace(
+        pid=558,
+        exe=lambda: str(python),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(558, str(python), "python.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == []
+
+
+def test_strict_detector_keeps_standalone_scanner_for_a_different_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    argv = [
+        str(python),
+        "-m",
+        "hermes_cli._scan_venv_blockers",
+        "--root",
+        str(tmp_path / "other-install"),
+    ]
+    parent = types.SimpleNamespace(
+        pid=559,
+        exe=lambda: str(python),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(559, str(python), "python.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == [(559, "python.exe", " ".join(argv))]
+
+
+def test_strict_detector_keeps_immediate_python_venv_non_update_parent(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    argv = [str(python), "-m", "hermes_cli.main", "serve"]
+    parent = types.SimpleNamespace(
+        pid=557,
+        exe=lambda: str(python),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(557, str(python), "python.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == [(557, "python.exe", " ".join(argv))]
+
+
+@pytest.mark.parametrize(
+    "global_args",
+    [
+        ["--safe-mode"],
+        ["--provider", "openrouter"],
+        ["--ignore-user-config", "--yolo"],
+        ["--"],
+    ],
+)
+def test_strict_detector_excludes_current_shim_with_global_options_before_update(
+    monkeypatch, tmp_path: Path, global_args: list[str]
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    shim = tmp_path / "venv" / "Scripts" / "hermes.exe"
+    argv = [str(shim), *global_args, "update", "--preflight"]
+    parent = types.SimpleNamespace(
+        pid=555,
+        exe=lambda: str(shim),
+        cmdline=lambda: argv,
+    )
+    current = types.SimpleNamespace(parent=lambda: parent)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else parent,
+        process_iter=lambda _attrs: iter(
+            [_detector_proc(555, str(shim), "hermes.exe", argv)]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "argv_tail",
+    [
+        ["--", "--", "update"],
+        ["--", "chat", "update"],
+        ["--update"],
+    ],
+)
+def test_current_update_shim_rejects_ambiguous_end_of_options(
+    argv_tail: list[str],
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    assert not update_cmd._is_current_update_shim_argv(
+        [r"C:\Hermes\venv\Scripts\hermes.exe", *argv_tail]
+    )
+
+
+def test_strict_detector_keeps_higher_target_venv_python_ancestor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import os
+    import hermes_cli.update_cmd as update_cmd
+
+    shell = types.SimpleNamespace(
+        pid=444,
+        exe=lambda: r"C:\Windows\System32\cmd.exe",
+        cmdline=lambda: [r"C:\Windows\System32\cmd.exe"],
+    )
+    current = types.SimpleNamespace(parent=lambda: shell)
+    venv_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda pid: current if int(pid) == os.getpid() else shell,
+        process_iter=lambda _attrs: iter(
+            [
+                _detector_proc(
+                    333,
+                    str(venv_python),
+                    "python.exe",
+                    [str(venv_python), "-m", "agent.run"],
+                )
+            ]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == [(333, "python.exe", f"{venv_python} -m agent.run")]
+
+
+def test_strict_detector_keeps_target_candidate_with_unreadable_exe(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter(
+            [
+                _detector_proc(
+                    777,
+                    None,
+                    "python.exe",
+                    ["python.exe", "-m", "hermes_cli.main", "serve"],
+                    cwd=str(tmp_path),
+                )
+            ]
+        )
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == [(777, "python.exe", "python.exe -m hermes_cli.main serve")]
+
+
+def test_strict_detector_fails_closed_when_python_identity_is_fully_unreadable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    proc = MagicMock()
+    proc.info = {
+        "pid": 778,
+        "exe": None,
+        "name": "python.exe",
+        "cmdline": None,
+        "cwd": None,
+    }
+    fake_psutil = types.SimpleNamespace(process_iter=lambda _attrs: iter([proc]))
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    with pytest.raises(RuntimeError, match=r"process 778 .* identity metadata was unreadable"):
+        update_cmd._detect_venv_python_processes(root=tmp_path, strict=True)
+
+
+def test_strict_detector_keeps_external_mcp_worker_with_live_target_wrapper(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    module = "agent.transports.hermes_tools_mcp_server"
+    wrapper_pid = 801
+    worker_pid = 802
+    wrapper_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    base_python = Path(r"C:\Python311\python.exe")
+    argv_tail = ["-m", module]
+    wrapper_argv = [str(wrapper_python), *argv_tail]
+    worker_argv = [str(base_python), *argv_tail]
+    wrapper_ancestor = _detector_ancestor(
+        wrapper_pid, wrapper_python, wrapper_argv
+    )
+    worker = _detector_proc(
+        worker_pid,
+        str(base_python),
+        "python.exe",
+        worker_argv,
+        cwd=r"C:\unrelated\workspace",
+        ppid=wrapper_pid,
+        parents=[wrapper_ancestor],
+    )
+    wrapper = _detector_proc(
+        wrapper_pid,
+        str(wrapper_python),
+        "python.exe",
+        wrapper_argv,
+        cwd=r"C:\unrelated\workspace",
+        ppid=1,
+    )
+    # Deliberately enumerate the worker first: discovery cannot depend on the
+    # order returned by the Windows process table.
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter([worker, wrapper])
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    matches = update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    )
+
+    assert {pid for pid, _name, _cmdline in matches} == {
+        wrapper_pid,
+        worker_pid,
+    }
+
+
+def test_strict_detector_keeps_general_base_worker_for_same_venv_invocation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    wrapper_pid = 811
+    worker_pid = 812
+    wrapper_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    base_python = Path(r"C:\Python311\python.exe")
+    argv_tail = [r"C:\tools\buzz_native_presence.py", "--watch"]
+    wrapper_argv = [str(wrapper_python), *argv_tail]
+    worker_argv = [str(base_python), *argv_tail]
+    wrapper_ancestor = _detector_ancestor(
+        wrapper_pid, wrapper_python, wrapper_argv
+    )
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter(
+            [
+                _detector_proc(
+                    wrapper_pid,
+                    str(wrapper_python),
+                    "python.exe",
+                    wrapper_argv,
+                    ppid=1,
+                ),
+                _detector_proc(
+                    worker_pid,
+                    str(base_python),
+                    "python.exe",
+                    worker_argv,
+                    cwd=r"C:\unrelated\workspace",
+                    ppid=wrapper_pid,
+                    parents=[wrapper_ancestor],
+                ),
+            ]
+        )
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    matches = update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    )
+
+    assert [pid for pid, _name, _cmdline in matches] == [wrapper_pid, worker_pid]
+
+
+def test_strict_detector_excludes_external_mcp_worker_from_other_install(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    module = "agent.transports.hermes_tools_mcp_server"
+    foreign_root = tmp_path / "other-install"
+    foreign_python = foreign_root / "venv" / "Scripts" / "python.exe"
+    base_python = Path(r"C:\Python311\python.exe")
+    wrapper_argv = [str(foreign_python), "-m", module]
+    worker = _detector_proc(
+        822,
+        str(base_python),
+        "python.exe",
+        [str(base_python), "-m", module],
+        cwd=r"C:\unrelated\workspace",
+        ppid=821,
+        parents=[_detector_ancestor(821, foreign_python, wrapper_argv)],
+    )
+    # Even an unreadable exact-MCP ancestry from another install must not make
+    # this target's strict scan fail: the process table has no edge to this
+    # target venv, so the live ancestry probe must not be attempted.
+    worker.ppid.side_effect = PermissionError("foreign process denied")
+    foreign_wrapper = _detector_proc(
+        821,
+        str(foreign_python),
+        "python.exe",
+        wrapper_argv,
+        ppid=1,
+    )
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter([worker, foreign_wrapper])
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == []
+    worker.ppid.assert_not_called()
+
+
+def test_strict_detector_does_not_rewalk_snapshot_proven_target_ancestry(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    wrapper_pid = 831
+    worker_pid = 832
+    wrapper_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    base_python = Path(r"C:\Python311\python.exe")
+    argv_tail = [r"C:\tools\buzz_native_presence.py", "--watch"]
+    wrapper_argv = [str(wrapper_python), *argv_tail]
+    worker = _detector_proc(
+        worker_pid,
+        str(base_python),
+        "python.exe",
+        [str(base_python), *argv_tail],
+        ppid=wrapper_pid,
+    )
+    worker.ppid.side_effect = AssertionError("snapshot ppid must be reused")
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter(
+            [
+                _detector_proc(
+                    wrapper_pid,
+                    str(wrapper_python),
+                    "python.exe",
+                    wrapper_argv,
+                    ppid=1,
+                ),
+                worker,
+            ]
+        )
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    matches = update_cmd._detect_venv_python_processes(root=tmp_path, strict=True)
+
+    assert [pid for pid, _name, _cmdline in matches] == [wrapper_pid, worker_pid]
+    worker.ppid.assert_not_called()
+
+
+def test_detector_uses_one_ppid_map_only_for_matching_external_invocation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    wrapper_pid = 841
+    wrapper_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    base_python = Path(r"C:\Python311\python.exe")
+    argv_tail = [r"C:\tools\buzz_native_presence.py", "--watch"]
+    wrapper = _detector_proc(
+        wrapper_pid,
+        str(wrapper_python),
+        "python.exe",
+        [str(wrapper_python), *argv_tail],
+        ppid=1,
+    )
+    worker = _detector_proc(
+        842,
+        str(base_python),
+        "python.exe",
+        [str(base_python), *argv_tail],
+        cwd=r"C:\unrelated\workspace",
+    )
+    worker.ppid.side_effect = AssertionError("per-process ppid must not be read")
+    unrelated = _detector_proc(
+        843,
+        str(base_python),
+        "python.exe",
+        [str(base_python), "-c", "import time; time.sleep(1)"],
+    )
+    unrelated.ppid.side_effect = AssertionError(
+        "unrelated Python ancestry must not be queried"
+    )
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter([wrapper, worker, unrelated]),
+        _ppid_map=lambda: {841: 1, 842: 841, 843: 1},
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    matches = update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    )
+
+    assert [pid for pid, _name, _cmdline in matches] == [wrapper_pid, 842]
+    worker.ppid.assert_not_called()
+    unrelated.ppid.assert_not_called()
+
+
+def test_strict_detector_fails_closed_when_parent_snapshot_is_unreadable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    wrapper_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    base_python = Path(r"C:\Python311\python.exe")
+    argv_tail = [r"C:\tools\buzz_native_presence.py", "--watch"]
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter(
+            [
+                _detector_proc(
+                    851,
+                    str(wrapper_python),
+                    "python.exe",
+                    [str(wrapper_python), *argv_tail],
+                    ppid=1,
+                ),
+                _detector_proc(
+                    852,
+                    str(base_python),
+                    "python.exe",
+                    [str(base_python), *argv_tail],
+                    cwd=r"C:\unrelated\workspace",
+                ),
+            ]
+        ),
+        _ppid_map=lambda: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    with pytest.raises(RuntimeError, match="parent process enumeration failed"):
+        update_cmd._detect_venv_python_processes(root=tmp_path, strict=True)
+
+
+def test_strict_detector_fails_when_candidate_is_absent_from_parent_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    wrapper_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    base_python = Path(r"C:\Python311\python.exe")
+    argv_tail = [r"C:\tools\buzz_native_presence.py", "--watch"]
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter(
+            [
+                _detector_proc(
+                    861,
+                    str(wrapper_python),
+                    "python.exe",
+                    [str(wrapper_python), *argv_tail],
+                    ppid=1,
+                ),
+                _detector_proc(
+                    862,
+                    str(base_python),
+                    "python.exe",
+                    [str(base_python), *argv_tail],
+                    cwd=r"C:\unrelated\workspace",
+                ),
+            ]
+        )
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"process 862 was absent from the parent snapshot",
+    ):
+        update_cmd._detect_venv_python_processes(
+            root=tmp_path,
+            strict=True,
+            _parent_by_pid={861: 1},
+        )
 
 
 
@@ -210,8 +898,6 @@ def test_terminate_safe_preview_refuses_reused_pid() -> None:
         # shadow the subcommand token (the hand-rolled matcher regressed this)
         "python.exe -m hermes_cli.main --profile gateway gateway run",
         "python.exe -m hermes_cli.main -p gateway gateway run",
-        # bare `gateway` defaults to `run` (mirrors the canonical matcher)
-        "python.exe -m hermes_cli.main gateway",
         # case variations survive
         "PYTHON.EXE -m hermes_cli.main GATEWAY RUN",
     ],
@@ -229,6 +915,8 @@ def test_is_pausable_gateway_accepts_gateway_run_chains(cmdline: str) -> None:
         "python.exe -m hermes_cli.main gateway stop",
         "python.exe -m hermes_cli.main gateway status",
         "python.exe -m hermes_cli.main gateway install",
+        # A bare gateway command is not proof that the operative action was run.
+        "python.exe -m hermes_cli.main gateway",
         # operator REPL / stray script
         "python.exe",
         "python.exe myscript.py gateway run",  # not a hermes_cli.main invocation
@@ -239,15 +927,107 @@ def test_is_pausable_gateway_rejects_everything_else(cmdline: str) -> None:
     assert _is_pausable_gateway(cmdline) is False
 
 
+def test_hermes_command_parser_is_exact_and_understands_python_options() -> None:
+    assert (
+        _hermes_cli_command(
+            "python.exe -X utf8 -m hermes_cli.main serve --host 127.0.0.1"
+        )
+        == "serve"
+    )
+    assert (
+        _hermes_cli_command(
+            "python.exe -m hermes_cli.main --profile serve gateway run"
+        )
+        == "gateway"
+    )
+    assert (
+        _hermes_cli_command(
+            "python.exe -m agent.transports.hermes_tools_mcp_server"
+        )
+        is None
+    )
+    assert (
+        _hermes_cli_command(
+            "python.exe script.py -m hermes_cli.main serve"
+        )
+        is None
+    )
+    assert (
+        _hermes_cli_command(
+            "python.exe -m hermes_cli.main --unknown serve"
+        )
+        is None
+    )
+
+
+def test_gateway_classifier_preserves_live_argv_token_boundaries() -> None:
+    argv = [
+        "python.exe",
+        "-m",
+        "hermes_cli.main",
+        "serve",
+        "--title",
+        "x gateway run",
+    ]
+
+    assert _hermes_cli_command(argv) == "serve"
+    assert not _is_pausable_gateway(argv)
+
+
+def test_strict_detector_keeps_exe_less_exact_mcp_candidate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    module = "agent.transports.hermes_tools_mcp_server"
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda _attrs: iter(
+            [
+                _detector_proc(
+                    778,
+                    None,
+                    "python.exe",
+                    ["python.exe", "-m", module],
+                    cwd=str(tmp_path),
+                )
+            ]
+        )
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert update_cmd._detect_venv_python_processes(
+        root=tmp_path, strict=True
+    ) == [(778, "python.exe", f"python.exe -m {module}")]
+
+
 def _run_main_with_detector(monkeypatch, capsys, matches):
     """Run main() with the process detector patched to return *matches*."""
     for name, mod in _psutil_fake().items():
         monkeypatch.setitem(sys.modules, name, mod)
-    import hermes_cli.main as cli_main
+    import hermes_cli.update_cmd as update_cmd
 
-    monkeypatch.setattr(cli_main, "_detect_venv_python_processes", lambda: matches)
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict: matches,
+    )
+    live = {
+        int(pid): scanner._ProcessSnapshot(
+            pid=int(pid),
+            ppid=1,
+            name=str(name),
+            exe=scanner._tokens(cmdline)[0] if scanner._tokens(cmdline) else "python.exe",
+            argv=tuple(scanner._tokens(cmdline)),
+            created_at=100.0 + int(pid),
+            process=MagicMock(),
+        )
+        for pid, name, cmdline in matches
+    }
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda pid: live[int(pid)])
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, root / "venv"))
     with pytest.raises(SystemExit) as excinfo:
-        main()
+        main(["--root", str(root)])
     out = capsys.readouterr().out
     return excinfo.value.code, json.loads(out)
 
@@ -259,12 +1039,18 @@ def test_probe_fail_json_is_unambiguous_failure() -> None:
     when psutil was missing after a gutted venv. The document must mark
     ``probe_failed`` and keep ``ok`` false.
     """
-    data = json.loads(_probe_fail_json("psutil is not available: No module named 'psutil'"))
+    data = json.loads(
+        _probe_fail_json(
+            message="psutil is not available: No module named 'psutil'"
+        )
+    )
     assert data["ok"] is False
-    assert data["probe_failed"] is True
-    assert data["blocked"] is False
+    assert data["ready"] is False
+    assert data["blocked"] is True
+    assert data["reason"] == "probe_failed"
     assert data["processes"] == []
-    assert "psutil" in data["error"]
+    assert data["error"]["code"] == "probe_failed"
+    assert "psutil" in data["error"]["message"]
 
 
 def test_main_psutil_missing_is_probe_failure_not_clear(monkeypatch, capsys):
@@ -279,13 +1065,17 @@ def test_main_psutil_missing_is_probe_failure_not_clear(monkeypatch, capsys):
     monkeypatch.setattr(builtins, "__import__", _no_psutil)
     monkeypatch.delitem(sys.modules, "psutil", raising=False)
 
+    root = Path(__file__).resolve().parents[2]
     with pytest.raises(SystemExit) as excinfo:
-        main()
+        main(["--root", str(root)])
     captured = capsys.readouterr()
     assert excinfo.value.code == 1
     data = json.loads(captured.out)
     assert data["ok"] is False
-    assert data["probe_failed"] is True
+    assert data["ready"] is False
+    assert data["blocked"] is True
+    assert data["reason"] == "probe_failed"
+    assert data["error"]["code"] == "probe_failed"
     assert "psutil" in captured.err.lower()
 
 
@@ -453,7 +1243,7 @@ def test_updater_owned_backend_ledger_failure_blocks(monkeypatch, capsys):
 
 
 def test_main_gateway_with_long_managed_runtime_path_is_exempt(monkeypatch, capsys):
-    """Regression: the detector must hand the FULL cmdline to the exemption.
+    r"""Regression: the detector must hand the FULL cmdline to the exemption.
 
     Gateways launched via the managed-runtime interpreter carry a >120-char
     exe path (`.hermes-runtime\python\generation-...\cpython-3.11-...`).
@@ -482,3 +1272,1246 @@ def test_main_gateway_with_long_managed_runtime_path_is_exempt(monkeypatch, caps
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [92]
     assert len(data["processes"][0]["cmdline"]) <= 120
+
+
+class _FakeProcess:
+    def __init__(self, *, parents=()):
+        self._parents = list(parents)
+        self.kills = 0
+
+    def parents(self):
+        return list(self._parents)
+
+    def kill(self):
+        self.kills += 1
+
+
+class _FakeAncestor:
+    def __init__(
+        self,
+        name: str,
+        exe: str,
+        argv: list[str],
+        *,
+        pid: int = 10,
+        created_at: float = 1.0,
+    ):
+        self.pid = pid
+        self._created_at = created_at
+        self._name = name
+        self._exe = exe
+        self._argv = argv
+
+    def create_time(self):
+        return self._created_at
+
+    def name(self):
+        return self._name
+
+    def exe(self):
+        return self._exe
+
+    def cmdline(self):
+        return list(self._argv)
+
+
+def _snapshot(
+    *,
+    pid: int,
+    ppid: int,
+    exe: Path,
+    argv: tuple[str, ...],
+    created_at: float,
+    process: _FakeProcess | None = None,
+):
+    return scanner._ProcessSnapshot(
+        pid=pid,
+        ppid=ppid,
+        name="python.exe",
+        exe=str(exe),
+        argv=argv,
+        created_at=created_at,
+        process=process or _FakeProcess(),
+    )
+
+
+def test_snapshot_distinguishes_pid_reuse_from_exit(monkeypatch) -> None:
+    no_such_process = type("NoSuchProcess", (Exception,), {})
+    initial = types.SimpleNamespace(
+        create_time=lambda: 100.0,
+        cmdline=lambda: [r"C:\Python311\python.exe", "-m", "worker"],
+        exe=lambda: r"C:\Python311\python.exe",
+        name=lambda: "python.exe",
+    )
+    reused = types.SimpleNamespace(create_time=lambda: 100.001)
+    processes = iter([initial, reused])
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda _pid: next(processes),
+        NoSuchProcess=no_such_process,
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    with pytest.raises(RuntimeError, match="changed generation"):
+        scanner._snapshot_for_pid(20, parent_by_pid={20: 10})
+
+    exit_reads = 0
+
+    def _exited_after_identity(_pid):
+        nonlocal exit_reads
+        exit_reads += 1
+        if exit_reads == 1:
+            return initial
+        raise no_such_process
+
+    fake_psutil.Process = _exited_after_identity
+    assert scanner._snapshot_for_pid(20, parent_by_pid={20: 10}) is None
+
+
+def test_scan_keeps_identity_refresh_generation_change_as_hard_blocker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    module = "agent.transports.hermes_tools_mcp_server"
+    initial = types.SimpleNamespace(
+        create_time=lambda: 100.0,
+        cmdline=lambda: [r"C:\Python311\python.exe", "-m", module],
+        exe=lambda: r"C:\Python311\python.exe",
+        name=lambda: "python.exe",
+    )
+    reused = types.SimpleNamespace(create_time=lambda: 100.001)
+    processes = iter([initial, reused])
+    parent_maps = MagicMock(return_value={20: 10})
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        Process=lambda _pid: next(processes),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (20, "python.exe", f"python.exe -m {module}")
+        ],
+    )
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["mcp_bridges"] == []
+    assert [entry["pid"] for entry in result["processes"]] == [20]
+    assert result["processes"][0]["action"] == "refuse"
+    assert parent_maps.call_count == 1
+
+
+def test_terminate_refuses_pid_reused_during_identity_refresh(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    initial = MagicMock()
+    initial.create_time.return_value = 100.0
+    initial.cmdline.return_value = [
+        r"C:\Python311\python.exe",
+        "-m",
+        "agent.transports.hermes_tools_mcp_server",
+    ]
+    initial.exe.return_value = r"C:\Python311\python.exe"
+    initial.ppid.return_value = 10
+    initial.name.return_value = "python.exe"
+    reused = types.SimpleNamespace(create_time=lambda: 100.001)
+    processes = iter([initial, reused])
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda _pid: next(processes),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=100.0)
+    initial.kill.assert_not_called()
+
+
+def test_scan_reports_worker_before_wrapper_and_keeps_relationship(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    module = "agent.transports.hermes_tools_mcp_server"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=1,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "-m", module),
+        created_at=100.0,
+    )
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=root / ".hermes-runtime" / "python" / "generation" / "python.exe",
+        argv=("python.exe", "-m", module),
+        created_at=101.0,
+    )
+    parent_maps = MagicMock(return_value={10: 1, 20: 10})
+    live_created_at = {10: 100.0, 20: 101.0}
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(
+            _ppid_map=parent_maps,
+            Process=lambda pid: types.SimpleNamespace(
+                create_time=lambda: live_created_at[int(pid)]
+            ),
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        ),
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (10, "python.exe", " ".join(wrapper.argv)),
+            (20, "python.exe", " ".join(worker.argv)),
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid, **_kwargs: {10: wrapper, 20: worker}[pid],
+    )
+    owner_probe = MagicMock(return_value="codex")
+    monkeypatch.setattr(scanner, "_owner_from_ancestry", owner_probe)
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert [entry["pid"] for entry in result["mcp_bridges"]] == [20, 10]
+    assert result["mcp_bridges"][0]["role"] == "mcp_bridge_worker"
+    assert result["mcp_bridges"][0]["wrapper_pid"] == 10
+    assert result["mcp_bridges"][1]["role"] == "mcp_bridge_wrapper"
+    assert all(entry["owner"] == "codex" for entry in result["mcp_bridges"])
+    assert owner_probe.call_count == 1
+    assert parent_maps.call_count == 2
+
+
+def test_scan_reports_only_host_proven_desktop_plugin_service_pairs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A detached Desktop plugin service is drainable only with its exact host.
+
+    This is the real Desktop updater failure shape: the plugin's venv wrapper
+    re-execs a managed-runtime worker, and the VBS service host would recreate
+    both unless the updater drains the proven pair after consent.
+    """
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    service = root.parent / "desktop-plugins" / "tracker" / "service.py"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=5,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), str(service)),
+        created_at=100.0,
+    )
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=root / ".hermes-runtime" / "python" / "generation" / "python.exe",
+        argv=(
+            str(root / ".hermes-runtime" / "python" / "generation" / "python.exe"),
+            str(service),
+        ),
+        created_at=101.0,
+    )
+    parent_maps = MagicMock(return_value={5: 1, 10: 5, 20: 10})
+    live_created_at = {10: 100.0, 20: 101.0}
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(
+            _ppid_map=parent_maps,
+            Process=lambda pid: types.SimpleNamespace(
+                create_time=lambda: live_created_at[int(pid)]
+            ),
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        ),
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (10, "python.exe", " ".join(wrapper.argv)),
+            (20, "python.exe", " ".join(worker.argv)),
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid, **_kwargs: {10: wrapper, 20: worker}[pid],
+    )
+    host_probe = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(scanner, "_desktop_plugin_service_host", host_probe)
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["processes"] == []
+    assert [entry["pid"] for entry in result["desktop_plugin_services"]] == [20, 10]
+    assert result["desktop_plugin_services"][0]["role"] == "desktop_plugin_worker"
+    assert result["desktop_plugin_services"][0]["wrapper_pid"] == 10
+    assert result["desktop_plugin_services"][1]["action"] == "terminate_desktop_plugin_service"
+    assert host_probe.call_count == 1
+
+
+def test_scan_keeps_desktop_plugin_script_without_proven_service_host_blocked(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    service = root.parent / "desktop-plugins" / "tracker" / "service.py"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=5,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), str(service)),
+        created_at=100.0,
+    )
+    parent_maps = MagicMock(return_value={5: 1, 10: 5})
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(
+            _ppid_map=parent_maps,
+            Process=lambda _pid: types.SimpleNamespace(create_time=lambda: 100.0),
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+        ),
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [(10, "python.exe", " ".join(wrapper.argv))],
+    )
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda _pid, **_kwargs: wrapper)
+    monkeypatch.setattr(scanner, "_desktop_plugin_service_host", lambda *_args: None)
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["desktop_plugin_services"] == []
+    assert [entry["pid"] for entry in result["processes"]] == [10]
+    assert result["processes"][0]["action"] == "refuse"
+
+
+def test_scan_owner_cache_is_bound_to_anchor_generation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    module = "agent.transports.hermes_tools_mcp_server"
+    wrappers = {
+        pid: _snapshot(
+            pid=pid,
+            ppid=10,
+            exe=venv / "Scripts" / "python.exe",
+            argv=(str(venv / "Scripts" / "python.exe"), "-m", module),
+            created_at=created_at,
+        )
+        for pid, created_at in ((20, 100.0), (30, 200.0))
+    }
+    parent_maps = MagicMock(return_value={20: 10, 30: 10, 10: 1})
+    live_created_at = {20: 100.0, 30: 200.0}
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        Process=lambda pid: types.SimpleNamespace(
+            create_time=lambda: live_created_at[int(pid)]
+        ),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    owner_probe = MagicMock(side_effect=["codex", "unknown"])
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (pid, "python.exe", " ".join(snapshot.argv))
+            for pid, snapshot in wrappers.items()
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid, **_kwargs: wrappers[pid],
+    )
+    monkeypatch.setattr(scanner, "_owner_from_ancestry", owner_probe)
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert [entry["owner"] for entry in result["mcp_bridges"]] == [
+        "codex",
+        "unknown",
+    ]
+    assert result["mcp_bridges"][1]["action"] == "refuse"
+    assert owner_probe.call_count == 2
+
+
+def test_scan_fails_closed_when_fresh_parent_snapshot_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=1,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "-m", "worker"),
+        created_at=100.0,
+    )
+    parent_maps = MagicMock(
+        side_effect=[{10: 1}, PermissionError("fresh parent map denied")]
+    )
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (10, "python.exe", " ".join(wrapper.argv))
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda _pid, **_kwargs: wrapper,
+    )
+
+    with pytest.raises(RuntimeError, match="parent process enumeration failed"):
+        scanner.scan_venv_blockers(root)
+
+    assert parent_maps.call_count == 2
+
+
+def test_scan_keeps_generation_recheck_error_as_hard_blocker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=1,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "-m", "worker"),
+        created_at=100.0,
+    )
+    parent_maps = MagicMock(return_value={10: 1})
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        Process=lambda _pid: (_ for _ in ()).throw(PermissionError("denied")),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (10, "python.exe", " ".join(wrapper.argv))
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda _pid, **_kwargs: wrapper,
+    )
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["mcp_bridges"] == []
+    assert [entry["pid"] for entry in result["processes"]] == [10]
+    assert result["processes"][0]["action"] == "refuse"
+    assert parent_maps.call_count == 2
+
+
+def test_scan_does_not_offer_worker_after_pid_generation_changes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    module = "agent.transports.hermes_tools_mcp_server"
+    wrapper = _snapshot(
+        pid=10,
+        ppid=1,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "-m", module),
+        created_at=100.0,
+    )
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=Path(r"C:\Python311\python.exe"),
+        argv=(r"C:\Python311\python.exe", "-m", module),
+        created_at=201.0,
+    )
+    parent_maps = MagicMock(
+        side_effect=[
+            {10: 1, 20: 10},  # discovery generation
+            {10: 1, 20: 10},  # fresh classification generation
+        ]
+    )
+
+    def _detect(*, root, strict, _parent_by_pid=None):
+        assert root == tmp_path / "install"
+        assert strict is True
+        parents = _parent_by_pid
+        if parents is None:
+            parents = parent_maps()
+        assert parents == {10: 1, 20: 10}
+        return [
+            (10, "python.exe", " ".join(wrapper.argv)),
+            (20, "python.exe", " ".join(worker.argv)),
+        ]
+
+    live_created_at = {10: 100.0, 20: 201.001}
+    fake_psutil = types.SimpleNamespace(
+        _ppid_map=parent_maps,
+        Process=lambda pid: types.SimpleNamespace(
+            create_time=lambda: live_created_at[int(pid)]
+        ),
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(update_cmd, "_detect_venv_python_processes", _detect)
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid, **_kwargs: {10: wrapper, 20: worker}[pid],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_owner_from_ancestry",
+        lambda _snapshot, **_kwargs: "codex",
+    )
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert all(entry["pid"] != 20 for entry in result["mcp_bridges"])
+    assert [entry["pid"] for entry in result["processes"]] == [20]
+    assert result["processes"][0]["action"] == "refuse"
+    assert parent_maps.call_count == 2
+
+
+def test_unreadable_target_gateway_is_a_hard_blocker_not_exempted(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict, **_kwargs: [
+            (77, "python.exe", "python.exe -m hermes_cli.main gateway run")
+        ],
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda _pid, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("access denied")
+        ),
+    )
+
+    result = scanner.scan_venv_blockers(root)
+
+    assert result["blocked"] is True
+    assert result["pausable_gateways"] == 0
+    assert [process["pid"] for process in result["processes"]] == [77]
+    assert result["processes"][0]["actionability"] == "hard_block"
+
+
+def test_terminate_refuses_managed_worker_after_wrapper_exits(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    process = _FakeProcess()
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=root / ".hermes-runtime" / "python" / "generation" / "python.exe",
+        argv=("python.exe", "-m", "agent.transports.hermes_tools_mcp_server"),
+        created_at=101.0,
+        process=process,
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda pid: worker)
+
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=101.0)
+    assert process.kills == 0
+
+
+def test_terminate_refuses_reused_unreadable_ancestor_before_codex(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+
+    def unreadable_name():
+        raise RuntimeError("ancestor metadata unreadable")
+
+    unreadable_parent = types.SimpleNamespace(
+        pid=10,
+        create_time=lambda: 99.0,
+        name=unreadable_name,
+        exe=lambda: r"C:\tools\old-parent.exe",
+        cmdline=lambda: ["old-parent.exe"],
+    )
+    codex = _FakeAncestor(
+        "codex.exe",
+        r"C:\tools\codex.exe",
+        ["codex.exe"],
+        pid=1,
+        created_at=90.0,
+    )
+    process = _FakeProcess(parents=[unreadable_parent, codex])
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(
+            str(venv / "Scripts" / "python.exe"),
+            "-m",
+            "agent.transports.hermes_tools_mcp_server",
+        ),
+        created_at=100.0,
+        process=process,
+    )
+    live_ancestors = {
+        10: types.SimpleNamespace(create_time=lambda: 99.001),
+        1: types.SimpleNamespace(create_time=lambda: 90.0),
+    }
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(Process=lambda pid: live_ancestors[int(pid)]),
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid: worker if int(pid) == worker.pid else None,
+    )
+
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=100.0)
+    assert process.kills == 0
+
+
+def test_external_worker_termination_targets_worker_not_live_wrapper(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    module = "agent.transports.hermes_tools_mcp_server"
+    wrapper_process = _FakeProcess()
+    wrapper = _snapshot(
+        pid=10,
+        ppid=1,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "-m", module),
+        created_at=100.0,
+        process=wrapper_process,
+    )
+    wrapper_parent = types.SimpleNamespace(pid=10)
+    worker_process = _FakeProcess(parents=[wrapper_parent])
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=Path(r"C:\Python311\python.exe"),
+        argv=(r"C:\Python311\python.exe", "-m", module),
+        created_at=101.0,
+        process=worker_process,
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid: {10: wrapper, 20: worker}.get(pid),
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_owner_from_ancestry",
+        lambda _snapshot, **_kwargs: "codex",
+    )
+
+    assert scanner.terminate_mcp_bridge(root, pid=20, created_at=101.0)
+    assert worker_process.kills == 1
+    assert wrapper_process.kills == 0
+
+
+def test_node_hosted_claude_ancestry_is_attributed_exactly(
+    monkeypatch, tmp_path: Path
+) -> None:
+    claude = _FakeAncestor(
+        "node.exe",
+        r"C:\Program Files\nodejs\node.exe",
+        [
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js",
+        ],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(Process=lambda _pid: claude),
+    )
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=tmp_path / "python.exe",
+        argv=("python.exe", "-m", "agent.transports.hermes_tools_mcp_server"),
+        created_at=101.0,
+        process=_FakeProcess(parents=[claude]),
+    )
+
+    assert scanner._owner_from_ancestry(snapshot) == "claude"
+    record = scanner._mcp_record(
+        snapshot, role="mcp_bridge_worker", wrapper_pid=None
+    )
+    assert record["actionable"] is True
+    assert record["action"] == "terminate_exact_mcp"
+
+
+@pytest.mark.parametrize(
+    ("parent_created_at", "expected_owner"),
+    [
+        (99.0, "codex"),
+        (100.0, "codex"),
+        (100.005, "unknown"),
+        (100.02, "unknown"),
+    ],
+)
+def test_snapshot_parent_map_rejects_reused_owner_pid(
+    monkeypatch,
+    tmp_path: Path,
+    parent_created_at: float,
+    expected_owner: str,
+) -> None:
+    parent = types.SimpleNamespace(
+        pid=10,
+        create_time=lambda: parent_created_at,
+        name=lambda: "codex.exe",
+        exe=lambda: r"C:\tools\codex.exe",
+        cmdline=lambda: ["codex.exe"],
+    )
+    fake_psutil = types.SimpleNamespace(Process=lambda _pid: parent)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=tmp_path / "python.exe",
+        argv=("python.exe", "-m", "agent.transports.hermes_tools_mcp_server"),
+        created_at=100.0,
+    )
+
+    assert (
+        scanner._owner_from_ancestry(
+            snapshot,
+            parent_by_pid={20: 10, 10: 0},
+        )
+        == expected_owner
+    )
+
+
+def test_snapshot_parent_map_rejects_owner_generation_changed_during_read(
+    monkeypatch, tmp_path: Path
+) -> None:
+    parent = types.SimpleNamespace(
+        pid=10,
+        create_time=lambda: 99.0,
+        name=lambda: "codex.exe",
+        exe=lambda: r"C:\tools\codex.exe",
+        cmdline=lambda: ["codex.exe"],
+    )
+    reused = types.SimpleNamespace(create_time=lambda: 99.001)
+    processes = iter([parent, reused])
+    fake_psutil = types.SimpleNamespace(Process=lambda _pid: next(processes))
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=tmp_path / "python.exe",
+        argv=("python.exe", "-m", "agent.transports.hermes_tools_mcp_server"),
+        created_at=100.0,
+    )
+
+    assert (
+        scanner._owner_from_ancestry(
+            snapshot,
+            parent_by_pid={20: 10, 10: 0},
+        )
+        == "unknown"
+    )
+
+
+def test_live_parent_ancestry_rejects_generation_changed_during_read(
+    monkeypatch, tmp_path: Path
+) -> None:
+    parent = _FakeAncestor(
+        "codex.exe",
+        r"C:\tools\codex.exe",
+        ["codex.exe"],
+        created_at=99.0,
+    )
+    reused = types.SimpleNamespace(create_time=lambda: 99.001)
+    fake_psutil = types.SimpleNamespace(Process=lambda _pid: reused)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=tmp_path / "python.exe",
+        argv=("python.exe", "-m", "agent.transports.hermes_tools_mcp_server"),
+        created_at=100.0,
+        process=_FakeProcess(parents=[parent]),
+    )
+
+    assert scanner._owner_from_ancestry(snapshot) == "unknown"
+
+
+@pytest.mark.parametrize("created_at", [float("nan"), float("inf"), -1.0, 102.0])
+def test_terminate_refuses_invalid_or_reused_process_identity(
+    monkeypatch, tmp_path: Path, created_at: float
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    process = _FakeProcess()
+    record = {
+        "created_at": 101.0,
+        "owner": "codex",
+        "role": "mcp_bridge_worker",
+        "actionable": True,
+        "action": "terminate_exact_mcp",
+    }
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_live_mcp_bridge_process",
+        lambda _root, _pid: (process, record),
+    )
+
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=created_at)
+    assert process.kills == 0
+
+
+def test_terminate_refuses_unknown_owner_even_for_exact_worker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    process = _FakeProcess()
+    record = {
+        "created_at": 101.0,
+        "owner": "unknown",
+        "role": "mcp_bridge_worker",
+        "actionable": False,
+        "action": "refuse",
+    }
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_live_mcp_bridge_process",
+        lambda _root, _pid: (process, record),
+    )
+
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=101.0)
+    assert process.kills == 0
+
+
+def test_terminate_rereads_and_refuses_changed_live_argv(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    process = _FakeProcess()
+    changed = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=root / ".hermes-runtime" / "python" / "generation" / "python.exe",
+        argv=("python.exe", "-m", "hermes_cli.main", "serve"),
+        created_at=101.0,
+        process=process,
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda pid: changed)
+
+    assert not scanner.terminate_mcp_bridge(root, pid=20, created_at=101.0)
+    assert process.kills == 0
+
+
+def test_terminate_desktop_plugin_service_drains_worker_before_wrapper_host(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    worker_process = _FakeProcess()
+    wrapper_process = _FakeProcess()
+    host_process = _FakeProcess()
+    worker_record = {
+        "created_at": 101.0,
+        "owner": "desktop",
+        "role": "desktop_plugin_worker",
+        "actionable": True,
+        "action": "terminate_desktop_plugin_service",
+    }
+    wrapper_record = {
+        "created_at": 100.0,
+        "owner": "desktop",
+        "role": "desktop_plugin_wrapper",
+        "actionable": True,
+        "action": "terminate_desktop_plugin_service",
+    }
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_live_desktop_plugin_service_process",
+        lambda _root, pid: (
+            (worker_process, worker_record, host_process)
+            if int(pid) == 20
+            else (wrapper_process, wrapper_record, host_process)
+        ),
+    )
+
+    assert scanner.terminate_desktop_plugin_service(root, pid=20, created_at=101.0)
+    assert worker_process.kills == 1
+    assert host_process.kills == 0
+
+    assert scanner.terminate_desktop_plugin_service(root, pid=10, created_at=100.0)
+    assert wrapper_process.kills == 1
+    assert host_process.kills == 1
+
+
+def test_terminate_venv_holder_stops_any_fresh_target_scan_match(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    process = _FakeProcess()
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "user-script.py"),
+        created_at=101.0,
+        process=process,
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict: [(20, "python.exe", "python.exe user-script.py")],
+    )
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda _pid: snapshot)
+
+    assert scanner.terminate_venv_holder(root, pid=20, created_at=101.0)
+    assert process.kills == 1
+
+
+def test_terminate_venv_holder_refuses_a_recycled_or_no_longer_scanned_pid(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import hermes_cli.update_cmd as update_cmd
+
+    root = tmp_path / "install"
+    venv = root / "venv"
+    process = _FakeProcess()
+    snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), "user-script.py"),
+        created_at=102.0,
+        process=process,
+    )
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        update_cmd,
+        "_detect_venv_python_processes",
+        lambda *, root, strict: [(20, "python.exe", "python.exe user-script.py")],
+    )
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", lambda _pid: snapshot)
+
+    assert not scanner.terminate_venv_holder(root, pid=20, created_at=101.0)
+    assert process.kills == 0
+
+
+@pytest.mark.windows_only
+def test_native_scanner_cli_excludes_its_exact_venv_redirector() -> None:
+    """Match the standalone subprocess that Desktop launches on Windows."""
+    root = Path(scanner.__file__).resolve().parents[1]
+    target_root, venv = scanner._validated_root(root)
+    python = venv / "Scripts" / "python.exe"
+
+    process = subprocess.Popen(
+        [
+            str(python),
+            "-m",
+            "hermes_cli._scan_venv_blockers",
+            "--root",
+            str(target_root),
+        ],
+        cwd=target_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    stdout, stderr = process.communicate(timeout=30)
+
+    assert process.returncode == 0, stderr
+    payload = json.loads(stdout)
+    records = [
+        *payload["processes"],
+        *payload["mcp_bridges"],
+        *payload["pausable_gateway_processes"],
+    ]
+    assert all(record["pid"] != process.pid for record in records)
+
+
+@pytest.mark.windows_only
+def test_native_scanner_preserves_identity_redacts_and_refuses_stale_identity(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Exercise the Windows psutil boundary without touching a live runtime."""
+    import psutil
+
+    root = Path(scanner.__file__).resolve().parents[1]
+    target_root, venv = scanner._validated_root(root)
+    module = "agent.transports.hermes_tools_mcp_server"
+    synthetic = tmp_path / "synthetic"
+    transport = synthetic / "agent" / "transports"
+    transport.mkdir(parents=True)
+    (synthetic / "agent" / "__init__.py").write_text("", encoding="utf-8")
+    (transport / "__init__.py").write_text("", encoding="utf-8")
+    (transport / "hermes_tools_mcp_server.py").write_text(
+        "import time\ntime.sleep(120)\n",
+        encoding="utf-8",
+    )
+
+    secret = "native-scanner-secret-9f6f1a"
+    hidden = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    children: list[subprocess.Popen[bytes]] = []
+    try:
+        bridge = subprocess.Popen(
+            [sys.executable, "-m", module],
+            cwd=synthetic,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=hidden,
+        )
+        children.append(bridge)
+        secret_holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(120)",
+                "--token",
+                secret,
+            ],
+            cwd=synthetic,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=hidden,
+        )
+        children.append(secret_holder)
+
+        def _redirector_worker_snapshot():
+            try:
+                descendants = psutil.Process(bridge.pid).children(recursive=True)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return None
+            for descendant in descendants:
+                try:
+                    snapshot = scanner._snapshot_for_pid(descendant.pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                if (
+                    snapshot is not None
+                    and scanner.is_exact_mcp_module_argv(snapshot.argv)
+                    and not scanner._within(snapshot.exe, venv)
+                ):
+                    return snapshot
+            return None
+
+        # CPython and uv both commonly use a venv-side redirector process on
+        # Windows, but keep the assertion conditional for runtimes that truly
+        # execute in-place. Give the redirector child a bounded startup window
+        # so a fast first scan cannot mistake a not-yet-spawned child for an
+        # in-place runtime.
+        redirector_deadline = time.monotonic() + 2.0
+        redirector_worker = None
+        while time.monotonic() < redirector_deadline:
+            redirector_worker = _redirector_worker_snapshot()
+            if redirector_worker is not None:
+                break
+            assert bridge.poll() is None
+            time.sleep(0.02)
+
+        # Owner attribution has separate ancestry tests above. Keep this test
+        # focused on the real Windows pid/exe/argv/create-time reads.
+        monkeypatch.setattr(
+            scanner,
+            "_owner_from_ancestry",
+            lambda _snapshot, **_kwargs: "codex",
+        )
+
+        deadline = time.monotonic() + 10.0
+        payload = None
+        bridge_record = None
+        worker_record = None
+        holder_record = None
+        while time.monotonic() < deadline:
+            assert bridge.poll() is None
+            assert secret_holder.poll() is None
+            payload = scanner.scan_venv_blockers(target_root)
+            bridge_record = next(
+                (
+                    entry
+                    for entry in payload["mcp_bridges"]
+                    if entry["pid"] == bridge.pid
+                ),
+                None,
+            )
+            worker_record = next(
+                (
+                    entry
+                    for entry in payload["mcp_bridges"]
+                    if redirector_worker is not None
+                    and entry["pid"] == redirector_worker.pid
+                ),
+                None,
+            )
+            holder_record = next(
+                (
+                    entry
+                    for entry in payload["processes"]
+                    if entry["pid"] == secret_holder.pid
+                ),
+                None,
+            )
+            if (
+                bridge_record is not None
+                and holder_record is not None
+                and (redirector_worker is None or worker_record is not None)
+            ):
+                break
+            time.sleep(0.05)
+
+        assert payload is not None
+        assert bridge_record is not None
+        assert holder_record is not None
+
+        bridge_snapshot = scanner._snapshot_for_pid(bridge.pid)
+        holder_snapshot = scanner._snapshot_for_pid(secret_holder.pid)
+        assert bridge_snapshot is not None
+        assert holder_snapshot is not None
+        assert bridge_snapshot.pid == bridge.pid
+        assert scanner.is_exact_mcp_module_argv(bridge_snapshot.argv)
+        assert scanner._within(bridge_snapshot.exe, venv)
+        assert bridge_record["role"] == "mcp_bridge_wrapper"
+        assert bridge_record["owner"] == "codex"
+        assert bridge_record["actionable"] is True
+        assert bridge_record["created_at"] == pytest.approx(
+            bridge_snapshot.created_at, abs=0.01
+        )
+
+        if redirector_worker is not None:
+            assert worker_record is not None
+            assert worker_record["role"] == "mcp_bridge_worker"
+            assert worker_record["wrapper_pid"] == bridge.pid
+            assert worker_record["owner"] == "codex"
+            assert worker_record["actionable"] is True
+            assert worker_record["created_at"] == pytest.approx(
+                redirector_worker.created_at, abs=0.01
+            )
+            bridge_order = next(
+                index
+                for index, entry in enumerate(payload["mcp_bridges"])
+                if entry["pid"] == bridge.pid
+            )
+            worker_order = next(
+                index
+                for index, entry in enumerate(payload["mcp_bridges"])
+                if entry["pid"] == redirector_worker.pid
+            )
+            assert worker_order < bridge_order
+
+            # A stale identity cannot terminate either member of the pair.
+            assert not scanner.terminate_mcp_bridge(
+                target_root,
+                pid=redirector_worker.pid,
+                created_at=redirector_worker.created_at + 10.0,
+            )
+            assert psutil.pid_exists(redirector_worker.pid)
+            assert bridge.poll() is None
+
+        raw_holder_cmdline = " ".join(holder_snapshot.argv)
+        assert secret in raw_holder_cmdline, "the OS snapshot must contain the fixture secret"
+        redacted = scanner._redact_sensitive_cmdline(raw_holder_cmdline)
+        assert secret not in redacted
+        assert "--token <redacted>" in redacted
+        assert secret not in json.dumps(payload)
+        assert holder_record["created_at"] == pytest.approx(
+            holder_snapshot.created_at, abs=0.01
+        )
+
+        stale_created_at = float(bridge_record["created_at"]) + 10.0
+        assert not scanner.terminate_mcp_bridge(
+            target_root,
+            pid=bridge.pid,
+            created_at=stale_created_at,
+        )
+        assert bridge.poll() is None, "a stale identity must not kill the live process"
+        live_snapshot = scanner._snapshot_for_pid(bridge.pid)
+        assert live_snapshot is not None
+        assert live_snapshot.created_at == pytest.approx(
+            bridge_snapshot.created_at, abs=0.01
+        )
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
