@@ -17,11 +17,13 @@
 # OS component -- is "frozen".
 #
 # CONTRACT (keep in sync with apps/desktop/electron/main.ts):
-#   cmd /d /s /c start "" /min powershell -NoProfile -ExecutionPolicy Bypass
+#   cmd /d /s /c start "" /min %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass
 #     -File scripts\desktop-update\windows.ps1
 #     -InstallRoot <path>   repo checkout (HERMES_HOME\hermes-agent)
 #     -Branch <ref>         branch to update against
 #     -DesktopPid <pid>     the Electron main process to wait out
+#     -BridgeLeaseId <id>   opaque MCP-quiesce capability to adopt
+#     [-RelaunchAppPath <path>] optional dev app path retained for relaunch
 #     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
 #     [-NoUi]               headless (tests); default shows a progress window
 #     [-NoMarkerCleanup]    leave .hermes-update-in-progress in place (tests)
@@ -46,6 +48,8 @@ param(
     [string]$Branch = "main",
     [int]$DesktopPid = 0,
     [string]$RelaunchExe = "",
+    [string]$RelaunchAppPath = "",
+    [string]$BridgeLeaseId = "",
     [switch]$NoUi,
     [switch]$NoMarkerCleanup,
     [switch]$SelfTestUi,
@@ -82,12 +86,14 @@ try {
 $TempDir = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $HermesHome = if ($InstallRoot) { Split-Path -Parent $InstallRoot } else { $TempDir }
 $MarkerPath = Join-Path $HermesHome ".hermes-update-in-progress"
+$BridgeLeasePath = Join-Path $HermesHome ".hermes-venv-quiesce"
 $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
 $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
 $script:Ui = $null
 $script:UiStage = "Hermes will open once done."   # until the first gate; matches ui.html
 $script:UiStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$script:MarkerBody = $null
 
 function Write-HandoffLog([string]$Message) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
@@ -552,19 +558,133 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
     } catch {}
 }
 
+function Adopt-McpBridgeLease {
+    # The lease ID is an opaque capability supplied only by the authenticated
+    # Desktop hand-off.  Never create a lease here and never accept a lease
+    # for another checkout.  The JSON rewrite is followed by an exact reread;
+    # failure leaves the original lease in place and aborts before mutation.
+    if ([string]::IsNullOrWhiteSpace($BridgeLeaseId)) { return $false }
+    if (-not (Test-Path -LiteralPath $BridgeLeasePath -PathType Leaf)) { return $false }
+
+    try {
+        $raw = [System.IO.File]::ReadAllText($BridgeLeasePath, [System.Text.Encoding]::UTF8)
+        $lease = $raw | ConvertFrom-Json
+        $properties = @($lease.PSObject.Properties.Name | Sort-Object)
+        $expectedProperties = @('created_at','expires_at','handoff_grace_until','install_root','lease_id','owner_pid','schema_version')
+        if (($properties -join '|') -ne ($expectedProperties -join '|')) { return $false }
+        if ($lease.schema_version -ne 1 -or "$($lease.lease_id)" -ne $BridgeLeaseId) { return $false }
+        $leaseRoot = [System.IO.Path]::GetFullPath("$($lease.install_root)").TrimEnd('\')
+        $expectedRoot = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+        if (-not $leaseRoot.Equals($expectedRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if ([int64]$lease.expires_at -lt $now -or [int64]$lease.created_at -gt ($now + 5)) { return $false }
+
+        $adopted = [ordered]@{
+            schema_version = 1
+            lease_id = "$($lease.lease_id)"
+            owner_pid = [int]$PID
+            created_at = [int64]$now
+            expires_at = [int64]($now + 1200)
+            handoff_grace_until = [int64]($now + 90)
+            install_root = $expectedRoot
+        }
+        $updatedRaw = (($adopted | ConvertTo-Json -Compress) + "`n")
+        if (-not (Replace-FileIfExact $BridgeLeasePath $raw $updatedRaw)) {
+            return $false
+        }
+
+        $check = [System.IO.File]::ReadAllText($BridgeLeasePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        return "$($check.lease_id)" -eq $BridgeLeaseId -and [int]$check.owner_pid -eq [int]$PID
+    } catch {
+        try { if ($temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } } catch {}
+        return $false
+    }
+}
+
+function Replace-FileIfExact([string]$Path, [string]$Expected, [string]$Replacement) {
+    $stream = $null
+    $reader = $null
+    try {
+        # Hold an exclusive handle while re-reading and replacing. If the
+        # Desktop revokes or renews the lease first, this call fails closed.
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $reader = New-Object System.IO.StreamReader(
+            $stream,
+            [System.Text.Encoding]::UTF8,
+            $true,
+            4096,
+            $true
+        )
+        $current = $reader.ReadToEnd()
+        $reader.Dispose()
+        $reader = $null
+        if ($current -cne $Expected) { return $false }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Replacement)
+        $stream.SetLength(0)
+        $stream.Position = 0
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { try { $reader.Dispose() } catch {} }
+        if ($stream) { try { $stream.Dispose() } catch {} }
+    }
+}
+
+function Claim-UpdateMarker([string]$Body) {
+    # CreateNew is the marker's ownership CAS: an existing claim is never
+    # overwritten by this updater. A failed write deliberately leaves any
+    # partial artifact in place so a relaunched Desktop remains fail-closed.
+    $stream = $null
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+        $stream = New-Object System.IO.FileStream(
+            $MarkerPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        return [System.IO.File]::ReadAllText($MarkerPath, [System.Text.Encoding]::UTF8) -eq $Body
+    } catch {
+        if ($stream) { try { $stream.Dispose() } catch {} }
+        return $false
+    }
+}
+
 function Remove-MarkerIfOwned {
     if ($NoMarkerCleanup) { return }
     try {
-        if (Test-Path -LiteralPath $MarkerPath) {
-            $firstLine = (Get-Content -LiteralPath $MarkerPath -TotalCount 1 -ErrorAction SilentlyContinue)
-            if ("$firstLine".Trim() -eq "$PID") {
-                Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
-                Write-HandoffLog "removed update marker (owned)"
-            } else {
-                Write-HandoffLog "leaving update marker: owned by pid '$firstLine', not us ($PID)"
-            }
+        if (-not $script:MarkerBody -or -not (Test-Path -LiteralPath $MarkerPath -PathType Leaf)) { return }
+        $tombstone = "$MarkerPath.cas-release-$PID-$([Guid]::NewGuid().ToString('N'))"
+        [System.IO.File]::Move($MarkerPath, $tombstone)
+        $raw = [System.IO.File]::ReadAllText($tombstone, [System.Text.Encoding]::UTF8)
+        if ($raw -eq $script:MarkerBody) {
+            [System.IO.File]::Delete($tombstone)
+            Write-HandoffLog "removed update marker (exact owner claim)"
+        } elseif (-not (Test-Path -LiteralPath $MarkerPath)) {
+            [System.IO.File]::Move($tombstone, $MarkerPath)
+            Write-HandoffLog "leaving update marker: claim changed during cleanup"
+        } else {
+            Write-HandoffLog "leaving update marker: a newer claim won cleanup"
         }
-    } catch {}
+    } catch {
+        try {
+            if ($tombstone -and (Test-Path -LiteralPath $tombstone) -and -not (Test-Path -LiteralPath $MarkerPath)) {
+                [System.IO.File]::Move($tombstone, $MarkerPath)
+            }
+        } catch {}
+    }
 }
 
 function Start-DesktopRelaunch {
@@ -1432,18 +1552,28 @@ try {
 
     # -- 0. Claim the update marker with OUR pid ---------------------------
     try {
+        if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestMarker -and -not (Adopt-McpBridgeLease)) {
+            throw "could not adopt the authenticated MCP bridge lease"
+        }
         $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $startedAt = 0L
         $hasStartedAt = [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$startedAt)
         if (-not $hasStartedAt -or $startedAt -gt $epoch -or ($epoch - $startedAt) -gt 1200) {
             $startedAt = $epoch
         }
-        # WriteAllText for byte-exact LF framing: Set-Content emits CRLF and
-        # the marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
-        [System.IO.File]::WriteAllText($MarkerPath, "$PID`n$startedAt`n")
+        # The marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
+        # Claim with an atomic create-only operation; never overwrite a
+        # concurrent updater's marker.
+        $script:MarkerBody = "$PID`n$startedAt`n"
+        if (-not (Claim-UpdateMarker $script:MarkerBody)) {
+            throw "update marker already exists or could not be claimed"
+        }
         Write-HandoffLog "claimed update marker (pid $PID)"
     } catch {
-        Write-HandoffLog "WARNING: could not write update marker: $($_.Exception.Message)"
+        $finalCode = 8
+        $finalMsg = "Update aborted: could not claim the authenticated update marker. Nothing was changed."
+        Write-HandoffLog "$finalMsg $($_.Exception.Message)"
+        throw
     }
 
     if ($SelfTestMarker) {
