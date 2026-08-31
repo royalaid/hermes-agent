@@ -89,9 +89,7 @@ def _state_payload(state: Optional[Any], goal: Dict[str, Any]) -> Dict[str, Any]
         "paused": status == "paused",
         "turns_used": state.turns_used,
         "max_turns": state.max_turns,
-        # GoalState has no optimistic revision field today. Keep this explicit
-        # so callers do not mistake timestamps or turn counts for a revision.
-        "revision": None,
+        "revision": state.revision,
         "stop_reason": stop_reason,
         "error_reason": state.last_reason if has_judge_error else None,
     }
@@ -145,7 +143,10 @@ def goal_control_tool(
     try:
         from hermes_cli.goals import (
             ConcurrentGoalStateChange,
+            GoalConflictError,
             GoalManager,
+            GoalMutationOutcomeUnknownError,
+            GoalPostconditionError,
             goal_state_payload,
             load_goal_authoritative,
             load_goal_snapshot_authoritative,
@@ -261,9 +262,22 @@ def goal_control_tool(
                     "persisted goal state does not match the requested action",
                     session_id=caller_session_id,
                 )
-    except ConcurrentGoalStateChange:
+    except GoalMutationOutcomeUnknownError:
         return _error(
-            "concurrent_state_change",
+            "mutation_outcome_unknown",
+            "goal mutation may have committed, but persisted state could not be verified; "
+            "do not retry blindly without first reading authoritative status",
+            session_id=caller_session_id,
+        )
+    except GoalPostconditionError:
+        return _error(
+            "transition_conflict" if action in {"pause", "resume"} else "mutation_conflict",
+            "persisted goal state could not be verified after mutation",
+            session_id=caller_session_id,
+        )
+    except (ConcurrentGoalStateChange, GoalConflictError):
+        return _error(
+            "transition_conflict" if action in {"pause", "resume"} else "mutation_conflict",
             "persisted goal changed while applying the requested action",
             session_id=caller_session_id,
         )
