@@ -38,7 +38,11 @@ class GatewayGoalCommandsMixin:
         from hermes_cli.goal_command import dispatch_goal_command
         from hermes_cli.goals import last_user_message_from_db
 
-        mgr, _session_entry = await self._get_goal_manager_for_event(event)
+        from hermes_cli.goals import GoalPersistenceError, goal_status_failure_message
+        try:
+            mgr, _session_entry = await self._get_goal_manager_for_event(event)
+        except GoalPersistenceError:
+            return goal_status_failure_message()
         if mgr is None:
             return t("gateway.goal.unavailable")
 
