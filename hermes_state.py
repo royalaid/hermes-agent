@@ -49,7 +49,7 @@ from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_profile_repair import SessionProfileRepairMixin
-from hermes_state_schema import SessionSchemaMixin
+from hermes_state_todo import SessionTodoMixinfrom hermes_state_schema import SessionSchemaMixin
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
@@ -445,7 +445,7 @@ class SessionDB(
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
     SessionMessagesMixin, SessionRewindMixin, SessionProfileRepairMixin,
-):
+    SessionMessagesMixin, SessionTodoMixin, SessionRewindMixin,):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 
     # Only these state-owned producers join automatic stale-open reconciliation; messaging/UI

@@ -4,6 +4,7 @@ import type { NavigateFunction } from 'react-router'
 
 import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import { hydrateSessionTodos, resolveStoredSessionTodoMessages } from '@/app/contrib/wiring-todo-hydration'
 import { defaultNewSessionTarget, prepareDefaultNewSession } from '@/app/session/new-session-route'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
@@ -128,7 +129,12 @@ import {
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { forgetSessionUnread } from '@/store/session-unread'
 import { $archivedSessions } from '@/store/sidebar-archive'
-import { restoreSessionTodosFromSnapshot } from '@/store/todos'
+import {
+  bindTodoHydrationToken,
+  captureTodoWriteFence,
+  releaseTodoHydrationToken,
+  restoreSessionTodosFromSnapshot
+} from '@/store/todos'
 import { dropTranscriptTail, dropTranscriptTailEverywhere, saveTranscriptTail } from '@/store/transcript-tail-cache'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionMessage, SessionResumeResult, UsageStats } from '@/types/hermes'
@@ -318,7 +324,10 @@ async function desktopSessionCreateParams(
   }
 
   const profile =
-    capturedRoute?.profile || requestedProfile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
+    capturedRoute?.profile ||
+    requestedProfile ||
+    $newChatProfile.get() ||
+    normalizeProfileKey($activeGatewayProfile.get())
 
   if (capturedRoute) {
     await ensureGatewayAgent(capturedRoute.connectionId, profile)
@@ -813,15 +822,17 @@ export function useSessionActions({
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
         const explicitTarget =
-          options?.profile !== undefined || options?.cwd !== undefined || options?.workspaceScope?.ownerRoute !== undefined
+          options?.profile !== undefined ||
+          options?.cwd !== undefined ||
+          options?.workspaceScope?.ownerRoute !== undefined
 
         const defaultTarget = options?.route === undefined && !explicitTarget ? defaultNewSessionTarget() : null
 
         const capturedRoute =
           options?.route !== undefined
             ? options.route
-            : options?.workspaceScope?.ownerRoute ??
-              (defaultTarget ? defaultTarget.route : resolveNewChatOwnerRoute(options?.profile))
+            : (options?.workspaceScope?.ownerRoute ??
+              (defaultTarget ? defaultTarget.route : resolveNewChatOwnerRoute(options?.profile)))
 
         // A named local profile uses the legacy profile-only transport (no
         // connectionId). Tab-strip "+" omits `options.profile`; the draft or
@@ -1275,6 +1286,8 @@ export function useSessionActions({
           setCurrentBranch(cachedViewState.branch)
           setSessionStartedAt(Date.now())
 
+          const todoHydrationFence = captureTodoWriteFence(cachedRuntimeId)
+
           try {
             let activated: SessionResumeResult | null = null
             const activateStartedAt = Date.now() / 1000
@@ -1448,6 +1461,7 @@ export function useSessionActions({
               // Reconcile its in-flight/queued tail onto the complete transcript
               // instead of replacing durable history while the turn is running.
               let acceptedPersistedDisplayTranscript = false
+              let todoHydrationMessages: SessionMessage[] | null = activated.messages
 
               if (persistedTranscriptPromise) {
                 const persisted = await persistedTranscriptPromise
@@ -1479,6 +1493,7 @@ export function useSessionActions({
                   (persisted.messages.length || !activatedMessages.length)
                 ) {
                   acceptedPersistedDisplayTranscript = Boolean(expectedProvenance)
+                  todoHydrationMessages = persisted.messages
 
                   // The REST hydration is a newest-tail page; graft it onto any
                   // older pages the previous view already backfilled so
@@ -1503,6 +1518,17 @@ export function useSessionActions({
                     liveProjection
                   )
                 }
+              }
+
+              try {
+                todoHydrationMessages = await resolveStoredSessionTodoMessages(
+                  storedSessionId,
+                  sessionRestScope,
+                  todoHydrationMessages
+                )
+              } catch {
+                // Candidate discovery failure is not proof of Todo absence.
+                todoHydrationMessages = null
               }
 
               const currentMessages = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.messages
@@ -1538,6 +1564,9 @@ export function useSessionActions({
                 clearedClarifyProjection?.messages ??
                 activatedMessages
 
+              if (todoHydrationMessages) {
+                hydrateSessionTodos(cachedRuntimeId, todoHydrationMessages, todoHydrationFence)
+              }
               releaseTranscriptView()
 
               const reconcileActivatedState = (state: ClientSessionState): ClientSessionState => {
@@ -1618,6 +1647,7 @@ export function useSessionActions({
             sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
             dropSessionState(cachedRuntimeId)
           } finally {
+            releaseTodoHydrationToken(todoHydrationFence)
             releaseTranscriptView()
           }
         }
@@ -1685,6 +1715,7 @@ export function useSessionActions({
       // it resumes into the streaming state rather than the "awaiting first
       // token" spinner.
       let recoveredInFlightTail = false
+      const todoHydrationFence = captureTodoWriteFence()
 
       try {
         const watchWindow = isWatchWindow()
@@ -1724,6 +1755,10 @@ export function useSessionActions({
             ...(sessionProfile ? { profile: sessionProfile } : {})
           })
         ).then(resumed => {
+          // Joiners share this resume result but own separate REST reads and
+          // provisional Todo tokens. Bind before either read can publish so
+          // the latest-started hydration wins in the returned runtime scope.
+          bindTodoHydrationToken(todoHydrationFence, resumed.session_id)
           resumeRuntimeBaselineMessages =
             sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
 
@@ -1801,6 +1836,28 @@ export function useSessionActions({
 
         const prefetchMatchesResumedSession =
           !prefetchedStoredSessionId || !resumedStoredSessionId || prefetchedStoredSessionId === resumedStoredSessionId
+
+        let todoHydrationMessages: SessionMessage[] | null =
+          prefetchedResult && prefetchMatchesResumedSession ? prefetchedResult.messages : resumed.messages
+
+        try {
+          todoHydrationMessages = await resolveStoredSessionTodoMessages(
+            storedSessionId,
+            sessionRestScope,
+            todoHydrationMessages
+          )
+        } catch {
+          // Candidate discovery failure is not proof of Todo absence.
+          todoHydrationMessages = null
+        }
+
+        if (!isCurrentResume()) {
+          return
+        }
+
+        if (todoHydrationMessages) {
+          hydrateSessionTodos(resumed.session_id, todoHydrationMessages, todoHydrationFence)
+        }
 
         const hasLiveProjection = Boolean(resumed.inflight || resumed.queued)
 
@@ -2200,6 +2257,7 @@ export function useSessionActions({
 
         notifyError(err, copy.resumeFailed)
       } finally {
+        releaseTodoHydrationToken(todoHydrationFence)
         displayRead.release()
 
         if (isCurrentResume()) {
