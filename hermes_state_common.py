@@ -352,7 +352,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -477,8 +477,133 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
     display_kind TEXT,
-    display_metadata TEXT
+    display_metadata TEXT,
+    todo_authority_json TEXT,
+    todo_pair_boundary_json TEXT
 );
+
+-- Sparse Todo authority tables are born empty on upgrade. Their indexes have
+-- work proportional only to accepted Todo authority, never transcript depth.
+CREATE TABLE IF NOT EXISTS todo_authorities (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    authority_json TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    compacted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_todo_authorities_latest
+    ON todo_authorities(session_id, message_id DESC)
+    WHERE active = 1 OR compacted = 1;
+
+CREATE TABLE IF NOT EXISTS todo_pair_boundaries (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    boundary_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS todo_authority_migrations (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    before_message_id INTEGER NOT NULL,
+    pending_results_json TEXT NOT NULL DEFAULT '[]',
+    deferred_pending_results_json TEXT NOT NULL DEFAULT '[]',
+    phase TEXT NOT NULL DEFAULT 'scan',
+    authority_checked_message_id INTEGER,
+    complete INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_todo_authority_message_insert
+AFTER INSERT ON messages
+WHEN NEW.todo_authority_json IS NOT NULL
+BEGIN
+    INSERT INTO todo_authorities
+           (message_id, session_id, authority_json, active, compacted)
+    VALUES (NEW.id, NEW.session_id, NEW.todo_authority_json, NEW.active, NEW.compacted)
+    ON CONFLICT(message_id) DO UPDATE SET
+        session_id = excluded.session_id,
+        authority_json = excluded.authority_json,
+        active = excluded.active,
+        compacted = excluded.compacted;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_todo_pair_boundary_message_insert
+AFTER INSERT ON messages
+WHEN NEW.role IN ('assistant', 'user', 'system')
+BEGIN
+    INSERT INTO todo_pair_boundaries
+           (session_id, message_id, role, boundary_json)
+    VALUES (NEW.session_id, NEW.id, NEW.role, NEW.todo_pair_boundary_json)
+    ON CONFLICT(session_id) DO UPDATE SET
+        message_id = excluded.message_id,
+        role = excluded.role,
+        boundary_json = excluded.boundary_json
+    WHERE excluded.message_id > todo_pair_boundaries.message_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_todo_authority_message_activity
+AFTER UPDATE OF active, compacted ON messages
+BEGIN
+    UPDATE todo_authorities
+       SET active = NEW.active, compacted = NEW.compacted
+     WHERE message_id = NEW.id;
+    DELETE FROM todo_pair_boundaries
+     WHERE session_id = NEW.session_id AND message_id = NEW.id
+       AND NOT (NEW.active = 1 OR NEW.compacted = 1);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_todo_authority_message_delete
+AFTER DELETE ON messages
+BEGIN
+    DELETE FROM todo_authorities WHERE message_id = OLD.id;
+    DELETE FROM todo_pair_boundaries
+     WHERE session_id = OLD.session_id AND message_id = OLD.id;
+END;
+
+-- A completed legacy scan stops at the first valid authority. If that indexed
+-- row later leaves the live/compacted transcript, reopen at a durable id
+-- boundary so an older still-live legacy carrier can be found in bounded
+-- slices. MAX preserves coverage when one lifecycle operation invalidates
+-- several rows; clearing pending results prevents pairing across the cut.
+CREATE TRIGGER IF NOT EXISTS trg_todo_migration_reopen_on_authority_activity
+AFTER UPDATE OF active, compacted ON messages
+WHEN OLD.todo_authority_json IS NOT NULL
+ AND (OLD.active = 1 OR OLD.compacted = 1)
+ AND NOT (NEW.active = 1 OR NEW.compacted = 1)
+BEGIN
+    INSERT INTO todo_authority_migrations
+           (session_id, before_message_id, pending_results_json, complete)
+    VALUES (OLD.session_id, OLD.id, '[]', 0)
+    ON CONFLICT(session_id) DO UPDATE SET
+        before_message_id = MAX(
+            todo_authority_migrations.before_message_id,
+            excluded.before_message_id
+        ),
+        pending_results_json = '[]',
+        deferred_pending_results_json = '[]',
+        phase = 'scan',
+        authority_checked_message_id = NULL,
+        complete = 0;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_todo_migration_reopen_on_authority_delete
+BEFORE DELETE ON messages
+WHEN OLD.todo_authority_json IS NOT NULL
+ AND (OLD.active = 1 OR OLD.compacted = 1)
+BEGIN
+    INSERT INTO todo_authority_migrations
+           (session_id, before_message_id, pending_results_json, complete)
+    VALUES (OLD.session_id, OLD.id, '[]', 0)
+    ON CONFLICT(session_id) DO UPDATE SET
+        before_message_id = MAX(
+            todo_authority_migrations.before_message_id,
+            excluded.before_message_id
+        ),
+        pending_results_json = '[]',
+        deferred_pending_results_json = '[]',
+        phase = 'scan',
+        authority_checked_message_id = NULL,
+        complete = 0;
+END;
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

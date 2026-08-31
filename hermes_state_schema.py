@@ -1300,6 +1300,20 @@ class SessionSchemaMixin:
                 # one large prompt copy per session.
                 self._dedupe_legacy_system_prompts(cursor)
 
+            if current_version < 27:
+                # v27: create only empty sparse authority/progress tables during
+                # schema reconciliation. Legacy transcript traversal is resumed
+                # in fixed slices by the Todo projection; startup never scans or
+                # decodes historical message payloads.
+                high_water = cursor.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM messages"
+                ).fetchone()[0]
+                cursor.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    ("todo_authority_legacy_high_water", str(int(high_water))),
+                )
+
             # The FTS storage layout is versioned independently of the main
             # schema (see the v23 note above). Stamp the current layout so the
             # main version can always advance: a fresh/optimized DB is at

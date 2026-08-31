@@ -1940,6 +1940,7 @@ export const ar = defineLocale({
   statusStack: {
     agents: 'الوكلاء',
     background: count => `${count} في الخلفية`,
+    restoredUnfinished: 'عمل غير مكتمل تمت استعادته',
     subagents: count => `${count} ${count === 1 ? 'وكيل فرعي' : 'وكيل فرعي'}`,
     todos: (done, total) => `المهام ${done}/${total}`,
     running: 'قيد التشغيل',
