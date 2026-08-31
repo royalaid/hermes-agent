@@ -2894,6 +2894,19 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class DeliveryOwnedReply(str):
+    """Final reply whose publication is already owned by the durable ledger."""
+
+    obligation_id: str
+
+    def __new__(cls, text: str, obligation_id: str):
+        if not obligation_id:
+            raise ValueError("delivery-owned reply requires an obligation id")
+        instance = super().__new__(cls, text)
+        instance.obligation_id = obligation_id
+        return instance
+
+
 def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     """Clear gateway-side STT cache attrs when media is merged into an event.
 
@@ -6677,8 +6690,25 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
 
-            # Call the handler (this can take a while with tool calls)
-            response = await self._message_handler(event)
+            # Recovered claimed results re-enter the exact final-response
+            # extraction/delivery pipeline but never the agent/tool handler.
+            _precomputed_response = getattr(
+                event, "_hermes_precomputed_response", None
+            )
+            if _precomputed_response is not None:
+                response = DeliveryOwnedReply(
+                    str(_precomputed_response),
+                    str(
+                        getattr(
+                            event, "_hermes_precomputed_obligation_id", ""
+                        )
+                    ),
+                )
+            else:
+                response = await self._message_handler(event)
+            _delivery_owned_obligation_id = getattr(
+                response, "obligation_id", None
+            )
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6848,6 +6878,38 @@ class BasePlatformAdapter(ABC):
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
+                # A claimed continuation already owns a durable publication row.
+                # Bind it to the final visible text and move it to attempting
+                # before *any* user-visible TTS/text delivery. Unlike ordinary
+                # best-effort rows, failure here is fail-closed.
+                _owned_obligation_id = None
+                _owned_delivery_adapter = None
+                if _delivery_owned_obligation_id:
+                    from gateway.delivery_ledger import prepare_claimed_result_delivery
+
+                    _owned_delivery_adapter = self._final_delivery_adapter(event.source)
+                    _owned_should_send = await asyncio.to_thread(
+                        prepare_claimed_result_delivery,
+                        _delivery_owned_obligation_id,
+                        session_key=session_key,
+                        platform=str(
+                            getattr(
+                                event.source.platform,
+                                "value",
+                                event.source.platform,
+                            )
+                        ),
+                        chat_id=event.source.chat_id,
+                        thread_id=getattr(event.source, "thread_id", None),
+                        content=text_content,
+                        adapter_profile=getattr(
+                            _owned_delivery_adapter, "_owner_profile", None
+                        ),
+                    )
+                    if not _owned_should_send:
+                        return
+                    _owned_obligation_id = _delivery_owned_obligation_id
+
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
                 _tts_cleanup_paths = {_tts_requested_path, *_tts_paths} - {None}
@@ -6894,12 +6956,22 @@ class BasePlatformAdapter(ABC):
                         except OSError:
                             pass
 
+                if _owned_obligation_id and _tts_caption_delivered:
+                    from gateway.delivery_ledger import mark_claimed_result_delivered
+
+                    await asyncio.to_thread(
+                        mark_claimed_result_delivered, _owned_obligation_id
+                    )
+
                 # Send the text portion. A reconnect may have replaced this
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
                 if text_content and not _tts_caption_delivered:
-                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    delivery_adapter = (
+                        _owned_delivery_adapter
+                        or self._final_delivery_adapter(event.source)
+                    )
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
                         delivery_adapter.name,
@@ -6915,8 +6987,8 @@ class BasePlatformAdapter(ABC):
                     # trouble must never block or delay the actual send.
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
-                    _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    _obligation_id = _owned_obligation_id
+                    if _obligation_id is None and not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
                         try:
@@ -6962,18 +7034,32 @@ class BasePlatformAdapter(ABC):
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
+                                mark_claimed_result_delivered,
+                                mark_claimed_result_failed,
                                 mark_delivered,
                                 mark_failed,
                             )
 
                             if getattr(result, "success", False):
-                                await asyncio.to_thread(mark_delivered, _obligation_id)
+                                _mark_delivered = (
+                                    mark_claimed_result_delivered
+                                    if _owned_obligation_id
+                                    else mark_delivered
+                                )
+                                await asyncio.to_thread(
+                                    _mark_delivered, _obligation_id
+                                )
                             else:
                                 _delivery_error = str(
                                     getattr(result, "error", "") or ""
                                 )
+                                _mark_failed = (
+                                    mark_claimed_result_failed
+                                    if _owned_obligation_id
+                                    else mark_failed
+                                )
                                 await asyncio.to_thread(
-                                    mark_failed,
+                                    _mark_failed,
                                     _obligation_id,
                                     _delivery_error,
                                 )
@@ -7168,6 +7254,16 @@ class BasePlatformAdapter(ABC):
                     delivery_attempted or _tts_caption_delivered
                     or images or local_files or media_files
                 )
+                if (
+                    _owned_obligation_id
+                    and not text_content
+                    and (delivery_succeeded or _tts_caption_delivered)
+                ):
+                    from gateway.delivery_ledger import mark_claimed_result_delivered
+
+                    await asyncio.to_thread(
+                        mark_claimed_result_delivered, _owned_obligation_id
+                    )
                 if not _anything_delivered and _response_pre_extract.strip():
                     logger.error(
                         "[%s] response_delivery_dropped: non-empty response "
@@ -7247,6 +7343,12 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            if locals().get("_delivery_owned_obligation_id"):
+                # Publication remains durably owned. Do not expose storage or
+                # reconciliation details, and do not add an unowned error reply.
+                if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                    raise
+                return
             # Send the error to the user so they aren't left with radio silence
             try:
                 error_type = type(e).__name__
