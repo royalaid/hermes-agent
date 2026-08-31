@@ -2156,6 +2156,7 @@ from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    DeliveryOwnedReply,
     _reply_anchor_for_event,
 )
 from gateway.platforms.event import MessageEvent, MessageType
