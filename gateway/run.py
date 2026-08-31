@@ -3011,6 +3011,7 @@ from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    DeliveryOwnedReply,
     EphemeralReply,
     MessageEvent,
     MessageType,
@@ -3259,6 +3260,10 @@ class _GoalContinuationRetry:
     claim_id: Optional[str] = None
     dropped: bool = False
     initial_retry_used: bool = False
+
+
+class GoalContinuationPublicationError(RuntimeError):
+    """A completed continuation could not cross its durable publication fence."""
 
 
 def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModelContext:
@@ -3907,6 +3912,17 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     cleaned = cleaned.replace("[[audio_as_voice]]", "").strip()
     cleaned = cleaned.replace("[[as_document]]", "").strip()
     return cleaned.strip()
+
+
+def _durable_delivery_text_for_response(response: str, adapter: Any) -> str:
+    """Project final text without exposing attachment directives or paths."""
+    from gateway.platforms.base import _strip_media_directives
+
+    _media_files, cleaned = adapter.extract_media(response)
+    _images, text_content = adapter.extract_images(cleaned)
+    text_content = _strip_media_directives(text_content).strip()
+    _local_files, text_content = adapter.extract_local_files(text_content)
+    return text_content.strip()
 
 
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
@@ -5891,8 +5907,13 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if ctx.defer_result_publication:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_interim_messages = (
+            ctx.interim_assistant_messages_enabled
+            and not ctx.defer_result_publication
+        )
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -9988,7 +10009,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "goal continuation: durable completion failed for session %s",
                 session_key,
             )
-            self._restore_dequeued_event_front(session_key, adapter, event)
+            if not getattr(event, "_hermes_delivery_obligation_id", None):
+                self._restore_dequeued_event_front(session_key, adapter, event)
             if retry is not None:
                 retry.event = event
                 retry.owner_task = None
@@ -10042,6 +10064,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if event_claim_identity(event) is None:
             return
+        if getattr(event, "_hermes_delivery_obligation_id", None):
+            # Execution finished and its output already has durable publication
+            # ownership. Re-arming this input would repeat agent/tool effects.
+            return
+        if getattr(event, "_hermes_execution_completed", False):
+            # The input claim contains the completed output. Startup transfers
+            # it into the delivery ledger instead of executing the agent again.
+            return
         retry = getattr(self, "_goal_continuation_retries", {}).get(session_key)
         if retry is not None and retry.dropped:
             return
@@ -10061,7 +10091,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(event.source)
         if self._is_goal_continuation_event(event):
             if not self._drop_goal_continuation_retry(session_key):
-                self._restore_dequeued_event_front(session_key, adapter, event)
+                if not getattr(
+                    event, "_hermes_execution_completed", False
+                ):
+                    self._restore_dequeued_event_front(
+                        session_key, adapter, event
+                    )
                 raise RuntimeError(
                     "durable continuation policy retirement is unavailable"
                 )
@@ -10074,6 +10109,201 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise RuntimeError(
                 "durable continuation policy retirement is unavailable"
             )
+
+    async def _commit_goal_continuation_result(
+        self,
+        *,
+        session_key: str,
+        source: "SessionSource",
+        event: "MessageEvent",
+        result: Dict[str, Any],
+        active_turn_token: Optional[str] = None,
+    ) -> str:
+        """Stage one completed result, then acknowledge its execution claim."""
+        from gateway import delivery_ledger
+        from gateway.goal_continuation_claims import (
+            event_claim_identity,
+            stage_completed_result,
+        )
+
+        identity = event_claim_identity(event)
+        content = result.get("final_response")
+        if identity is None or not isinstance(content, str):
+            raise GoalContinuationPublicationError("durable result staging failed")
+        adapter = self._adapter_for_source(source)
+        profile = getattr(adapter, "_owner_profile", None) or source.profile
+        claim_home = getattr(self, "_goal_continuation_claim_home", None)
+        try:
+            delivery_text = _durable_delivery_text_for_response(content, adapter)
+            source_payload = source.to_dict()
+            source_payload["is_bot"] = bool(source.is_bot)
+            source_payload["role_authorized"] = False
+            source_json = json.dumps(
+                source_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            await asyncio.to_thread(
+                stage_completed_result,
+                session_key,
+                identity[0],
+                identity[1],
+                content,
+                delivery_text=delivery_text,
+                active_turn_token=active_turn_token,
+                home=claim_home,
+            )
+            setattr(event, "_hermes_execution_completed", True)
+            obligation_id = await asyncio.to_thread(
+                delivery_ledger.record_claimed_result,
+                session_key=session_key,
+                claim_id=identity[0],
+                claim_event_id=identity[1],
+                platform=source.platform.value,
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                content=delivery_text,
+                adapter_profile=profile,
+                active_turn_token=active_turn_token,
+                raw_content=content,
+                source_json=source_json,
+                message_ref=getattr(event, "message_id", None),
+                home=claim_home,
+            )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                raise
+            raise GoalContinuationPublicationError(
+                "durable result staging failed"
+            ) from exc
+
+        setattr(event, "_hermes_delivery_obligation_id", obligation_id)
+        result["_delivery_obligation_id"] = obligation_id
+        if not self._complete_goal_continuation_claim_event(
+            session_key, adapter, event
+        ):
+            raise GoalContinuationPublicationError(
+                "durable claim acknowledgement failed"
+            )
+        return obligation_id
+
+    def _reconcile_completed_goal_continuation_claims(self) -> int:
+        """Retire staged claim heads before startup can re-execute them."""
+        from gateway import delivery_ledger
+        from gateway.goal_continuation_claims import (
+            GoalContinuationClaimError,
+            MAX_EVENTS,
+            clear_event_claim_identity,
+            complete_claim_event,
+            event_claim_identity,
+            load_claims,
+        )
+
+        reconciled = 0
+        for _recovery_pass in range(MAX_EVENTS + 1):
+            claims = load_claims(
+                home=getattr(self, "_goal_continuation_claim_home", None)
+            )
+            progressed = False
+            for claim in claims:
+                head = claim.events[0]
+                identity = event_claim_identity(head)
+                if identity is None:
+                    raise GoalContinuationClaimError(
+                        "durable continuation result identity is unavailable"
+                    )
+                claim_home = getattr(
+                    self, "_goal_continuation_claim_home", None
+                )
+                obligation = delivery_ledger.get_claimed_result(
+                    *identity,
+                    home=claim_home,
+                )
+                completed_content = claim.completed_results.get(identity[1])
+                delivery_text = claim.completed_delivery_texts.get(identity[1])
+                if completed_content is None:
+                    if obligation is not None:
+                        raise GoalContinuationClaimError(
+                            "durable result exists without completed claim state"
+                        )
+                    continue
+                if delivery_text is None:
+                    raise GoalContinuationClaimError(
+                        "durable continuation delivery text is unavailable"
+                    )
+                active_turn_token = claim.completed_turn_tokens.get(identity[1])
+                source_payload = head.source.to_dict()
+                source_payload["is_bot"] = bool(head.source.is_bot)
+                source_payload["role_authorized"] = False
+                source_json = json.dumps(
+                    source_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if obligation is None:
+                    obligation_id = delivery_ledger.record_claimed_result(
+                        session_key=claim.session_key,
+                        claim_id=identity[0],
+                        claim_event_id=identity[1],
+                        platform=head.source.platform.value,
+                        chat_id=head.source.chat_id,
+                        thread_id=head.source.thread_id,
+                        content=delivery_text,
+                        adapter_profile=claim.profile,
+                        active_turn_token=active_turn_token,
+                        raw_content=completed_content,
+                        source_json=source_json,
+                        message_ref=getattr(head, "message_id", None),
+                        home=claim_home,
+                    )
+                    obligation = delivery_ledger.get_claimed_result(
+                        *identity,
+                        home=claim_home,
+                    )
+                    if (
+                        obligation is None
+                        or obligation["obligation_id"] != obligation_id
+                    ):
+                        raise GoalContinuationClaimError(
+                            "durable continuation result transfer is unavailable"
+                        )
+                expected_profile = claim.profile or "default"
+                if (
+                    obligation["session_key"] != claim.session_key
+                    or obligation["platform"] != head.source.platform.value
+                    or obligation["chat_id"] != str(head.source.chat_id)
+                    or obligation["thread_id"]
+                    != (str(head.source.thread_id) if head.source.thread_id else None)
+                    or obligation["content"] != delivery_text
+                    or obligation["profile"] != expected_profile
+                    or obligation["active_turn_token"] != active_turn_token
+                    or obligation["raw_content"] != completed_content
+                    or obligation["source_json"] != source_json
+                    or obligation["message_ref"]
+                    != (str(head.message_id) if head.message_id else None)
+                ):
+                    raise GoalContinuationClaimError(
+                        "durable continuation result cannot bind to its claim"
+                    )
+                if not complete_claim_event(
+                    claim.session_key,
+                    identity[0],
+                    identity[1],
+                    home=getattr(self, "_goal_continuation_claim_home", None),
+                ):
+                    raise GoalContinuationClaimError(
+                        "durable continuation result acknowledgement failed"
+                    )
+                clear_event_claim_identity(head)
+                reconciled += 1
+                progressed = True
+            if not progressed:
+                return reconciled
+        raise GoalContinuationClaimError(
+            "durable continuation completed-result recovery exceeded its bound"
+        )
 
     def _recover_goal_continuation_claims(self, *, schedule: bool = True) -> int:
         """Restore strict durable claim FIFOs before startup admits new input."""
@@ -10202,15 +10432,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from gateway.goal_continuation_claims import (
                     clear_event_claim_identity,
+                    complete_claim_event,
                     event_claim_identity,
+                    load_claims,
                     retire_claim,
                 )
 
-                retire_claim(
-                    session_key,
-                    retry.claim_id,
-                    home=getattr(self, "_goal_continuation_claim_home", None),
+                identity = event_claim_identity(retry.event)
+                owned_obligation_id = getattr(
+                    retry.event, "_hermes_delivery_obligation_id", None
                 )
+                if owned_obligation_id:
+                    from gateway.delivery_ledger import get_claimed_result
+
+                    if identity is None or identity[0] != retry.claim_id:
+                        raise RuntimeError(
+                            "durable completed continuation identity is unavailable"
+                        )
+                    claim = next(
+                        (
+                            item
+                            for item in load_claims(
+                                home=getattr(
+                                    self, "_goal_continuation_claim_home", None
+                                )
+                            )
+                            if item.session_key == session_key
+                            and item.claim_id == retry.claim_id
+                        ),
+                        None,
+                    )
+                    completed_content = (
+                        claim.completed_results.get(identity[1]) if claim else None
+                    )
+                    delivery_text = (
+                        claim.completed_delivery_texts.get(identity[1])
+                        if claim
+                        else None
+                    )
+                    obligation = get_claimed_result(
+                        *identity,
+                        home=getattr(
+                            self, "_goal_continuation_claim_home", None
+                        ),
+                    )
+                    if (
+                        claim is None
+                        or completed_content is None
+                        or delivery_text is None
+                        or obligation is None
+                        or obligation["obligation_id"] != owned_obligation_id
+                        or obligation["content"] != delivery_text
+                        or obligation["raw_content"] != completed_content
+                    ):
+                        raise RuntimeError(
+                            "durable completed continuation ownership is inconsistent"
+                        )
+                    next_event = complete_claim_event(
+                        session_key,
+                        retry.claim_id,
+                        identity[1],
+                        home=getattr(
+                            self, "_goal_continuation_claim_home", None
+                        ),
+                    )
+                    if next_event is not None:
+                        retire_claim(
+                            session_key,
+                            retry.claim_id,
+                            home=getattr(
+                                self, "_goal_continuation_claim_home", None
+                            ),
+                        )
+                else:
+                    retire_claim(
+                        session_key,
+                        retry.claim_id,
+                        home=getattr(
+                            self, "_goal_continuation_claim_home", None
+                        ),
+                    )
                 adapter = self._adapter_for_source(retry.event.source)
                 pending_slot = getattr(adapter, "_pending_messages", None)
                 events = [retry.event]
@@ -10262,9 +10563,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if retry.claim_id and not self._drop_goal_continuation_retry(
                         session_key
                     ):
-                        self._restore_dequeued_event_front(
-                            session_key, adapter, event
-                        )
+                        if not getattr(
+                            event, "_hermes_execution_completed", False
+                        ):
+                            self._restore_dequeued_event_front(
+                                session_key, adapter, event
+                            )
                         return False
                     self._finish_goal_continuation_retry(session_key, retry)
                 self._stage_next_queued_event(
@@ -13819,6 +14123,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self._clear_resume_pending_for_claimed_obligations(claimed)
         return claimed
 
+    @staticmethod
+    def _claimed_result_replay_event(row: Dict[str, Any]) -> MessageEvent:
+        """Rebuild only the non-authoritative routing needed for output replay."""
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        source_payload = json.loads(row["source_json"])
+        if not isinstance(source_payload, dict):
+            raise ValueError("invalid claimed-result replay source")
+        source_data = dict(source_payload)
+        is_bot = source_data.pop("is_bot", False)
+        role_authorized = source_data.pop("role_authorized", False)
+        if not isinstance(is_bot, bool) or role_authorized is not False:
+            raise ValueError("invalid claimed-result replay trust state")
+        source = SessionSource.from_dict(source_data)
+        source.is_bot = is_bot
+        source.role_authorized = False
+        if (
+            source.platform.value != row["platform"]
+            or str(source.chat_id) != str(row["chat_id"])
+            or (str(source.thread_id) if source.thread_id else None)
+            != (str(row["thread_id"]) if row.get("thread_id") else None)
+            or (source.profile or "default") != (row.get("profile") or "default")
+        ):
+            raise ValueError("claimed-result replay route mismatch")
+        raw_content = row.get("raw_content")
+        if not isinstance(raw_content, str):
+            raise ValueError("claimed-result replay payload is unavailable")
+        if row.get("needs_marker"):
+            raw_content = row.get("marker", RECOVERED_MARKER) + raw_content
+        event = MessageEvent(
+            text="",
+            source=source,
+            message_id=row.get("message_ref"),
+            internal=True,
+            allow_gateway_control=False,
+            goal_continuation=True,
+        )
+        setattr(event, "_hermes_precomputed_response", raw_content)
+        setattr(
+            event,
+            "_hermes_precomputed_obligation_id",
+            row["obligation_id"],
+        )
+        return event
+
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
         """Redeliver final responses for rows already claimed (and
         resume-cleared) by :meth:`_claim_pending_obligations`.
@@ -13876,6 +14225,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 # Startup claims preserve their historical state; attempts cap
                 # + stale cutoff bound later retries.
+                continue
+            if (
+                row.get("claim_id")
+                and row.get("claim_event_id")
+                and row.get("source_json")
+                and row.get("raw_content") is not None
+                and not row.get("runtime_recovery")
+            ):
+                try:
+                    replay_event = self._claimed_result_replay_event(row)
+                    await adapter._process_message_background(
+                        replay_event, row["session_key"]
+                    )
+                    from gateway.delivery_ledger import get_claimed_result
+
+                    replay_state = await asyncio.to_thread(
+                        get_claimed_result,
+                        row["claim_id"],
+                        row["claim_event_id"],
+                    )
+                    if replay_state and replay_state["state"] == "delivered":
+                        redelivered += 1
+                except Exception:
+                    from gateway.delivery_ledger import mark_claimed_result_failed
+
+                    await asyncio.to_thread(
+                        mark_claimed_result_failed,
+                        row["obligation_id"],
+                        "replay_pipeline_failed",
+                    )
+                    logger.warning(
+                        "Claimed-result replay pipeline failed for obligation %s",
+                        row["obligation_id"],
+                    )
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -14255,13 +14638,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _recover_unclean_sessions(self) -> tuple[int, int]:
         """Recover exact active turns, then run the legacy recency fallback."""
+        from gateway.delivery_ledger import completed_active_turn_tokens
+
         exact = 0
         fallback = 0
+        try:
+            completed_tokens = await asyncio.to_thread(
+                completed_active_turn_tokens,
+                home=getattr(self, "_goal_continuation_claim_home", None),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "completed-result ownership recovery is unavailable"
+            ) from exc
         try:
             agent_timeout = max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800))
             marker_max_age = max(60 * 60, int(agent_timeout * 2))
             exact = await self.async_session_store.recover_interrupted_turns(
-                max_age_seconds=marker_max_age
+                max_age_seconds=marker_max_age,
+                completed_turn_tokens=completed_tokens,
             )
         except Exception as exc:
             logger.warning("Exact active-turn recovery on startup failed: %s", exc)
@@ -14685,6 +15080,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info("Recovered %s background process(es) from previous run", recovered)
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
+
+        # Transfer completed continuation checkpoints into publication ownership
+        # before active-turn recovery can convert their crash markers into a
+        # second execution.
+        await asyncio.to_thread(
+            self._reconcile_completed_goal_continuation_claims
+        )
 
         # Recover sessions that were active when the gateway last exited.
         # Exact durable turn markers cover long-running work; the 120-second
@@ -23724,6 +24126,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Suppressing intentional silence marker for session %s",
                     session_entry.session_id,
                 )
+                _owned_id = agent_result.get("_delivery_obligation_id")
+                if _owned_id:
+                    from gateway.delivery_ledger import mark_claimed_result_delivered
+
+                    await asyncio.to_thread(
+                        mark_claimed_result_delivered, _owned_id
+                    )
                 response = ""
 
             # Auto voice reply: send TTS audio before the text response
@@ -23781,8 +24190,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event._streamed_final_response = str(response or "")
                 except Exception:
                     pass
+                _owned_id = agent_result.get("_delivery_obligation_id")
+                if _owned_id:
+                    from gateway.delivery_ledger import mark_claimed_result_delivered
+
+                    await asyncio.to_thread(
+                        mark_claimed_result_delivered, _owned_id
+                    )
                 return None
 
+            _owned_id = agent_result.get("_delivery_obligation_id")
+            if _owned_id and response:
+                return DeliveryOwnedReply(response, _owned_id)
             return response
             
         except Exception as e:
@@ -23805,6 +24224,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await _err_adapter.stop_typing(source.chat_id)
             except Exception:
                 pass
+            if isinstance(e, GoalContinuationPublicationError):
+                logger.warning(
+                    "goal continuation: completed result is waiting for durable replay "
+                    "for session %s",
+                    session_key,
+                )
+                return None
             logger.exception("Agent error in session %s", session_key)
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
@@ -25327,69 +25753,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_already_delivered: bool = False,
         deliver_media: bool = True,
         stream_consumer=None,
+        delivery_obligation_id: Optional[str] = None,
     ) -> None:
-        """Deliver a queued response using the normal text+attachment split."""
-        if not text_already_delivered:
-            text_content = _strip_response_attachments_for_direct_send(response, adapter)
-            if text_content:
-                # Reconcile-by-edit first (live finding, 2026-08-16 canary):
-                # when the stream consumer delivered/sealed a message but its
-                # recorded payload didn't confirm the final (post-stream
-                # mutation), plain-sending here creates the duplicate — the
-                # sealed message already carries most of the answer. A sealed
-                # native stream is a regular message; chat.update on it is
-                # live-verified working. Fall back to plain send only when
-                # there is no editable message or the edit fails.
-                _reconciled = False
-                _sc_msg_id = getattr(stream_consumer, "message_id", None)
-                if (
-                    _sc_msg_id
-                    and _sc_msg_id != "__no_edit__"
-                    and not getattr(stream_consumer, "_turn_split_delivery", False)
-                ):
-                    try:
-                        _edit_res = await adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=_sc_msg_id,
-                            content=text_content,
-                            finalize=True,
+        """Deliver a queued response using its existing publication ownership."""
+        if delivery_obligation_id:
+            from gateway.delivery_ledger import prepare_claimed_result_delivery
+
+            visible_text = _strip_response_attachments_for_direct_send(
+                response, adapter
+            )
+            should_send = await asyncio.to_thread(
+                prepare_claimed_result_delivery,
+                delivery_obligation_id,
+                session_key=str(
+                    getattr(source, "session_key", "")
+                    or self._session_key_for_source(source)
+                ),
+                platform=str(
+                    getattr(source.platform, "value", source.platform)
+                ),
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                content=visible_text,
+                adapter_profile=getattr(adapter, "_owner_profile", None),
+            )
+            if not should_send:
+                return
+
+        try:
+            if not text_already_delivered:
+                text_content = _strip_response_attachments_for_direct_send(
+                    response, adapter
+                )
+                if text_content:
+                    # Reconcile-by-edit first: a sealed native stream is a regular
+                    # editable message. Fall back to a new send when unavailable.
+                    reconciled = False
+                    stream_message_id = getattr(stream_consumer, "message_id", None)
+                    if (
+                        stream_message_id
+                        and stream_message_id != "__no_edit__"
+                        and not getattr(
+                            stream_consumer, "_turn_split_delivery", False
                         )
-                        if getattr(_edit_res, "success", False):
-                            _reconciled = True
-                            logger.info(
-                                "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
-                                _sc_msg_id,
+                    ):
+                        try:
+                            edit_result = await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=stream_message_id,
+                                content=text_content,
+                                finalize=True,
                             )
-                    except Exception as _qe:
-                        logger.debug(
-                            "Queued-lane reconcile edit failed (%s); falling back to send.",
-                            _qe,
+                            if getattr(edit_result, "success", False):
+                                reconciled = True
+                                logger.info(
+                                    "Queued-lane final reconciled by editing "
+                                    "message %s in place (no duplicate send).",
+                                    stream_message_id,
+                                )
+                        except Exception as edit_error:
+                            logger.debug(
+                                "Queued-lane reconcile edit failed (%s); "
+                                "falling back to send.",
+                                edit_error,
+                            )
+                    if not reconciled:
+                        send_result = await adapter.send(
+                            source.chat_id,
+                            text_content,
+                            metadata=metadata,
                         )
-                if not _reconciled:
-                    await adapter.send(
-                        source.chat_id,
-                        text_content,
-                        metadata=metadata,
+                        if not getattr(send_result, "success", True):
+                            raise GoalContinuationPublicationError(
+                                "claimed continuation delivery failed"
+                            )
+
+            # Failed turns still deliver normalized failure text, but do not
+            # upload attachments as if the turn succeeded.
+            if deliver_media:
+                synthetic_event = MessageEvent(
+                    text="",
+                    source=source,
+                    message_id=event_message_id,
+                )
+                await self._deliver_media_from_response(
+                    response,
+                    synthetic_event,
+                    adapter,
+                    thread_metadata=metadata,
+                )
+        except BaseException as exc:
+            if delivery_obligation_id and isinstance(exc, Exception):
+                from gateway.delivery_ledger import mark_claimed_result_failed
+
+                try:
+                    await asyncio.to_thread(
+                        mark_claimed_result_failed,
+                        delivery_obligation_id,
+                        "platform_delivery_failed",
                     )
+                except Exception:
+                    logger.debug(
+                        "claimed-result ledger failure update failed",
+                        exc_info=True,
+                    )
+            raise
+        else:
+            if delivery_obligation_id:
+                from gateway.delivery_ledger import mark_claimed_result_delivered
 
-        # Failed turns still deliver their (normalized failure) text above,
-        # but must not upload attachments as if the turn succeeded — mirrors
-        # the ``not agent_result.get("failed")`` guard on the completed-turn
-        # delivery path.
-        if not deliver_media:
-            return
-
-        synthetic_event = MessageEvent(
-            text="",
-            source=source,
-            message_id=event_message_id,
-        )
-        await self._deliver_media_from_response(
-            response,
-            synthetic_event,
-            adapter,
-            thread_metadata=metadata,
-        )
+                await asyncio.to_thread(
+                    mark_claimed_result_delivered, delivery_obligation_id
+                )
 
     async def _run_background_task(
         self,
@@ -30697,6 +31172,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        defer_result_publication: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -30802,6 +31278,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if defer_result_publication:
+            _streaming_enabled = False
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -31001,9 +31479,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        from gateway.goal_continuation_claims import event_claim_identity
+
+        durable_claimed_event = (
+            claimed_event is not None
+            and event_claim_identity(claimed_event) is not None
+        )
+        claimed_active_turn_token = None
+        if durable_claimed_event and session_key:
+            try:
+                token_reader = getattr(
+                    getattr(self, "session_store", None),
+                    "get_active_turn_token",
+                    None,
+                )
+                candidate_token = (
+                    token_reader(session_key) if callable(token_reader) else None
+                )
+                if isinstance(candidate_token, str) and candidate_token:
+                    claimed_active_turn_token = candidate_token
+            except Exception as exc:
+                self._restore_unacknowledged_goal_continuation_claim_event(
+                    session_key, source, claimed_event
+                )
+                raise GoalContinuationPublicationError(
+                    "durable active-turn ownership is unavailable"
+                ) from exc
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             try:
-                return await self._run_agent_inner(
+                result = await self._run_agent_inner(
                     message, context_prompt, history, source, session_id,
                     session_key=session_key, run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
@@ -31014,7 +31518,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     persist_user_display_kind=persist_user_display_kind,
                     message_type=message_type,
                     claimed_event=claimed_event,
+                    durable_claimed_event=durable_claimed_event,
+                    claimed_active_turn_token=claimed_active_turn_token,
                 )
+                if (
+                    durable_claimed_event
+                    and session_key
+                    and "_delivery_obligation_id" not in result
+                ):
+                    await self._commit_goal_continuation_result(
+                        session_key=session_key,
+                        source=source,
+                        event=claimed_event,
+                        result=result,
+                        active_turn_token=claimed_active_turn_token,
+                    )
+                return result
             except BaseException:
                 self._restore_unacknowledged_goal_continuation_claim_event(
                     session_key, source, claimed_event
@@ -31024,7 +31543,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile_home = self._resolve_profile_home_for_source(source)
         try:
             with _profile_runtime_scope(profile_home):
-                return await self._run_agent_inner(
+                result = await self._run_agent_inner(
                     message, context_prompt, history, source, session_id,
                     session_key=session_key, run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
@@ -31035,7 +31554,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     persist_user_display_kind=persist_user_display_kind,
                     message_type=message_type,
                     claimed_event=claimed_event,
+                    durable_claimed_event=durable_claimed_event,
+                    claimed_active_turn_token=claimed_active_turn_token,
                 )
+            if (
+                durable_claimed_event
+                and session_key
+                and "_delivery_obligation_id" not in result
+            ):
+                await self._commit_goal_continuation_result(
+                    session_key=session_key,
+                    source=source,
+                    event=claimed_event,
+                    result=result,
+                    active_turn_token=claimed_active_turn_token,
+                )
+            return result
         except BaseException:
             self._restore_unacknowledged_goal_continuation_claim_event(
                 session_key, source, claimed_event
@@ -31185,6 +31719,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         claimed_event: Optional[MessageEvent] = None,
+        durable_claimed_event: bool = False,
+        claimed_active_turn_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -31209,10 +31745,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                defer_result_publication=durable_claimed_event,
             )
-            if claimed_event is not None and session_key:
-                self._complete_goal_continuation_claim_event(
-                    session_key, self._adapter_for_source(source), claimed_event
+            if durable_claimed_event and session_key:
+                await self._commit_goal_continuation_result(
+                    session_key=session_key,
+                    source=source,
+                    event=claimed_event,
+                    result=result,
+                    active_turn_token=claimed_active_turn_token,
                 )
             return result
 
@@ -31481,7 +32022,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             log_mode_enabled=log_mode_enabled,
-            interim_assistant_messages_enabled=interim_assistant_messages_enabled,
+            interim_assistant_messages_enabled=(
+                interim_assistant_messages_enabled
+                and not durable_claimed_event
+            ),
+            defer_result_publication=durable_claimed_event,
             needs_progress_queue=needs_progress_queue,
             _native_slack_task_cards=_native_slack_task_cards,
             _voice_ack_fired=_voice_ack_fired,
@@ -31776,6 +32321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if (
             _stts_adapter is not None
+            and not durable_claimed_event
             and _is_voice_input
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
         ):
@@ -32445,11 +32991,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if callable(_mark_turn):
                         _mark_turn(session_key, run_generation)
 
-            if claimed_event is not None and session_key:
-                if not self._complete_goal_continuation_claim_event(
-                    session_key, adapter, claimed_event
-                ):
-                    return result
+            if durable_claimed_event and session_key:
+                await self._commit_goal_continuation_result(
+                    session_key=session_key,
+                    source=source,
+                    event=claimed_event,
+                    result=result,
+                    active_turn_token=claimed_active_turn_token,
+                )
 
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
@@ -32606,6 +33155,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # normalization and any final response processing applied by
                     # _run_agent_task; sending the raw copy bypasses those steps.
                     _delivery_result = response if isinstance(response, dict) else (result or {})
+                    _owned_delivery_id = _delivery_result.get(
+                        "_delivery_obligation_id"
+                    )
                     _previewed = bool(_delivery_result.get("response_previewed"))
                     first_response = _delivery_result.get("final_response", "")
                     _already_streamed = _stream_confirmed_final_delivery(
@@ -32628,6 +33180,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
                         )
+                        if _owned_delivery_id:
+                            from gateway.delivery_ledger import (
+                                mark_claimed_result_delivered,
+                            )
+
+                            await asyncio.to_thread(
+                                mark_claimed_result_delivered,
+                                _owned_delivery_id,
+                            )
                     elif first_response:
                         try:
                             if _already_streamed:
@@ -32649,9 +33210,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 text_already_delivered=_already_streamed,
                                 deliver_media=not _delivery_result.get("failed"),
                                 stream_consumer=_sc,
+                                delivery_obligation_id=_owned_delivery_id,
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
+                            if _owned_delivery_id:
+                                raise
+                    elif _owned_delivery_id:
+                        from gateway.delivery_ledger import (
+                            mark_claimed_result_delivered,
+                        )
+
+                        await asyncio.to_thread(
+                            mark_claimed_result_delivered,
+                            _owned_delivery_id,
+                        )
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in

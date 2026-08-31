@@ -3204,9 +3204,17 @@ class SessionStore:
             entry.active_turn_started_at = None
         return True
 
+    def get_active_turn_token(self, session_key: str) -> Optional[str]:
+        """Return the current exact turn owner without exposing other state."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            return entry.active_turn_token if entry is not None else None
+
     def recover_interrupted_turns(
         self,
         max_age_seconds: int = 60 * 60,
+        completed_turn_tokens: Optional[Dict[str, set[str]]] = None,
     ) -> int:
         """Promote exact crash-left turn markers into ``resume_pending``.
 
@@ -3228,6 +3236,23 @@ class SessionStore:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
                 if not entry.active_turn_token:
+                    continue
+
+                completed_tokens = (completed_turn_tokens or {}).get(
+                    entry.session_key, set()
+                )
+                turn_is_completed = (
+                    entry.active_turn_token == completed_tokens
+                    if isinstance(completed_tokens, str)
+                    else entry.active_turn_token in completed_tokens
+                )
+                if turn_is_completed:
+                    # The exact turn already produced a claim-bound durable
+                    # result. Clearing its crash marker must not synthesize a
+                    # second execution merely because delivery is pending.
+                    entry.active_turn_token = None
+                    entry.active_turn_started_at = None
+                    changed = True
                     continue
 
                 started_at = entry.active_turn_started_at
