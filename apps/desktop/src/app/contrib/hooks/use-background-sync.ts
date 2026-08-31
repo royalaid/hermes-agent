@@ -20,7 +20,7 @@ import {
   sessionMatchesStoredId,
   setCurrentCwd
 } from '@/store/session'
-import type { SessionProfileRoute } from '@/store/session-request-router'
+import { ownerRouteProfileScope, type SessionProfileRoute } from '@/store/session-request-router'
 import {
   $sessionStates,
   $sessionTiles,
@@ -28,13 +28,38 @@ import {
   SESSION_WATCHDOG_TIMEOUT_MS,
   setSessionStalled
 } from '@/store/session-states'
+import { captureTodoWriteFence, clearActiveSessionTodos, releaseTodoHydrationToken } from '@/store/todos'
 
 import type { ClientSessionState } from '../../types'
 import type { GatewayRequester } from '../types'
+import { hydrateSessionTodos, resolveStoredSessionTodoMessages } from '../wiring-todo-hydration'
 
 interface ActiveTranscriptSession {
   ownerRoute?: SessionProfileRoute
   profile?: string | null
+}
+
+function ownerRouteTranscriptKey(ownerRoute: SessionProfileRoute, storedSessionId: string): string {
+  return JSON.stringify([
+    ownerRoute.connectionId,
+    ownerRoute.profile,
+    ownerRoute.targetProfile ?? '',
+    ownerRoute.mode ?? '',
+    storedSessionId
+  ])
+}
+
+function activeTranscriptOwnerKey(
+  session: ActiveTranscriptSession | null | undefined,
+  storedSessionId: string
+): string | undefined {
+  if (!session) {
+    return undefined
+  }
+
+  return session.ownerRoute
+    ? ownerRouteTranscriptKey(session.ownerRoute, storedSessionId)
+    : `${session.profile ?? 'default'}:${storedSessionId}`
 }
 
 /** Resolve an active transcript from visible rows or its unique hidden owner. */
@@ -98,10 +123,14 @@ function tileTranscriptSignatureKey(tile: TileTranscriptTarget): string {
  */
 export async function reconcileTileTranscripts({
   requestSequenceRef,
+  busyRef,
+  isOwnerCurrent = () => true,
   signatureRef,
   updateSessionState,
   tiles: tilesOverride
 }: {
+  busyRef: MutableRefObject<boolean>
+  isOwnerCurrent?: () => boolean
   requestSequenceRef: MutableRefObject<number>
   signatureRef: MutableRefObject<Map<string, string>>
   tiles?: TileTranscriptTarget[]
@@ -121,6 +150,10 @@ export async function reconcileTileTranscripts({
   }
 
   for (const tile of tiles) {
+    if (!isOwnerCurrent()) {
+      return
+    }
+
     const storedSessionId = tile.storedSessionId
     const runtimeSessionId = tile.runtimeId
 
@@ -139,6 +172,7 @@ export async function reconcileTileTranscripts({
     }
 
     const requestId = ++requestSequenceRef.current
+    const todoHydrationFence = captureTodoWriteFence(runtimeSessionId)
 
     // With a tiles override (test path), the live $sessionTiles check can't
     // see the synthetic tile — treat override tiles as present.
@@ -166,6 +200,8 @@ export async function reconcileTileTranscripts({
 
       if (
         requestId !== requestSequenceRef.current ||
+        busyRef.current ||
+        !isOwnerCurrent() ||
         tileRuntimeOwnsLiveState(runtimeSessionId) ||
         !tileStillPresent()
       ) {
@@ -180,6 +216,26 @@ export async function reconcileTileTranscripts({
       const signature = sessionMessagesSignature(latest.messages)
 
       if (signatureRef.current.get(signatureKey) === signature) {
+        continue
+      }
+
+      const todoMessages = await resolveStoredSessionTodoMessages(storedSessionId, profileScope, latest.messages)
+      const tileIsCurrentAfterTodoRead = (tilesOverride ?? $sessionTiles.get()).includes(tile)
+
+      if (
+        requestId !== requestSequenceRef.current ||
+        busyRef.current ||
+        !isOwnerCurrent() ||
+        !tileIsCurrentAfterTodoRead
+      ) {
+        signatureRef.current.delete(signatureKey)
+
+        continue
+      }
+
+      const todoAccepted = hydrateSessionTodos(runtimeSessionId, todoMessages, todoHydrationFence)
+
+      if (!todoAccepted) {
         continue
       }
 
@@ -199,6 +255,8 @@ export async function reconcileTileTranscripts({
       )
     } catch {
       // Non-fatal: the next change event retries.
+    } finally {
+      releaseTodoHydrationToken(todoHydrationFence)
     }
   }
 }
@@ -226,16 +284,18 @@ export async function reconcileActiveTranscript({
     return
   }
 
+  const ownerKey = activeTranscriptOwnerKey(stored, storedSessionId)
+  if (!ownerKey) {
+    return
+  }
+  const ownerIsCurrent = () => activeTranscriptOwnerKey(resolveSession(storedSessionId), storedSessionId) === ownerKey
+
   const requestId = requestSequenceRef.current + 1
   requestSequenceRef.current = requestId
+  const todoHydrationFence = captureTodoWriteFence(runtimeSessionId)
 
   try {
-    const profileScope: ProfileScope = stored.ownerRoute
-      ? {
-          connectionId: stored.ownerRoute.connectionId,
-          profile: stored.ownerRoute.targetProfile ?? stored.ownerRoute.profile
-        }
-      : stored.profile
+    const profileScope: ProfileScope = stored.ownerRoute ? ownerRouteProfileScope(stored.ownerRoute) : stored.profile
 
     const latest = await getLatestSessionMessages(storedSessionId, profileScope)
 
@@ -243,24 +303,35 @@ export async function reconcileActiveTranscript({
       requestId !== requestSequenceRef.current ||
       busyRef.current ||
       selectedStoredSessionIdRef.current !== storedSessionId ||
-      activeSessionIdRef.current !== runtimeSessionId
+      activeSessionIdRef.current !== runtimeSessionId ||
+      !ownerIsCurrent()
     ) {
       return
     }
 
-    const signatureKey = stored.ownerRoute
-      ? JSON.stringify([
-          stored.ownerRoute.connectionId,
-          stored.ownerRoute.profile,
-          stored.ownerRoute.targetProfile ?? '',
-          stored.ownerRoute.mode ?? '',
-          storedSessionId
-        ])
-      : `${stored.profile ?? 'default'}:${storedSessionId}`
+    const signatureKey = ownerKey
 
     const signature = sessionMessagesSignature(latest.messages)
 
     if (signatureRef.current.get(signatureKey) === signature) {
+      return
+    }
+
+    const todoMessages = await resolveStoredSessionTodoMessages(storedSessionId, profileScope, latest.messages)
+
+    if (
+      requestId !== requestSequenceRef.current ||
+      busyRef.current ||
+      selectedStoredSessionIdRef.current !== storedSessionId ||
+      activeSessionIdRef.current !== runtimeSessionId ||
+      !ownerIsCurrent()
+    ) {
+      return
+    }
+
+    const todoAccepted = hydrateSessionTodos(runtimeSessionId, todoMessages, todoHydrationFence)
+
+    if (!todoAccepted) {
       return
     }
 
@@ -280,6 +351,8 @@ export async function reconcileActiveTranscript({
     )
   } catch {
     // Non-fatal: the next change event or manual resume can hydrate the view.
+  } finally {
+    releaseTodoHydrationToken(todoHydrationFence)
   }
 }
 
@@ -472,6 +545,11 @@ export function rehydrateLiveSessionStatuses(
           messages: sealOpenToolParts(existing.messages)
         })
       }
+
+      // The same authoritative absence also substitutes for a missed terminal
+      // todo cleanup. Reuse the normal policy so finished linger and explicit
+      // active/paused continuation snapshots remain intact.
+      clearActiveSessionTodos(runtimeSessionId)
     }
   }
 
@@ -745,6 +823,7 @@ export function useBackgroundSync({
       return
     }
 
+    let retired = false
     let lastRunAt = 0
     let timer: null | number = null
     let typingDeferTimer: null | number = null
@@ -764,6 +843,12 @@ export function useBackgroundSync({
       // (#93942 scenario A). Signature-gated per tile, so no-change ticks
       // cost nothing.
       void reconcileTileTranscripts({
+        busyRef: {
+          get current() {
+            return $busy.get()
+          }
+        },
+        isOwnerCurrent: () => !retired,
         requestSequenceRef: tileRequestSequenceRef,
         signatureRef: tileSignatureRef,
         updateSessionState
@@ -814,6 +899,7 @@ export function useBackgroundSync({
     })
 
     return () => {
+      retired = true
       unsubscribe()
 
       if (timer !== null) {
@@ -825,6 +911,8 @@ export function useBackgroundSync({
       }
     }
   }, [
+    activeConnectionId,
+    activeGatewayProfile,
     changeEventsAvailable,
     gatewayState,
     refreshMessagingSessions,

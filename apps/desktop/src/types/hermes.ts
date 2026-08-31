@@ -644,6 +644,7 @@ export type TimelineDisplayMetadata =
       duration_seconds?: number
     }
   | { reactions: MessageReaction[] }
+  | { todo_snapshot: true | { todos: unknown[] } }
 
 /** One emoji reaction on a message. One per author, iOS-Tapback style. */
 export interface MessageReaction {
@@ -674,12 +675,12 @@ export interface SessionMessage {
   reasoning_content?: null | string
   reasoning_details?: unknown
   display_kind?:
-    'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | 'personality_switch' | 'steer' | string
+    null | "async_delegation_complete" | "auto_continue" | "hidden" | "model_switch" | "personality_switch" | "steer" | string
   /**
    * A backend older than this app can still serve this as unparsed JSON text,
    * so readers must narrow before indexing into it.
    */
-  display_metadata?: string | TimelineDisplayMetadata
+  display_metadata?: null | string | TimelineDisplayMetadata
   role: 'assistant' | 'system' | 'tool' | 'user'
   /**
    * Durable `messages.id` from the backend. The renderer's own message ids are
