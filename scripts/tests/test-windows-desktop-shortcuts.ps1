@@ -9,11 +9,35 @@ $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-shortcut-test-{
 try {
     $targetExe = Join-Path $tempRoot 'Hermes.exe'
     $shortcutPath = Join-Path $tempRoot 'Programs\Hermes.lnk'
+    $legacyShortcutPath = Join-Path $tempRoot 'Programs\Electron.lnk'
+    $otherShortcutPath = Join-Path $tempRoot 'OtherPrograms\Hermes.lnk'
+    $unrelatedElectronPath = Join-Path $tempRoot 'OtherPrograms\Electron.lnk'
     New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $shortcutPath) -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $otherShortcutPath) -Force | Out-Null
     New-Item -ItemType File -Path $targetExe -Force | Out-Null
 
     . $helper
-    New-HermesDesktopShortcuts -TargetExe $targetExe -ShortcutPaths @($shortcutPath) | Out-Null
+    $wsh = New-Object -ComObject WScript.Shell
+    $legacyShortcut = $wsh.CreateShortcut($legacyShortcutPath)
+    $legacyShortcut.TargetPath = $targetExe
+    $legacyShortcut.Description = 'Electron'
+    $legacyShortcut.Save()
+    Set-HermesShortcutIdentity -ShortcutPath $legacyShortcutPath -DisplayName 'Electron'
+
+    $unrelatedElectron = $wsh.CreateShortcut($unrelatedElectronPath)
+    $unrelatedElectron.TargetPath = $targetExe
+    $unrelatedElectron.Description = 'Unrelated Electron app'
+    $unrelatedElectron.Save()
+
+    New-HermesDesktopShortcuts -TargetExe $targetExe -ShortcutPaths @($shortcutPath, $otherShortcutPath) | Out-Null
+
+    if (Test-Path -LiteralPath $legacyShortcutPath) {
+        throw 'Hermes-owned legacy Electron.lnk was not removed'
+    }
+    if (-not (Test-Path -LiteralPath $unrelatedElectronPath)) {
+        throw 'Unrelated Electron.lnk was removed'
+    }
 
     $shell = New-Object -ComObject Shell.Application
     $folder = $shell.NameSpace((Split-Path -Parent $shortcutPath))
