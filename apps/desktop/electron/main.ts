@@ -13344,7 +13344,11 @@ function focusWindow(win) {
   win.focus()
 }
 
-function spawnSecondaryWindow({ sessionId, ownerRoute, watch }: { sessionId?: string; ownerRoute?: unknown; watch?: boolean } = {}) {
+function spawnSecondaryWindow({
+  sessionId,
+  ownerRoute,
+  watch
+}: { sessionId?: string; ownerRoute?: unknown; watch?: boolean } = {}) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({

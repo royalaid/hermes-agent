@@ -224,8 +224,14 @@ test('registry keeps same-id windows separate for different exact owners', () =>
   const first = makeFakeWindow()
   const second = makeFakeWindow()
 
-  assert.equal(registry.openOrFocus('shared-id', () => first, ownerA), first)
-  assert.equal(registry.openOrFocus('shared-id', () => second, ownerB), second)
+  assert.equal(
+    registry.openOrFocus('shared-id', () => first, ownerA),
+    first
+  )
+  assert.equal(
+    registry.openOrFocus('shared-id', () => second, ownerB),
+    second
+  )
   assert.equal(registry.size, 2)
   assert.equal(registry.has('shared-id', ownerA), true)
   assert.equal(registry.has('shared-id', ownerB), true)

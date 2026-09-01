@@ -66,9 +66,9 @@ const normKey = (profile: null | string | undefined): string => (profile ?? '').
 export const isSessionOwnerRoute = (owner: SessionOwnerScope): owner is SessionOwnerRoute =>
   Boolean(
     owner &&
-      typeof owner === 'object' &&
-      typeof (owner as Partial<SessionOwnerRoute>).connectionId === 'string' &&
-      typeof (owner as Partial<SessionOwnerRoute>).profile === 'string'
+    typeof owner === 'object' &&
+    typeof (owner as Partial<SessionOwnerRoute>).connectionId === 'string' &&
+    typeof (owner as Partial<SessionOwnerRoute>).profile === 'string'
   )
 
 export function ownerRouteProfileScope(ownerRoute: SessionOwnerRoute): { connectionId: string; profile: string } {
