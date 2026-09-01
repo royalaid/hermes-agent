@@ -144,38 +144,43 @@ export function useSessionStateCache({
 
   const sessionStateCache = sessionStateByRuntimeIdRef.current
 
-  const bindKnownRuntime = useCallback((storedSessionId: string, runtimeId: string, sourceOwner?: SessionOwnerRoute) => {
-    const canonical = currentSessionBinding(storedSessionId)
-    const hintedOwner = sessionTileOwnerRoute(storedSessionId) ?? getSessionOwnerHint(storedSessionId)
+  const bindKnownRuntime = useCallback(
+    (storedSessionId: string, runtimeId: string, sourceOwner?: SessionOwnerRoute) => {
+      const canonical = currentSessionBinding(storedSessionId)
+      const hintedOwner = sessionTileOwnerRoute(storedSessionId) ?? getSessionOwnerHint(storedSessionId)
 
-    const sourceBinding = sourceOwner
-      ? normalizeSessionBinding({
-          ownerRoute: {
-            ...sourceOwner,
-            profile: canonical?.ownerRoute.profile ?? sourceOwner.profile,
-            targetProfile: sourceOwner.targetProfile ?? sourceOwner.profile
-          },
-          storedSessionId
-        })
-      : null
+      const sourceBinding = sourceOwner
+        ? normalizeSessionBinding({
+            ownerRoute: {
+              ...sourceOwner,
+              profile: canonical?.ownerRoute.profile ?? sourceOwner.profile,
+              targetProfile: sourceOwner.targetProfile ?? sourceOwner.profile
+            },
+            storedSessionId
+          })
+        : null
 
-    if (sourceBinding && canonical && !bindingsEqual(sourceBinding, canonical)) {
-      return false
-    }
+      if (sourceBinding && canonical && !bindingsEqual(sourceBinding, canonical)) {
+        return false
+      }
 
-    if (!sourceOwner && canonical && runtimeForExactSessionBinding(canonical) !== runtimeId) {
-      return false
-    }
+      if (!sourceOwner && canonical && runtimeForExactSessionBinding(canonical) !== runtimeId) {
+        return false
+      }
 
-    const binding =
-      canonical ?? sourceBinding ?? (hintedOwner ? normalizeSessionBinding({ ownerRoute: hintedOwner, storedSessionId }) : null)
+      const binding =
+        canonical ??
+        sourceBinding ??
+        (hintedOwner ? normalizeSessionBinding({ ownerRoute: hintedOwner, storedSessionId }) : null)
 
-    if (binding) {
-      bindRuntimeToSession(binding, runtimeId)
-    }
+      if (binding) {
+        bindRuntimeToSession(binding, runtimeId)
+      }
 
-    return true
-  }, [])
+      return true
+    },
+    []
+  )
 
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
@@ -194,12 +199,7 @@ export function useSessionStateCache({
       if (
         storedSessionId &&
         sourceOwner &&
-        !acceptsSessionRuntimeSource(
-          storedSessionId,
-          sessionId,
-          sourceOwner,
-          sessionId === activeSessionIdRef.current
-        )
+        !acceptsSessionRuntimeSource(storedSessionId, sessionId, sourceOwner, sessionId === activeSessionIdRef.current)
       ) {
         return createClientSessionState(storedSessionId)
       }
@@ -412,12 +412,7 @@ export function useSessionStateCache({
       if (
         storedSessionId &&
         sourceOwner &&
-        !acceptsSessionRuntimeSource(
-          storedSessionId,
-          sessionId,
-          sourceOwner,
-          sessionId === activeSessionIdRef.current
-        )
+        !acceptsSessionRuntimeSource(storedSessionId, sessionId, sourceOwner, sessionId === activeSessionIdRef.current)
       ) {
         return sessionStateCache.get(sessionId) ?? createClientSessionState(storedSessionId)
       }
