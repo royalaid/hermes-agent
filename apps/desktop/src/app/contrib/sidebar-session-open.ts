@@ -1,4 +1,5 @@
 import type { SessionInfo } from '@/hermes'
+import { forgetSessionOwnerHintsForSession } from '@/store/session'
 import { normalizeSessionBinding } from '@/store/session-binding'
 import { sessionOwnerRouteFromRow } from '@/store/session-request-router'
 import { $sidebarSessionsOpenInNewTab } from '@/store/sidebar-open-preference'
@@ -19,6 +20,9 @@ export function openSidebarSession(
   const placement = intent ?? ($sidebarSessionsOpenInNewTab.get() ? 'tab' : 'main')
 
   if (!binding) {
+    // Untagged rows belong to the ambient backend that supplied them. Clear
+    // any stale explicit route before the id-only open path can resolve it.
+    forgetSessionOwnerHintsForSession(sessionId)
     openSession(sessionId, navigate, placement)
 
     return
