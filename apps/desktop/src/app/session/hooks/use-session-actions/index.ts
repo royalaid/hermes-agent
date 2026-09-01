@@ -53,6 +53,7 @@ import {
 import { $projectScope, resolveNewSessionCwd } from '@/store/projects'
 import { setApprovalRequest } from '@/store/prompts'
 import { clearStoredTranscriptReadOnly, markStoredTranscriptReadOnly } from '@/store/read-only-transcript'
+import { openRouteTile } from '@/store/route-tiles'
 import {
   $activeSessionStoredIdRotation,
   $connection,
@@ -143,7 +144,13 @@ import {
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
-import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
+import {
+  isContributedRoute,
+  navigateToWorkspacePage,
+  NEW_CHAT_ROUTE,
+  sessionRoute,
+  SETTINGS_ROUTE
+} from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
 import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
@@ -725,6 +732,12 @@ export function useSessionActions({
       }
 
       if (item.route) {
+        if (isContributedRoute(item.route)) {
+          openRouteTile(item.route)
+
+          return
+        }
+
         navigateToWorkspacePage(navigate, item.route)
       }
     },
@@ -964,6 +977,7 @@ export function useSessionActions({
         }
 
         const exactRuntimeId = runtimeForExactSessionBinding(requestedBinding)
+
         const state =
           runtimeId && runtimeId === exactRuntimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
 

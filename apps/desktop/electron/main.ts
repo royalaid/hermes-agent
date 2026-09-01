@@ -3514,6 +3514,8 @@ function killHermesOwnedVenvDaemons(updateRoot) {
       forceKillProcessTree(pid)
     }
   }
+}
+
 function isFileLocked(filePath) {
   return isShimLocked(filePath)
 }
