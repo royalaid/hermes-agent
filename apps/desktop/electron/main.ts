@@ -3481,18 +3481,33 @@ function forceKillAllHermesBackendTrees(updateRoot: string) {
     return
   }
 
-  const root = `${path.resolve(updateRoot).replace(/'/g, "''").replace(/[\\/]+$/, '')}\\`
+  const root = `${path
+    .resolve(updateRoot)
+    .replace(/'/g, "''")
+    .replace(/[\\/]+$/, '')}\\`
+  const desktopPluginsRoot = `${path
+    .resolve(path.dirname(updateRoot), 'desktop-plugins')
+    .replace(/'/g, "''")
+    .replace(/[\\/]+$/, '')}\\`
   const desktopExecutable = path.resolve(process.execPath).replace(/'/g, "''")
 
   const script = `
 $ErrorActionPreference = 'SilentlyContinue'
 $root = '${root}'
+$desktopPluginsRoot = '${desktopPluginsRoot}'
 $desktopExecutable = '${desktopExecutable}'
 $processes = @(Get-CimInstance Win32_Process)
 $targets = @($processes | Where-Object {
   $executable = [string]$_.ExecutablePath
+  $commandLine = [string]$_.CommandLine
+  $isInstallProcess = $executable.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+  $isPluginSupervisor =
+    ($executable.EndsWith('\wscript.exe', [StringComparison]::OrdinalIgnoreCase) -or
+      $executable.EndsWith('\cscript.exe', [StringComparison]::OrdinalIgnoreCase)) -and
+    $commandLine.IndexOf($desktopPluginsRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+    $commandLine.IndexOf('service-host.vbs', [StringComparison]::OrdinalIgnoreCase) -ge 0
   $_.ProcessId -ne ${process.pid} -and
-    $executable.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and
+    ($isInstallProcess -or $isPluginSupervisor) -and
     -not $executable.Equals($desktopExecutable, [StringComparison]::OrdinalIgnoreCase)
 })
 $targetIds = @{}
@@ -4184,6 +4199,10 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
 }
 
 function runWindowsHandoffPreflight(updateRoot: string, purpose: UpdatePreflightPurpose) {
+  // Update consent is the authority: stop every install-root process and each
+  // Hermes Desktop plugin restart host before classification can veto handoff.
+  forceKillAllHermesBackendTrees(updateRoot)
+
   return runWindowsUpdatePreflight(purpose, {
     releaseTrackedBackendTrees: () =>
       releaseBackendLockForUpdate(updateRoot, purpose === 'bootstrap-recovery' ? 'bootstrap' : 'updates'),
