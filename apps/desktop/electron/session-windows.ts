@@ -229,8 +229,10 @@ function createSessionWindowRegistry() {
 
   return {
     openOrFocus,
-    get: (sessionId: string, ownerRoute?: SessionWindowOwnerRoute) => windows.get(sessionWindowKey(sessionId, ownerRoute)),
-    has: (sessionId: string, ownerRoute?: SessionWindowOwnerRoute) => windows.has(sessionWindowKey(sessionId, ownerRoute)),
+    get: (sessionId: string, ownerRoute?: SessionWindowOwnerRoute) =>
+      windows.get(sessionWindowKey(sessionId, ownerRoute)),
+    has: (sessionId: string, ownerRoute?: SessionWindowOwnerRoute) =>
+      windows.has(sessionWindowKey(sessionId, ownerRoute)),
     get size() {
       return windows.size
     }
