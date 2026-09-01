@@ -1469,6 +1469,7 @@ Write-Output ('ROOT=' + $PID + ';CHILD=' + $writer.Id)
       const os = await import('node:os')
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-job-boundary-'))
       const sentinel = path.join(tmp, 'sentinel.txt')
+      const releasePath = path.join(tmp, 'release')
       const rootPidPath = path.join(tmp, 'root.pid')
       const writerPidPath = path.join(tmp, 'writer.pid')
       const quotePowerShellLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`
@@ -1477,12 +1478,13 @@ Write-Output ('ROOT=' + $PID + ';CHILD=' + $writer.Id)
       const script = `
 $ErrorActionPreference = 'Stop'
 $sentinel = ${quotePowerShellLiteral(sentinel)}
+$releasePath = ${quotePowerShellLiteral(releasePath)}
 $rootPidPath = ${quotePowerShellLiteral(rootPidPath)}
 $writerPidPath = ${quotePowerShellLiteral(writerPidPath)}
 Set-Content -LiteralPath $rootPidPath -Value ([string]$PID)
 $writer = Start-Process -FilePath ${quotePowerShellLiteral(ps)} -ArgumentList @(
   '-NoLogo','-NoProfile','-NonInteractive','-Command',
-  ('Start-Sleep -Milliseconds 1500; Set-Content -LiteralPath ''' + $sentinel + ''' -Value LATE_MUTATION')
+  ('$deadline = (Get-Date).AddSeconds(8); while (-not (Test-Path -LiteralPath ''' + $releasePath + ''') -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }; if (Test-Path -LiteralPath ''' + $releasePath + ''') { Set-Content -LiteralPath ''' + $sentinel + ''' -Value LATE_MUTATION }')
 ) -PassThru -WindowStyle Hidden
 Set-Content -LiteralPath $writerPidPath -Value ([string]$writer.Id)
 Start-Sleep -Seconds 20
@@ -1516,6 +1518,15 @@ Start-Sleep -Seconds 20
         const writerPid = Number(fs.readFileSync(writerPidPath, 'utf8').trim())
         assert.ok(Number.isInteger(rootPid) && rootPid > 0)
         assert.ok(Number.isInteger(writerPid) && writerPid > 0)
+        const rootCreatedAt = await queryWindowsProcessCreatedAt(rootPid, { platform: 'win32', timeoutMs: 2_000 })
+        const writerCreatedAt = await queryWindowsProcessCreatedAt(writerPid, { platform: 'win32', timeoutMs: 2_000 })
+        assert.ok(rootCreatedAt && rootCreatedAt > 0, 'production root generation unavailable')
+        assert.ok(writerCreatedAt && writerCreatedAt > 0, 'production writer generation unavailable')
+
+        const identities = [
+          { pid: rootPid, createdAt: rootCreatedAt },
+          { pid: writerPid, createdAt: writerCreatedAt }
+        ]
 
         // Abort only after the descendant is real, so the production runner's
         // tree snapshot and the delayed-write safety check cover both nodes.
@@ -1528,15 +1539,10 @@ Start-Sleep -Seconds 20
 
         const { identitiesStillPresent } = await import('./windows-process-terminate')
 
-        const identities = [
-          { pid: rootPid },
-          { pid: writerPid },
-          ...(typeof result.pid === 'number' ? [{ pid: result.pid }] : [])
-        ]
-
         assert.deepEqual(await identitiesStillPresent(identities), [])
 
-        await new Promise(resolve => setTimeout(resolve, 1_800))
+        fs.writeFileSync(releasePath, 'release')
+        await new Promise(resolve => setTimeout(resolve, 500))
         assert.equal(fs.existsSync(sentinel), false)
         assert.deepEqual(await identitiesStillPresent(identities), [])
       } finally {
