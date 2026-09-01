@@ -851,28 +851,37 @@ describe('scanVenvBlockers', () => {
     assert.equal(wrongVenv.kind, 'probe-failure')
   })
 
-  it('passes the canonical root to the target interpreter with a scrubbed environment', async () => {
+  it('uses a candidate-owned carrier instead of the target checkout scanner', async () => {
     const calls: any[] = []
+    let targetScannerInvoked = false
 
     const exec = (async (command: string, args: string[], options: any) => {
       calls.push({ command, args, options })
 
+      if (args[0] === '-m' && args[1] === 'hermes_cli._scan_venv_blockers') {
+        targetScannerInvoked = true
+
+        return {
+          stdout: JSON.stringify({ schema_version: 1, ok: true, blocked: false, processes: [] }),
+          stderr: ''
+        }
+      }
+
       return { stdout: JSON.stringify(scanEnvelope(canonicalRoot, expectedVenv)), stderr: '' }
     }) as any
 
-    await scanVenvBlockers(requestedRoot, exec, resolveVenv, canonicalize)
+    const outcome = await scanVenvBlockers(requestedRoot, exec, resolveVenv, canonicalize)
 
+    assert.equal(targetScannerInvoked, false, `target scanner was invoked with ${JSON.stringify(calls[0]?.args)}`)
+    assert.equal(outcome.kind, 'clear')
     assert.equal(calls.length, 1)
     assert.equal(calls[0].command, venvPython)
-    assert.deepEqual(calls[0].args, [
-      '-m',
-      'hermes_cli._scan_venv_blockers',
-      '--root',
-      canonicalRoot
-    ])
+    assert.equal(calls[0].args[0], '-I')
+    assert.ok(path.isAbsolute(calls[0].args[1]))
+    assert.deepEqual(calls[0].args.slice(2), ['--root', canonicalRoot])
     assert.equal(calls[0].options.cwd, canonicalRoot)
     assert.equal(calls[0].options.windowsHide, true)
-    assert.ok(calls[0].options.timeout > 0)
+    assert.equal(calls[0].options.timeout, 60_000)
     assert.equal(Object.hasOwn(calls[0].options.env, 'PYTHONPATH'), false)
   })
 
@@ -992,11 +1001,10 @@ describe('terminateMcpBridge', () => {
     assert.deepEqual(canonicalized, [requestedRoot, unresolvedVenv])
     assert.equal(calls.length, 1)
     assert.equal(calls[0].command, venvPython)
-    assert.deepEqual(calls[0].args, [
-      '-m',
-      'hermes_cli._scan_venv_blockers',
-      '--root',
-      canonicalRoot,
+    assert.equal(calls[0].args[0], '-I')
+    assert.ok(path.isAbsolute(calls[0].args[1]))
+    assert.deepEqual(calls[0].args.slice(2), [
+      '--root', canonicalRoot,
       '--terminate-mcp-bridge',
       '44',
       '--created-at',
@@ -1151,15 +1159,32 @@ describe('terminateMcpBridge', () => {
 describe('stopSafeVenvBlockers', () => {
   it('stops only blockers explicitly classified as safe local previews', async () => {
     const calls: Array<{ command: string; args: string[] }> = []
+    const requestedRoot = path.join(volumeRoot, 'requested', 'install')
+    const canonicalRoot = path.join(volumeRoot, 'canonical', 'install')
+    const venvPython = path.join(canonicalRoot, 'venv', 'Scripts', 'python.exe')
+    const expectedVenv = path.join(canonicalRoot, 'resolved-venv')
 
     const exec = (async (command: string, args: string[]) => {
       calls.push({ command, args })
 
-      return { stdout: '', stderr: '' }
+      return {
+        stdout: JSON.stringify({
+          schema_version: 2,
+          mode: 'terminate_venv_holder',
+          ok: true,
+          terminated: true,
+          pid: 47484,
+          created_at: 1722798000.25,
+          root: canonicalRoot,
+          venv: expectedVenv,
+          error: null
+        }),
+        stderr: ''
+      }
     }) as any
 
     const outcome = await stopSafeVenvBlockers(
-      '/update/root',
+      requestedRoot,
       {
         blocked: true,
         processes: [
@@ -1186,14 +1211,22 @@ describe('stopSafeVenvBlockers', () => {
         pausableGateways: 0
       },
       exec,
-      () => 'C:\\Hermes\\venv\\Scripts\\python.exe'
+      () => venvPython,
+      value => {
+        if (value === requestedRoot) {return canonicalRoot}
+
+        if (value === path.dirname(path.dirname(venvPython))) {return expectedVenv}
+
+        throw new Error(`unexpected canonicalization target: ${value}`)
+      }
     )
 
-    assert.deepEqual(calls, [
-      {
-        command: 'C:\\Hermes\\venv\\Scripts\\python.exe',
-        args: ['-m', 'hermes_cli._scan_venv_blockers', '--terminate-safe', '47484', '1722798000.25']
-      }
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].command, venvPython)
+    assert.equal(calls[0].args[0], '-I')
+    assert.ok(path.isAbsolute(calls[0].args[1]))
+    assert.deepEqual(calls[0].args.slice(2), [
+      '--root', canonicalRoot, '--terminate-venv-holder', '47484', '--created-at', '1722798000.25'
     ])
     assert.deepEqual(outcome, { stopped: [47484], failed: [] })
   })
@@ -1252,11 +1285,10 @@ describe('terminateDesktopPluginService', () => {
       await terminateDesktopPluginService(requestedRoot, service, exec, resolveVenv, canonicalize),
       true
     )
-    assert.deepEqual(calls[0].args, [
-      '-m',
-      'hermes_cli._scan_venv_blockers',
-      '--root',
-      canonicalRoot,
+    assert.equal(calls[0].args[0], '-I')
+    assert.ok(path.isAbsolute(calls[0].args[1]))
+    assert.deepEqual(calls[0].args.slice(2), [
+      '--root', canonicalRoot,
       '--terminate-desktop-plugin-service',
       '45',
       '--created-at',
@@ -1711,15 +1743,32 @@ describe('scanVenvBlockers', () => {
 describe('stopSafeVenvBlockers', () => {
   it('stops only blockers explicitly classified as safe local previews', async () => {
     const calls: Array<{ command: string; args: string[] }> = []
+    const requestedRoot = path.join(volumeRoot, 'requested', 'install')
+    const canonicalRoot = path.join(volumeRoot, 'canonical', 'install')
+    const venvPython = path.join(canonicalRoot, 'venv', 'Scripts', 'python.exe')
+    const expectedVenv = path.join(canonicalRoot, 'resolved-venv')
 
     const exec = (async (command: string, args: string[]) => {
       calls.push({ command, args })
 
-      return { stdout: '', stderr: '' }
+      return {
+        stdout: JSON.stringify({
+          schema_version: 2,
+          mode: 'terminate_venv_holder',
+          ok: true,
+          terminated: true,
+          pid: 47484,
+          created_at: 1722798000.25,
+          root: canonicalRoot,
+          venv: expectedVenv,
+          error: null
+        }),
+        stderr: ''
+      }
     }) as any
 
     const outcome = await stopSafeVenvBlockers(
-      '/update/root',
+      requestedRoot,
       {
         blocked: true,
         processes: [
@@ -1743,14 +1792,22 @@ describe('stopSafeVenvBlockers', () => {
         ]
       },
       exec,
-      () => 'C:\\Hermes\\venv\\Scripts\\python.exe'
+      () => venvPython,
+      value => {
+        if (value === requestedRoot) {return canonicalRoot}
+
+        if (value === path.dirname(path.dirname(venvPython))) {return expectedVenv}
+
+        throw new Error(`unexpected canonicalization target: ${value}`)
+      }
     )
 
-    assert.deepEqual(calls, [
-      {
-        command: 'C:\\Hermes\\venv\\Scripts\\python.exe',
-        args: ['-m', 'hermes_cli._scan_venv_blockers', '--terminate-safe', '47484', '1722798000.25']
-      }
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].command, venvPython)
+    assert.equal(calls[0].args[0], '-I')
+    assert.ok(path.isAbsolute(calls[0].args[1]))
+    assert.deepEqual(calls[0].args.slice(2), [
+      '--root', canonicalRoot, '--terminate-venv-holder', '47484', '--created-at', '1722798000.25'
     ])
     assert.deepEqual(outcome, { stopped: [47484], failed: [] })
   })

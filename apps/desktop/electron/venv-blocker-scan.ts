@@ -12,6 +12,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
+import { buildUpdateScannerArgv } from './update-scanner-carrier'
+
 const execFileAsync = promisify(execFile)
 
 // ---------------------------------------------------------------------------
@@ -125,7 +127,6 @@ export function isExactActionableDesktopPluginService(
 // force-release deadline is separate and passes its remaining budget to the
 // termination path; a scan timeout must never silently consume that budget.
 const SCAN_TIMEOUT_MS = 60_000
-const SCAN_MODULE = 'hermes_cli._scan_venv_blockers'
 
 /** Optional UI metadata the scanner attaches to an exact `-m http.server` record. */
 const LOCAL_PREVIEW_HINT_KEYS = ['kind', 'safeToStop', 'label', 'port', 'createTime']
@@ -184,16 +185,14 @@ export async function stopSafeVenvBlockers(
   updateRoot: string,
   result: VenvBlockerScanResult,
   execOverride?: typeof execFileAsync,
-  resolvePython: typeof resolveVenvPython = resolveVenvPython
+  resolvePython: typeof resolveVenvPython = resolveVenvPython,
+  canonicalizeOverride?: (root: string) => string
 ): Promise<{ stopped: number[]; failed: number[] }> {
-  const execFn = execOverride || execFileAsync
   const stopped: number[] = []
   const failed: number[] = []
-  const pythonPath = resolvePython(updateRoot)
 
   for (const process of result.processes) {
     if (
-      !pythonPath ||
       !process.safeToStop ||
       process.kind !== 'local-preview' ||
       !process.createTime ||
@@ -206,14 +205,19 @@ export async function stopSafeVenvBlockers(
       continue
     }
 
-    try {
-      await execFn(
-        pythonPath,
-        ['-m', 'hermes_cli._scan_venv_blockers', '--terminate-safe', String(process.pid), String(process.createTime)],
-        { cwd: updateRoot, windowsHide: true, timeout: 10_000, maxBuffer: 256 * 1024 }
-      )
+    const terminated = await terminateScannedHolder(
+      updateRoot,
+      { ...process, createdAt: process.createTime },
+      '--terminate-venv-holder',
+      'terminate_venv_holder',
+      execOverride,
+      resolvePython,
+      canonicalizeOverride
+    )
+
+    if (terminated) {
       stopped.push(process.pid)
-    } catch {
+    } else {
       failed.push(process.pid)
     }
   }
@@ -713,7 +717,7 @@ export async function scanVenvBlockers(
 
     const watchdogMs = Math.max(1, Math.min(SCAN_TIMEOUT_MS, Math.trunc(timeoutMs)))
 
-    const proc = await execFn(venvPython, ['-m', SCAN_MODULE, '--root', scanRoot], {
+    const proc = await execFn(venvPython, buildUpdateScannerArgv(scanRoot), {
       cwd: scanRoot,
       encoding: 'utf-8',
       timeout: watchdogMs,
@@ -833,10 +837,7 @@ async function terminateScannedHolder(
     const proc = await execFn(
       venvPython,
       [
-        '-m',
-        SCAN_MODULE,
-        '--root',
-        scanRoot,
+        ...buildUpdateScannerArgv(scanRoot),
         actionFlag,
         String(holder.pid),
         '--created-at',
