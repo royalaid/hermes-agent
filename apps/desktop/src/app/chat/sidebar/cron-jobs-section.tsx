@@ -382,7 +382,13 @@ function CronJobSidebarRow({
   )
 }
 
-export function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (sessionId: string, session?: SessionInfo) => void }) {
+export function CronJobSidebarRuns({
+  jobId,
+  onOpenRun
+}: {
+  jobId: string
+  onOpenRun: (sessionId: string, session?: SessionInfo) => void
+}) {
   const { t } = useI18n()
   const c = t.cron
   const selectedSessionId = useStore($selectedStoredSessionId)

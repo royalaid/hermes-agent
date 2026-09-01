@@ -222,10 +222,13 @@ describe('useSessionTileDelegate resumeTile', () => {
     patchSessionTile('shared-id', { runtimeId: 'runtime-a' })
 
     vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({ session_id: 'runtime-b' } as never)
-    renderTile(vi.fn(async () => ({}) as never), {
-      runtimeIdByStoredSessionIdRef,
-      sessionStateByRuntimeIdRef
-    })
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      {
+        runtimeIdByStoredSessionIdRef,
+        sessionStateByRuntimeIdRef
+      }
+    )
     $sidebarSessionsOpenInNewTab.set(true)
 
     openSidebarSession('shared-id', rowB, vi.fn())
@@ -291,7 +294,10 @@ describe('useSessionTileDelegate resumeTile', () => {
         return hydrationA.promise
       })
       .mockResolvedValueOnce({ messages: [], session_id: 'shared-hydration' } as never)
-    renderTile(vi.fn(async () => ({}) as never), { updateSessionState })
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      { updateSessionState }
+    )
 
     const paneResume = sessionTileDelegate()!.resumeTile('shared-hydration')
 
@@ -326,10 +332,13 @@ describe('useSessionTileDelegate resumeTile', () => {
       workspaceMode: 'sessions'
     })
     patchSessionTile('shared-id', { runtimeId: 'runtime-a' })
-    renderTile(vi.fn(async () => ({}) as never), {
-      runtimeIdByStoredSessionIdRef,
-      sessionStateByRuntimeIdRef
-    })
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      {
+        runtimeIdByStoredSessionIdRef,
+        sessionStateByRuntimeIdRef
+      }
+    )
     $sidebarSessionsOpenInNewTab.set(true)
 
     openSidebarSession('shared-id', ownedRow, vi.fn())
@@ -358,10 +367,13 @@ describe('useSessionTileDelegate resumeTile', () => {
     $selectedStoredSessionId.set('shared-id')
     $activeSessionId.set('runtime-a')
     $messages.set([{ id: 'from-a' }] as never)
-    renderTile(vi.fn(async () => ({}) as never), {
-      runtimeIdByStoredSessionIdRef,
-      sessionStateByRuntimeIdRef
-    })
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      {
+        runtimeIdByStoredSessionIdRef,
+        sessionStateByRuntimeIdRef
+      }
+    )
     navigate.mockClear()
 
     openSidebarSession('shared-id', rowB, navigate)
@@ -484,11 +496,14 @@ describe('useSessionTileDelegate resumeTile', () => {
         return refreshA.promise
       })
       .mockResolvedValueOnce({ messages: [], session_id: 'shared-refresh' } as never)
-    renderTile(vi.fn(async () => ({}) as never), {
-      runtimeIdByStoredSessionIdRef,
-      sessionStateByRuntimeIdRef,
-      updateSessionState
-    })
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      {
+        runtimeIdByStoredSessionIdRef,
+        sessionStateByRuntimeIdRef,
+        updateSessionState
+      }
+    )
 
     const refresh = sessionTileDelegate()!.resumeTile('shared-refresh', { refreshTranscript: true })
 
