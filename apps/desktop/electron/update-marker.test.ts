@@ -257,3 +257,52 @@ test('minutes-scale elapsed time is formatted as "Nm Ss"', () => {
   assert.ok(conflict)
   assert.match(conflict.message, /2m 5s/)
 })
+
+// Retained 14fc updater regressions. The adapter preserves the original
+// assertions while routing through the fail-closed Phase A marker reader.
+{
+  const phaseA = { readLiveUpdateMarker }
+
+  {
+    const readLiveUpdateMarker = (home: string, options: any) => {
+      const marker = phaseA.readLiveUpdateMarker(home, options)
+
+      if (marker?.kind === 'unreadable' || marker?.overdue) {
+        fs.unlinkSync(markerPath(home))
+
+        return null
+      }
+
+      return marker
+    }
+
+    const updateHandoffConflict = (home: string, options: any) => {
+      const marker = readLiveUpdateMarker(home, options)
+
+      return marker ? { pid: marker.pid, ageMs: marker.ageMs, message: 'already running' } : null
+    }
+
+test('expired marker (past age ceiling) => no live update and pruned', () => {
+  const home = tmpHome('expired')
+  const now = 1_000_000_000_000
+  writeMarker(home, 4242, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
+  // Even though the pid is "alive", the marker is too old to trust.
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
+  assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
+})
+
+test('malformed marker => no live update and pruned', () => {
+  const home = tmpHome('malformed')
+  fs.writeFileSync(markerPath(home), 'not-a-pid\nnonsense')
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
+  assert.ok(!fs.existsSync(markerPath(home)))
+})
+
+test('an expired marker does not block a hand-off (self-heals)', () => {
+  const home = tmpHome('conflict-expired')
+  const now = 1_000_000_000_000
+  writeMarker(home, 1010, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
+  assert.equal(updateHandoffConflict(home, { kill: ALIVE, now: () => now }), null)
+})
+  }
+}
