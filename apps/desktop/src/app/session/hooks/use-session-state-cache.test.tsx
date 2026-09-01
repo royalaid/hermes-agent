@@ -106,7 +106,9 @@ describe('useSessionStateCache — source-qualified runtime binding', () => {
     const bindingB = normalizeSessionBinding({ ownerRoute: routeB, storedSessionId: 'shared-id' })!
 
     claimSessionBinding(bindingB)
-    render(<Harness activeSessionId="runtime-b" onReady={value => (cache = value)} selectedStoredSessionId="shared-id" />)
+    render(
+      <Harness activeSessionId="runtime-b" onReady={value => (cache = value)} selectedStoredSessionId="shared-id" />
+    )
 
     act(() => {
       cache.updateSessionState('runtime-b', state => ({ ...state }), 'shared-id', routeB)
@@ -141,10 +143,17 @@ describe('useSessionStateCache — source-qualified runtime binding', () => {
     const binding = normalizeSessionBinding({ ownerRoute: canonicalRoute, storedSessionId: 'shared-id' })!
 
     claimSessionBinding(binding)
-    render(<Harness activeSessionId="runtime-a" onReady={value => (cache = value)} selectedStoredSessionId="shared-id" />)
+    render(
+      <Harness activeSessionId="runtime-a" onReady={value => (cache = value)} selectedStoredSessionId="shared-id" />
+    )
 
     act(() => {
-      cache.updateSessionState('runtime-wrong-target', state => ({ ...state, busy: true }), 'shared-id', mismatchedSource)
+      cache.updateSessionState(
+        'runtime-wrong-target',
+        state => ({ ...state, busy: true }),
+        'shared-id',
+        mismatchedSource
+      )
     })
 
     expect(cache.runtimeIdByStoredSessionIdRef.current.has('shared-id')).toBe(false)
@@ -154,7 +163,13 @@ describe('useSessionStateCache — source-qualified runtime binding', () => {
 
   it('keeps legacy untagged single-source binding when no exact owner conflicts', () => {
     let cache!: Cache
-    render(<Harness activeSessionId="runtime-legacy" onReady={value => (cache = value)} selectedStoredSessionId="legacy-id" />)
+    render(
+      <Harness
+        activeSessionId="runtime-legacy"
+        onReady={value => (cache = value)}
+        selectedStoredSessionId="legacy-id"
+      />
+    )
 
     act(() => {
       cache.updateSessionState('runtime-legacy', state => ({ ...state }), 'legacy-id')
