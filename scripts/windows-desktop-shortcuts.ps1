@@ -165,6 +165,35 @@ function New-HermesDesktopShortcuts {
         }
     }
 
+    # Older development launches could register Electron.lnk with Hermes's
+    # AppUserModelID. Windows Search may rank that stale name above the current
+    # Hermes.lnk even after a successful repair. Remove only shortcuts whose
+    # Shell identity proves that Hermes owns them.
+    $shellApp = New-Object -ComObject Shell.Application
+    foreach ($parent in @($ShortcutPaths | ForEach-Object { Split-Path -Parent $_ } | Sort-Object -Unique)) {
+        $legacyPath = Join-Path $parent 'Electron.lnk'
+        if (-not (Test-Path -LiteralPath $legacyPath -PathType Leaf)) { continue }
+
+        try {
+            $folder = $shellApp.NameSpace($parent)
+            $item = if ($null -ne $folder) { $folder.ParseName('Electron.lnk') } else { $null }
+            $appUserModelId = if ($null -ne $item) {
+                [string]$item.ExtendedProperty('System.AppUserModel.ID')
+            } else {
+                ''
+            }
+            if ($appUserModelId -ne $script:HermesWindowsAppUserModelId) { continue }
+
+            Remove-Item -LiteralPath $legacyPath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $legacyPath) {
+                throw 'shortcut still exists after removal'
+            }
+        } catch {
+            $failures += "$legacyPath ($($_.Exception.Message))"
+            Write-Warning "Could not remove legacy Hermes Electron shortcut: $legacyPath"
+        }
+    }
+
     # Repaint the Start Menu and Desktop after a direct-to-exe update. This is
     # best effort: the shortcut itself is already valid if the cache utility is
     # unavailable on a particular Windows SKU.
