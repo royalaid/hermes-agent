@@ -17,16 +17,30 @@ class TreeAssertion:
     absent: tuple[str, ...] = ()
     ordered: tuple[tuple[str, str], ...] = ()
 KILL_ALL_MERGE = "merge: integrate kill-all Windows updater baseline"
+DURABLE_TODO_MERGE = "Merge draft PR #99644: durable Todo state"
+CHARACTERIZED_MERGE_SIDE_SUBJECTS = frozenset({DURABLE_TODO_MERGE})
+PATCH_ASSERTIONS: dict[str, tuple[TreeAssertion, ...]] = {
+    "[verified] fix(desktop): restore wheel scrolling in panes": (TreeAssertion(
+        "apps/desktop/src/app/chat/sidebar/index.tsx", contains=("const SCROLL_GUTTER", "GROUP_BODY = 'max-h-none overflow-visible'")),),
+    "docs(goals): document model goal control": (TreeAssertion(
+        "toolsets.py", contains=('"goal": {', '"tools": ["goal_control"]')),),
+}
 MERGE_ASSERTIONS: dict[str, tuple[TreeAssertion, ...]] = {
+    DURABLE_TODO_MERGE: (
+        TreeAssertion("agent/message_metadata.py", contains=("def stamp_persisted_todo_snapshot", "def has_persisted_todo_snapshot_provenance")),
+        TreeAssertion("hermes_state.py", contains=("def get_todo_state_messages", "_TODO_STATE_LOOKUP_SQL")),
+        TreeAssertion("apps/desktop/src/lib/todos.ts", contains=("export function latestSessionTodoState", "export function todosFromSnapshotMetadata")),
+        TreeAssertion("tui_gateway/server.py", contains=("def _has_structured_todo_snapshot",)),
+    ),
     KILL_ALL_MERGE: (TreeAssertion(
-        "apps/desktop/electron/main.ts", contains=("function forceKillAllHermesBackendTrees",),
-        absent=("from './venv-blocker-scan'", "scanVenvBlockers(updateRoot)"),
-        ordered=(("forceKillAllHermesBackendTrees(updateRoot)", "const lock = await releaseBackendLockForUpdate(updateRoot)"),)),),
+        "apps/desktop/electron/main.ts",
+        contains=("function forceKillAllHermesBackendTrees", "  forceKillAllHermesBackendTrees(updateRoot)"),
+        ordered=(("  forceKillAllHermesBackendTrees(updateRoot)", "return runWindowsUpdatePreflight(purpose"),)),),
     "merge: integrate live Windows update transport": (
         TreeAssertion("apps/desktop/electron/updater-process.ts", contains=("export function resolveWindowsUpdateTransport",)),
         TreeAssertion("apps/desktop/electron/main.ts", contains=("resolveWindowsUpdateTransport,",
-            "resolveWindowsUpdateTransport(resolveUpdateRoot())", "windowsUpdateTransport?.kind === 'manual'",
-            "windowsUpdateTransport?.kind === 'script' ? windowsUpdateTransport.handoff : null"))),
+            "const windowsTransport = resolveWindowsUpdateTransport(updateRoot)",
+            "windowsTransport.kind === 'manual'", "launchWindowsUpdateTransport("))),
     "merge: integrate Windows updater transport regression coverage": (TreeAssertion(
         "apps/desktop/electron/updater-process.test.ts", contains=(
             "test('resolveWindowsUpdateTransport selects the live checkout script'",
@@ -91,6 +105,11 @@ def _rerere_autoupdated_paths(done: subprocess.CompletedProcess[str]) -> set[str
     prefix, suffix = "Staged '", "' using previous resolution."
     return {line[len(prefix):-len(suffix)] for line in f"{done.stdout}\n{done.stderr}".splitlines()
             if line.startswith(prefix) and line.endswith(suffix)}
+def _rerere_paths_accounted_for(repo: Path, rerere_paths: set[str], staged_paths: set[str]) -> bool:
+    if not rerere_paths:
+        return False
+    return all(path in staged_paths or not _git(repo, "diff", "HEAD", "--quiet", "--", path, check=False).returncode
+               for path in rerere_paths)
 def _scratch_rebase(repo: Path, published: str, upstream: str, base: str,
                     assertions: Sequence[TreeAssertion], checks: Sequence[Sequence[str]]) -> tuple[str, set[str], set[str]]:
     scratch = Path(tempfile.mkdtemp(prefix="hermes-fork-refresh-"))
@@ -113,8 +132,8 @@ def _scratch_rebase(repo: Path, published: str, upstream: str, base: str,
             if staged:
                 staged_paths = set(staged.splitlines())
                 rerere_paths = _rerere_autoupdated_paths(done)
-                if not rerere_paths or not rerere_paths.issubset(staged_paths):
-                    raise RefreshError("staged rebase state lacks rerere autoupdate provenance")
+                if not _rerere_paths_accounted_for(scratch, rerere_paths, staged_paths):
+                    raise RefreshError(f"staged rebase state lacks rerere autoupdate provenance: staged={sorted(staged_paths)!r}, rerere={sorted(rerere_paths)!r}")
                 resolved_head = head.stdout.strip()
                 continued = _git(scratch, "rebase", "--continue", check=False, timeout=1800)
                 if continued.returncode:
@@ -178,28 +197,41 @@ def compose(repo: str | Path, *, upstream_remote: str = "upstream", published_re
     merges = [sha for sha in commits if len(parents[sha]) > 1]
     merge_set = set(merges)
     registry = MERGE_ASSERTIONS if merge_assertions is None else merge_assertions
-    subject_lines = _lines(repo, "log", "--no-walk=unsorted", "--format=%H%x00%s", *merges) if merges else []
+    subject_lines = _lines(repo, "log", "--no-walk=unsorted", "--format=%H%x00%s", *commits) if commits else []
     subjects = dict(line.split("\x00", 1) for line in subject_lines)
     resolved = {sha: registry.get(sha) or registry.get(subjects[sha]) for sha in merges}
     missing = [sha for sha in merges if resolved[sha] is None]
     if missing: raise RefreshError(f"uncharacterized merge(s): {', '.join(missing)}")
-    assertions = tuple(item for sha in merges for item in resolved[sha])
-    _assert_tree(repo, published, assertions)
     non_merges = [sha for sha in commits if sha not in merge_set]
+    resolved_patches = {sha: PATCH_ASSERTIONS.get(sha) or PATCH_ASSERTIONS.get(subjects[sha]) for sha in non_merges}
+    assertions = tuple(item for sha in merges for item in resolved[sha]) + tuple(
+        item for sha in non_merges if resolved_patches[sha] for item in resolved_patches[sha]
+    )
+    _assert_tree(repo, published, assertions)
     before = _cherry(repo, upstream, published, base)
     if set(before) != set(non_merges): raise RefreshError("captured non-merge range lacks stable patch dispositions")
     candidate, stopped, rerere_resolved = _scratch_rebase(repo, published, upstream, base, assertions, checks)
     after = _cherry(repo, candidate, published, base)
     failed, represented = [sha for sha in non_merges if after.get(sha) != "-"], {}
+    patch_represented = {sha for sha in failed if resolved_patches[sha]}
+    for merge_sha in merges:
+        if subjects[merge_sha] not in CHARACTERIZED_MERGE_SIDE_SUBJECTS:
+            continue
+        first_parent, side_parent = parents[merge_sha][:2]
+        for sha in failed:
+            if (not _git(repo, "merge-base", "--is-ancestor", sha, side_parent, check=False).returncode
+                    and _git(repo, "merge-base", "--is-ancestor", sha, first_parent, check=False).returncode):
+                represented[sha] = merge_sha
     kill_merge = next((sha for sha in merges if subjects[sha] == KILL_ALL_MERGE), None)
     kill_side = parents[kill_merge][1] if kill_merge else None
     if kill_side in failed: represented[kill_side] = kill_merge
-    failed = [sha for sha in failed if sha not in represented and sha not in rerere_resolved]
+    failed = [sha for sha in failed if sha not in represented and sha not in patch_represented and sha not in rerere_resolved]
     if failed: raise RefreshError(f"fork changes missing from candidate: {', '.join(failed)}")
     result["candidate"] = candidate
     dispositions = {sha: {"commit": sha, "status": "represented_by_merge_assertion" if sha in represented
+        else "represented_by_patch_assertion" if sha in patch_represented
         else "rerere_resolved" if sha in rerere_resolved else "empty" if sha in stopped else "replayed",
-        "represented_by": represented.get(sha),
+        "represented_by": represented.get(sha) or (sha if sha in patch_represented else None),
         "preexisting_patch": before[sha] == "-"} for sha in non_merges}
     result["dispositions"] = [{"commit": sha, "status": "characterized_merge_assertion",
         "assertion_count": len(resolved[sha])} if sha in merge_set else dispositions[sha] for sha in commits]
