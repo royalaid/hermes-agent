@@ -19,22 +19,13 @@ import {
   type SessionBinding,
   setMainSessionBinding
 } from '@/store/session-binding'
-import {
-  $sessionTiles,
-  dropSessionState,
-  patchSessionTile,
-  type SessionTile
-} from '@/store/session-states'
+import { $sessionTiles, dropSessionState, patchSessionTile, type SessionTile } from '@/store/session-states'
 import { canOpenSessionWindow } from '@/store/windows'
 
 import { openSession } from '../open-session'
 
 export type ExactSidebarOpenOutcome =
-  | 'created-cold'
-  | 'focused-warm'
-  | 'moved-to-main'
-  | 'rebound-cold'
-  | 'unresolved-owner'
+  'created-cold' | 'focused-warm' | 'moved-to-main' | 'rebound-cold' | 'unresolved-owner'
 
 export interface ExactSidebarOpenRequest {
   binding: SessionBinding
@@ -77,7 +68,7 @@ export function openExactSidebarSession({
   const previous = tileBinding(tile) ?? (selectedInMain ? getMainSessionBinding(storedSessionId, profile) : null)
   const { detached, runtimeId } = detachRuntimeForSession(binding, previous)
   const legacyTileOwnerUnresolved = Boolean(tile && !tileBinding(tile))
-  const legacyTileRuntimeId = legacyTileOwnerUnresolved ? tile?.runtimeId ?? null : null
+  const legacyTileRuntimeId = legacyTileOwnerUnresolved ? (tile?.runtimeId ?? null) : null
   const coldRebind = detached || legacyTileOwnerUnresolved
   const sameOwnerWarm = !coldRebind && Boolean(previous && runtimeId)
 

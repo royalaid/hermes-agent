@@ -172,7 +172,9 @@ export function bindRuntimeToSession(binding: SessionBinding, runtimeId: string,
   }
 
   const current = runtimeBindings.get(normalized.storedSessionId)
-  const nextGeneration = generation ?? current?.generation ?? currentSessionBindingGeneration(normalized.storedSessionId)
+
+  const nextGeneration =
+    generation ?? current?.generation ?? currentSessionBindingGeneration(normalized.storedSessionId)
 
   if (
     current &&
@@ -280,7 +282,8 @@ export function detachRuntimeForSession(
     return { detached: false, runtimeId: null }
   }
 
-  const runtimeId = runtimeAdapter?.detach(next.storedSessionId) ?? invalidateSessionRuntimeBinding(next.storedSessionId)
+  const runtimeId =
+    runtimeAdapter?.detach(next.storedSessionId) ?? invalidateSessionRuntimeBinding(next.storedSessionId)
 
   // The adapter clears the renderer cache; the central registry and generation
   // are always retired here as the binding authority.
