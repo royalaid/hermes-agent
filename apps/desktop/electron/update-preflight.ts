@@ -189,6 +189,59 @@ export async function runWindowsUpdatePreflight(
     }
   }
 
+  const forceReleaseAndRescan = async (
+    blockedResult: VenvBlockerScanResult
+  ): Promise<{ scan: ScanOutcome } | { outcome: UpdatePreflightOutcome }> => {
+    if (typeof deps.forceReleaseInstallHolders !== 'function') {
+      return {
+        outcome: {
+          kind: 'blocked',
+          reason: 'holders',
+          result: blockedResult,
+          message: formatBlockerMessage(blockedResult)
+        }
+      }
+    }
+
+    let forced: WindowsUpdateForceReleaseOutcome
+
+    try {
+      forced = await deps.forceReleaseInstallHolders()
+    } catch (error) {
+      return {
+        outcome: {
+          kind: 'probe-failure',
+          error: `force-release threw: ${errorText(error)}`,
+          message: formatProbeFailedMessage()
+        }
+      }
+    }
+
+    if (forced.kind === 'needs-elevation') {
+      return {
+        outcome: {
+          kind: 'blocked',
+          reason: 'needs-elevation',
+          message: forced.message,
+          elevationHolders: forced.holders
+        }
+      }
+    }
+
+    if (forced.kind !== 'clear') {
+      return {
+        outcome: {
+          kind: 'blocked',
+          reason: 'unlock-failed',
+          result: blockedResult,
+          message: forced.message
+        }
+      }
+    }
+
+    return { scan: await scanFailClosed() }
+  }
+
   const pollGenericHoldersUntil = async (current: ScanOutcome, deadline: number): Promise<ScanOutcome> => {
     let outcome = current
 
@@ -206,18 +259,31 @@ export async function runWindowsUpdatePreflight(
     return outcome
   }
 
-  const observed = await scanFailClosed()
+  let observed = await scanFailClosed()
 
   if (observed.kind === 'probe-failure') {
     return { kind: 'probe-failure', error: observed.error, message: formatProbeFailedMessage() }
   }
 
   if (observed.kind === 'blocked' && !exactDrainableOnly(observed.result)) {
-    return {
-      kind: 'blocked',
-      reason: 'holders',
-      result: observed.result,
-      message: formatBlockerMessage(observed.result)
+    const forced = await forceReleaseAndRescan(observed.result)
+
+    if ('outcome' in forced) {
+      return forced.outcome
+    }
+    observed = forced.scan
+
+    if (observed.kind === 'probe-failure') {
+      return { kind: 'probe-failure', error: observed.error, message: formatProbeFailedMessage() }
+    }
+
+    if (observed.kind === 'blocked' && !exactDrainableOnly(observed.result)) {
+      return {
+        kind: 'blocked',
+        reason: 'holders',
+        result: observed.result,
+        message: formatBlockerMessage(observed.result)
+      }
     }
   }
 
@@ -250,9 +316,22 @@ export async function runWindowsUpdatePreflight(
       return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
     }
 
-    if (firstClear.kind === 'blocked' && genericHoldersOnly(firstClear.result) && !exactDrainableOnly(firstClear.result)) {
-      genericHolderDeadline = now() + genericHolderTimeoutMs
-      firstClear = await pollGenericHoldersUntil(firstClear, genericHolderDeadline)
+    if (
+      firstClear.kind === 'blocked' &&
+      genericHoldersOnly(firstClear.result) &&
+      !exactDrainableOnly(firstClear.result)
+    ) {
+      if (typeof deps.forceReleaseInstallHolders === 'function') {
+        const forced = await forceReleaseAndRescan(firstClear.result)
+
+        if ('outcome' in forced) {
+          return forced.outcome
+        }
+        firstClear = forced.scan
+      } else {
+        genericHolderDeadline = now() + genericHolderTimeoutMs
+        firstClear = await pollGenericHoldersUntil(firstClear, genericHolderDeadline)
+      }
 
       if (firstClear.kind === 'probe-failure') {
         return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
@@ -375,7 +454,20 @@ export async function runWindowsUpdatePreflight(
         return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
       }
 
-      firstClear = await pollGenericHoldersUntil(firstClear, genericHolderDeadline)
+      if (
+        firstClear.kind === 'blocked' &&
+        genericHoldersOnly(firstClear.result) &&
+        typeof deps.forceReleaseInstallHolders === 'function'
+      ) {
+        const forced = await forceReleaseAndRescan(firstClear.result)
+
+        if ('outcome' in forced) {
+          return forced.outcome
+        }
+        firstClear = forced.scan
+      } else {
+        firstClear = await pollGenericHoldersUntil(firstClear, genericHolderDeadline)
+      }
 
       if (firstClear.kind === 'probe-failure') {
         return { kind: 'probe-failure', error: firstClear.error, message: formatProbeFailedMessage() }
@@ -403,8 +495,17 @@ export async function runWindowsUpdatePreflight(
       }
 
       if (secondClear.kind === 'blocked' && genericHoldersOnly(secondClear.result)) {
-        genericHolderDeadline ??= now() + genericHolderTimeoutMs
-        secondClear = await pollGenericHoldersUntil(secondClear, genericHolderDeadline)
+        if (typeof deps.forceReleaseInstallHolders === 'function') {
+          const forced = await forceReleaseAndRescan(secondClear.result)
+
+          if ('outcome' in forced) {
+            return forced.outcome
+          }
+          secondClear = forced.scan
+        } else {
+          genericHolderDeadline ??= now() + genericHolderTimeoutMs
+          secondClear = await pollGenericHoldersUntil(secondClear, genericHolderDeadline)
+        }
 
         if (secondClear.kind === 'probe-failure') {
           return { kind: 'probe-failure', error: secondClear.error, message: formatProbeFailedMessage() }
