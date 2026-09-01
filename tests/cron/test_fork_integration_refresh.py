@@ -467,6 +467,14 @@ def test_staged_state_without_rerere_provenance_fails_closed(
         compose(repos, dry_run=True)
 
 
+def test_rerere_resolution_identical_to_head_is_accounted_for(repos: Repos) -> None:
+    path = "shared.txt"
+
+    assert refresh._rerere_paths_accounted_for(repos.runner, {path}, {"other.txt"}) is True
+    (repos.runner / path).write_text("different\n", encoding="utf-8")
+    assert refresh._rerere_paths_accounted_for(repos.runner, {path}, {"other.txt"}) is False
+
+
 def test_nonadvancing_rerere_continuation_fails_closed(
     repos: Repos, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
