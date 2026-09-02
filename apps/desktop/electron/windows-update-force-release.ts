@@ -55,7 +55,7 @@ export type WindowsUpdateForceReleaseDeps = {
     deadlineAt?: number
   ) => Promise<ForceReleaseTerminateResult>
   excludePids?: ReadonlySet<number>
-  /** Non-elevated budget. Spec: five seconds or less. */
+  /** Non-elevated wall-clock budget for discovery plus identity-verified termination. */
   deadlineMs?: number
   settleMs?: number
 }
@@ -541,7 +541,7 @@ export async function runWindowsUpdateForceRelease(
     holders: lastHolders,
     message: blockedMessage(
       lastHolders,
-      'install file locks could not be cleared within five seconds'
+      'install file locks could not be cleared within the force-release budget'
     )
   }
 }
