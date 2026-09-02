@@ -1,0 +1,495 @@
+{
+  "database_mode": "ro",
+  "evaluation": {
+    "by_detector": {
+      "HFL-01": {
+        "fn": 0,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "support_negative": 20,
+        "support_positive": 4,
+        "tn": 20,
+        "tp": 4
+      },
+      "HFL-03": {
+        "fn": 0,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "support_negative": 20,
+        "support_positive": 4,
+        "tn": 20,
+        "tp": 4
+      },
+      "HFL-04": {
+        "fn": 0,
+        "fp": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "support_negative": 20,
+        "support_positive": 4,
+        "tn": 20,
+        "tp": 4
+      }
+    },
+    "case_results": [
+      {
+        "case_id": "positive-01-HFL-01",
+        "labels": {
+          "HFL-01": true,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": true,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260731_125342_93e523"
+        ]
+      },
+      {
+        "case_id": "positive-02-HFL-01",
+        "labels": {
+          "HFL-01": true,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": true,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260827_190047_a36fe5"
+        ]
+      },
+      {
+        "case_id": "positive-03-HFL-01",
+        "labels": {
+          "HFL-01": true,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": true,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260731_125342_93e523"
+        ]
+      },
+      {
+        "case_id": "positive-04-HFL-01",
+        "labels": {
+          "HFL-01": true,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": true,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260827_190047_a36fe5"
+        ]
+      },
+      {
+        "case_id": "positive-05-HFL-03",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": true,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": true,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260805_224954_f3dace"
+        ]
+      },
+      {
+        "case_id": "positive-06-HFL-03",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": true,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": true,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260827_190047_a36fe5"
+        ]
+      },
+      {
+        "case_id": "positive-07-HFL-03",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": true,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": true,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260805_224954_f3dace"
+        ]
+      },
+      {
+        "case_id": "positive-08-HFL-03",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": true,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": true,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260827_190047_a36fe5"
+        ]
+      },
+      {
+        "case_id": "positive-09-HFL-04",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": true
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": true
+        },
+        "source_sessions": [
+          "@session:default/20260826_214550_0924a9"
+        ]
+      },
+      {
+        "case_id": "positive-10-HFL-04",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": true
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": true
+        },
+        "source_sessions": [
+          "@session:default/20260825_142947_4a2dfd"
+        ]
+      },
+      {
+        "case_id": "positive-11-HFL-04",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": true
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": true
+        },
+        "source_sessions": [
+          "@session:default/20260826_214550_0924a9"
+        ]
+      },
+      {
+        "case_id": "positive-12-HFL-04",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": true
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": true
+        },
+        "source_sessions": [
+          "@session:default/20260825_142947_4a2dfd"
+        ]
+      },
+      {
+        "case_id": "clean-01",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260821_171445_ce6780"
+        ]
+      },
+      {
+        "case_id": "clean-02",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260818_021842_27fab3"
+        ]
+      },
+      {
+        "case_id": "clean-03",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260826_214550_0924a9"
+        ]
+      },
+      {
+        "case_id": "clean-04",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260828_215327_cc5c4a"
+        ]
+      },
+      {
+        "case_id": "clean-05",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260828_112952_a37cef"
+        ]
+      },
+      {
+        "case_id": "clean-06",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260829_162810_e91118"
+        ]
+      },
+      {
+        "case_id": "clean-07",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260829_232229_12ea4b"
+        ]
+      },
+      {
+        "case_id": "clean-08",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260730_102207_238035"
+        ]
+      },
+      {
+        "case_id": "clean-09",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260825_142947_4a2dfd"
+        ]
+      },
+      {
+        "case_id": "clean-10",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260829_233907_98a1d7e3"
+        ]
+      },
+      {
+        "case_id": "clean-11",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260827_190047_a36fe5"
+        ]
+      },
+      {
+        "case_id": "clean-12",
+        "labels": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "predictions": {
+          "HFL-01": false,
+          "HFL-03": false,
+          "HFL-04": false
+        },
+        "source_sessions": [
+          "@session:default/20260731_125342_93e523"
+        ]
+      }
+    ],
+    "cases_total": 24,
+    "clean_cases": 12,
+    "equal_positive_and_clean": true,
+    "positive_cases": 12
+  },
+  "false_positive_review": {
+    "entries": [
+      {
+        "classification": "confirmed_signal",
+        "invocation_call_id": "call_8IiDJN9jz9H1jJ48WfljzSiG",
+        "invocation_message_id": 334432,
+        "message_ids": [
+          334432,
+          334433
+        ],
+        "pattern_id": "HFL-03",
+        "rationale": "The Windows drive path is a direct archive argument to POSIX tar, and the paired tool result reports failure. This is a direct consumer/path dialect mismatch rather than metadata, shell syntax, or a process-filter pattern.",
+        "review_basis": "Read the assistant command and paired tool result from the read-only session projection.",
+        "session_id": "20260831_104858_5812bc"
+      }
+    ],
+    "false_positives": 0,
+    "notes": "Hand review covers every signal in the final last-three-days shadow-signals.jsonl. The final window has one confirmed signal and zero false positives; an earlier exploratory cutoff included a grep-pattern false positive but that older session is outside this report window. No session-store rows were written.",
+    "signals_reviewed": 1,
+    "status": "complete"
+  },
+  "mode": "shadow",
+  "read_only": true,
+  "recommendation": {
+    "decision": "PHASE_1_TYPE_I",
+    "false_positives": 0,
+    "gate_results": {
+      "HFL-01": {
+        "negative_support": 20,
+        "passes": true,
+        "positive_support": 4,
+        "precision": 1.0,
+        "recall": 1.0
+      },
+      "HFL-03": {
+        "negative_support": 20,
+        "passes": true,
+        "positive_support": 4,
+        "precision": 1.0,
+        "recall": 1.0
+      },
+      "HFL-04": {
+        "negative_support": 20,
+        "passes": true,
+        "positive_support": 4,
+        "precision": 1.0,
+        "recall": 1.0
+      }
+    },
+    "rationale": "all three deterministic detectors meet the held-out gates and live signals were reviewed",
+    "review_complete": true,
+    "scope": "Type-I next-decision cases"
+  },
+  "scan": {
+    "database_mode": "ro",
+    "message_rows_scanned": 26236,
+    "read_only": true,
+    "sessions_scanned": 2042,
+    "signals_by_pattern": {
+      "HFL-01": 0,
+      "HFL-03": 1,
+      "HFL-04": 0
+    },
+    "signals_fired": 1
+  },
+  "schema_version": "loop-risk-monitor-shadow/v1",
+  "session_store": "local read-only state.db",
+  "since": 1788068654.0
+}
