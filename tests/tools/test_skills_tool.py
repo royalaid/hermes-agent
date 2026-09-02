@@ -858,17 +858,14 @@ class TestSkillViewCollisionDetection:
     """Regression tests for skill_view name collision handling.
 
     When a skill name resolves to multiple paths across the local skills
-    dir and external_dirs, skill_view must refuse to guess. Silent
-    shadowing — where ``/skills`` shows the local version but
-    ``skill_view`` loads the external one — is the bug class this guards
-    against. Reproduces with `skills.external_dirs` registered in
-    config.yaml and a same-name skill nested under a category locally.
+    dir and external_dirs, skill_view must resolve the deterministic
+    two-source case. Profile-local content wins over an external copy,
+    and the shadowed path is surfaced. Reproduces with
+    `skills.external_dirs` registered in config.yaml and a same-name
+    skill nested under a category locally.
 
-    Adapted from a regression suite originally proposed by @polkn in PR
-    #6136 (which used local-first precedence). The collision-refusal
-    behavior preserves the same protection without silently picking a
-    side, and gives the user an actionable hint (use the categorized
-    path) to recover.
+    A three-way collision still refuses to guess, while byte-identical
+    copies are harmless and resolve silently.
     """
 
     def _patch_dirs(self, local_dir, external_dirs):
@@ -882,8 +879,7 @@ class TestSkillViewCollisionDetection:
         )
 
     def test_nested_local_collides_with_top_level_external(self, tmp_path):
-        """The original bug scenario: nested local + top-level external,
-        same name. Now refuses with both paths surfaced."""
+        """The original bug scenario resolves to the profile-local copy."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -902,14 +898,98 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("explore-codebase")
 
         result = json.loads(raw)
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
+        assert "EXTERNAL VERSION" not in result["content"]
+        assert len(result["shadowed"]) == 1
+        assert str(external_dir) in result["shadowed"][0]
+
+    def test_identical_duplicate_resolves_silently(self, tmp_path):
+        """Byte-identical local/external copies do not report a shadow."""
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        local_skill = _make_skill(
+            local_dir,
+            "shared",
+            category="category",
+            body="IDENTICAL VERSION",
+        )
+        external_skill = _make_skill(
+            external_dir,
+            "shared",
+            body="IDENTICAL VERSION",
+        )
+        external_skill.joinpath("SKILL.md").write_bytes(
+            local_skill.joinpath("SKILL.md").read_bytes()
+        )
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            result = json.loads(skill_view("shared"))
+
+        assert result["success"] is True
+        assert "IDENTICAL VERSION" in result["content"]
+        assert "shadowed" not in result
+
+    def test_same_bundled_manifest_hash_resolves_silently(self, tmp_path):
+        """Matching bundled origin hashes identify copies despite changed bytes."""
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        _make_skill(local_dir, "shared", body="LOCAL VERSION")
+        _make_skill(external_dir, "shared", body="EXTERNAL VERSION")
+        (local_dir / ".bundled_manifest").write_text("shared:origin-hash\n")
+        (external_dir / ".bundled_manifest").write_text("shared:origin-hash\n")
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            result = json.loads(skill_view("shared"))
+
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
+        assert "shadowed" not in result
+
+    def test_explicit_categorized_path_selects_requested_source(self, tmp_path):
+        """A categorized path bypasses bare-name collision resolution."""
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        _make_skill(
+            local_dir,
+            "explore-codebase",
+            category="foundations/runtime",
+            body="LOCAL VERSION",
+        )
+        _make_skill(external_dir, "explore-codebase", body="EXTERNAL VERSION")
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            result = json.loads(skill_view("foundations/runtime/explore-codebase"))
+
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
+        assert "shadowed" not in result
+
+    def test_explicit_categorized_path_missing_does_not_fall_back(self, tmp_path):
+        """A missing explicit path must not silently load a bare-name match."""
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        _make_skill(local_dir, "explore-codebase", body="TOP LEVEL VERSION")
+
+        p1, p2 = self._patch_dirs(local_dir, [])
+        with p1, p2:
+            result = json.loads(skill_view("missing/explore-codebase"))
+
         assert result["success"] is False
-        assert "Ambiguous skill name 'explore-codebase'" in result["error"]
-        assert "matches" in result
-        assert len(result["matches"]) == 2
-        # Both paths surfaced
-        assert any("foundations/runtime" in p for p in result["matches"])
-        assert any("external" in p for p in result["matches"])
-        assert "hint" in result
+        assert "not found" in result["error"].lower()
+        assert "TOP LEVEL VERSION" not in json.dumps(result)
 
 
     def test_support_markdown_does_not_collide_with_real_skill(self, tmp_path):
@@ -944,13 +1024,12 @@ class TestSkillViewCollisionDetection:
 
         result = json.loads(raw)
         assert result["success"] is True
-        assert result["path"] == "creative/sketch/SKILL.md"
+        assert result["path"].replace("\\", "/") == "creative/sketch/SKILL.md"
         assert "REAL SKETCH SKILL" in result["content"]
 
 
-    def test_two_externals_same_name_also_refuse(self, tmp_path):
-        """Collision detection is symmetric — two external dirs with
-        same-name skills also trigger the refusal."""
+    def test_two_externals_same_name_use_configured_precedence(self, tmp_path):
+        """Two external copies use configured order as deterministic precedence."""
         local_dir = tmp_path / "local"
         ext_a = tmp_path / "ext_a"
         ext_b = tmp_path / "ext_b"
@@ -966,6 +1045,30 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("pr")
 
         result = json.loads(raw)
+        assert result["success"] is True
+        assert "EXT_A VERSION" in result["content"]
+        assert "EXT_B VERSION" not in result["content"]
+        assert result["shadowed"] == [
+            str(ext_b / "pr" / "SKILL.md")
+        ]
+
+    def test_three_distinct_sources_refuse(self, tmp_path):
+        """A three-way distinct collision remains an actionable refusal."""
+        local_dir = tmp_path / "local"
+        ext_a = tmp_path / "ext_a"
+        ext_b = tmp_path / "ext_b"
+        local_dir.mkdir()
+        ext_a.mkdir()
+        ext_b.mkdir()
+
+        _make_skill(local_dir, "pr", body="LOCAL VERSION")
+        _make_skill(ext_a, "pr", body="EXT_A VERSION")
+        _make_skill(ext_b, "pr", body="EXT_B VERSION")
+
+        p1, p2 = self._patch_dirs(local_dir, [ext_a, ext_b])
+        with p1, p2:
+            result = json.loads(skill_view("pr"))
+
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
-        assert len(result["matches"]) == 2
+        assert len(result["matches"]) == 3
