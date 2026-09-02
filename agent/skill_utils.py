@@ -559,8 +559,13 @@ def iter_project_skill_files(project_dir: Path):
 
 
 def normalize_skill_lookup_name(identifier: str) -> str:
-    """Translate a trusted absolute skill path (slash commands / cron may store
-    them) to the relative form ``skill_view()`` accepts."""
+    """Normalize a skill identifier to a ``skill_view()``-safe relative path.
+
+    Slash commands and cron jobs may store absolute paths to skills that live
+    under ``~/.hermes/skills/`` (including via symlinks) or configured
+    ``skills.external_dirs``. ``skill_view()`` accepts trusted absolute paths,
+    but callers may still translate them to a relative form for portability.
+    """
     raw_identifier = (identifier or "").strip()
     if not raw_identifier:
         return raw_identifier

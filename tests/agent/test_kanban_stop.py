@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
+from hermes_cli import kanban_db as kb
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
+    record_kanban_guardrail_halt,
     session_called_kanban_terminal,
 )
 
@@ -72,6 +77,43 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_guardrail_halt_blocks_worker_task_as_capability(tmp_path, monkeypatch):
+    """A guardrail halt is a typed lifecycle block, not a crash/reclaim."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="guardrail task", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        claimed = kb.claim_task(conn, task_id, claimer="worker")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    decision = SimpleNamespace(
+        code="same_tool_failure_halt",
+        tool_name="skill_view",
+        message="Stopped skill_view after repeated failures.",
+    )
+
+    assert record_kanban_guardrail_halt(decision, task_id=task_id) is True
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        events = kb.list_events(conn, task_id)
+        blocked = [event for event in events if event.kind == "blocked"]
+        assert blocked
+        assert blocked[-1].payload["kind"] == "capability"
+        assert not [event for event in events if event.kind == "crashed"]
 
 
 
