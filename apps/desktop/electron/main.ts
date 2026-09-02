@@ -427,7 +427,6 @@ import {
   stagedUpdaterEnvironment,
   terminateSpawnedUpdaterIfExact
 } from './updater-process'
-import { isHermesOwnedVenvDaemon } from './venv-holder-select'
 import {
   isExactVenvHolder,
   scanVenvBlockers,
@@ -436,6 +435,7 @@ import {
   terminateMcpBridge,
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
+import { isHermesOwnedVenvDaemon } from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
