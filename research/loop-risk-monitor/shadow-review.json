@@ -1,0 +1,18 @@
+{
+  "status": "complete",
+  "signals_reviewed": 1,
+  "false_positives": 0,
+  "entries": [
+    {
+      "pattern_id": "HFL-03",
+      "session_id": "20260831_104858_5812bc",
+      "message_ids": [334432, 334433],
+      "invocation_message_id": 334432,
+      "invocation_call_id": "call_8IiDJN9jz9H1jJ48WfljzSiG",
+      "classification": "confirmed_signal",
+      "rationale": "The Windows drive path is a direct archive argument to POSIX tar, and the paired tool result reports failure. This is a direct consumer/path dialect mismatch rather than metadata, shell syntax, or a process-filter pattern.",
+      "review_basis": "Read the assistant command and paired tool result from the read-only session projection."
+    }
+  ],
+  "notes": "Hand review covers every signal in the final last-three-days shadow-signals.jsonl. The final window has one confirmed signal and zero false positives; an earlier exploratory cutoff included a grep-pattern false positive but that older session is outside this report window. No session-store rows were written."
+}
