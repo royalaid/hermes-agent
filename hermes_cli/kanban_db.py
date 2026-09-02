@@ -10869,6 +10869,19 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    # Windows: the gateway inherits the environment snapshot of whatever
+    # launched it (Desktop hand-off, Explorer, an installer). That snapshot can
+    # predate PATH edits or lack the HKCU ``Path`` block outright, and the
+    # worker copies it verbatim — so a CLI that resolves in a fresh shell is
+    # ``command not found`` inside the worker (exit 127). Overlay the live
+    # registry PATH: managed -> Machine -> User -> inherited. Best-effort; a
+    # failed registry read leaves the inherited PATH as-is. Desktop
+    # counterpart: #79726.
+    if _IS_WINDOWS:
+        from hermes_cli.windows_host_path import overlay_windows_host_path
+
+        overlay_windows_host_path(env)
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
