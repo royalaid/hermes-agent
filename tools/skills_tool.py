@@ -66,6 +66,7 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -191,31 +192,142 @@ def _is_remote_env_backend(backend: str) -> bool:
 _secret_capture_callback = None
 
 
+def _is_absolute_skill_identifier(name: str) -> bool:
+    """Return whether *name* is an absolute POSIX or Windows path."""
+    if not isinstance(name, str):
+        return False
+    candidate = name.strip()
+    return bool(
+        PurePosixPath(candidate).is_absolute()
+        or PureWindowsPath(candidate).is_absolute()
+        or PureWindowsPath(candidate).drive
+    )
+
+
+def _is_explicit_skill_path(name: str) -> bool:
+    """Return whether a skill identifier names an on-disk path explicitly."""
+    if not isinstance(name, str):
+        return False
+    candidate = name.strip()
+    normalized = candidate.replace("\\", "/")
+    return bool(
+        _is_absolute_skill_identifier(candidate)
+        or "/" in normalized
+        or normalized.startswith("skills/")
+        or normalized.endswith(".md")
+    )
+
+
 def _skill_lookup_path_error(name: str) -> Optional[str]:
     """Return an error if a local skill lookup *name* can escape search roots.
 
-    The skill ``name`` is joined onto each trusted search dir to build the
-    on-disk lookup path, so it must stay relative and free of ``..`` segments —
-    otherwise ``name="../outside"`` or an absolute path could select a skill
-    (and read files) outside the skills directory. Mirrors the ``file_path``
-    validation done later via ``tools.path_security``. We also reject Windows
-    drive paths (e.g. ``C:\\skills``), whose ``:`` would otherwise be misread as
-    a plugin namespace separator.
+    Relative identifiers are joined onto trusted search dirs and must stay free
+    of ``..`` segments. Absolute identifiers are allowed here so ``skill_view``
+    can resolve them explicitly, but the resolver later requires their target
+    to be inside a trusted skills root before reading it. Mirrors the
+    ``file_path`` validation done later via ``tools.path_security``.
     """
     from tools.path_security import has_traversal_component
 
     if not isinstance(name, str):
         return "Skill name must be a string."
     candidate = name.strip()
-    if (
-        PurePosixPath(candidate).is_absolute()
-        or PureWindowsPath(candidate).is_absolute()
-        or PureWindowsPath(candidate).drive
-    ):
-        return "Skill name must be a relative path within the skills directory."
     if has_traversal_component(candidate):
         return "Skill name cannot contain '..' path traversal components."
     return None
+
+
+def _path_is_within_roots(path: Path, roots: List[Path]) -> bool:
+    """Return whether a resolved path is contained by one trusted root."""
+    try:
+        resolved_path = path.expanduser().resolve()
+    except (OSError, RuntimeError):
+        resolved_path = path.expanduser()
+    for root in roots:
+        try:
+            resolved_path.relative_to(root.expanduser().resolve())
+            return True
+        except (ValueError, OSError, RuntimeError):
+            continue
+    return False
+
+
+def _candidate_from_exact_path(path: Path) -> Optional[Tuple[Optional[Path], Path]]:
+    """Return a skill candidate for an explicit directory or markdown path."""
+    if path.is_dir():
+        skill_md = path / "SKILL.md"
+        if skill_md.is_file() and not _is_skill_support_path(path):
+            return path, skill_md
+        return None
+    if not path.is_file() or _is_skill_support_path(path):
+        return None
+    if path.name == "SKILL.md":
+        return path.parent, path
+    if path.suffix.lower() == ".md":
+        return None, path
+    return None
+
+
+def _candidate_byte_hash(skill_dir: Optional[Path], skill_md: Path) -> Optional[str]:
+    """Hash a candidate's bytes and relative file names for identity checks."""
+    digest = hashlib.sha256()
+    try:
+        if skill_dir is None:
+            digest.update(skill_md.name.encode("utf-8"))
+            digest.update(skill_md.read_bytes())
+            return digest.hexdigest()
+        files = sorted(
+            (path for path in skill_dir.rglob("*") if path.is_file()),
+            key=lambda path: path.relative_to(skill_dir).as_posix(),
+        )
+        for path in files:
+            digest.update(path.relative_to(skill_dir).as_posix().encode("utf-8"))
+            digest.update(path.read_bytes())
+    except (OSError, IOError, RuntimeError, ValueError):
+        return None
+    return digest.hexdigest()
+
+
+def _bundled_manifest_hash(
+    search_root: Path, candidate_names: Set[str]
+) -> Optional[str]:
+    """Read a candidate's origin hash from a bundled skill manifest."""
+    manifest = search_root / ".bundled_manifest"
+    try:
+        lines = manifest.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except (OSError, IOError):
+        return None
+    for line in lines:
+        key, separator, value = line.partition(":")
+        if separator and key.strip() in candidate_names and value.strip():
+            return value.strip()
+    return None
+
+
+def _candidates_have_same_identity(
+    left: Tuple[Optional[Path], Path, Path],
+    right: Tuple[Optional[Path], Path, Path],
+) -> bool:
+    """Return whether two skill candidates represent the same source bytes."""
+    left_hash = _candidate_byte_hash(left[0], left[1])
+    right_hash = _candidate_byte_hash(right[0], right[1])
+    if left_hash is not None and left_hash == right_hash:
+        return True
+
+    names = {left[1].parent.name, right[1].parent.name}
+    for _, skill_md, _ in (left, right):
+        try:
+            frontmatter, _ = _parse_frontmatter(
+                skill_md.read_text(encoding="utf-8-sig", errors="replace")
+            )
+            manifest_name = frontmatter.get("name")
+            if manifest_name:
+                names.add(str(manifest_name))
+        except Exception:
+            continue
+    left_manifest = _bundled_manifest_hash(left[2], names)
+    right_manifest = _bundled_manifest_hash(right[2], names)
+    return bool(left_manifest and right_manifest and left_manifest == right_manifest)
 
 
 def load_env() -> Dict[str, str]:
@@ -1124,7 +1236,7 @@ def skill_view(
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
-        if ":" in name:
+        if ":" in name and not _is_absolute_skill_identifier(name):
             from agent.skill_utils import is_valid_namespace, parse_qualified_name
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
@@ -1260,19 +1372,20 @@ def skill_view(
 
         skill_dir = None
         skill_md = None
+        skill_source_root = None
+        shadowed_paths: List[str] = []
 
         # Collision detection: collect ALL candidates across every dir using
         # every lookup strategy (direct path, recursive by parent dir name,
-        # legacy flat <name>.md). If more than one matches, refuse and tell
-        # the caller — silent shadowing of a local skill by a same-named
-        # external skill is a real bug class (`/skills` shows one, agent
-        # loaded the other) so we surface it loudly instead of guessing.
+        # legacy flat <name>.md). Explicit paths use only their exact target;
+        # a missing explicit path must never fall back to a bare-name match.
         from agent.skill_utils import iter_skill_index_files
 
-        candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
+        candidates: List[Tuple[Optional[Path], Path, Path]] = []
+        # Each tuple is (skill_dir, skill_md, trusted search root).
         seen_md: set = set()
 
-        def _record(sd: Optional[Path], smd: Path) -> None:
+        def _record(sd: Optional[Path], smd: Path, search_root: Path) -> None:
             try:
                 key = smd.resolve()
             except Exception:
@@ -1280,67 +1393,104 @@ def skill_view(
             if key in seen_md:
                 return
             seen_md.add(key)
-            candidates.append((sd, smd))
+            candidates.append((sd, smd, search_root))
 
-        for search_dir in all_dirs:
-            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
-            # at the top of the dir).
-            direct_path = search_dir / name
-            if (
-                not _is_skill_support_path(direct_path)
-                and direct_path.is_dir()
-                and (direct_path / "SKILL.md").exists()
-            ):
-                _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
-            ):
-                _record(None, direct_path.with_suffix(".md"))
+        explicit_path = _is_explicit_skill_path(name) or bool(local_category_name)
+        if explicit_path:
+            requested_path = local_category_name or name
+            normalized_path = requested_path.strip().replace("\\", "/")
+            explicit_targets: List[Tuple[Path, Path]] = []
 
-            # Strategy 1b: categorized form for plugin namespace fall-through
-            # (e.g., a "myplugin:explore" name with no plugin registered also
-            # tries the on-disk path "myplugin/explore").
-            if local_category_name:
-                categorized_path = search_dir / local_category_name
-                if (
-                    not _is_skill_support_path(categorized_path)
-                    and categorized_path.is_dir()
-                    and (categorized_path / "SKILL.md").exists()
-                ):
-                    _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(
-                    ".md"
-                ).exists() and not _is_skill_support_path(
-                    categorized_path.with_suffix(".md")
-                ):
-                    _record(None, categorized_path.with_suffix(".md"))
+            if _is_absolute_skill_identifier(requested_path):
+                absolute_path = Path(requested_path).expanduser()
+                if not _path_is_within_roots(absolute_path, all_dirs):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                "Explicit absolute skill paths must be inside a "
+                                "trusted skills directory; use a relative path "
+                                "within the skills directory."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                for search_root in all_dirs:
+                    if _path_is_within_roots(absolute_path, [search_root]):
+                        explicit_targets.append((absolute_path, search_root))
+                        break
+            else:
+                if normalized_path == "skills" or normalized_path.startswith("skills/"):
+                    # ``skills/...`` is relative to HERMES_HOME. In the normal
+                    # runtime this is exactly active_skills_dir; include the
+                    # canonical path as a fallback for patched/test roots.
+                    relative_path = (
+                        ""
+                        if normalized_path == "skills"
+                        else normalized_path.removeprefix("skills/")
+                    )
+                    explicit_roots = [active_skills_dir]
+                    hermes_skills_dir = get_hermes_home() / "skills"
+                    try:
+                        same_root = (
+                            hermes_skills_dir.resolve()
+                            == active_skills_dir.resolve()
+                        )
+                    except (OSError, RuntimeError):
+                        same_root = hermes_skills_dir == active_skills_dir
+                    if not same_root and hermes_skills_dir.exists():
+                        explicit_roots.append(hermes_skills_dir)
+                else:
+                    relative_path = normalized_path
+                    explicit_roots = all_dirs
+                for search_root in explicit_roots:
+                    explicit_targets.append((search_root / relative_path, search_root))
 
-            # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name),
-            # plus frontmatter `name:` lookup. `skills_list()` exposes the
-            # frontmatter name, so `skill_view(name)` must accept it too even
-            # when the on-disk directory is a shorter category/alias.
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
+            for target_path, search_root in explicit_targets:
+                if not _path_is_within_roots(target_path, [search_root]):
                     continue
-                try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
-                    fm, _ = _parse_frontmatter(fm_content)
-                except Exception:
-                    fm = {}
-                if fm.get("name") == name:
-                    _record(found_skill_md.parent, found_skill_md)
-
-            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-            # Exclude skill support docs: references/templates/assets/scripts
-            # are loaded through skill_view(skill, file_path=...) and must not
-            # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
+                exact_candidate = _candidate_from_exact_path(target_path)
+                if exact_candidate is not None:
+                    _record(exact_candidate[0], exact_candidate[1], search_root)
+        else:
+            for search_dir in all_dirs:
+                # Strategy 1: direct path (e.g., "mlops/axolotl" or bare
+                # "axolotl" at the top of the dir).
+                direct_path = search_dir / name
+                if (
+                    not _is_skill_support_path(direct_path)
+                    and direct_path.is_dir()
+                    and (direct_path / "SKILL.md").exists()
                 ):
-                    _record(None, found_md)
+                    _record(direct_path, direct_path / "SKILL.md", search_dir)
+                elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
+                    direct_path.with_suffix(".md")
+                ):
+                    _record(None, direct_path.with_suffix(".md"), search_dir)
+
+                # Strategy 2: recursive by directory name (catches nested
+                # skills like "foundations/runtime/explore-codebase" called
+                # by bare name), plus frontmatter `name:` lookup.
+                for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+                    if found_skill_md.parent.name == name:
+                        _record(found_skill_md.parent, found_skill_md, search_dir)
+                        continue
+                    try:
+                        fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
+                        fm, _ = _parse_frontmatter(fm_content)
+                    except Exception:
+                        fm = {}
+                    if fm.get("name") == name:
+                        _record(found_skill_md.parent, found_skill_md, search_dir)
+
+                # Strategy 3: legacy flat <name>.md files anywhere under the
+                # dir. Exclude support docs, which are loaded through
+                # skill_view(skill, file_path=...).
+                for found_md in search_dir.rglob(f"{name}.md"):
+                    if found_md.name != "SKILL.md" and not _is_skill_support_path(
+                        found_md
+                    ):
+                        _record(None, found_md, search_dir)
 
         if len(candidates) > 1 and project_dirs:
             # Cross-tier collision resolution: a project skill intentionally
@@ -1367,31 +1517,60 @@ def skill_view(
                 candidates = project_candidates
 
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
-            logging.getLogger(__name__).warning(
-                "Skill name collision for '%s': %d candidates — %s",
-                name, len(candidates), "; ".join(paths),
-            )
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": (
-                        f"Ambiguous skill name '{name}': {len(candidates)} skills "
-                        "match across your local skills dir and external_dirs. "
-                        "Refusing to guess — load one explicitly by its categorized path."
-                    ),
-                    "matches": paths,
-                    "hint": (
-                        "Pass the full relative path instead of the bare name "
-                        "(e.g., 'category/skill-name'), or rename one of the "
-                        "colliding skills so each name is unique."
-                    ),
-                },
-                ensure_ascii=False,
-            )
+            paths = [str(smd) for _, smd, _ in candidates]
+            groups: List[List[Tuple[Optional[Path], Path, Path]]] = []
+            for candidate in candidates:
+                for group in groups:
+                    if _candidates_have_same_identity(candidate, group[0]):
+                        group.append(candidate)
+                        break
+                else:
+                    groups.append([candidate])
 
-        if candidates:
-            skill_dir, skill_md = candidates[0]
+            if len(groups) <= 2:
+                local_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if _path_is_within_roots(candidate[1], [active_skills_dir])
+                ]
+                selected = (local_candidates or candidates)[0]
+                if len(groups) > 1:
+                    selected_group = next(
+                        group for group in groups if selected in group
+                    )
+                    shadowed_paths = [
+                        str(candidate[1])
+                        for group in groups
+                        if group is not selected_group
+                        for candidate in group
+                    ]
+                skill_dir, skill_md, skill_source_root = selected
+            else:
+                logging.getLogger(__name__).warning(
+                    "Skill name collision for '%s': %d distinct sources (%d candidates) — %s",
+                    name, len(groups), len(candidates), "; ".join(paths),
+                )
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Ambiguous skill name '{name}': {len(groups)} distinct "
+                            "skill sources match across your local skills dir and "
+                            "external_dirs. Refusing to guess — load one explicitly "
+                            "by its categorized path."
+                        ),
+                        "matches": paths,
+                        "hint": (
+                            "Pass the full relative path instead of the bare name "
+                            "(e.g., 'category/skill-name'), or rename one of the "
+                            "colliding skills so each name is unique."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+        if candidates and not skill_md:
+            skill_dir, skill_md, skill_source_root = candidates[0]
 
         # Quarantine gate: a project-tier skill with a dangerous scan verdict
         # must not load even by explicit name (same chokepoint the index and
@@ -1461,6 +1640,8 @@ def skill_view(
         _trusted_dirs = [active_skills_dir.resolve()]
         try:
             _trusted_dirs.extend(d.resolve() for d in all_dirs)
+            if skill_source_root is not None:
+                _trusted_dirs.append(skill_source_root.resolve())
         except Exception:
             pass
         for _td in _trusted_dirs:
@@ -1869,6 +2050,7 @@ def skill_view(
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
+            **({"shadowed": shadowed_paths} if shadowed_paths else {}),
             "org_provenance": org_provenance,
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"

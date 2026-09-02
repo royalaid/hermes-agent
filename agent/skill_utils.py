@@ -979,9 +979,8 @@ def normalize_skill_lookup_name(identifier: str) -> str:
 
     Slash commands and cron jobs may store absolute paths to skills that live
     under ``~/.hermes/skills/`` (including via symlinks) or configured
-    ``skills.external_dirs``. ``skill_view()`` rejects absolute names for
-    security, so callers must translate trusted absolute paths to their
-    relative form first.
+    ``skills.external_dirs``. ``skill_view()`` accepts trusted absolute paths,
+    but callers may still translate them to a relative form for portability.
     """
     raw_identifier = (identifier or "").strip()
     if not raw_identifier:

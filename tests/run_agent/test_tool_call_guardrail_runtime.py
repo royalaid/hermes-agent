@@ -409,10 +409,13 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.kanban_stop.record_kanban_guardrail_halt") as record_halt,
     ):
         result = agent.run_conversation("search repeatedly")
 
     assert result["turn_exit_reason"] == "guardrail_halt"
+    record_halt.assert_called_once()
+    assert record_halt.call_args.args[0].code == "repeated_exact_failure_block"
     halt_text = result["final_response"]
     assert "stopped retrying" in halt_text
 
