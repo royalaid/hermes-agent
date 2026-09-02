@@ -2265,6 +2265,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    # A GUI-launched gateway may hold an old PATH without the current user
+    # entries. Preserve managed paths first and overlay the live host PATH.
+    if _kb._IS_WINDOWS:
+        from hermes_cli.windows_host_path import overlay_windows_host_path
+
+        overlay_windows_host_path(env)
+
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
