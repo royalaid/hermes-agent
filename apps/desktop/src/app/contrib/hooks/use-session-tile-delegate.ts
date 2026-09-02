@@ -375,6 +375,16 @@ export function useSessionTileDelegate({
           return delegate.resumeTile(storedSessionId, options)
         }
 
+        if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
+          const delegate = sessionTileDelegate()
+
+          if (!delegate) {
+            throw new Error('session binding changed while resume was in flight')
+          }
+
+          return delegate.resumeTile(storedSessionId, options)
+        }
+
         if (outcome.mode === 'read-only') {
           const readOnlyId = readOnlyRuntimeIdFor(storedSessionId)
 
