@@ -265,7 +265,12 @@ function parseIdentityRecord(
   // A generic record may additionally carry the scanner's local-preview UI
   // metadata.  Those hints never relax the hard block the tuple below enforces;
   // they only tell Desktop which single PID it may ask the scanner to stop.
-  const optional = kind === 'process' ? ['created_at', 'parent_pid', ...LOCAL_PREVIEW_HINT_KEYS] : []
+  // Both scanner copies attach parent_pid to every generic record they build,
+  // and a pausable gateway is built through the same generic-record path. Not
+  // accepting it here turned every scan taken while a gateway was alive into a
+  // probe-failure (masked in production only because the pre-scan kill-all
+  // had already removed the gateway).
+  const optional = kind === 'process' ? ['created_at', 'parent_pid', ...LOCAL_PREVIEW_HINT_KEYS] : ['parent_pid']
 
   if (!hasExactKeys(entry, required, optional)) {return null}
 
