@@ -170,7 +170,7 @@ describe('restart manager output parser', () => {
     assert.equal(holders[0]?.pid, 12)
     assert.match(String(holders[0]?.resource), /hermes\.exe/)
     assert.equal(RESTART_MANAGER_ROW_SPLIT_EXPRESSION, "$part.Split([char]'|', 4)")
-    assert.match(buildRestartManagerScript(['C:\\a']), /\$part\.Split\(\[char\]'\|', 4\)/)
+    assert.match(buildRestartManagerScript('C:\\a.txt'), /\$part\.Split\(\[char\]'\|', 4\)/)
   })
 
   it('preserves per-resource RM evidence instead of collapsing to resources[0]', () => {

@@ -699,7 +699,7 @@ describe('raceWithBudget', () => {
 
 describe('restart manager script contract', () => {
   it('emits a literal pipe split that does not over-escape regex', () => {
-    const script = buildRestartManagerScript(['C:\\h\\venv\\Scripts\\hermes.exe'])
+    const script = buildRestartManagerScript('C:\\h\\rm-list.txt')
     assert.match(script, /\$part\.Split\(\[char\]'\|', 4\)/)
     assert.doesNotMatch(script, /\$part -split '\\\\\|'/)
     assert.doesNotMatch(script, /\$part -split '\\\|'/)
