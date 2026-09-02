@@ -122,14 +122,15 @@ describe('syncWorkspaceRoute', () => {
     expect(fronted()).toBe(true)
   })
 
-  it('fronts on a contributed page route', () => {
+  it('leaves the workspace alone on a contributed route — that lands as a route tile, not a page', () => {
     const dispose = contributeRoute()
 
     try {
       syncWorkspaceRoute(CONTRIBUTED_ROUTE)
 
       expect(appViewForPath(CONTRIBUTED_ROUTE)).toBe('extension')
-      expect(fronted()).toBe(true)
+      expect($workspaceIsPage.get()).toBe(false)
+      expect(revealTreePane).not.toHaveBeenCalled()
     } finally {
       dispose()
     }

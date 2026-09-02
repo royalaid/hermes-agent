@@ -733,7 +733,7 @@ export function useSessionActions({
 
       if (item.route) {
         if (isContributedRoute(item.route)) {
-          openRouteTile(item.route)
+          openRouteTile(item.route, 'center')
 
           return
         }
