@@ -237,6 +237,11 @@ import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
+import {
+  getInstallMutationSet,
+  type InstallResourceLocks,
+  probeInstallResourceLocks
+} from './install-mutation-set'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -428,6 +433,7 @@ import {
   terminateSpawnedUpdaterIfExact
 } from './updater-process'
 import {
+  formatProbeFailedMessage,
   isExactVenvHolder,
   scanVenvBlockers,
   stopSafeVenvBlockers,
@@ -472,7 +478,10 @@ import {
   probeWindowsRemote,
   terminateOwnedWindowsDashboardForUpdate
 } from './windows-remote-lifecycle'
-import { listRestartManagerHoldersForResources } from './windows-restart-manager'
+import {
+  listRestartManagerHoldersForResources,
+  RESTART_MANAGER_DEFAULT_TIMEOUT_MS
+} from './windows-restart-manager'
 import {
   alreadyHasNoSandbox,
   buildNoSandboxRelaunchArgs,
@@ -3516,30 +3525,63 @@ function killHermesOwnedVenvDaemons(updateRoot) {
   }
 }
 
-function isFileLocked(filePath) {
-  return isShimLocked(filePath)
+// The files the updater will replace or delete: every native module, DLL,
+// and executable under venv\ and .hermes-runtime\. This is what pip/uv
+// actually needs free. The previous proxy (three shim files) only proved the
+// uv launcher was gone; the real interpreter runs from .hermes-runtime and
+// keeps site-packages .pyd files mapped without touching the shim
+// (docs/analysis/2026-09-02-windows-update-holder-ownership-gap.md, section 2).
+function installLockResources(updateRoot) {
+  return getInstallMutationSet(updateRoot)
 }
 
-function installLockResources(updateRoot) {
-  const candidates = [
-    path.join(updateRoot, 'venv', 'Scripts', 'hermes.exe'),
-    path.join(updateRoot, 'venv', 'Scripts', 'python.exe'),
-    path.join(updateRoot, 'venv', 'python.exe')
-  ]
+// Exclusive-open probe over the mutation set, split into files only our
+// link can lock (definite) and uv-shared hard links that need per-process
+// attribution. Falls back to the shim probe on a checkout without a venv.
+function probeInstallLocks(updateRoot): InstallResourceLocks {
+  const resources = installLockResources(updateRoot)
 
-  return candidates.filter(candidate => {
-    try {
-      return fs.existsSync(candidate)
-    } catch {
-      return false
-    }
+  if (resources.length === 0) {
+    const shim = venvHermesShimPath(updateRoot)
+
+    return { definite: isShimLocked(shim) ? [shim] : [], shared: [] }
+  }
+
+  return probeInstallResourceLocks(resources)
+}
+
+function lockedInstallResources(updateRoot, limit?: number) {
+  const locks = probeInstallLocks(updateRoot)
+  const all = [...locks.definite, ...locks.shared]
+
+  return typeof limit === 'number' ? all.slice(0, limit) : all
+}
+
+// Holders proven by the kernel: Restart Manager over the locked files, with
+// per-process module attribution for uv-shared files so a foreign venv that
+// maps the same wheel through its own hard link is never listed or killed.
+async function attributedInstallHolders(updateRoot, timeoutMs = RESTART_MANAGER_DEFAULT_TIMEOUT_MS) {
+  const locks = probeInstallLocks(updateRoot)
+
+  if (locks.definite.length === 0 && locks.shared.length === 0) {return []}
+
+  return listRestartManagerHoldersForResources(locks.definite, {
+    shared: locks.shared,
+    // Attribute against the venv, the only tree the sync rewrites: a process
+    // that maps runtime DLLs but no venv file is not a holder of this update.
+    attributionRoot: path.join(updateRoot, 'venv'),
+    timeoutMs
   })
 }
 
-function isAnyInstallResourceLocked(updateRoot) {
-  const resources = installLockResources(updateRoot)
+async function isAnyInstallResourceLocked(updateRoot): Promise<boolean> {
+  const locks = probeInstallLocks(updateRoot)
 
-  return resources.length === 0 ? isShimLocked(venvHermesShimPath(updateRoot)) : resources.some(isFileLocked)
+  if (locks.definite.length > 0) {return true}
+
+  if (locks.shared.length === 0) {return false}
+
+  return (await attributedInstallHolders(updateRoot)).length > 0
 }
 
 // Force-kill the entire process TREE rooted at each PID. Node's child.kill()
@@ -3564,66 +3606,6 @@ function forceKillProcessTree(pid) {
   } catch {
     // Already gone, or no permission — best effort; the unlock wait below is
     // the real gate.
-  }
-}
-
-// Kill every non-Desktop process executing from this Hermes install. Selecting
-// tree roots keeps taskkill /T authoritative across Python/Node trampolines;
-// this is target collection only, never a holder-classification gate.
-function forceKillAllHermesBackendTrees(updateRoot: string) {
-  if (!IS_WINDOWS) {
-    return
-  }
-
-  const root = `${path
-    .resolve(updateRoot)
-    .replace(/'/g, "''")
-    .replace(/[\\/]+$/, '')}\\`
-  const desktopPluginsRoot = `${path
-    .resolve(path.dirname(updateRoot), 'desktop-plugins')
-    .replace(/'/g, "''")
-    .replace(/[\\/]+$/, '')}\\`
-  const desktopExecutable = path.resolve(process.execPath).replace(/'/g, "''")
-
-  const script = `
-$ErrorActionPreference = 'SilentlyContinue'
-$root = '${root}'
-$desktopPluginsRoot = '${desktopPluginsRoot}'
-$desktopExecutable = '${desktopExecutable}'
-$processes = @(Get-CimInstance Win32_Process)
-$targets = @($processes | Where-Object {
-  $executable = [string]$_.ExecutablePath
-  $commandLine = [string]$_.CommandLine
-  $isInstallProcess = $executable.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
-  $isPluginSupervisor =
-    ($executable.EndsWith('\wscript.exe', [StringComparison]::OrdinalIgnoreCase) -or
-      $executable.EndsWith('\cscript.exe', [StringComparison]::OrdinalIgnoreCase)) -and
-    $commandLine.IndexOf($desktopPluginsRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-    $commandLine.IndexOf('service-host.vbs', [StringComparison]::OrdinalIgnoreCase) -ge 0
-  $_.ProcessId -ne ${process.pid} -and
-    ($isInstallProcess -or $isPluginSupervisor) -and
-    -not $executable.Equals($desktopExecutable, [StringComparison]::OrdinalIgnoreCase)
-})
-$targetIds = @{}
-foreach ($target in $targets) {
-  $targetIds[[int]$target.ProcessId] = $true
-}
-foreach ($target in $targets) {
-  if (-not $targetIds.ContainsKey([int]$target.ParentProcessId)) {
-    & taskkill.exe /PID ([string]$target.ProcessId) /T /F *> $null
-  }
-}
-`
-
-  try {
-    execFileSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', script],
-      hiddenWindowsChildOptions({ stdio: 'ignore' })
-    )
-  } catch {
-    // Each tree kill is best effort; the existing shim-unlock wait below is
-    // still the fail-closed hand-off gate.
   }
 }
 
@@ -3987,7 +3969,10 @@ async function releaseBackendLock(updateRoot, tag) {
   const gate = await waitForBackendRelease(
     initialPids,
     {
-      isShimLocked: () => Boolean(isShimLocked(shim)),
+      // Prove the whole mutation set, not just the shim: a holder that maps a
+      // site-packages .pyd without touching hermes.exe used to pass this gate
+      // and break the venv sync later inside the updater.
+      isShimLocked: () => isAnyInstallResourceLocked(updateRoot),
       isPidAlive: isPidAliveWindows,
       collectStragglerPids: () => {
         const stragglers = []
@@ -4025,8 +4010,12 @@ async function releaseBackendLock(updateRoot, tag) {
   // imports broken (the July 2026 brotlicffi/_sodium.pyd incidents). Failing
   // the update loudly and keeping the app running is strictly better than a
   // bricked install that needs manual venv surgery.
+  const stillLocked = lockedInstallResources(updateRoot, 3)
+    .map(resource => path.relative(updateRoot, resource))
+    .join(', ')
+
   rememberLog(
-    `[${tag}] venv shim still locked after 15s; aborting hand-off (something outside this app holds the venv)`
+    `[${tag}] install files still locked after 15s (${stillLocked || 'unknown'}); handing to identity-verified force-release`
   )
 
   return { unlocked: false }
@@ -4123,11 +4112,13 @@ function forceReleaseHoldersFromScan(updateRoot: string, result: VenvBlockerScan
 }
 
 async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
-  const resources = installLockResources(updateRoot)
   const exclude = new Set<number>([process.pid].filter(pid => Number.isInteger(pid) && pid > 0))
 
   return runWindowsUpdateForceRelease({
-    deadlineMs: 5_000,
+    // Discovery alone (mutation-set probe + one Restart Manager session) can
+    // take several seconds on a loaded workstation; the old five-second budget
+    // timed out before a single holder was enumerated.
+    deadlineMs: 20_000,
     settleMs: 150,
     excludePids: exclude,
     isResourceLocked: async () => isAnyInstallResourceLocked(updateRoot),
@@ -4141,13 +4132,12 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
 
       return forceReleaseHoldersFromScan(updateRoot, outcome.result)
     },
-    listRestartManagerHolders: async (budgetMs) => {
-      const rmResources = resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
-      const timeoutMs = Math.max(0, Math.min(3_500, Math.trunc(budgetMs)))
+    listRestartManagerHolders: async budgetMs => {
+      const timeoutMs = Math.max(0, Math.min(RESTART_MANAGER_DEFAULT_TIMEOUT_MS, Math.trunc(budgetMs)))
 
       if (timeoutMs <= 0) {return []}
 
-      return listRestartManagerHoldersForResources(rmResources, { timeoutMs })
+      return attributedInstallHolders(updateRoot, timeoutMs)
     },
     terminateHolder: (holder, budgetMs, signal, deadlineAt) =>
       terminateWindowsHolderWithinDeadline(holder, {
@@ -4165,20 +4155,17 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
   message: string
   elevationHolders?: ForceReleaseHolder[]
 }> {
-  if (!isAnyInstallResourceLocked(updateRoot)) {
+  if (!(await isAnyInstallResourceLocked(updateRoot))) {
     return { ok: true, message: 'already clear' }
   }
 
-  const resources = installLockResources(updateRoot)
   const excludePids = [process.pid].filter(pid => Number.isInteger(pid) && pid > 0)
   const scanOutcome = await scanVenvBlockers(updateRoot)
 
   const scannerHolders =
     scanOutcome.kind === 'blocked' ? forceReleaseHoldersFromScan(updateRoot, scanOutcome.result) : []
 
-  const rmHolders = await listRestartManagerHoldersForResources(
-    resources.length > 0 ? resources : [venvHermesShimPath(updateRoot)]
-  )
+  const rmHolders = await attributedInstallHolders(updateRoot)
 
   const holders = mergeInstallHolders([...scannerHolders, ...rmHolders], new Set(excludePids)).filter(
     holder => Number.isInteger(holder.pid) && holder.pid > 0
@@ -4269,7 +4256,7 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
       }
     }
 
-    if (isAnyInstallResourceLocked(updateRoot)) {
+    if (await isAnyInstallResourceLocked(updateRoot)) {
       const survivorDetail = (response.survivors ?? [])
         .map(entry => `PID ${entry.pid}${entry.resource ? ` resource=${entry.resource}` : ''} ${entry.detail || 'locked'}`.trim())
         .join('; ')
@@ -4301,10 +4288,46 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
   }
 }
 
-function runWindowsHandoffPreflight(updateRoot: string, purpose: UpdatePreflightPurpose) {
-  // Update consent is the authority: stop every install-root process and each
-  // Hermes Desktop plugin restart host before classification can veto handoff.
-  forceKillAllHermesBackendTrees(updateRoot)
+async function runWindowsHandoffPreflight(
+  updateRoot: string,
+  purpose: UpdatePreflightPurpose
+): Promise<UpdatePreflightOutcome> {
+  // Observe before anything is stopped. A scanner self-check failure (schema
+  // drift, unreadable process table) aborts here with zero side effects. The
+  // path-rooted kill-all that used to run first SIGKILLed the gateway and
+  // every plugin service seven times on 2026-09-02 for updates that never
+  // started; holders are now released by identity further down instead.
+  const observed = await scanVenvBlockers(updateRoot)
+
+  if (observed.kind === 'probe-failure') {
+    return { kind: 'probe-failure', error: observed.error, message: formatProbeFailedMessage() }
+  }
+
+  // Desktop plugin services restart themselves from a Windows Script Host
+  // loop that ignores update markers. Stop each exact, revalidated service
+  // through the scanner (worker first, then wrapper plus its proven host) so
+  // the loop cannot reopen the venv during handoff. Update consent authorizes
+  // this; nothing outside the scanner's proof is touched.
+  if (observed.kind === 'blocked') {
+    const services = [...observed.result.desktopPluginServices].sort(
+      (left, right) =>
+        Number(right.role === 'desktop_plugin_worker') - Number(left.role === 'desktop_plugin_worker')
+    )
+
+    for (const service of services) {
+      let stopped = false
+
+      try {
+        stopped = await terminateDesktopPluginService(updateRoot, service)
+      } catch {
+        stopped = false
+      }
+
+      rememberLog(
+        `[updates] plugin service PID ${service.pid} (${service.role}) ${stopped ? 'stopped' : 'not stopped'} before handoff`
+      )
+    }
+  }
 
   return runWindowsUpdatePreflight(purpose, {
     releaseTrackedBackendTrees: () =>
