@@ -234,6 +234,7 @@ describe('parseVenvBlockerScanOutput', () => {
   // blocker breaks this fixture.
   it('tolerates exemption diagnostics while enforcing blocked/processes consistency', () => {
     const evidence = [{ pid: 78, purpose: 'serve', port: 9119 }]
+
     const clear = parseObject(
       scanEnvelope(expectedRoot, expectedVenv, {
         pausable_gateways: 0,
@@ -742,6 +743,21 @@ describe('parseVenvBlockerScanOutput', () => {
     }
   })
 
+  it('accepts the scanner parent_pid on a pausable gateway record', () => {
+    // The Python scanner builds gateway records through _generic_record, which
+    // attaches parent_pid whenever the parent is known. A live gateway must not
+    // turn a clean scan into a probe-failure.
+    const outcome = parseObject(
+      scanEnvelope(expectedRoot, expectedVenv, {
+        pausable_gateways: 1,
+        pausable_gateway_processes: [pausableGateway({ parent_pid: 4242 })]
+      })
+    )
+
+    assert.equal(outcome.kind, 'clear')
+    assert.equal(outcome.kind === 'clear' && outcome.result.pausableGateways, 1)
+  })
+
   it('requires gateway count equality and the exact downstream-drainable tuple', () => {
     const invalid = [
       scanEnvelope(expectedRoot, expectedVenv, { pausable_gateways: -1 }),
@@ -770,6 +786,14 @@ describe('parseVenvBlockerScanOutput', () => {
       scanEnvelope(expectedRoot, expectedVenv, {
         pausable_gateways: 1,
         pausable_gateway_processes: [pausableGateway({ action: 'refuse' })]
+      }),
+      scanEnvelope(expectedRoot, expectedVenv, {
+        pausable_gateways: 1,
+        pausable_gateway_processes: [pausableGateway({ parent_pid: 0 })]
+      }),
+      scanEnvelope(expectedRoot, expectedVenv, {
+        pausable_gateways: 1,
+        pausable_gateway_processes: [pausableGateway({ parent_pid: 4242, unexpected: true })]
       })
     ]
 
