@@ -54,7 +54,7 @@ class TestPathTraversalBlocked:
         assert "do-not-leak" not in json.dumps(result)
 
     def test_absolute_skill_name_blocked(self, fake_skills):
-        """An absolute skill name must not bypass the trusted search root."""
+        """An absolute path outside trusted roots must still be rejected."""
         tmp_path = fake_skills["tmp_path"]
         outside_skill = tmp_path / "outside-absolute"
         outside_skill.mkdir()
@@ -66,6 +66,22 @@ class TestPathTraversalBlocked:
         assert result["success"] is False
         assert "relative path" in result["error"].lower()
         assert "do-not-leak" not in json.dumps(result)
+
+    def test_absolute_trusted_skill_name_allowed(self, fake_skills):
+        """An absolute path to a trusted skill may be used explicitly."""
+        result = json.loads(skill_view(str(fake_skills["skill_dir"] / "SKILL.md")))
+
+        assert result["success"] is True
+        assert "A test skill." in result["content"]
+
+    def test_hermes_home_relative_skill_name_allowed(self, fake_skills, monkeypatch):
+        """The active HERMES_HOME-relative ``skills/...`` form is supported."""
+        monkeypatch.setenv("HERMES_HOME", str(fake_skills["tmp_path"]))
+
+        result = json.loads(skill_view("skills/test-skill/SKILL.md"))
+
+        assert result["success"] is True
+        assert "A test skill." in result["content"]
 
     def test_legit_skill_name_still_works(self, fake_skills):
         """A normal skill name must still resolve after the name guard."""

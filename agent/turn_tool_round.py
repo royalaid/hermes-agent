@@ -161,6 +161,14 @@ def run_tool_round(
 
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
+        try:
+            from agent.kanban_stop import record_kanban_guardrail_halt
+
+            record_kanban_guardrail_halt(decision, task_id=effective_task_id)
+        except Exception:
+            # The guardrail response must remain user-visible even if lifecycle
+            # repair cannot reach the kanban database.
+            logger.debug("Could not record kanban guardrail halt", exc_info=True)
         _turn_exit_reason = "guardrail_halt"
         final_response = agent._toolguard_controlled_halt_response(decision)
         agent._emit_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
