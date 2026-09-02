@@ -387,6 +387,7 @@ describe('MCP bridge drain', () => {
         processes: [{ pid: 909, name: 'python.exe', cmdline: 'python.exe late.py', createdAt: 909.5 }]
       })
     }
+
     const { calls, deps } = makeDeps([clear(), late, clear(), clear()], {
       forceReleaseInstallHolders: async () => {
         calls.push('force-release')
@@ -1068,19 +1069,27 @@ describe('production update mutation permit wiring', () => {
     assert.doesNotMatch(main, /const launch = launchWindowsUpdateTransport\(/)
   })
 
-  it('aggressively kills install trees and Desktop plugin restart hosts before preflight', async () => {
+  it('observes before it stops anything and never runs a path-rooted kill-all', async () => {
     const fs = await import('node:fs')
     const path = await import('node:path')
     const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
-    const wiringStart = main.indexOf('function runWindowsHandoffPreflight')
-    const wiringEnd = main.indexOf('\nfunction ', wiringStart + 1)
+    const wiringStart = main.indexOf('async function runWindowsHandoffPreflight')
+    const wiringEnd = main.indexOf('\nasync function ', wiringStart + 1)
     const wiring = main.slice(wiringStart, wiringEnd)
-    const killerStart = main.indexOf('function forceKillAllHermesBackendTrees')
-    const killerEnd = main.indexOf('\nfunction ', killerStart + 1)
-    const killer = main.slice(killerStart, killerEnd)
 
-    assert.match(wiring, /forceKillAllHermesBackendTrees\(updateRoot\)/)
-    assert.match(killer, /service-host\.vbs/i)
-    assert.match(killer, /taskkill\.exe[\s\S]*\/T[\s\S]*\/F/)
+    // 2026-09-02: the kill-all ran before the first scan, so a scanner
+    // self-check failure still SIGKILLed the gateway and plugin services.
+    assert.equal(main.includes('forceKillAllHermesBackendTrees'), false)
+    assert.doesNotMatch(wiring, /taskkill/)
+    assert.doesNotMatch(wiring, /Get-CimInstance Win32_Process/)
+
+    const scanAt = wiring.indexOf('await scanVenvBlockers(updateRoot)')
+    const probeAbortAt = wiring.indexOf("observed.kind === 'probe-failure'")
+    const pluginStopAt = wiring.indexOf('terminateDesktopPluginService(updateRoot, service)')
+    const preflightAt = wiring.indexOf('runWindowsUpdatePreflight(purpose')
+
+    assert.ok(scanAt > 0 && probeAbortAt > scanAt, 'first scan happens before any mutation and probe-failure aborts')
+    assert.ok(pluginStopAt > probeAbortAt, 'exact plugin services stop only after a non-failing scan')
+    assert.ok(preflightAt > pluginStopAt, 'the transactional preflight runs last')
   })
 })

@@ -173,6 +173,7 @@ def _base_result(
         "pausable_gateways": 0,
         "pausable_gateway_processes": [],
         "deferred_backends": 0,
+        "deferred_backend_evidence": [],
         "error": error,
     }
 
@@ -1216,6 +1217,11 @@ def scan_venv_blockers(root: str | Path) -> dict[str, Any]:
             "pausable_gateways": len(gateways),
             "pausable_gateway_processes": gateways,
             "deferred_backends": deferred_backends,
+            # Contract parity with hermes_cli/_scan_venv_blockers.py (#98350):
+            # the Desktop parser requires this key. The candidate-owned carrier
+            # never consults the target ledger, so it defers nothing and the
+            # sanitized evidence list is always empty.
+            "deferred_backend_evidence": [],
         }
     )
     return result

@@ -13,6 +13,7 @@ import {
   resolveUpdateScannerCarrier,
   UPDATE_SCANNER_RESOURCE_PATH
 } from './update-scanner-carrier'
+import { parseVenvBlockerScanOutput } from './venv-blocker-scan'
 
 describe('update scanner carrier resolution', () => {
   it('resolves development bytes from candidate source', () => {
@@ -77,6 +78,23 @@ describe('update scanner carrier resolution', () => {
       const child = spawnSync(python.exe, argv, { encoding: 'utf-8', windowsHide: true })
       assert.equal(child.status, 0, child.stderr || child.stdout)
       const output = JSON.parse(child.stdout)
+
+      // The preflight consumes carrier stdout through the exact-envelope parser.
+      // A carrier that drifts from hermes_cli/_scan_venv_blockers.py by even one
+      // key turns every clean scan into `probe-failure` and aborts the update
+      // with "Desktop could not verify the Hermes installation is free".
+      const canonicalRoot = fs.realpathSync.native(root)
+
+      const parsed = parseVenvBlockerScanOutput(child.stdout, {
+        expectedRoot: canonicalRoot,
+        expectedVenv: path.join(canonicalRoot, 'venv')
+      })
+
+      assert.notEqual(
+        parsed.kind,
+        'probe-failure',
+        `carrier envelope rejected by Desktop parser: ${(parsed as { error?: string }).error ?? ''}`
+      )
       assert.equal(output.schema_version, 2)
       assert.equal(output.mode, 'scan')
       assert.equal(output.ok, true)
