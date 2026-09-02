@@ -645,7 +645,7 @@ export function parseVenvBlockerScanOutput(raw: string, target: ScanTargetIdenti
         typeof entry !== 'object' ||
         entry === null ||
         !Number.isInteger((entry as { pid?: unknown }).pid) ||
-        ((entry as { pid: number }).pid) <= 0
+        (entry as { pid: number }).pid <= 0
     )
   ) {
     return { kind: 'probe-failure', error: 'deferred_backend_evidence must list sanitized backend identities' }
