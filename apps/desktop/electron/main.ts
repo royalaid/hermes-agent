@@ -434,7 +434,11 @@ import {
   terminateMcpBridge,
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
-import { isHermesOwnedVenvDaemon } from './venv-holder-select'
+import {
+  buildVenvHolderListCommand,
+  isHermesOwnedUpdateHolder,
+  parseServePidFile
+} from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
@@ -3385,38 +3389,60 @@ function isShimLocked(shimPath) {
   }
 }
 
-// Kill only Hermes-OWNED venv daemons (the memory plugin's hindsight daemon:
-// exe under venv\Scripts AND cmdline referencing hindsight_api.main). The
-// daemon is spawned DETACHED, so it outlives the backend tree-kill and keeps
-// venv files mapped. External holders (a user terminal running `hermes`,
-// unrelated scripts) are NOT killed — scanVenvBlockers reports them and the
-// hand-off aborts, per existing design. Selection lives in the pure
-// venv-holder-select module (ordinal path-prefix, no PowerShell -like
-// wildcard hazards) so it's testable without Electron.
+// Kill Hermes-OWNED venv holders that outlive the tracked-backend tree kill
+// and keep venv\Lib\site-packages\*.pyd mapped: hindsight, the operator
+// Tailscale `hermes serve` tree (serve.pid / real --port), execute_code
+// kernels, and venv-launched MCP bridges. External holders (a user terminal
+// running `hermes`, unrelated scripts) are NOT killed — scanVenvBlockers
+// reports them and the hand-off aborts. Selection lives in the pure
+// venv-holder-select module (ordinal path-prefix + argv shape, no
+// PowerShell -like wildcard hazards) so it's testable without Electron.
 function killHermesOwnedVenvDaemons(updateRoot) {
   if (!IS_WINDOWS) {
     return
   }
 
   const scriptsDir = path.join(updateRoot, 'venv', 'Scripts')
+  const runtimePythonDir = path.join(updateRoot, '.hermes-runtime', 'python')
+  const killed = new Set()
+
+  const killHolder = (pid, reason) => {
+    if (!Number.isInteger(pid) || pid <= 0 || killed.has(pid)) {
+      return
+    }
+
+    killed.add(pid)
+    rememberLog(`[updates] stopping Hermes-owned venv holder (${reason}) PID ${pid} before hand-off`)
+    forceKillProcessTree(pid)
+  }
+
+  // Fast path: serve.pid is the listening worker. taskkill /T from that PID
+  // does not reach its venv\Scripts trampoline parent, so also kill the
+  // parent when the worker matches the operator-serve argv shape. The WMI
+  // pass below still catches kernel/MCP children whose parent is already gone.
+  try {
+    const servePid = parseServePidFile(fs.readFileSync(path.join(HERMES_HOME, 'serve.pid'), 'utf8'))
+
+    if (servePid) {
+      killHolder(servePid, 'operator-serve.pid')
+    }
+  } catch {
+    void 0
+  }
 
   let holders = []
 
   try {
     const out = execFileSync(
       'powershell',
-      [
-        '-NoProfile',
-        '-Command',
-        'Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.CommandLine } | Select-Object ProcessId, ExecutablePath, CommandLine | ConvertTo-Json -Compress'
-      ],
+      ['-NoProfile', '-Command', buildVenvHolderListCommand()],
       hiddenWindowsChildOptions({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 })
     )
 
     const parsed = JSON.parse(String(out || '[]'))
 
     holders = (Array.isArray(parsed) ? parsed : [parsed]).filter(p =>
-      isHermesOwnedVenvDaemon(p?.ExecutablePath, p?.CommandLine, scriptsDir)
+      isHermesOwnedUpdateHolder(p?.ExecutablePath, p?.CommandLine, scriptsDir, runtimePythonDir)
     )
   } catch {
     // Best-effort: the venv-blocker scan downstream is the real backstop.
@@ -3424,12 +3450,7 @@ function killHermesOwnedVenvDaemons(updateRoot) {
   }
 
   for (const holder of holders) {
-    const pid = Number(holder?.ProcessId)
-
-    if (Number.isInteger(pid) && pid > 0) {
-      rememberLog(`[updates] stopping Hermes-owned venv daemon (hindsight) PID ${pid} before hand-off`)
-      forceKillProcessTree(pid)
-    }
+    killHolder(Number(holder?.ProcessId), 'argv-identity')
   }
 }
 
@@ -3856,11 +3877,10 @@ async function releaseBackendLock(updateRoot, tag) {
   // startGatewaysAfterUpdateAbort. No-op off Windows.
   stopGatewayBeforeUpdate(venvHermesShimPath(updateRoot), HERMES_HOME)
 
-  // Reap Hermes-OWNED venv daemons the tree-kill above cannot reach: the
-  // memory plugin's hindsight daemon is spawned DETACHED (it outlives the
-  // backend) yet runs off venv\Scripts\pythonw.exe, keeping venv files
-  // mapped past the backend teardown (#75477/#75478). Narrowly scoped
-  // (venv-holder-select) — external holders are never killed here.
+  // Reap Hermes-OWNED venv holders the tree-kill above cannot reach:
+  // hindsight (detached), the operator Tailscale serve tree + kernels,
+  // and venv-launched MCP bridges. Narrowly scoped (venv-holder-select)
+  // — a user terminal running `hermes` is never killed here.
   killHermesOwnedVenvDaemons(updateRoot)
 
   const shim = venvHermesShimPath(updateRoot)
