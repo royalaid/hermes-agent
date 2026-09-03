@@ -32,10 +32,21 @@ MERGE_ASSERTIONS: dict[str, tuple[TreeAssertion, ...]] = {
         TreeAssertion("apps/desktop/src/lib/todos.ts", contains=("export function latestSessionTodoState", "export function todosFromSnapshotMetadata")),
         TreeAssertion("tui_gateway/server.py", contains=("def _has_structured_todo_snapshot",)),
     ),
-    KILL_ALL_MERGE: (TreeAssertion(
-        "apps/desktop/electron/main.ts",
-        contains=("function forceKillAllHermesBackendTrees", "  forceKillAllHermesBackendTrees(updateRoot)"),
-        ordered=(("  forceKillAllHermesBackendTrees(updateRoot)", "return runWindowsUpdatePreflight(purpose"),)),),
+    KILL_ALL_MERGE: (
+        TreeAssertion(
+            "apps/desktop/electron/main.ts",
+            contains=(
+                "function killHermesOwnedVenvDaemons",
+                "isHermesOwnedUpdateHolder",
+                "buildVenvHolderListCommand",
+            ),
+            absent=("function forceKillAllHermesBackendTrees",),
+        ),
+        TreeAssertion(
+            "apps/desktop/electron/venv-holder-select.ts",
+            contains=("export function isHermesOwnedUpdateHolder", "isOperatorManagedServeCmdline"),
+        ),
+    ),
     "merge: integrate live Windows update transport": (
         TreeAssertion("apps/desktop/electron/updater-process.ts", contains=("export function resolveWindowsUpdateTransport",)),
         TreeAssertion("apps/desktop/electron/main.ts", contains=("resolveWindowsUpdateTransport,",
