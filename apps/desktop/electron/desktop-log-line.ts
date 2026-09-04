@@ -17,3 +17,31 @@
 export function formatDesktopLogLine(text: string, stamp = new Date().toISOString()): string {
   return `[${stamp}] [hermes] ${text}`
 }
+
+export const HERMES_LOG_CAP = 300
+
+/**
+ * Append formatted lines to the in-memory desktop log.
+ *
+ * Bundlers lower `const hermesLog = []` past module-scope callers of
+ * `rememberLog` (pool-limits load runs at import). A missing sink must not
+ * throw — that crash is an uncaught main-process exception and the window
+ * never opens.
+ */
+export function appendCappedLogLines(
+  log: string[] | null | undefined,
+  lines: readonly string[],
+  cap = HERMES_LOG_CAP
+): boolean {
+  if (!Array.isArray(log) || lines.length === 0) {
+    return false
+  }
+
+  log.push(...lines)
+
+  if (log.length > cap) {
+    log.splice(0, log.length - cap)
+  }
+
+  return true
+}
