@@ -4511,25 +4511,91 @@ def _log_only_write(text: str) -> None:
     except Exception:
         pass
 
-def _run_logged_subprocess(cmd, *, cwd=None, env=None):
-    """Run ``cmd`` capturing combined output into update.log (not the terminal).
+def _update_log_append(text: str) -> None:
+    """Append ``text`` to update.log whether or not the mirror stream is on.
 
-    Returns the ``CompletedProcess`` (with ``stdout`` populated) so the caller
-    can decide whether to surface the captured output on failure.
+    ``_log_only_write`` reaches the mirror that ``_install_hangup_protection``
+    wraps around stdout -- but that mirror is deliberately a no-op in
+    ``--gateway`` mode, which is exactly how the Desktop hand-off runs
+    ``hermes update``. There the captured Electron build used to vanish: not
+    on the terminal, not in the log. Fall back to the log file itself so the
+    build output always lands somewhere inspectable.
     """
-    result = subprocess.run(
+    if not text:
+        return
+    stream = _m().sys.stdout
+    if getattr(stream, "_log", None) is not None:
+        _log_only_write(text)
+        return
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        log_path = get_hermes_home() / "logs" / "update.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+            log_file.write(text if text.endswith("\n") else text + "\n")
+    except Exception:
+        pass
+
+
+_LOGGED_SUBPROCESS_PROGRESS_SECONDS = 30.0
+
+
+def _run_logged_subprocess(
+    cmd,
+    *,
+    cwd=None,
+    env=None,
+    label: str = "desktop build",
+    progress_every: float = _LOGGED_SUBPROCESS_PROGRESS_SECONDS,
+):
+    """Run ``cmd``, streaming its combined output into update.log as it arrives.
+
+    The output never reaches the terminal line by line (it is megabytes of
+    npm/vite noise), but the run is not allowed to look dead either: every
+    ``progress_every`` seconds one short status line goes to stdout. That
+    line is what keeps the Desktop hand-off's idle watchdog alive -- the
+    2026-09-05 update was killed at its 600 s ceiling because a ~10 minute
+    desktop rebuild produced nothing on the pipe and nothing in update.log
+    (the whole build was buffered until it exited, then discarded in
+    gateway mode).
+
+    Returns a ``CompletedProcess`` with ``stdout`` populated so the caller can
+    surface the captured tail on failure.
+    """
+    import time as _time
+
+    started = _time.monotonic()
+    last_progress = started
+    lines: list[str] = []
+    proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         env=env,
-        check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
+        bufsize=1,
     )
-    _log_only_write(result.stdout or "")
-    return result
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            _update_log_append(line)
+            now = _time.monotonic()
+            if progress_every > 0 and now - last_progress >= progress_every:
+                last_progress = now
+                print(
+                    f"  … {label} running: {int(now - started)}s, "
+                    f"{len(lines)} lines captured (full output: logs/update.log)",
+                    flush=True,
+                )
+    finally:
+        proc.stdout.close()
+        returncode = proc.wait()
+    return subprocess.CompletedProcess(cmd, returncode, stdout="".join(lines), stderr=None)
 
 def _classify_fetch_failure(stderr: str) -> str:
     """Map git-fetch stderr to a one-line, user-facing diagnosis.
@@ -8200,10 +8266,12 @@ def _rebuild_desktop_after_update(
     from hermes_constants import with_hermes_node_path
 
     build_env = with_hermes_node_path()
+    print("  → Rebuilding desktop app (several minutes; progress every 30s, full log: logs/update.log)")
     build_result = _m()._run_logged_subprocess(
         desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
     )
     if build_result.returncode != 0:
+        print(f"  ⚠ Desktop build exited {build_result.returncode}; retrying once")
         build_result = _m()._run_logged_subprocess(
             desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
         )
