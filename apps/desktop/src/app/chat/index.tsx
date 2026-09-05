@@ -292,7 +292,7 @@ function ChatRuntimeBoundary({
   const view = useSessionView()
   const runtimeId = useStore(view.$runtimeId)
   const storeMessages = useMessagesWhileVisible(view.$messages)
-  const transcriptIdentityKey = sessionKey ?? runtimeId
+  const transcriptIdentityKey = sessionKey ?? runtimeId ?? ''
   const incomingMessages = suppressMessages ? NO_MESSAGES : storeMessages
   const deduplicatedIncomingMessages = adoptLatestDuplicatePersistedRows(incomingMessages)
   const windowStateRef = useRef(new Map<string, SessionWindowMemo>())
