@@ -8542,6 +8542,20 @@ def cmd_gui(args: argparse.Namespace):
     if not (desktop_dir / "package.json").exists():
         print(f"Desktop GUI source not found at: {desktop_dir}")
         sys.exit(1)
+    if getattr(args, "build_needed", False):
+        # Desktop asks this to tell a bundle built from the current tree from
+        # one a killed or failed update left behind. Git cannot: after a
+        # same-branch reset the bundle's stamp commit is unrelated to HEAD
+        # (2026-09-05: install-stamp named the merged commit while app.asar
+        # was still the previous build). The content-hash stamp knows.
+        source_mode = bool(getattr(args, "source", False))
+        try:
+            needed = _desktop_build_needed(desktop_dir, PROJECT_ROOT, source_mode=source_mode)
+        except Exception as exc:  # noqa: BLE001 - a probe must answer, not crash
+            print(json.dumps({"build_needed": None, "error": str(exc)}))
+            return
+        print(json.dumps({"build_needed": bool(needed), "source_mode": source_mode}))
+        return
 
     try:
         from hermes_logging import setup_logging as _setup_logging_gui

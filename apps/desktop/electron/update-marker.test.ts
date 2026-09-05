@@ -22,6 +22,7 @@ import {
   isPidAlive,
   markerPath,
   readLiveUpdateMarker,
+  releaseUpdateMarkerIfOwnedBy,
   UPDATE_HANDOFF_BRIDGE_GRACE_MS,
   UPDATE_MARKER_MAX_AGE_MS,
   updateHandoffConflict,
@@ -306,3 +307,23 @@ test('an expired marker does not block a hand-off (self-heals)', () => {
 })
   }
 }
+
+// The Desktop holds the marker under its own pid during the holder drain so
+// the gateway/serve watchdogs stay quiet, then hands the slot back before the
+// hand-off script claims it with CreateNew (2026-09-05).
+test('releaseUpdateMarkerIfOwnedBy removes only a marker that names the given pid', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-marker-release-'))
+
+  try {
+    assert.equal(releaseUpdateMarkerIfOwnedBy(home, process.pid), false, 'nothing to release')
+
+    writeUpdateMarker(home, process.pid, { startedAt: Math.floor(Date.now() / 1000) })
+    assert.equal(fs.existsSync(markerPath(home)), true)
+    assert.equal(releaseUpdateMarkerIfOwnedBy(home, process.pid + 1), false, 'another owner keeps its marker')
+    assert.equal(fs.existsSync(markerPath(home)), true)
+    assert.equal(releaseUpdateMarkerIfOwnedBy(home, process.pid), true)
+    assert.equal(fs.existsSync(markerPath(home)), false)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})

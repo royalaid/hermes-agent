@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -408,7 +408,7 @@ import {
   shouldCountCommits
 } from './update-count'
 import { UpdateInFlightTransaction, waitForLocalBackendClearance, waitForUpdateClearance } from './update-gate'
-import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
+import { readLiveUpdateMarker, releaseUpdateMarkerIfOwnedBy, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import {
   authorizeUpdateMutation,
   runAuthorizedUpdateMutation,
@@ -438,6 +438,7 @@ import {
   desktopPluginServiceUnits,
   formatProbeFailedMessage,
   isExactVenvHolder,
+  resolveVenvPython,
   scanVenvBlockers,
   stopSafeVenvBlockers,
   terminateDesktopPluginServiceDetailed,
@@ -2427,10 +2428,17 @@ async function waitForUpdateToFinish() {
       rememberLog(`[updates] detached update finished OK (branch ${result.branch})`)
     } else if (result) {
       rememberLog(`[updates] detached update FAILED (exit ${result.exitCode}): ${result.message}`)
-      dialog.showErrorBox(
-        'Hermes update did not finish',
-        `${result.message}\n\nDetails: ${path.join(HERMES_HOME, 'logs', 'desktop-update-handoff.log')}`
-      )
+      // Asynchronous on purpose: showErrorBox blocks the main process, so the
+      // backend never started, the log never flushed and the plugin hosts
+      // never came back until the user found the dialog (2026-09-05).
+      void dialog
+        .showMessageBox({
+          type: 'error',
+          title: 'Hermes update did not finish',
+          message: result.message,
+          detail: `Details: ${path.join(HERMES_HOME, 'logs', 'desktop-update-handoff.log')}`
+        })
+        .catch(() => {})
     }
   } catch (err) {
     rememberLog(`[updates] could not read hand-off result: ${err.message}`)
@@ -4396,6 +4404,15 @@ async function runWindowsHandoffPreflight(
     return { kind: 'probe-failure', error: observed.error, message: formatProbeFailedMessage() }
   }
 
+  // Hold the update marker under our own pid for the whole drain. The gateway
+  // and serve watchdogs (HERMES_HOME\gateway-service\*.vbs) stay quiet while
+  // .hermes-update-in-progress exists; without it the gateway watchdog
+  // relaunched the gateway 30 s after `gateway stop --all` on 2026-09-05,
+  // inside the lock gate. The slot is handed back before the hand-off script
+  // claims the marker (it uses CreateNew) and on every refused outcome.
+  writeUpdateMarker(HERMES_HOME, process.pid, { startedAt: Math.floor(Date.now() / 1000) })
+  rememberLog('[updates] holding the update marker for the holder drain')
+
   // Desktop plugin services restart themselves from a Windows Script Host
   // loop that ignores update markers. Stop each exact, revalidated service
   // UNIT through the scanner — supervisor first, then wrapper, then worker —
@@ -4421,7 +4438,7 @@ async function runWindowsHandoffPreflight(
     }
   }
 
-  return runWindowsUpdatePreflight(purpose, {
+  const outcome = await runWindowsUpdatePreflight(purpose, {
     releaseTrackedBackendTrees: () =>
       releaseBackendLockForUpdate(updateRoot, purpose === 'bootstrap-recovery' ? 'bootstrap' : 'updates'),
     forceReleaseInstallHolders: () => forceReleaseInstallHoldersForUpdate(updateRoot),
@@ -4433,6 +4450,22 @@ async function runWindowsHandoffPreflight(
     terminateDesktopPluginService: service => stopDesktopPluginServiceUnit(updateRoot, service),
     terminateMcpBridge: bridge => terminateMcpBridge(updateRoot, bridge)
   })
+
+  if (outcome.kind !== 'clear') {
+    releaseDrainUpdateMarker('refused preflight')
+  }
+
+  return outcome
+}
+
+// Hand the update marker back after the drain, whether the hand-off goes
+// ahead (the script claims it with CreateNew) or the update aborts (the
+// watchdogs may relaunch what the drain stopped, and the backend restart
+// must not park behind our own marker).
+function releaseDrainUpdateMarker(reason: string) {
+  if (releaseUpdateMarkerIfOwnedBy(HERMES_HOME, process.pid)) {
+    rememberLog(`[updates] released the drain update marker (${reason})`)
+  }
 }
 
 async function applyUpdates(opts: { stopSafeBlockers?: boolean; forceUpdateElevated?: boolean } = {}) {
@@ -4604,6 +4637,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       const message = 'Update aborted: the MCP bridge prevention lease was lost before handoff.'
       rememberLog('[updates] bridge lease missing after a clear preflight')
       emitUpdateProgress({ stage: 'error', message, percent: null })
+      releaseDrainUpdateMarker('lost bridge lease')
       startHermes().catch(() => {})
       relaunchStoppedDesktopPluginHosts('lost bridge lease')
 
@@ -4616,6 +4650,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       const message = 'Update aborted: Hermes could not preserve the MCP bridge pause for updater handoff.'
       rememberLog('[updates] could not extend bridge lease across updater handoff')
       emitUpdateProgress({ stage: 'error', message, percent: null })
+      releaseDrainUpdateMarker('lease handoff failure')
       startHermes().catch(() => {})
       relaunchStoppedDesktopPluginHosts('lease handoff failure')
 
@@ -4623,6 +4658,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     }
 
     bridgeLease = handoffLease
+    releaseDrainUpdateMarker('handing the marker to the updater script')
 
     const updateStartedAt = Math.floor(Date.now() / 1000)
 
@@ -4853,6 +4889,8 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
     }
 
     bridgeLease = handoffLease
+
+    releaseDrainUpdateMarker('handing the marker to the recovery updater')
 
     const child = runAuthorizedUpdateMutation(mutationPermit, () =>
       spawnUpdaterProcess(updater, updaterArgs, {
@@ -18090,7 +18128,39 @@ function resolveHermesVersion() {
 // Fail-quiet: dev runs (no stamp), non-git builds, and shallow-clone gaps all
 // report in-sync rather than risk a false "your install is torn" warning.
 async function detectRendererSkew() {
-  return detectBundleSkew(INSTALL_STAMP, runGit, resolveUpdateRoot())
+  const probe = IS_PACKAGED && !updateInFlightTransaction.isActive() ? probeDesktopBuildNeeded : undefined
+
+  return detectBundleSkew(INSTALL_STAMP, runGit, resolveUpdateRoot(), probe)
+}
+
+// `hermes desktop --build-needed`: the checkout's own content-hash test of
+// its packaged bundle. This is what catches a bundle whose swap never happened
+// after a same-branch reset, where the build stamp is unrelated to HEAD and
+// git alone reports "in sync" (2026-09-05: install-stamp named the merged
+// commit, app.asar was still the previous build).
+async function probeDesktopBuildNeeded(): Promise<boolean | null> {
+  const root = resolveUpdateRoot()
+  const python = resolveVenvPython(root)
+
+  if (!python) {return null}
+
+  try {
+    const stdout = await new Promise<string>((resolve, reject) => {
+      execFile(
+        python,
+        ['-m', 'hermes_cli.main', 'desktop', '--build-needed'],
+        { cwd: root, encoding: 'utf8', timeout: 20_000, windowsHide: true },
+        (error, out) => (error ? reject(error) : resolve(String(out ?? '')))
+      )
+    })
+
+    const last = stdout.trim().split(/\r?\n/).pop() ?? ''
+    const parsed = JSON.parse(last)
+
+    return typeof parsed?.build_needed === 'boolean' ? parsed.build_needed : null
+  } catch {
+    return null
+  }
 }
 
 // Re-resolve the live Hermes version and push it into the native About panel

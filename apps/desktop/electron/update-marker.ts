@@ -459,3 +459,37 @@ export function updateHandoffConflict(
     message: `An update is already running (PID ${owner.pid}, started ${elapsed} ago). Wait for it to finish, then try again.`
   }
 }
+
+/**
+ * Delete the marker only while it still names `pid` as its owner.
+ *
+ * The Desktop holds the marker under its own pid for the length of the
+ * holder drain: the gateway and serve watchdogs in HERMES_HOME\gateway-service
+ * treat `.hermes-update-in-progress` as "do not relaunch", and without it the
+ * gateway watchdog brought the gateway back 30 s after `gateway stop --all`
+ * on 2026-09-05, inside the lock gate. The hand-off script claims the marker
+ * with CreateNew, so the Desktop must hand the slot back first; every refused
+ * outcome hands it back as well.
+ */
+export function releaseUpdateMarkerIfOwnedBy(hermesHome: string, pid: number): boolean {
+  const file = markerPath(hermesHome)
+  let raw: string
+
+  try {
+    raw = fs.readFileSync(file, 'utf8')
+  } catch {
+    return false
+  }
+
+  const owner = Number.parseInt((raw.split(/\r?\n/)[0] ?? '').trim(), 10)
+
+  if (!Number.isInteger(owner) || owner !== pid) {return false}
+
+  try {
+    fs.rmSync(file, { force: true })
+
+    return true
+  } catch {
+    return false
+  }
+}

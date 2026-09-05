@@ -2380,6 +2380,8 @@ public static class HermesForceReleaseNative {
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
   [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool TerminateProcess(IntPtr process, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError = true)]
   public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern bool TerminateJobObject(IntPtr job, uint exitCode);
@@ -2529,6 +2531,19 @@ public static class HermesForceReleaseNative {
     }
     return contained ? 1 : 0;
   }
+  public static int ProcessIsInAnyJob(IntPtr process) {
+    return ProcessIsInJob(IntPtr.Zero, process);
+  }
+  // Degraded containment: an authenticated holder that already lives in a job
+  // whose hierarchy refuses ours is terminated by handle after suspension.
+  public static int TerminateProcessAndWait(IntPtr process, int waitMs) {
+    if (!TerminateProcess(process, 1)) {
+      int error = Marshal.GetLastWin32Error();
+      return error == 0 ? -1 : -error;
+    }
+    uint result = WaitForSingleObject(process, (uint)Math.Max(0, waitMs));
+    return result == 0 ? 0 : -258;
+  }
   public static IntPtr OpenNamedTargetJob(string name, out int error) {
     IntPtr job = OpenJobObject(JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_TERMINATE | JOB_OBJECT_QUERY | SYNCHRONIZE, false, name);
     error = job == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
@@ -2575,6 +2590,7 @@ $externalTargetJob = -not [string]::IsNullOrWhiteSpace($targetJobName)
 $handles = @{}
 $suspended = New-Object 'System.Collections.Generic.List[int]'
 $contained = New-Object 'System.Collections.Generic.HashSet[int]'
+$degraded = New-Object 'System.Collections.Generic.List[int]'
 $success = $false
 $exitCode = 1
 $fallbackSnapshotUsed = $false
@@ -2626,13 +2642,28 @@ function Assert-NativeSuccess([int]$code, [string]$operation) {
 }
 
 function Assign-ContainedProcess([IntPtr]$processHandle, [int]$currentPid) {
+  # Returns $true when the process is inside our job, $false when containment
+  # is degraded for it: ERROR_ACCESS_DENIED (5) is how Windows refuses to nest
+  # a process that already lives in a job whose hierarchy does not admit ours
+  # (a service launcher's job, a supervised backend). It is still the exact,
+  # authenticated holder: it stays suspended (no job needed for that) and is
+  # terminated by handle instead of through the job. 2026-09-05: the gateway's
+  # venv trampoline failed here with win32=5 and the whole force-release
+  # reported failure while the holder kept the venv locked.
   $assignCode = [HermesForceReleaseNative]::AssignProcessHandle($job, $processHandle)
-  if ($assignCode -ne 0) { throw ('TREE_ASSIGN_FAILED pid=' + $currentPid + ' win32=' + (-$assignCode)) }
+  if ($assignCode -ne 0) {
+    if ((-$assignCode) -eq 5 -and [HermesForceReleaseNative]::ProcessIsInAnyJob($processHandle) -eq 1) {
+      [void]$degraded.Add($currentPid)
+      return $false
+    }
+    throw ('TREE_ASSIGN_FAILED pid=' + $currentPid + ' win32=' + (-$assignCode))
+  }
   $membershipCode = [HermesForceReleaseNative]::ProcessIsInJob($job, $processHandle)
   if ($membershipCode -ne 1) {
     Assert-NativeSuccess $membershipCode ('TREE_ASSIGN_MEMBERSHIP_FAILED pid=' + $currentPid)
     throw ('TREE_ASSIGN_MEMBERSHIP_FAILED pid=' + $currentPid + ' win32=0')
   }
+  return $true
 }
 
 function Pause-BoundaryTest([string]$phase, [int]$currentPid) {
@@ -2696,8 +2727,7 @@ try {
     }
   }
   $handles[[string]$pidTarget] = $rootHandle
-  Assign-ContainedProcess $rootHandle $pidTarget
-  [void]$contained.Add($pidTarget)
+  if (Assign-ContainedProcess $rootHandle $pidTarget) { [void]$contained.Add($pidTarget) }
   Pause-BoundaryTest 'after-root-assignment' $pidTarget
   $suspendRoot = [HermesForceReleaseNative]::SuspendProcess($rootHandle)
   Assert-NativeSuccess $suspendRoot 'TREE_SUSPEND_FAILED'
@@ -2738,8 +2768,7 @@ try {
         throw ('TREE_OPEN_FAILED win32=' + $childOpenError)
       }
       $handles[[string]$childPid] = $childHandle
-      Assign-ContainedProcess $childHandle $childPid
-      [void]$contained.Add($childPid)
+      if (Assign-ContainedProcess $childHandle $childPid) { [void]$contained.Add($childPid) }
       Pause-BoundaryTest 'after-child-assignment' $childPid
       $childSuspend = [HermesForceReleaseNative]::SuspendProcess($childHandle)
       Assert-NativeSuccess $childSuspend 'TREE_SUSPEND_FAILED'
@@ -2755,8 +2784,17 @@ try {
     }
   }
 
-  $terminateCode = [HermesForceReleaseNative]::TerminateJobAndWait($job, $waitMs)
-  Assert-NativeSuccess $terminateCode 'TREE_TERMINATE_FAILED'
+  if ($contained.Count -gt 0) {
+    $terminateCode = [HermesForceReleaseNative]::TerminateJobAndWait($job, $waitMs)
+    Assert-NativeSuccess $terminateCode 'TREE_TERMINATE_FAILED'
+  }
+  # Every member is suspended, so terminating the degraded ones by handle
+  # after the job cannot let a survivor spawn past the boundary.
+  foreach ($degradedPid in $degraded) {
+    $degradedHandle = $handles[[string]$degradedPid]
+    $degradedCode = [HermesForceReleaseNative]::TerminateProcessAndWait($degradedHandle, $waitMs)
+    Assert-NativeSuccess $degradedCode ('TREE_TERMINATE_FAILED degraded pid=' + $degradedPid)
+  }
   $allRows = @([pscustomobject]@{ pid = $pidTarget; created = $rootRevalidated }) + @($rows.ToArray())
   if (-not $externalTargetJob) {
     foreach ($row in $allRows) {
@@ -2772,6 +2810,7 @@ try {
   $success = $true
   $exitCode = 0
   Write-Output 'TERMINATED'
+  if ($degraded.Count -gt 0) { Write-Output ('CONTAINMENT_DEGRADED pids=' + ($degraded -join ',')) }
 } catch {
   $message = [string]$_.Exception.Message
   # Elevation is authorized only when opening the exact authenticated holder
@@ -2789,7 +2828,7 @@ try {
   }
 } finally {
   if ($job -ne [IntPtr]::Zero) {
-    if (-not $success) { [HermesForceReleaseNative]::TerminateJobAndWait($job, $waitMs) | Out-Null }
+    if (-not $success -and $contained.Count -gt 0) { [HermesForceReleaseNative]::TerminateJobAndWait($job, $waitMs) | Out-Null }
     [HermesForceReleaseNative]::CloseHandle($job) | Out-Null
   }
   for ($index = $suspended.Count - 1; $index -ge 0; $index--) {
