@@ -74,10 +74,14 @@ function defaultDeps(deps: PluginHostRestoreDeps) {
   }
 }
 
-function isPathUnder(target: string, root: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(target))
+// The launch line is a Windows Script Host argv, so its paths are Windows
+// paths regardless of where this code runs (CI lints these tests on Linux).
+const winPath = path.win32
 
-  return relative.length > 0 && !relative.startsWith('..') && !path.isAbsolute(relative)
+function isPathUnder(target: string, root: string): boolean {
+  const relative = winPath.relative(winPath.resolve(root), winPath.resolve(target))
+
+  return relative.length > 0 && !relative.startsWith('..') && !winPath.isAbsolute(relative)
 }
 
 function scriptArgument(argv: readonly string[]): string | null {
@@ -120,15 +124,15 @@ export function isRelaunchableDesktopPluginHost(
 
   if (!executable) {return false}
 
-  const binary = path.basename(executable.replace(/^"|"$/g, '')).toLowerCase()
+  const binary = winPath.basename(executable.replace(/^"|"$/g, '')).toLowerCase()
 
   if (binary !== 'wscript.exe' && binary !== 'cscript.exe') {return false}
 
   const script = scriptArgument(host.argv)
 
-  if (!script || path.extname(script).toLowerCase() !== '.vbs') {return false}
+  if (!script || winPath.extname(script).toLowerCase() !== '.vbs') {return false}
 
-  if (!isPathUnder(script, path.join(hermesHome, 'desktop-plugins'))) {return false}
+  if (!isPathUnder(script, winPath.join(hermesHome, 'desktop-plugins'))) {return false}
 
   try {
     return existsSync(script)

@@ -1345,7 +1345,10 @@ describe('desktopPluginServiceUnits', () => {
 })
 
 describe('parseTerminateOutputDetailed', () => {
-  const target = { expectedRoot: 'C:\\hermes\\install', expectedVenv: 'C:\\hermes\\install\\venv' }
+  const target = {
+    expectedRoot: path.join(volumeRoot, 'hermes', 'install'),
+    expectedVenv: path.join(volumeRoot, 'hermes', 'install', 'venv')
+  }
   const holder = { pid: 45, name: 'python.exe', cmdline: '<redacted>', createdAt: 124.75 }
 
   const envelope = (overrides: Record<string, unknown> = {}) => ({
