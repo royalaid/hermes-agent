@@ -33,6 +33,14 @@ def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
         help="Build the desktop app but do not launch it (used by the installer's --update flow)",
     )
     gui_parser.add_argument(
+        "--build-needed",
+        action="store_true",
+        help=(
+            "Print {\"build_needed\": bool} for the packaged desktop app and exit; "
+            "Desktop asks this to detect a bundle a failed update left stale"
+        ),
+    )
+    gui_parser.add_argument(
         "--fake-boot",
         action="store_true",
         help="Enable deterministic desktop boot delays for validating startup UI",

@@ -95,9 +95,35 @@ $script:UiStage = "Hermes will open once done."   # until the first gate; matche
 $script:UiStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $script:MarkerBody = $null
 
+$script:HandoffLogDrops = 0
+
+function Add-HandoffLogLines([string[]]$Lines) {
+    # Append to the hand-off log, retrying briefly when another process holds
+    # the file (a log viewer with an exclusive handle did exactly that on
+    # 2026-09-05 and every line was lost). Lines that still cannot be written
+    # are counted and reported on the next successful write, so the log says
+    # it has a gap instead of silently ending mid-update.
+    if (-not $Lines -or $Lines.Count -eq 0) { return }
+    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+        try {
+            if ($script:HandoffLogDrops -gt 0) {
+                $notice = "{0:yyyy-MM-ddTHH:mm:ssK} WARNING: {1} hand-off log line(s) could not be written while another process held this file; see the console output" -f (Get-Date), $script:HandoffLogDrops
+                Add-Content -LiteralPath $LogPath -Value (@($notice) + $Lines) -Encoding UTF8
+                $script:HandoffLogDrops = 0
+            } else {
+                Add-Content -LiteralPath $LogPath -Value $Lines -Encoding UTF8
+            }
+            return
+        } catch {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    $script:HandoffLogDrops += $Lines.Count
+}
+
 function Write-HandoffLog([string]$Message) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
-    try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
+    Add-HandoffLogLines @($line)
     Write-Host $line
 }
 
@@ -871,6 +897,21 @@ if ($env:HERMES_UPDATE_STEP_IDLE_SECONDS) {
     }
 }
 
+# A quiet step is not a silent one to the person watching. `hermes update`
+# runs the desktop rebuild for minutes with nothing on its pipes (the build
+# streams to logs/update.log), and the hand-off window used to show only the
+# "running:" line for that whole stretch. Every StepHeartbeatSeconds of pipe
+# silence, Invoke-HermesStep writes one "still running" line with the elapsed
+# time and the update log's size, age and last line. 0 disables. Overridable
+# for the self-test; not documented as a user knob.
+$script:StepHeartbeatSeconds = 30
+if ($env:HERMES_UPDATE_STEP_HEARTBEAT_SECONDS) {
+    $parsedHeartbeat = -1
+    if ([int]::TryParse($env:HERMES_UPDATE_STEP_HEARTBEAT_SECONDS, [ref]$parsedHeartbeat) -and $parsedHeartbeat -ge 0) {
+        $script:StepHeartbeatSeconds = $parsedHeartbeat
+    }
+}
+
 # Silence on the pipes is NOT silence in the update. `hermes update` captures
 # the (very loud) Electron/vite build into logs/update.log instead of its own
 # stdout (hermes_cli/update_cmd.py, the update-log tee), so a real update is
@@ -896,6 +937,73 @@ function Get-StepProgressLogStamp {
     } catch {
         return $null
     }
+}
+
+function Get-FileTailLine([string]$Path, [int]$MaxChars = 160) {
+    # Last non-empty line of a file another process is appending to. Reads at
+    # most the final 4 KiB with FileShare.ReadWrite so the writer is never
+    # blocked; $null when the file is absent or unreadable.
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $take = [Math]::Min(4096, $fs.Length)
+            if ($take -le 0) { return $null }
+            $fs.Seek(-$take, [System.IO.SeekOrigin]::End) | Out-Null
+            $bytes = New-Object byte[] $take
+            $read = $fs.Read($bytes, 0, $take)
+            $text = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $read)
+        } finally { $fs.Dispose() }
+        $lines = @($text -split "`r?`n" | Where-Object { $_.Trim() })
+        if ($lines.Count -eq 0) { return $null }
+        $last = $lines[$lines.Count - 1].Trim()
+        if ($last.Length -gt $MaxChars) { $last = $last.Substring(0, $MaxChars) + "..." }
+        return $last
+    } catch {
+        return $null
+    }
+}
+
+function Write-StepLines($Sink, [int]$Flushed, [string]$Prefix, [switch]$Final) {
+    # Log every complete line that arrived in $Sink since index $Flushed and
+    # return the new index. A trailing partial line waits for its newline
+    # unless -Final. Lines are batched per call (one Add-Content), so a chatty
+    # step costs one file append per drain pass, not one per line.
+    $length = $Sink.Length
+    if ($length -le $Flushed) { return $Flushed }
+    $text = $Sink.ToString($Flushed, $length - $Flushed)
+    $segment = $text
+    if (-not $Final) {
+        $end = $text.LastIndexOf("`n")
+        if ($end -lt 0) { return $Flushed }
+        $segment = $text.Substring(0, $end + 1)
+    }
+    $stamp = "{0:yyyy-MM-ddTHH:mm:ssK}" -f (Get-Date)
+    $lines = @()
+    foreach ($ln in ($segment -split "`r?`n")) {
+        if ($ln.Trim()) { $lines += ("{0} {1}{2}" -f $stamp, $Prefix, $ln) }
+    }
+    if ($lines.Count -gt 0) {
+        Add-HandoffLogLines $lines
+        foreach ($line in $lines) { Write-Host $line }
+    }
+    return $Flushed + $segment.Length
+}
+
+function Get-StepHeartbeatLine([string]$Tag, [int]$StepPid, [datetime]$StartedAt, [datetime]$LastProgressAt) {
+    $now = Get-Date
+    $elapsed = [int]($now - $StartedAt).TotalSeconds
+    $idle = [int]($now - $LastProgressAt).TotalSeconds
+    $logNote = "no update log yet"
+    try {
+        $fi = New-Object System.IO.FileInfo($script:StepProgressLogPath)
+        if ($fi.Exists) {
+            $age = [int]($now - $fi.LastWriteTime).TotalSeconds
+            $tail = Get-FileTailLine $fi.FullName
+            $logNote = "update.log {0} bytes, last written {1}s ago" -f $fi.Length, $age
+            if ($tail) { $logNote += (": " + $tail) }
+        }
+    } catch {}
+    return ("{0}| still running: {1}s elapsed, no pipe output for {2}s (pid {3}); {4}" -f $Tag, $elapsed, $idle, $StepPid, $logNote)
 }
 
 if (-not ("HermesUpdateJob" -as [type])) {
@@ -1158,12 +1266,15 @@ function Refresh-ManagedDesktopShortcuts {
 }
 
 function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
-    # The window does not stream child output, so no line-pump: both pipes
-    # drain asynchronously (no deadlock however chatty the child) while a small
-    # DoEvents loop keeps the marquee animating through long silent
-    # stretches (pip installs) -- the old EndOfStream pump blocked on quiet
-    # children and froze it. Full output still lands in the hand-off log
-    # afterwards, where `hermes debug share` picks it up.
+    # Both pipes drain asynchronously (no deadlock however chatty the child)
+    # while a small DoEvents loop keeps the marquee animating through long
+    # silent stretches (pip installs) -- the old EndOfStream pump blocked on
+    # quiet children and froze it. Complete lines are written to the hand-off
+    # log as they arrive (Write-StepLines), so the console/window and
+    # `hermes debug share` see the step's progress live instead of a dump after
+    # it exits; a "still running" heartbeat covers pipe-silent stretches. The
+    # progress window's stage stays orchestrator-owned: child output is
+    # logged, never parsed into it.
     #
     # The drain is bounded once the step exits (#90455). Waiting for pipe EOF
     # is waiting on the step's whole surviving descendant tree, and this
@@ -1212,13 +1323,27 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     $abandonAt = $null
     $abandoned = $false
     $lastProgressAt = Get-Date
+    $stepStartedAt = $lastProgressAt
+    $lastHeartbeatAt = $lastProgressAt
+    $outFlushed = 0
+    $errFlushed = 0
+    $outPrefix = "{0}| " -f $Tag
+    $errPrefix = "{0}!| " -f $Tag
     $progressLogStamp = Get-StepProgressLogStamp
     $stalled = $false
     while ($true) {
         $moved = $false
         $outDone = Step-PipeDrain $stdoutReader ([ref]$outTask) $outBuffer $outSink ([ref]$moved)
         $errDone = Step-PipeDrain $stderrReader ([ref]$errTask) $errBuffer $errSink ([ref]$moved)
-        if ($moved) { $lastProgressAt = Get-Date }
+        if ($moved) {
+            $lastProgressAt = Get-Date
+            $lastHeartbeatAt = $lastProgressAt
+            $outFlushed = Write-StepLines $outSink $outFlushed $outPrefix
+            $errFlushed = Write-StepLines $errSink $errFlushed $errPrefix
+        } elseif ($script:StepHeartbeatSeconds -gt 0 -and -not $proc.HasExited -and ((Get-Date) - $lastHeartbeatAt).TotalSeconds -ge $script:StepHeartbeatSeconds) {
+            $lastHeartbeatAt = Get-Date
+            Write-HandoffLog (Get-StepHeartbeatLine $Tag $proc.Id $stepStartedAt $lastProgressAt)
+        }
         if ($proc.HasExited) {
             if ($outDone -and $errDone) { break }
             # Clock starts at the step's exit, not at its start: a slow step is
@@ -1290,14 +1415,12 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     if ($abandoned) {
         Write-HandoffLog ("{0}!| pipe drain abandoned after {1}s: '{0}' exited but a surviving descendant still holds its stdout/stderr handles. Continuing the hand-off with the output captured so far (#90455)." -f $Tag, $script:StepDrainGraceSeconds)
     }
+    # Everything that arrived was logged live; only a trailing partial line
+    # (no newline before the pipe closed) is still pending.
+    [void](Write-StepLines $outSink $outFlushed $outPrefix -Final)
+    [void](Write-StepLines $errSink $errFlushed $errPrefix -Final)
     $outText = $outSink.ToString()
     $errText = $errSink.ToString()
-    foreach ($ln in ($outText -split "`r?`n")) {
-        if ($ln.Trim()) { Write-HandoffLog ("{0}| {1}" -f $Tag, $ln) }
-    }
-    foreach ($ln in ($errText -split "`r?`n")) {
-        if ($ln.Trim()) { Write-HandoffLog ("{0}!| {1}" -f $Tag, $ln) }
-    }
     $all = $outText
     if ($errText) { $all += "`n" + $errText }
     $code = if ($stalled) { 124 } else { $proc.ExitCode }
@@ -1365,6 +1488,11 @@ if ($SelfTestUi) {
 #            goes to logs/update.log, not stdout, for 40+ minutes). Guards the
 #            watchdog's other cliff: the idle ceiling must count update.log
 #            growth as progress and must NOT kill the healthy step.
+#   livelog -- a step whose first line must reach the hand-off log while the
+#            step is still running, and whose quiet stretch must produce a
+#            "still running" heartbeat. The child itself watches the log for
+#            its own first line and encodes the answer in its exit code, so
+#            the proof is not a timing coincidence.
 if ($SelfTestPipeDrain) {
     New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
     $hold = 60
@@ -1382,6 +1510,7 @@ if ($SelfTestPipeDrain) {
     $stallGrandchildPidFile = Join-Path $TempDir "hermes-step-stall-grandchild-$stamp.pid"
     $logStallPs1 = Join-Path $TempDir "hermes-step-logstall-$stamp.ps1"
     $logStallProgress = Join-Path $TempDir "hermes-step-logstall-$stamp.update.log"
+    $liveLogPs1 = Join-Path $TempDir "hermes-step-livelog-$stamp.ps1"
     # UseShellExecute=$false with no redirection is what makes the grandchild
     # inherit our stdout/stderr -- the whole point of the fixture. Anything
     # that redirects (Start-Process, subprocess with stdout=DEVNULL) would
@@ -1437,10 +1566,27 @@ Write-Output "silent but logging"
 for ($i = 0; $i -lt $Hold; $i++) { Add-Content -LiteralPath $ProgressLog -Value ("build tick {0}" -f $i); Start-Sleep -Seconds 1 }
 exit 3
 '@
+    # Prints a line, then polls the hand-off log for that line while it is
+    # still alive: exit 9 = the line was streamed before the step exited,
+    # exit 10 = it was not (the pre-streaming behaviour: dump after exit).
+    $liveLogSource = @'
+param([int]$WaitSeconds, [string]$HandoffLog)
+Write-Output "live line one"
+[Console]::Out.Flush()
+$deadline = (Get-Date).AddSeconds($WaitSeconds)
+$seenAt = $null
+# Single-line loop on purpose: a closing brace in column 0 inside this
+# here-string would end the -SelfTest block early for the source-contract tests.
+while ((Get-Date) -lt $deadline) { if ($null -eq $seenAt) { try { if ((Get-Content -LiteralPath $HandoffLog -Raw -ErrorAction Stop) -match "livelog\| live line one") { $seenAt = Get-Date } } catch {} } elseif (((Get-Date) - $seenAt).TotalSeconds -ge 5) { break }; Start-Sleep -Milliseconds 250 }
+Write-Output "live line two"
+[Console]::Out.Flush()
+if ($null -ne $seenAt) { exit 9 } else { exit 10 }
+'@
     [System.IO.File]::WriteAllText($childPs1, $childSource)
     [System.IO.File]::WriteAllText($floodPs1, $floodSource)
     [System.IO.File]::WriteAllText($stallPs1, $stallSource)
     [System.IO.File]::WriteAllText($logStallPs1, $logStallSource)
+    [System.IO.File]::WriteAllText($liveLogPs1, $liveLogSource)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $res = Invoke-HermesStep $powershell @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $childPs1,
@@ -1506,7 +1652,35 @@ exit 3
     $logStallSw.Stop()
     $logStallElapsed = [Math]::Round($logStallSw.Elapsed.TotalSeconds, 2)
 
-    Remove-Item -LiteralPath $childPs1, $floodPs1, $stallPs1, $logStallPs1, $pidFile, $stallPidFile, $stallGrandchildPidFile, $logStallProgress -Force -ErrorAction SilentlyContinue
+    # livelog arm: a 2s heartbeat so the quiet stretch (the child only polls
+    # the log) is short; the child keeps waiting 5s after it sees its line so
+    # at least one heartbeat lands before it exits.
+    # The child is pipe-silent while it polls, which the idle watchdog (set to
+    # seconds by the pytest caller) would read as a stall: lift the ceiling
+    # for exactly this arm, the way logstall swaps in its own progress log.
+    $liveWait = 12
+    $savedHeartbeat = $script:StepHeartbeatSeconds
+    $savedIdle = $script:StepIdleTimeoutSeconds
+    $script:StepHeartbeatSeconds = 2
+    $script:StepIdleTimeoutSeconds = $liveWait + 30
+    $liveLogSw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $livelog = Invoke-HermesStep $powershell @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $liveLogPs1,
+            "-WaitSeconds", [string]$liveWait, "-HandoffLog", $LogPath
+        ) "livelog"
+    } finally {
+        $script:StepHeartbeatSeconds = $savedHeartbeat
+        $script:StepIdleTimeoutSeconds = $savedIdle
+    }
+    $liveLogSw.Stop()
+    $liveLogElapsed = [Math]::Round($liveLogSw.Elapsed.TotalSeconds, 2)
+    $liveLogText = ""
+    try { $liveLogText = Get-Content -LiteralPath $LogPath -Raw -ErrorAction Stop } catch {}
+    $liveHeartbeatSeen = $liveLogText -match "livelog\| still running: "
+    $liveSecondLineLogged = $liveLogText -match "livelog\| live line two"
+
+    Remove-Item -LiteralPath $childPs1, $floodPs1, $stallPs1, $logStallPs1, $liveLogPs1, $pidFile, $stallPidFile, $stallGrandchildPidFile, $logStallProgress -Force -ErrorAction SilentlyContinue
 
     # The grandchild still being alive at return is what makes this a proof
     # rather than a timing coincidence: the pipe was demonstrably still open.
@@ -1534,8 +1708,14 @@ exit 3
     if ($logstall.Code -ne 3) { $problems += "logstall arm exit code $($logstall.Code), expected 3 -- the idle watchdog killed a pipe-silent step whose progress was visible as update.log growth (the shape of every real 40+ min build)" }
     if ($logstall.Output -notmatch "silent but logging") { $problems += "logstall arm step output was lost" }
     if ($logStallElapsed -ge $logStallBudget) { $problems += "logstall arm returned in ${logStallElapsed}s, over the ${logStallBudget}s budget" }
+    $liveLogBudget = $liveWait + 30
+    if ($livelog.Code -ne 9) { $problems += "livelog arm exit code $($livelog.Code), expected 9 -- the step's first line did not reach the hand-off log while the step was still running (output is being dumped after exit again)" }
+    if (-not $liveHeartbeatSeen) { $problems += "livelog arm produced no 'still running' heartbeat during its quiet stretch" }
+    if (-not $liveSecondLineLogged) { $problems += "livelog arm's final line was not logged" }
+    if ($livelog.Output -notmatch "live line one" -or $livelog.Output -notmatch "live line two") { $problems += "livelog arm step output was lost from the returned Output" }
+    if ($liveLogElapsed -ge $liveLogBudget) { $problems += "livelog arm returned in ${liveLogElapsed}s, over the ${liveLogBudget}s budget" }
 
-    $detail = "leak: elapsed=${elapsed}s budget=${budget}s code=$($res.Code) grandchildAlive=$leakAlive | flood: ${floodKb}KB in ${floodElapsed}s budget=${floodBudget}s bytes=$floodBytes code=$($flood.Code) | stall: elapsed=${stallElapsed}s budget=${stallBudget}s code=$($stall.Code) childAlive=$stallAlive descendantAlive=$stallGrandchildAlive quiesced=$($stall.TreeQuiesced) | logstall: elapsed=${logStallElapsed}s budget=${logStallBudget}s code=$($logstall.Code)"
+    $detail = "leak: elapsed=${elapsed}s budget=${budget}s code=$($res.Code) grandchildAlive=$leakAlive | flood: ${floodKb}KB in ${floodElapsed}s budget=${floodBudget}s bytes=$floodBytes code=$($flood.Code) | stall: elapsed=${stallElapsed}s budget=${stallBudget}s code=$($stall.Code) childAlive=$stallAlive descendantAlive=$stallGrandchildAlive quiesced=$($stall.TreeQuiesced) | logstall: elapsed=${logStallElapsed}s budget=${logStallBudget}s code=$($logstall.Code) | livelog: elapsed=${liveLogElapsed}s budget=${liveLogBudget}s code=$($livelog.Code) heartbeat=$liveHeartbeatSeen"
     if ($problems.Count -gt 0) {
         Write-Host "PIPE-DRAIN SELF-TEST: FAIL $detail -- $($problems -join '; ')"
         exit 1
