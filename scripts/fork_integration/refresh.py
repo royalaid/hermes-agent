@@ -60,8 +60,9 @@ MERGE_ASSERTIONS: dict[str, tuple[TreeAssertion, ...]] = {
 def _git(repo: Path, *args: str, check: bool = True, timeout: int = 600) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(GIT_ENV)
-    done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
-        encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=timeout,
+    done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+        stdin=subprocess.DEVNULL, timeout=timeout,
         creationflags=CREATE_NO_WINDOW, env=env)
     if check and done.returncode: raise RefreshError(f"git {' '.join(args)} failed: {(done.stderr or done.stdout).strip()}")
     return done
@@ -107,8 +108,9 @@ def _assert_tree(repo: Path, revision: str, assertions: Sequence[TreeAssertion])
                 raise RefreshError(f"merge ordering assertion failed for {assertion.path} at {revision}")
 def _run_checks(scratch: Path, checks: Sequence[Sequence[str]]) -> None:
     for command in checks:
-        done = subprocess.run(list(command), cwd=scratch, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=1800,
+        done = subprocess.run(list(command), cwd=scratch, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.DEVNULL, timeout=1800,
             creationflags=CREATE_NO_WINDOW)
         if done.returncode:
             raise RefreshError(f"focused check failed ({' '.join(command)}): {(done.stderr or done.stdout).strip()}")
