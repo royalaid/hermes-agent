@@ -13,16 +13,34 @@
  * OpenProcess/TerminateProcess sequence. Implement from Win32 docs only.
  */
 
+import type { DesktopPluginServiceProcess } from './venv-blocker-scan'
+
 export type ForceReleaseHolder = {
   pid: number
   createdAt: number
   name: string
   cmdline: string
   source: 'scanner' | 'restart-manager'
+  /**
+   * ONE exact file this process currently holds, as proven by Restart
+   * Manager. The exact-terminate script re-proves ownership of this path
+   * before it terminates anything, so it must never be a fabricated default
+   * or a joined list (both made every termination fail with
+   * TERMINATION_CURRENT_LOCK_OWNERSHIP_MISMATCH on 2026-09-03/04).
+   */
   resource?: string
+  /** Every locked path attributed to this process, for messages and logs. */
+  resources?: string[]
   parentPid?: number
   wrapperPid?: number
   role?: 'worker' | 'wrapper' | 'other'
+  /**
+   * How to stop this holder. A Desktop plugin service is stopped as a unit
+   * through the scanner (supervisor, wrapper, workers); the generic path
+   * terminates exactly one PID and would leave the supervisor to respawn it.
+   */
+  terminateVia?: 'exact-process' | 'desktop-plugin-service'
+  service?: DesktopPluginServiceProcess
 }
 
 export type ForceReleaseTerminateResult =
@@ -58,6 +76,10 @@ export type WindowsUpdateForceReleaseDeps = {
   /** Non-elevated wall-clock budget for discovery plus identity-verified termination. */
   deadlineMs?: number
   settleMs?: number
+  /** Forensics: every discovery pass, so a refusal names what it saw and how long it took. */
+  onDiscovery?: (info: { pass: number; scanner: number; restartManager: number; elapsedMs: number }) => void
+  /** Forensics: the outcome of every termination attempt. */
+  onHolderOutcome?: (holder: ForceReleaseHolder, result: ForceReleaseTerminateResult, elapsedMs: number) => void
 }
 
 export type WindowsUpdateForceReleaseOutcome =
@@ -203,6 +225,8 @@ export function mergeInstallHolders(
   excludePids: ReadonlySet<number> = new Set()
 ): ForceReleaseHolder[] {
   const merged: ForceReleaseHolder[] = []
+  // PIDs whose primary resource already came from Restart Manager evidence.
+  const provenResource = new Set<number>()
 
   for (const entry of holders) {
     if (!Number.isInteger(entry.pid) || entry.pid <= 0) {
@@ -222,11 +246,35 @@ export function mergeInstallHolders(
     if (existingIndex < 0) {
       merged.push({ ...entry })
 
+      if (entry.source === 'restart-manager' && entry.resource) {
+        provenResource.add(entry.pid)
+      }
+
       continue
     }
 
     const existing = merged[existingIndex]!
-    const resources = [existing.resource, entry.resource].filter(Boolean) as string[]
+
+    const evidence = Array.from(
+      new Set(
+        [...(existing.resources ?? []), existing.resource, ...(entry.resources ?? []), entry.resource].filter(
+          Boolean
+        ) as string[]
+      )
+    )
+
+    // Keep ONE exact resource for the ownership proof and prefer the first
+    // Restart Manager attribution: it names a file the process really maps.
+    // A joined "a; b" string is not a path and never verifies.
+    const entryProvesResource = entry.source === 'restart-manager' && Boolean(entry.resource)
+
+    const primaryResource =
+      entryProvesResource && !provenResource.has(existing.pid) ? entry.resource : existing.resource ?? entry.resource
+
+    if (entryProvesResource) {
+      provenResource.add(existing.pid)
+    }
+
     const preferredSource = existing.source === 'scanner' || entry.source === 'scanner' ? 'scanner' : entry.source
 
     // Prefer the more precise (fractional) create-time when both match within tolerance.
@@ -240,18 +288,22 @@ export function mergeInstallHolders(
       ...entry,
       createdAt,
       source: preferredSource,
-      resource: resources.length ? Array.from(new Set(resources)).join('; ') : existing.resource,
+      resource: primaryResource,
+      ...(evidence.length ? { resources: evidence } : {}),
       parentPid: existing.parentPid ?? entry.parentPid,
       wrapperPid: existing.wrapperPid ?? entry.wrapperPid,
-      role: existing.role === 'other' || existing.role == null ? entry.role ?? existing.role : existing.role
+      role: existing.role === 'other' || existing.role == null ? entry.role ?? existing.role : existing.role,
+      terminateVia: existing.terminateVia ?? entry.terminateVia,
+      service: existing.service ?? entry.service
     }
   }
 
   return attachHolderTreeRelationships(merged)
 }
 
-function formatHolderLine(holder: ForceReleaseHolder): string {
-  const resource = holder.resource ? ` resource=${holder.resource}` : ''
+export function formatHolderLine(holder: ForceReleaseHolder): string {
+  const evidence = holder.resources?.length ? holder.resources : holder.resource ? [holder.resource] : []
+  const resource = evidence.length ? ` resource=${evidence.join('; ')}` : ''
 
   return `PID ${holder.pid} ${holder.name}${resource}`
 }
@@ -352,6 +404,8 @@ export async function runWindowsUpdateForceRelease(
   let protectedHolders: ForceReleaseHolder[] = []
   let mismatchHolders: ForceReleaseHolder[] = []
   let lastHolders: ForceReleaseHolder[] = []
+  let restartManagerHolders: ForceReleaseHolder[] = []
+  let pass = 0
 
   while (remaining() > 0) {
     if (!(await resourceLockedWithinDeadline())) {
@@ -371,13 +425,21 @@ export async function runWindowsUpdateForceRelease(
 
     if (remaining() <= 0) {break}
 
-    const rmBudget = remaining()
+    // Restart Manager enumeration is the expensive step (about half a second
+    // per holder for friendly-name resolution; 8 s measured on a loaded
+    // workstation). Query it once up front, and again only when the scanner
+    // sees nothing, so later passes spend the budget on termination.
+    if (pass === 0 || scanned.length === 0) {
+      const rmBudget = remaining()
 
-    const fromRm = await raceWithBudget(
-      deps.listRestartManagerHolders(rmBudget),
-      rmBudget,
-      () => [] as ForceReleaseHolder[]
-    )
+      restartManagerHolders = await raceWithBudget(
+        deps.listRestartManagerHolders(rmBudget),
+        rmBudget,
+        () => [] as ForceReleaseHolder[]
+      )
+    }
+
+    const fromRm = restartManagerHolders
 
     if (remaining() <= 0) {
       lastHolders = orderHoldersLeafFirst(mergeInstallHolders([...scanned, ...fromRm], excludePids))
@@ -387,6 +449,14 @@ export async function runWindowsUpdateForceRelease(
 
     const holders = orderHoldersLeafFirst(mergeInstallHolders([...scanned, ...fromRm], excludePids))
     lastHolders = holders
+
+    try {
+      deps.onDiscovery?.({ pass, scanner: scanned.length, restartManager: fromRm.length, elapsedMs: now() - passStarted })
+    } catch {
+      void 0
+    }
+
+    pass += 1
 
     if (holders.length === 0) {
       // Locked with no enumerable holders: fail closed rather than mutate.
@@ -419,12 +489,19 @@ export async function runWindowsUpdateForceRelease(
       // are terminal. Never race/abandon this mutating operation.
       const controller = new AbortController()
       const abortTimer = setTimeout(() => controller.abort(), budget)
+      const terminateStarted = now()
       let result: ForceReleaseTerminateResult
 
       try {
         result = await deps.terminateHolder(target, budget, controller.signal, deadline)
       } finally {
         clearTimeout(abortTimer)
+      }
+
+      try {
+        deps.onHolderOutcome?.(target, result, now() - terminateStarted)
+      } catch {
+        void 0
       }
 
       switch (result.kind) {

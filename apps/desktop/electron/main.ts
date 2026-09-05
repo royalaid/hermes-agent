@@ -164,6 +164,7 @@ import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { appendCappedLogLines, formatDesktopLogLine } from './desktop-log-line'
+import { recordStoppedDesktopPluginHost, restoreStoppedDesktopPluginHosts } from './desktop-plugin-host-restore'
 import { resolveDesktopRemoteRoute } from './desktop-remote-route'
 import {
   buildPosixCleanupScript,
@@ -433,11 +434,13 @@ import {
   terminateSpawnedUpdaterIfExact
 } from './updater-process'
 import {
+  type DesktopPluginServiceProcess,
+  desktopPluginServiceUnits,
   formatProbeFailedMessage,
   isExactVenvHolder,
   scanVenvBlockers,
   stopSafeVenvBlockers,
-  terminateDesktopPluginService,
+  terminateDesktopPluginServiceDetailed,
   terminateMcpBridge,
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
@@ -504,6 +507,7 @@ import { installWindowsSystemCaTrust } from './windows-system-ca'
 import {
   attachHolderTreeRelationships,
   type ForceReleaseHolder,
+  formatHolderLine,
   mergeInstallHolders,
   runWindowsUpdateForceRelease
 } from './windows-update-force-release'
@@ -2371,6 +2375,7 @@ function readProvenUpdateOwnerClaim(): { pid: number; startedAt: number } | null
 // rather than a frozen splash. Returns true if it parked at all.
 async function waitForUpdateToFinish() {
   let announced = false
+  let stillBlocked = false
 
   const outcome = await waitForLocalBackendClearance(updateGateDeps(), {
     onWaitTick: async reason => {
@@ -2386,6 +2391,7 @@ async function waitForUpdateToFinish() {
       )
     },
     onStillBlocked: async reason => {
+      stillBlocked = true
       rememberLog(`[updates] local backend remains parked after bounded wait (${reason})`)
       await advanceBootProgress(
         'backend.update-wait',
@@ -2428,6 +2434,14 @@ async function waitForUpdateToFinish() {
     }
   } catch (err) {
     rememberLog(`[updates] could not read hand-off result: ${err.message}`)
+  }
+
+  // The preflight stopped plugin service supervisors so they could not reopen
+  // the venv mid-update; the updater relaunches this app when it is done, so
+  // this is the first moment it is safe to bring them back. A parked backend
+  // means an updater may still own the install: leave the ledger for later.
+  if (!stillBlocked) {
+    relaunchStoppedDesktopPluginHosts('update boot')
   }
 
   if (outcome === 'clear') {
@@ -4112,31 +4126,40 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
       cmdline: service.cmdline,
       source: 'scanner',
       wrapperPid: service.wrapperPid,
-      role: service.role === 'desktop_plugin_worker' ? 'worker' : 'wrapper'
+      role: service.role === 'desktop_plugin_worker' ? 'worker' : 'wrapper',
+      // Stop the whole service unit through the scanner: the generic exact
+      // terminate kills one PID and leaves the Windows Script Host loop to
+      // respawn the service ten seconds later.
+      terminateVia: 'desktop-plugin-service',
+      service
     })
   }
 
   return attachHolderTreeRelationships(holders)
 }
 
-function forceReleaseHoldersFromScan(updateRoot: string, result: VenvBlockerScanResult): ForceReleaseHolder[] {
-  const resources = installLockResources(updateRoot)
-  const defaultResource = resources[0] ?? venvHermesShimPath(updateRoot)
-
-  return scanResultToForceReleaseHolders(result).map(holder => ({
-    ...holder,
-    resource: holder.resource ?? defaultResource
-  }))
+function forceReleaseHoldersFromScan(_updateRoot: string, result: VenvBlockerScanResult): ForceReleaseHolder[] {
+  // No fabricated resource. The exact-terminate script proves through Restart
+  // Manager that the target currently holds `resource`; defaulting every
+  // scanner holder to the hermes.exe shim made that proof fail with
+  // TERMINATION_CURRENT_LOCK_OWNERSHIP_MISMATCH for every process that maps
+  // only .pyd files or its own image (measured 2026-09-04: 7.5 s per refusal,
+  // holders alive at the end of the budget). Restart Manager evidence merges
+  // in by PID; a scanner-only holder is stopped on its scanner-proven identity.
+  return scanResultToForceReleaseHolders(result)
 }
+
+// Measured on the 2026-09-04 host: mutation-set probe 0.5 s, scanner 1.2 s,
+// Restart Manager 8.1 s, one exact termination 7.5 s (PowerShell boundary
+// with Add-Type compile). Two holders need about 30 s; the previous 20 s
+// budget ended every attempt as "timeout" with the holders still alive.
+const FORCE_RELEASE_DEADLINE_MS = 60_000
 
 async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
   const exclude = new Set<number>([process.pid].filter(pid => Number.isInteger(pid) && pid > 0))
 
   return runWindowsUpdateForceRelease({
-    // Discovery alone (mutation-set probe + one Restart Manager session) can
-    // take several seconds on a loaded workstation; the old five-second budget
-    // timed out before a single holder was enumerated.
-    deadlineMs: 20_000,
+    deadlineMs: FORCE_RELEASE_DEADLINE_MS,
     settleMs: 150,
     excludePids: exclude,
     isResourceLocked: async () => isAnyInstallResourceLocked(updateRoot),
@@ -4157,14 +4180,66 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
 
       return attributedInstallHolders(updateRoot, timeoutMs)
     },
-    terminateHolder: (holder, budgetMs, signal, deadlineAt) =>
-      terminateWindowsHolderWithinDeadline(holder, {
+    onDiscovery: info => {
+      rememberLog(
+        `[updates] force-release discovery pass ${info.pass}: scanner=${info.scanner} restart-manager=${info.restartManager} (${info.elapsedMs}ms)`
+      )
+    },
+    onHolderOutcome: (holder, result, elapsedMs) => {
+      const detail = 'detail' in result && result.detail ? ` ${String(result.detail).split(/\r?\n/)[0]}` : ''
+
+      rememberLog(`[updates] force-release ${formatHolderLine(holder)} -> ${result.kind}${detail} (${elapsedMs}ms)`)
+    },
+    terminateHolder: async (holder, budgetMs, signal, deadlineAt) => {
+      if (holder.terminateVia === 'desktop-plugin-service' && holder.service) {
+        const stopped = await stopDesktopPluginServiceUnit(updateRoot, holder.service)
+
+        return stopped ? { kind: 'terminated' } : { kind: 'failed', detail: 'plugin service unit not stopped' }
+      }
+
+      // Restart Manager named a file this process holds: let the script
+      // re-prove that ownership. A scanner-only holder has no such file, and
+      // the script treats a missing pair as "no resource claim" rather than
+      // failing on a claim it cannot verify.
+      const proveResource = holder.source === 'restart-manager' || Boolean(holder.resource)
+
+      return terminateWindowsHolderWithinDeadline(holder, {
         budgetMs,
         deadlineAt: deadlineAt ?? Date.now(),
         signal,
-        installRoot: updateRoot
+        ...(proveResource ? { installRoot: updateRoot } : {})
       })
+    }
   })
+}
+
+// Stop one Desktop plugin service unit (Windows Script Host supervisor, venv
+// wrapper, managed-runtime workers) through the scanner and remember the
+// supervisor so it is relaunched when the update finishes or aborts.
+async function stopDesktopPluginServiceUnit(updateRoot: string, service: DesktopPluginServiceProcess): Promise<boolean> {
+  const outcome = await terminateDesktopPluginServiceDetailed(updateRoot, service)
+
+  if (outcome.terminated && outcome.host) {
+    recordStoppedDesktopPluginHost(HERMES_HOME, outcome.host, { log: rememberLog })
+  }
+
+  return outcome.terminated
+}
+
+function relaunchStoppedDesktopPluginHosts(reason: string) {
+  if (!IS_WINDOWS) {return}
+
+  try {
+    const restored = restoreStoppedDesktopPluginHosts(HERMES_HOME, { log: rememberLog })
+
+    if (restored.relaunched.length > 0 || restored.skipped.length > 0) {
+      rememberLog(
+        `[updates] plugin service hosts after ${reason}: relaunched=${restored.relaunched.length} skipped=${restored.skipped.length}`
+      )
+    }
+  } catch (error) {
+    rememberLog(`[updates] could not relaunch plugin service hosts after ${reason}: ${error instanceof Error ? error.message : String(error)}`)
+  }
 }
 
 async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
@@ -4323,26 +4398,25 @@ async function runWindowsHandoffPreflight(
 
   // Desktop plugin services restart themselves from a Windows Script Host
   // loop that ignores update markers. Stop each exact, revalidated service
-  // through the scanner (worker first, then wrapper plus its proven host) so
-  // the loop cannot reopen the venv during handoff. Update consent authorizes
-  // this; nothing outside the scanner's proof is touched.
+  // UNIT through the scanner — supervisor first, then wrapper, then worker —
+  // exactly once per unit, so the loop cannot reopen the venv during handoff.
+  // (Worker-first draining in two calls was the 2026-09-04 failure: the
+  // wrapper exited with its child, the second call had nothing to prove, and
+  // the supervisor respawned the service inside the lock-release window.)
+  // Update consent authorizes this; nothing outside the scanner's proof is
+  // touched, and the stopped supervisor is relaunched after the update.
   if (observed.kind === 'blocked') {
-    const services = [...observed.result.desktopPluginServices].sort(
-      (left, right) =>
-        Number(right.role === 'desktop_plugin_worker') - Number(left.role === 'desktop_plugin_worker')
-    )
-
-    for (const service of services) {
+    for (const service of desktopPluginServiceUnits(observed.result.desktopPluginServices)) {
       let stopped = false
 
       try {
-        stopped = await terminateDesktopPluginService(updateRoot, service)
+        stopped = await stopDesktopPluginServiceUnit(updateRoot, service)
       } catch {
         stopped = false
       }
 
       rememberLog(
-        `[updates] plugin service PID ${service.pid} (${service.role}) ${stopped ? 'stopped' : 'not stopped'} before handoff`
+        `[updates] plugin service unit anchored at PID ${service.pid} (${service.role}${service.wrapperPid ? `, wrapper ${service.wrapperPid}` : ''}) ${stopped ? 'stopped' : 'not stopped'} before handoff`
       )
     }
   }
@@ -4356,7 +4430,7 @@ async function runWindowsHandoffPreflight(
     clearMcpBridgeLease: lease => {
       clearMcpBridgeQuiesceLease(HERMES_HOME, lease)
     },
-    terminateDesktopPluginService: service => terminateDesktopPluginService(updateRoot, service),
+    terminateDesktopPluginService: service => stopDesktopPluginServiceUnit(updateRoot, service),
     terminateMcpBridge: bridge => terminateMcpBridge(updateRoot, bridge)
   })
 }
@@ -4492,6 +4566,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       )
       emitUpdateProgress({ stage: 'error', message: preflight.message, percent: null })
       startHermes().catch(() => {})
+      relaunchStoppedDesktopPluginHosts('refused preflight')
 
       // Hand the classified blockers back so the renderer can offer to stop the
       // safe local previews among them and retry. Elevation holders drive the
@@ -4530,6 +4605,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       rememberLog('[updates] bridge lease missing after a clear preflight')
       emitUpdateProgress({ stage: 'error', message, percent: null })
       startHermes().catch(() => {})
+      relaunchStoppedDesktopPluginHosts('lost bridge lease')
 
       return { ok: false, error: 'mcp-bridge-quiesce-handoff-failed', message }
     }
@@ -4541,6 +4617,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       rememberLog('[updates] could not extend bridge lease across updater handoff')
       emitUpdateProgress({ stage: 'error', message, percent: null })
       startHermes().catch(() => {})
+      relaunchStoppedDesktopPluginHosts('lease handoff failure')
 
       return { ok: false, error: 'mcp-bridge-quiesce-handoff-failed', message }
     }
@@ -4672,6 +4749,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
       if (IS_WINDOWS) {
         // Same drain-semantics restore as the earlier abort paths (#70337).
         startGatewaysAfterUpdateAbort(venvHermesShimPath(updateRoot))
+        relaunchStoppedDesktopPluginHosts('updater spawn failure')
       }
 
       return { ok: false, error: 'updater-spawn-failed', message }

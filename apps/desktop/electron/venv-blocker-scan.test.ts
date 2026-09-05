@@ -16,14 +16,17 @@ import { describe, it } from 'vitest'
 
 import {
   type DesktopPluginServiceProcess,
+  desktopPluginServiceUnits,
   formatBlockerMessage,
   formatProbeFailedMessage,
   type McpBridgeProcess,
+  parseTerminateOutputDetailed,
   parseVenvBlockerScanOutput,
   resolveVenvPython,
   scanVenvBlockers,
   stopSafeVenvBlockers,
   terminateDesktopPluginService,
+  terminateDesktopPluginServiceDetailed,
   terminateMcpBridge
 } from './venv-blocker-scan'
 
@@ -1305,6 +1308,121 @@ describe('stopSafeVenvBlockers', () => {
   })
 })
 
+describe('desktopPluginServiceUnits', () => {
+  const service = (overrides: Partial<DesktopPluginServiceProcess>): DesktopPluginServiceProcess => ({
+    pid: 1,
+    name: 'python.exe',
+    cmdline: '<redacted>',
+    createdAt: 10,
+    owner: 'desktop',
+    role: 'desktop_plugin_wrapper',
+    actionable: true,
+    actionability: 'exact_desktop_plugin_service',
+    action: 'terminate_desktop_plugin_service',
+    ...overrides
+  })
+
+  it('anchors each unit on its wrapper and keeps a wrapper-less worker as its own unit', () => {
+    const units = desktopPluginServiceUnits([
+      service({ pid: 20, role: 'desktop_plugin_worker', wrapperPid: 10 }),
+      service({ pid: 10 }),
+      service({ pid: 31, role: 'desktop_plugin_worker' }),
+      service({ pid: 21, role: 'desktop_plugin_worker', wrapperPid: 10 })
+    ])
+
+    assert.deepEqual(
+      units.map(unit => [unit.pid, unit.role]),
+      [
+        [10, 'desktop_plugin_wrapper'],
+        [31, 'desktop_plugin_worker']
+      ]
+    )
+  })
+
+  it('returns nothing for no services', () => {
+    assert.deepEqual(desktopPluginServiceUnits([]), [])
+  })
+})
+
+describe('parseTerminateOutputDetailed', () => {
+  const target = { expectedRoot: 'C:\\hermes\\install', expectedVenv: 'C:\\hermes\\install\\venv' }
+  const holder = { pid: 45, name: 'python.exe', cmdline: '<redacted>', createdAt: 124.75 }
+
+  const envelope = (overrides: Record<string, unknown> = {}) => ({
+    schema_version: 2,
+    mode: 'terminate_desktop_plugin_service',
+    ok: true,
+    terminated: true,
+    pid: 45,
+    created_at: 124.75,
+    root: target.expectedRoot,
+    venv: target.expectedVenv,
+    error: null,
+    ...overrides
+  })
+
+  const host = {
+    pid: 24692,
+    created_at: 1788436393.1,
+    argv: ['C:\\Windows\\system32\\wscript.exe', 'C:\\Users\\u\\AppData\\Local\\hermes\\desktop-plugins\\tracker\\service-host.vbs'],
+    cwd: 'C:\\Users\\u'
+  }
+
+  it('returns the stopped supervisor for a plugin service stop', () => {
+    const outcome = parseTerminateOutputDetailed(
+      JSON.stringify(envelope({ host })),
+      target,
+      holder,
+      'terminate_desktop_plugin_service'
+    )
+
+    assert.equal(outcome.terminated, true)
+    assert.deepEqual(outcome.host, { pid: 24692, createdAt: 1788436393.1, argv: host.argv, cwd: 'C:\\Users\\u' })
+  })
+
+  it('accepts a null host and an absent host key', () => {
+    assert.equal(
+      parseTerminateOutputDetailed(JSON.stringify(envelope({ host: null })), target, holder, 'terminate_desktop_plugin_service').terminated,
+      true
+    )
+    assert.equal(
+      parseTerminateOutputDetailed(JSON.stringify(envelope()), target, holder, 'terminate_desktop_plugin_service').host,
+      null
+    )
+  })
+
+  it('fails closed on a malformed host record or a host on a non-plugin mode', () => {
+    const malformed = parseTerminateOutputDetailed(
+      JSON.stringify(envelope({ host: { pid: 'x', argv: [] } })),
+      target,
+      holder,
+      'terminate_desktop_plugin_service'
+    )
+
+    assert.equal(malformed.terminated, false)
+
+    const wrongMode = parseTerminateOutputDetailed(
+      JSON.stringify(envelope({ mode: 'terminate_mcp_bridge', host })),
+      target,
+      holder,
+      'terminate_mcp_bridge'
+    )
+
+    assert.equal(wrongMode.terminated, false)
+  })
+
+  it('never reports a host for a stop that did not terminate', () => {
+    const outcome = parseTerminateOutputDetailed(
+      JSON.stringify(envelope({ terminated: false, host })),
+      target,
+      holder,
+      'terminate_desktop_plugin_service'
+    )
+
+    assert.deepEqual(outcome, { terminated: false, host: null })
+  })
+})
+
 describe('terminateDesktopPluginService', () => {
   const requestedRoot = path.join(volumeRoot, 'requested', 'install')
   const canonicalRoot = path.join(volumeRoot, 'canonical', 'install')
@@ -1367,6 +1485,26 @@ describe('terminateDesktopPluginService', () => {
       '--created-at',
       '124.75'
     ])
+  })
+
+  it('reports the stopped supervisor so the Desktop can relaunch it after the update', async () => {
+    const host = {
+      pid: 24692,
+      created_at: 1788436393.1,
+      argv: ['C:\\Windows\\system32\\wscript.exe', 'C:\\Users\\u\\AppData\\Local\\hermes\\desktop-plugins\\tracker\\service-host.vbs'],
+      cwd: null
+    }
+
+    const outcome = await terminateDesktopPluginServiceDetailed(
+      requestedRoot,
+      service,
+      execReturn(envelope({ host })),
+      resolveVenv,
+      canonicalize
+    )
+
+    assert.equal(outcome.terminated, true)
+    assert.deepEqual(outcome.host, { pid: 24692, createdAt: 1788436393.1, argv: host.argv, cwd: null })
   })
 
   it('fails closed without invoking Python for an unproven service or mismatched response', async () => {

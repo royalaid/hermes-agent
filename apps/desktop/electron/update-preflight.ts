@@ -1,6 +1,7 @@
 import type { McpBridgeQuiesceLease } from './mcp-bridge-quiesce'
 import {
   type DesktopPluginServiceProcess,
+  desktopPluginServiceUnits,
   formatBlockerMessage,
   formatProbeFailedMessage,
   isExactActionableDesktopPluginService,
@@ -412,15 +413,12 @@ export async function runWindowsUpdatePreflight(
         }
       }
 
-      const desktopPluginTerminationOrder = [...firstClear.result.desktopPluginServices].sort(
-        (left, right) =>
-          Number(right.role === 'desktop_plugin_worker') - Number(left.role === 'desktop_plugin_worker')
-      )
-
-      // A plugin's managed-runtime worker must stop before its venv wrapper.
-      // The wrapper termination then stops its proven service host, preventing
-      // that host from recreating either child during the update handoff.
-      for (const service of desktopPluginTerminationOrder) {
+      // One stop per plugin service UNIT. The scanner stops the proven
+      // supervisor first, then the venv wrapper, then the worker(s), so a
+      // second call for the other member would find nothing to prove and
+      // report false. (Worker-first, two-call draining left the Windows
+      // Script Host loop alive to respawn the service ten seconds later.)
+      for (const service of desktopPluginServiceUnits(firstClear.result.desktopPluginServices)) {
         try {
           if (!(await deps.terminateDesktopPluginService(service))) {
             return {

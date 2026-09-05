@@ -1192,33 +1192,124 @@ def _live_desktop_plugin_service_process(
     ), host
 
 
-def terminate_desktop_plugin_service(
+def _desktop_plugin_service_unit(
+    root: Path,
+    pid: int,
+) -> tuple[dict[str, Any], Any, _ProcessSnapshot, list[_ProcessSnapshot]] | None:
+    """Re-prove one plugin service UNIT from either of its members.
+
+    A Desktop plugin service is three processes that only make sense together:
+    the Windows Script Host supervisor (``service-host.vbs``), the venv
+    trampoline wrapper it launched, and the managed-runtime worker(s) that
+    wrapper re-exec'd.  Returns ``(record, host, wrapper, workers)`` for the
+    requested PID (worker or wrapper), or ``None`` when any member can no
+    longer be proven live and identical.
+    """
+    live = _live_desktop_plugin_service_process(root, int(pid))
+    if live is None:
+        return None
+    _process, record, host = live
+    wrapper_pid = int(record.get("wrapper_pid", record["pid"]))
+    wrapper = _snapshot_for_pid(wrapper_pid)
+    if wrapper is None:
+        return None
+    script = _desktop_plugin_script(wrapper.argv, root)
+    if script is None or not _within(wrapper.exe, _venv_dir(root)):
+        return None
+    try:
+        children = list(wrapper.process.children(recursive=True))
+    except Exception:
+        return None
+    wrappers = {wrapper.pid: script}
+    snapshots: dict[int, _ProcessSnapshot] = {wrapper.pid: wrapper}
+    for child in children:
+        try:
+            snapshot = _snapshot_for_pid(int(child.pid))
+        except Exception:
+            return None
+        if snapshot is not None:
+            snapshots[snapshot.pid] = snapshot
+    workers: list[_ProcessSnapshot] = []
+    for snapshot in snapshots.values():
+        if snapshot.pid == wrapper.pid:
+            continue
+        classified = _desktop_plugin_role(snapshot, root, wrappers, snapshots)
+        if classified is not None and classified[0] == "desktop_plugin_worker":
+            workers.append(snapshot)
+    return record, host, wrapper, workers
+
+
+def _kill_proven_member(process: Any) -> bool:
+    """Kill one identity-proven unit member; a member that already exited counts."""
+    import psutil  # noqa: PLC0415
+
+    try:
+        process.kill()
+    except psutil.NoSuchProcess:
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def _service_host_relaunch(host: Any) -> dict[str, Any] | None:
+    """Describe the stopped supervisor so the Desktop can relaunch it later."""
+    try:
+        argv = [str(value) for value in (host.cmdline() or [])]
+        created_at = float(host.create_time())
+    except Exception:
+        return None
+    if not argv:
+        return None
+    try:
+        cwd = host.cwd()
+    except Exception:
+        cwd = None
+    return {
+        "pid": int(host.pid),
+        "created_at": created_at,
+        "argv": argv,
+        "cwd": str(cwd) if cwd else None,
+    }
+
+
+def terminate_desktop_plugin_service_unit(
     root: str | Path,
     *,
     pid: int,
     created_at: float,
-) -> bool:
-    """Stop one exact plugin helper, never an arbitrary process tree.
+) -> dict[str, Any]:
+    """Stop one exact plugin service unit top-down; never an arbitrary tree.
 
-    The managed-runtime child is drained before its venv wrapper by the
-    Electron preflight.  The wrapper call then stops its exact VBS/cscript
-    supervisor first, which prevents the service host from recreating the
-    helper while the updater has the installation open.
+    Order matters and is the whole point: the supervisor host dies FIRST so
+    it cannot respawn anything, then the venv wrapper, then the managed-
+    runtime worker(s).  The previous worker-first order was self-defeating:
+    killing the worker made the uv trampoline wrapper exit on its own, the
+    follow-up wrapper call then found nothing to prove, the host was never
+    stopped, and ``service-host.vbs`` relaunched the service ten seconds
+    later - inside the updater's lock-release window (2026-09-03/04
+    ``venv-unlock-failed`` incidents).
+
+    Every member is re-proven (PID + create time, exe root, script, host
+    argv) in one snapshot before the first kill.  A member that exits
+    between proof and kill counts as stopped.  Returns ``{"terminated":
+    bool, "host": {...} | None}``; ``host`` describes the stopped supervisor
+    so the Desktop can relaunch it after the update finishes or aborts.
     """
     target_root, _venv = _validated_root(root)
     try:
         expected_created_at = float(created_at)
     except (TypeError, ValueError):
-        return False
+        return {"terminated": False, "host": None}
     if not math.isfinite(expected_created_at) or expected_created_at <= 0:
-        return False
+        return {"terminated": False, "host": None}
     try:
-        live = _live_desktop_plugin_service_process(target_root, int(pid))
+        unit = _desktop_plugin_service_unit(target_root, int(pid))
     except Exception:
-        return False
-    if live is None:
-        return False
-    process, record, host = live
+        return {"terminated": False, "host": None}
+    if unit is None:
+        return {"terminated": False, "host": None}
+    record, host, wrapper, workers = unit
     if (
         record.get("owner") != "desktop"
         or record.get("role")
@@ -1228,18 +1319,27 @@ def terminate_desktop_plugin_service(
         or abs(float(record["created_at"]) - expected_created_at)
         > _CREATE_TIME_TOLERANCE_SECONDS
     ):
-        return False
-    try:
-        # Stopping the host only when we drain the wrapper preserves the
-        # worker-before-wrapper proof/order and prevents its 10-second restart
-        # loop from reopening the venv during the actual update.
-        if record["role"] == "desktop_plugin_wrapper":
-            host.kill()
-        process.kill()
-    except Exception:
-        return False
-    return True
+        return {"terminated": False, "host": None}
+    relaunch = _service_host_relaunch(host)
+    stopped = _kill_proven_member(host)
+    stopped = _kill_proven_member(wrapper.process) and stopped
+    for worker in workers:
+        stopped = _kill_proven_member(worker.process) and stopped
+    return {"terminated": stopped, "host": relaunch if stopped else None}
 
+
+def terminate_desktop_plugin_service(
+    root: str | Path,
+    *,
+    pid: int,
+    created_at: float,
+) -> bool:
+    """Boolean view of :func:`terminate_desktop_plugin_service_unit`."""
+    return bool(
+        terminate_desktop_plugin_service_unit(root, pid=pid, created_at=created_at)[
+            "terminated"
+        ]
+    )
 
 def terminate_venv_holder(
     root: str | Path,
@@ -1328,6 +1428,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if terminate_requested:
         try:
             target_root, venv = _validated_root(root_text)
+            stopped_host: dict[str, Any] | None = None
             if mcp_terminate_requested:
                 pid = args.terminate_mcp_bridge
                 terminated = terminate_mcp_bridge(
@@ -1338,11 +1439,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 mode = "terminate_mcp_bridge"
             elif desktop_plugin_terminate_requested:
                 pid = args.terminate_desktop_plugin_service
-                terminated = terminate_desktop_plugin_service(
+                unit_outcome = terminate_desktop_plugin_service_unit(
                     target_root,
                     pid=pid,
                     created_at=args.created_at,
                 )
+                terminated = bool(unit_outcome["terminated"])
+                stopped_host = unit_outcome.get("host")
                 mode = "terminate_desktop_plugin_service"
             else:
                 pid = args.terminate_venv_holder
@@ -1354,21 +1457,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 mode = "terminate_venv_holder"
         except Exception as exc:
             _emit_probe_fail(str(exc), root=root_text, code="probe_failed")
-        print(
-            json.dumps(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "mode": mode,
-                    "ok": True,
-                    "terminated": terminated,
-                    "pid": pid,
-                    "created_at": args.created_at,
-                    "root": str(target_root),
-                    "venv": str(venv),
-                    "error": None,
-                }
-            )
-        )
+        document: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "mode": mode,
+            "ok": True,
+            "terminated": terminated,
+            "pid": pid,
+            "created_at": args.created_at,
+            "root": str(target_root),
+            "venv": str(venv),
+            "error": None,
+        }
+        if mode == "terminate_desktop_plugin_service":
+            # The stopped supervisor's launch line: the Desktop relaunches it
+            # once the update finishes or aborts, so stopping the plugin
+            # service for the update does not strand it until next login.
+            document["host"] = stopped_host
+        print(json.dumps(document))
         raise SystemExit(0)
 
     try:

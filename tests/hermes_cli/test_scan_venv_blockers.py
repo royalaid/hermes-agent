@@ -2178,22 +2178,111 @@ def test_terminate_rereads_and_refuses_changed_live_argv(
     assert process.kills == 0
 
 
-def test_terminate_desktop_plugin_service_drains_worker_before_wrapper_host(
+class _UnitMember(_FakeProcess):
+    """A unit member that records kill order into a shared journal."""
+
+    def __init__(self, label: str, journal: list[str], *, pid: int = 0, gone: bool = False):
+        super().__init__()
+        self.label = label
+        self.journal = journal
+        self.pid = pid
+        self.gone = gone
+
+    def kill(self):
+        import psutil
+
+        self.journal.append(self.label)
+        if self.gone:
+            raise psutil.NoSuchProcess(self.pid)
+        self.kills += 1
+
+    def cmdline(self):
+        return ["C:\\Windows\\system32\\wscript.exe", "C:\\hermes\\desktop-plugins\\tracker\\service-host.vbs"]
+
+    def create_time(self):
+        return 90.0
+
+    def cwd(self):
+        return "C:\\hermes"
+
+
+def _plugin_unit(journal: list[str], *, worker_gone: bool = False):
+    host = _UnitMember("host", journal, pid=5)
+    wrapper = _UnitMember("wrapper", journal, pid=10)
+    worker = _UnitMember("worker", journal, pid=20, gone=worker_gone)
+    wrapper_snapshot = _snapshot(
+        pid=10,
+        ppid=5,
+        exe=Path("C:/hermes/install/venv/Scripts/python.exe"),
+        argv=("python.exe", "C:\\hermes\\desktop-plugins\\tracker\\service.py"),
+        created_at=100.0,
+        process=wrapper,
+    )
+    worker_snapshot = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=Path("C:/hermes/install/.hermes-runtime/python/generation/python.exe"),
+        argv=("python.exe", "C:\\hermes\\desktop-plugins\\tracker\\service.py"),
+        created_at=101.0,
+        process=worker,
+    )
+    return host, wrapper_snapshot, worker_snapshot
+
+
+def test_terminate_desktop_plugin_service_stops_host_then_wrapper_then_worker_from_either_member(
     monkeypatch, tmp_path: Path
 ) -> None:
+    """The supervisor dies first so nothing can respawn; one call stops the unit.
+
+    Worker-first draining in two calls was the 2026-09-04 failure: the venv
+    wrapper exited on its own when its child died, the wrapper call had
+    nothing left to prove, the Windows Script Host loop survived and
+    relaunched the service ten seconds later inside the updater's lock
+    window.
+    """
     root = tmp_path / "install"
     venv = root / "venv"
-    worker_process = _FakeProcess()
-    wrapper_process = _FakeProcess()
-    host_process = _FakeProcess()
+    journal: list[str] = []
+    host, wrapper, worker = _plugin_unit(journal)
     worker_record = {
+        "pid": 20,
         "created_at": 101.0,
         "owner": "desktop",
         "role": "desktop_plugin_worker",
         "actionable": True,
         "action": "terminate_desktop_plugin_service",
+        "wrapper_pid": 10,
     }
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_desktop_plugin_service_unit",
+        lambda _root, pid: (worker_record, host, wrapper, [worker]) if int(pid) == 20 else None,
+    )
+
+    outcome = scanner.terminate_desktop_plugin_service_unit(root, pid=20, created_at=101.0)
+
+    assert outcome["terminated"] is True
+    assert journal == ["host", "wrapper", "worker"]
+    assert host.kills == 1 and wrapper.process.kills == 1 and worker.process.kills == 1
+    assert outcome["host"] == {
+        "pid": 5,
+        "created_at": 90.0,
+        "argv": host.cmdline(),
+        "cwd": "C:\\hermes",
+    }
+    assert scanner.terminate_desktop_plugin_service(root, pid=20, created_at=101.0) is True
+
+
+def test_terminate_desktop_plugin_service_counts_a_member_that_already_exited(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    journal: list[str] = []
+    host, wrapper, worker = _plugin_unit(journal, worker_gone=True)
     wrapper_record = {
+        "pid": 10,
         "created_at": 100.0,
         "owner": "desktop",
         "role": "desktop_plugin_wrapper",
@@ -2203,22 +2292,140 @@ def test_terminate_desktop_plugin_service_drains_worker_before_wrapper_host(
     monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
     monkeypatch.setattr(
         scanner,
-        "_live_desktop_plugin_service_process",
-        lambda _root, pid: (
-            (worker_process, worker_record, host_process)
-            if int(pid) == 20
-            else (wrapper_process, wrapper_record, host_process)
-        ),
+        "_desktop_plugin_service_unit",
+        lambda _root, pid: (wrapper_record, host, wrapper, [worker]),
     )
 
-    assert scanner.terminate_desktop_plugin_service(root, pid=20, created_at=101.0)
-    assert worker_process.kills == 1
-    assert host_process.kills == 0
+    outcome = scanner.terminate_desktop_plugin_service_unit(root, pid=10, created_at=100.0)
 
-    assert scanner.terminate_desktop_plugin_service(root, pid=10, created_at=100.0)
-    assert wrapper_process.kills == 1
-    assert host_process.kills == 1
+    assert outcome["terminated"] is True
+    assert journal == ["host", "wrapper", "worker"]
+    assert worker.process.kills == 0
 
+
+def test_terminate_desktop_plugin_service_refuses_a_changed_or_unproven_unit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    journal: list[str] = []
+    host, wrapper, worker = _plugin_unit(journal)
+    record = {
+        "pid": 10,
+        "created_at": 100.0,
+        "owner": "desktop",
+        "role": "desktop_plugin_wrapper",
+        "actionable": True,
+        "action": "terminate_desktop_plugin_service",
+    }
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "_desktop_plugin_service_unit",
+        lambda _root, pid: (record, host, wrapper, [worker]),
+    )
+
+    # create-time drift beyond tolerance = a different process generation
+    assert scanner.terminate_desktop_plugin_service_unit(root, pid=10, created_at=100.5) == {
+        "terminated": False,
+        "host": None,
+    }
+    monkeypatch.setattr(scanner, "_desktop_plugin_service_unit", lambda _root, pid: None)
+    assert scanner.terminate_desktop_plugin_service(root, pid=10, created_at=100.0) is False
+    assert journal == []
+
+
+def test_desktop_plugin_service_unit_resolves_wrapper_host_and_workers_from_a_worker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    service = root.parent / "desktop-plugins" / "tracker" / "service.py"
+    host = _FakeProcess()
+    wrapper_children: list = []
+    wrapper_process = _FakeProcess()
+    wrapper_process.children = lambda recursive=False: list(wrapper_children)
+    wrapper = _snapshot(
+        pid=10,
+        ppid=5,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), str(service)),
+        created_at=100.0,
+        process=wrapper_process,
+    )
+    worker = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=root / ".hermes-runtime" / "python" / "generation" / "python.exe",
+        argv=(str(root / ".hermes-runtime" / "python" / "generation" / "python.exe"), str(service)),
+        created_at=101.0,
+    )
+    stray = _snapshot(
+        pid=21,
+        ppid=10,
+        exe=root / ".hermes-runtime" / "python" / "generation" / "python.exe",
+        argv=(str(root / ".hermes-runtime" / "python" / "generation" / "python.exe"), "-c", "pass"),
+        created_at=102.0,
+    )
+    wrapper_children.extend([types.SimpleNamespace(pid=20), types.SimpleNamespace(pid=21)])
+    worker_record = {
+        "pid": 20,
+        "created_at": 101.0,
+        "owner": "desktop",
+        "role": "desktop_plugin_worker",
+        "actionable": True,
+        "action": "terminate_desktop_plugin_service",
+        "wrapper_pid": 10,
+    }
+    monkeypatch.setattr(
+        scanner,
+        "_live_desktop_plugin_service_process",
+        lambda _root, pid: (worker.process, worker_record, host) if int(pid) == 20 else None,
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_snapshot_for_pid",
+        lambda pid, **_kwargs: {10: wrapper, 20: worker, 21: stray}[int(pid)],
+    )
+
+    unit = scanner._desktop_plugin_service_unit(root, 20)
+
+    assert unit is not None
+    record, unit_host, unit_wrapper, workers = unit
+    assert record is worker_record
+    assert unit_host is host
+    assert unit_wrapper is wrapper
+    assert [member.pid for member in workers] == [20]
+
+
+def test_main_reports_the_stopped_supervisor_for_a_plugin_service_stop(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    root = tmp_path / "install"
+    venv = root / "venv"
+    host = {"pid": 5, "created_at": 90.0, "argv": ["wscript.exe", "host.vbs"], "cwd": None}
+    monkeypatch.setattr(scanner, "_validated_root", lambda _root: (root, venv))
+    monkeypatch.setattr(
+        scanner,
+        "terminate_desktop_plugin_service_unit",
+        lambda _root, *, pid, created_at: {"terminated": True, "host": host},
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        scanner.main(
+            ["--root", str(root), "--terminate-desktop-plugin-service", "20", "--created-at", "101.0"]
+        )
+
+    assert exit_info.value.code == 0
+    document = json.loads(capsys.readouterr().out.strip())
+    assert document["mode"] == "terminate_desktop_plugin_service"
+    assert document["terminated"] is True
+    assert document["host"] == host
+
+    monkeypatch.setattr(scanner, "terminate_mcp_bridge", lambda _root, *, pid, created_at: True)
+    with pytest.raises(SystemExit):
+        scanner.main(["--root", str(root), "--terminate-mcp-bridge", "20", "--created-at", "101.0"])
+    assert "host" not in json.loads(capsys.readouterr().out.strip())
 
 def test_terminate_venv_holder_stops_any_fresh_target_scan_match(
     monkeypatch, tmp_path: Path

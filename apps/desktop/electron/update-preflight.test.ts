@@ -481,7 +481,7 @@ describe('MCP bridge drain', () => {
     ])
   })
 
-  it('drains an exact Desktop plugin worker before its wrapper after explicit consent', async () => {
+  it('stops an exact Desktop plugin service unit once, through its wrapper anchor, after explicit consent', async () => {
     const wrapper = desktopPluginService()
 
     const worker = desktopPluginService({
@@ -511,7 +511,8 @@ describe('MCP bridge drain', () => {
       'lease',
       'wait:0',
       'scan',
-      'terminate-desktop-plugin:302:334.5',
+      // One call per unit: the scanner stops supervisor, wrapper and worker
+      // together. A second call for the worker would find nothing to prove.
       'terminate-desktop-plugin:301:333.5',
       'wait:0',
       'scan',
@@ -1085,7 +1086,12 @@ describe('production update mutation permit wiring', () => {
 
     const scanAt = wiring.indexOf('await scanVenvBlockers(updateRoot)')
     const probeAbortAt = wiring.indexOf("observed.kind === 'probe-failure'")
-    const pluginStopAt = wiring.indexOf('terminateDesktopPluginService(updateRoot, service)')
+    const pluginStopAt = wiring.indexOf('stopDesktopPluginServiceUnit(updateRoot, service)')
+
+    // 2026-09-04: worker-first, two-call draining left the Windows Script
+    // Host loop alive to respawn the service inside the lock window.
+    assert.match(wiring, /desktopPluginServiceUnits\(/)
+    assert.doesNotMatch(wiring, /role === 'desktop_plugin_worker'\) - Number/)
     const preflightAt = wiring.indexOf('runWindowsUpdatePreflight(purpose')
 
     assert.ok(scanAt > 0 && probeAbortAt > scanAt, 'first scan happens before any mutation and probe-failure aborts')
