@@ -581,6 +581,11 @@ py-modules = [
   "hermes_logging",
   "utils",
   "mcp_serve",
+  # Imported by packaged code (agent/__init__.py, hermes_state.py,
+  # gateway/run.py); missing here = ModuleNotFoundError in the uv2nix venv.
+  "hermes_mcp_update_gate",
+  "hermes_state_holders",
+  "hermes_state_registry",
 ]
 
 [tool.setuptools.packages.find]
