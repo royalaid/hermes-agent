@@ -91,8 +91,10 @@ export interface ActiveTranscriptRefreshDeps {
 
 function runtimeOwnsLiveTranscript(runtimeSessionId: string): boolean {
   const state = $sessionStates.get()[runtimeSessionId]
-  if (state && (state.busy || state.awaitingResponse || state.needsInput || state.turnLive)) return true
+
+  if (state && (state.busy || state.awaitingResponse || state.needsInput || state.turnLive)) {return true}
   const visibleTail = state?.messages.findLast(message => !message.hidden)
+
   return visibleTail?.role === 'user' && visibleTail.id === 'user-queued-' + runtimeSessionId
 }
 
@@ -100,6 +102,7 @@ type TileTranscriptTarget = { ownerRoute?: SessionProfileRoute; storedSessionId:
 
 function tileTranscriptSignatureKey(tile: TileTranscriptTarget): string {
   const route = tile.ownerRoute
+
   return 'tile:' + (route ? route.connectionId + ':' + (route.targetProfile ?? route.profile) + ':' : '') + tile.storedSessionId
 }
 

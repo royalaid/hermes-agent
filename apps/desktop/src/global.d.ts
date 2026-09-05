@@ -1,9 +1,10 @@
 import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
+import type { SessionOwnerRoute } from '@/store/session-request-router'
+
 import type { HermesNotification } from '../electron/notification-types'
 import type { PoolLimits } from '../electron/pool-limits'
-import type { SessionOwnerRoute } from '@/store/session-request-router'
 
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
