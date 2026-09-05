@@ -54,12 +54,13 @@ param(
     [switch]$NoMarkerCleanup,
     [switch]$SelfTestUi,
     [switch]$SelfTestPipeDrain,
-    [switch]$SelfTestMarker
+    [switch]$SelfTestMarker,
+    [switch]$SelfTestLog
 )
 
-if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $InstallRoot) {
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestLog -and -not $InstallRoot) {
     # Mandatory in spirit; relaxed in the signature only so the self-test
-    # switches can drive the UI / the pipe drain without a checkout.
+    # switches can drive the UI / the pipe drain / the log without a checkout.
     throw "-InstallRoot is required"
 }
 
@@ -96,26 +97,54 @@ $script:UiStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $script:MarkerBody = $null
 
 $script:HandoffLogDrops = 0
+$script:HandoffLogUtf8 = [System.Text.UTF8Encoding]::new($false)
+$script:HandoffLogRetries = 6
+$script:HandoffLogRetryMs = 50
 
 function Add-HandoffLogLines([string[]]$Lines) {
-    # Append to the hand-off log, retrying briefly when another process holds
-    # the file (a log viewer with an exclusive handle did exactly that on
-    # 2026-09-05 and every line was lost). Lines that still cannot be written
-    # are counted and reported on the next successful write, so the log says
-    # it has a gap instead of silently ending mid-update.
+    # Append a batch of lines to the hand-off log through our own FileStream,
+    # never Add-Content. Two properties of Add-Content lost every line of the
+    # 2026-09-05 updates as soon as anything else looked at the log:
+    #
+    #  * It opens the file with FileShare.Write ONLY (measured: while its
+    #    provider writer is held, a Read-access open is refused). Every log
+    #    reader -- git-bash `tail -F` / `wc -l`, PowerShell Get-Content -Tail,
+    #    any .NET reader -- holds Read access, so the two handles are mutually
+    #    exclusive: while a reader has the file Add-Content's open fails with
+    #    a sharing violation, and while Add-Content has it the reader fails.
+    #    A `tail -F` held for minutes lost everything; a `wc -l` every 15 s
+    #    lost whatever coincided (70/500 under a tight polling loop).
+    #  * Its IOException is a NON-terminating error. Under this script's
+    #    $ErrorActionPreference = "Continue" it printed the red "being used by
+    #    another process" block and fell through to `return`, so the try/catch
+    #    retry never executed and the drop counter never moved.
+    #
+    # FileShare.ReadWrite | Delete lets every reader coexist (0/500 under the
+    # same poller, 0/300 against a Get-Content -Tail loop where Add-Content
+    # lost 287). A .NET constructor exception IS terminating, so the retry
+    # below really runs. The floor that remains -- a holder that opened the
+    # file with FileShare.Read, i.e. no write sharing at all -- is counted and
+    # announced by the next successful write, so the log says it has a gap
+    # instead of ending mid-update. Nothing here may throw into the update
+    # path: a lost log line is a WARNING, never a failed update.
     if (-not $Lines -or $Lines.Count -eq 0) { return }
-    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+    $payload = $Lines
+    if ($script:HandoffLogDrops -gt 0) {
+        $notice = "{0:yyyy-MM-ddTHH:mm:ssK} WARNING: {1} hand-off log line(s) could not be written while another process held this file; see the console output" -f (Get-Date), $script:HandoffLogDrops
+        $payload = @($notice) + $Lines
+    }
+    $bytes = $script:HandoffLogUtf8.GetBytes(($payload -join "`r`n") + "`r`n")
+    for ($attempt = 0; $attempt -lt $script:HandoffLogRetries; $attempt++) {
         try {
-            if ($script:HandoffLogDrops -gt 0) {
-                $notice = "{0:yyyy-MM-ddTHH:mm:ssK} WARNING: {1} hand-off log line(s) could not be written while another process held this file; see the console output" -f (Get-Date), $script:HandoffLogDrops
-                Add-Content -LiteralPath $LogPath -Value (@($notice) + $Lines) -Encoding UTF8
-                $script:HandoffLogDrops = 0
-            } else {
-                Add-Content -LiteralPath $LogPath -Value $Lines -Encoding UTF8
-            }
+            $stream = [System.IO.FileStream]::new($LogPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+            $script:HandoffLogDrops = 0
             return
         } catch {
-            Start-Sleep -Milliseconds 50
+            # A sharing violation (IOException) is the retryable case. Anything
+            # else (log dir gone, permissions) will not improve in 50 ms, but
+            # one bounded pass costs nothing and keeps this path branch-free.
+            Start-Sleep -Milliseconds $script:HandoffLogRetryMs
         }
     }
     $script:HandoffLogDrops += $Lines.Count
@@ -966,7 +995,7 @@ function Get-FileTailLine([string]$Path, [int]$MaxChars = 160) {
 function Write-StepLines($Sink, [int]$Flushed, [string]$Prefix, [switch]$Final) {
     # Log every complete line that arrived in $Sink since index $Flushed and
     # return the new index. A trailing partial line waits for its newline
-    # unless -Final. Lines are batched per call (one Add-Content), so a chatty
+    # unless -Final. Lines are batched per call (one file append), so a chatty
     # step costs one file append per drain pass, not one per line.
     $length = $Sink.Length
     if ($length -le $Flushed) { return $Flushed }
@@ -1531,7 +1560,7 @@ exit 7
     # Writes straight to the console stream, holding nothing: a step that is
     # merely loud. `hermes update` is this shape -- the Electron/vite build
     # alone is megabytes. Few large lines rather than many small ones on
-    # purpose: Write-HandoffLog is one Add-Content per line and runs inside the
+    # purpose: Write-HandoffLog is one file append per line and runs inside the
     # measured window, so line-heavy output would time the logger instead of
     # the drain.
     $floodSource = @'
@@ -1721,6 +1750,90 @@ if ($null -ne $seenAt) { exit 9 } else { exit 10 }
         exit 1
     }
     Write-Host "PIPE-DRAIN SELF-TEST: PASS $detail"
+    exit 0
+}
+
+# -SelfTestLog: prove the hand-off log survives a concurrent reader ---------
+# The 2026-09-05 log loss needs no update to reproduce, only a second handle
+# on desktop-update-handoff.log. Two arms, both through the real
+# Write-HandoffLog / Add-HandoffLogLines:
+#
+#   shared  -- a reader holds the file for the whole arm with Read access and
+#              FileShare.ReadWrite, the handle every log viewer holds
+#              (git-bash tail -F / wc -l, Get-Content -Tail, .NET readers).
+#              Every line must land and the drop counter must stay 0. This is
+#              the arm Add-Content failed: its FileShare.Write open is refused
+#              while any Read-access handle exists.
+#   blocked -- a holder that shares only Read, so no writer can open the file
+#              at all: the floor. The lines must be COUNTED, nothing may throw
+#              out of the logging path, and the first write after the holder
+#              lets go must announce the gap with a WARNING line.
+# Exits before any marker/desktop machinery, same as -SelfTestUi; touches
+# nothing but the log under $TempDir (no -InstallRoot => $HermesHome = TEMP).
+if ($SelfTestLog) {
+    New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $logExisted = Test-Path -LiteralPath $LogPath
+    $problems = @()
+    $sharedLines = 50
+    Write-HandoffLog "SELF-TEST: log sharing (no update will run)"
+
+    $reader = $null
+    try {
+        $reader = [System.IO.File]::Open($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        for ($i = 1; $i -le $sharedLines; $i++) { Write-HandoffLog "SELF-TEST: shared-reader line $i" }
+        $stamp = "{0:yyyy-MM-ddTHH:mm:ssK}" -f (Get-Date)
+        Add-HandoffLogLines @("$stamp SELF-TEST: shared-reader batch a", "$stamp SELF-TEST: shared-reader batch b")
+    } catch {
+        $problems += "shared arm threw out of the logging path: $($_.Exception.Message)"
+    } finally {
+        if ($reader) { $reader.Dispose() }
+    }
+    $sharedDrops = $script:HandoffLogDrops
+
+    $blockedLines = 3
+    $holder = $null
+    try {
+        $holder = [System.IO.File]::Open($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        for ($i = 1; $i -le $blockedLines; $i++) { Write-HandoffLog "SELF-TEST: blocked line $i" }
+    } catch {
+        $problems += "blocked arm threw out of the logging path: $($_.Exception.Message)"
+    } finally {
+        if ($holder) { $holder.Dispose() }
+    }
+    $blockedDrops = $script:HandoffLogDrops
+    Write-HandoffLog "SELF-TEST: after release"
+    $finalDrops = $script:HandoffLogDrops
+
+    $text = ""
+    try { $text = [System.IO.File]::ReadAllText($LogPath) } catch { $problems += "could not read the log back: $($_.Exception.Message)" }
+    $sharedSeen = ([regex]::Matches($text, "SELF-TEST: shared-reader line \d+\r\n")).Count
+    $batchSeen = ([regex]::Matches($text, "SELF-TEST: shared-reader batch [ab]\r\n")).Count
+    $blockedSeen = ([regex]::Matches($text, "SELF-TEST: blocked line \d+")).Count
+    $warningSeen = $text -match "WARNING: $blockedLines hand-off log line\(s\) could not be written"
+    $afterSeen = $text -match "SELF-TEST: after release"
+    $stampOk = $text -match "(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} SELF-TEST: shared-reader line 1\r$"
+    $bom = $false
+    if (-not $logExisted) {
+        try { $head = [System.IO.File]::ReadAllBytes($LogPath); $bom = ($head.Length -ge 3 -and $head[0] -eq 0xEF -and $head[1] -eq 0xBB -and $head[2] -eq 0xBF) } catch {}
+    }
+
+    if ($sharedSeen -ne $sharedLines) { $problems += "shared arm: $sharedSeen of $sharedLines lines reached the log while a Read/ReadWrite reader held it (an Add-Content FileShare.Write open loses all of them)" }
+    if ($batchSeen -ne 2) { $problems += "shared arm: batched Add-HandoffLogLines wrote $batchSeen of 2 lines" }
+    if ($sharedDrops -ne 0) { $problems += "shared arm: drop counter is $sharedDrops, expected 0" }
+    if (-not $stampOk) { $problems += "line format changed: expected '{yyyy-MM-ddTHH:mm:ssK} message' with CRLF" }
+    if ($blockedSeen -ne 0) { $problems += "blocked arm: $blockedSeen line(s) landed while a FileShare.Read holder had the file (the holder did not block writers; fixture invalid)" }
+    if ($blockedDrops -ne $blockedLines) { $problems += "blocked arm: drop counter is $blockedDrops, expected $blockedLines (drops are not being counted -- the retry catch is not running)" }
+    if (-not $warningSeen) { $problems += "blocked arm: the first write after release did not announce the $blockedLines dropped line(s) with a WARNING" }
+    if (-not $afterSeen) { $problems += "blocked arm: the write after release was lost" }
+    if ($finalDrops -ne 0) { $problems += "blocked arm: drop counter is $finalDrops after the announcing write, expected 0" }
+    if ($bom) { $problems += "a fresh log was created with a UTF-8 BOM" }
+
+    $detail = "shared: lines=$sharedSeen/$sharedLines batch=$batchSeen/2 drops=$sharedDrops | blocked: landed=$blockedSeen counted=$blockedDrops warning=$warningSeen afterRelease=$afterSeen finalDrops=$finalDrops | bom=$bom"
+    if ($problems.Count -gt 0) {
+        Write-Host "LOG SELF-TEST: FAIL $detail -- $($problems -join '; ')"
+        exit 1
+    }
+    Write-Host "LOG SELF-TEST: PASS $detail"
     exit 0
 }
 
