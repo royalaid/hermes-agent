@@ -8,6 +8,17 @@ import path from 'node:path'
 
 import { describe, it } from 'vitest'
 
+// The sandbox execution needs a `python` on PATH that can import psutil; the
+// scanner refuses to run without it. Skip with a reason instead of failing
+// on hosts/runners that only have a bare interpreter.
+const pythonHasPsutil = (() => {
+  try {
+    return spawnSync('python', ['-c', 'import psutil'], { encoding: 'utf-8', windowsHide: true }).status === 0
+  } catch {
+    return false
+  }
+})()
+
 import {
   buildUpdateScannerArgv,
   resolveUpdateScannerCarrier,
@@ -49,7 +60,7 @@ describe('update scanner carrier resolution', () => {
     assert.equal(fs.existsSync(path.join(desktopRoot, scannerResource.from)), true)
   })
 
-  it('materializes and executes isolated argv without importing the target checkout scanner', () => {
+  it.skipIf(!pythonHasPsutil)('materializes and executes isolated argv without importing the target checkout scanner', () => {
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'Hermes carrier [old] & schema-v1 '))
 
     try {

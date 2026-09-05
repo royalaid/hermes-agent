@@ -69,14 +69,18 @@ function chatWindowWebPreferences(preloadPath: string) {
 function buildSessionWindowUrl(sessionId: string, { devServer, ownerRoute, profile, rendererIndexPath, watch }: any = {}) {
   const params = new URLSearchParams({ win: 'secondary' })
 
-  if (watch) params.set('watch', '1')
+  if (watch) {params.set('watch', '1')}
   const profileKey = typeof profile === 'string' ? profile.trim() : ''
-  if (profileKey) params.set('profile', profileKey)
-  if (ownerRoute?.connectionId) params.set('ownerConnectionId', ownerRoute.connectionId)
-  if (ownerRoute?.profile) params.set('ownerProfile', ownerRoute.profile)
-  if (ownerRoute?.targetProfile) params.set('ownerTargetProfile', ownerRoute.targetProfile)
 
-  const query = 
+  if (profileKey) {params.set('profile', profileKey)}
+
+  if (ownerRoute?.connectionId) {params.set('ownerConnectionId', ownerRoute.connectionId)}
+
+  if (ownerRoute?.profile) {params.set('ownerProfile', ownerRoute.profile)}
+
+  if (ownerRoute?.targetProfile) {params.set('ownerTargetProfile', ownerRoute.targetProfile)}
+
+  const query = `?${params.toString()}`
   const route = `#/${encodeURIComponent(sessionId)}`
 
   if (devServer) {

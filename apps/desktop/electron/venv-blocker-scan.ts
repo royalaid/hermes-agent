@@ -12,6 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
+import { parseTerminatedPluginServiceHost, type TerminatedPluginServiceHost } from './desktop-plugin-host-restore'
 import { buildUpdateScannerArgv } from './update-scanner-carrier'
 
 const execFileAsync = promisify(execFile)
@@ -331,6 +332,34 @@ function parseIdentityRecord(
 
 // Identity-typed: the preflight force-drain asks this of generic blockers, MCP
 // bridges, and Desktop plugin services alike, and only PID/create-time matter.
+/**
+ * Collapse plugin service records into one anchor per logical service unit.
+ *
+ * A Desktop plugin service is one unit of three processes (Windows Script
+ * Host supervisor, venv wrapper, managed-runtime worker). The scanner stops
+ * the whole unit from either member, top-down, so the preflight must issue
+ * exactly one stop per unit: the wrapper record when it is present, else the
+ * worker. Stopping the worker first and then the wrapper was the 2026-09-04
+ * failure — the wrapper exited on its own when its child died, the wrapper
+ * call then had nothing to prove, and the supervisor was never stopped.
+ */
+export function desktopPluginServiceUnits(
+  services: readonly DesktopPluginServiceProcess[]
+): DesktopPluginServiceProcess[] {
+  const byUnit = new Map<number, DesktopPluginServiceProcess>()
+
+  for (const service of services) {
+    const unit = service.wrapperPid ?? service.pid
+    const current = byUnit.get(unit)
+
+    if (!current || (current.role !== 'desktop_plugin_wrapper' && service.role === 'desktop_plugin_wrapper')) {
+      byUnit.set(unit, service)
+    }
+  }
+
+  return [...byUnit.values()].sort((left, right) => left.pid - right.pid)
+}
+
 export function isExactVenvHolder(
   process: VenvBlockerIdentity
 ): process is VenvBlockerIdentity & { createdAt: number } {
@@ -764,18 +793,35 @@ export async function scanVenvBlockers(
   })
 }
 
-function parseTerminateOutput(
+export interface TerminateOutcome {
+  terminated: boolean
+  /** The plugin service supervisor the scanner stopped, when it stopped one. */
+  host: TerminatedPluginServiceHost | null
+}
+
+const NOT_TERMINATED: TerminateOutcome = Object.freeze({ terminated: false, host: null })
+
+export function parseTerminateOutput(
   raw: string,
   target: ScanTargetIdentity,
   holder: VenvBlockerIdentity & { createdAt: number },
   mode: 'terminate_mcp_bridge' | 'terminate_desktop_plugin_service' | 'terminate_venv_holder'
 ): boolean {
+  return parseTerminateOutputDetailed(raw, target, holder, mode).terminated
+}
+
+export function parseTerminateOutputDetailed(
+  raw: string,
+  target: ScanTargetIdentity,
+  holder: VenvBlockerIdentity & { createdAt: number },
+  mode: 'terminate_mcp_bridge' | 'terminate_desktop_plugin_service' | 'terminate_venv_holder'
+): TerminateOutcome {
   let parsed: any
 
   try {
     parsed = JSON.parse(raw)
   } catch {
-    return false
+    return NOT_TERMINATED
   }
 
   const fields = [
@@ -790,7 +836,10 @@ function parseTerminateOutput(
     'error'
   ]
 
-  if (!hasExactKeys(parsed, fields)) {return false}
+  // Only a plugin service stop reports the supervisor it stopped.
+  const optional = mode === 'terminate_desktop_plugin_service' ? ['host'] : []
+
+  if (!hasExactKeys(parsed, fields, optional)) {return NOT_TERMINATED}
 
   const actualRoot = comparableCanonicalPath(parsed.root)
   const actualVenv = comparableCanonicalPath(parsed.venv)
@@ -812,10 +861,20 @@ function parseTerminateOutput(
     actualRoot !== expectedRoot ||
     actualVenv !== expectedVenv
   ) {
-    return false
+    return NOT_TERMINATED
   }
 
-  return parsed.terminated
+  let host: TerminatedPluginServiceHost | null = null
+
+  if (Object.hasOwn(parsed, 'host') && parsed.host !== null) {
+    host = parseTerminatedPluginServiceHost(parsed.host)
+
+    // A malformed supervisor record means the carrier and this parser
+    // disagree; fail closed rather than trust the rest of the envelope.
+    if (!host) {return NOT_TERMINATED}
+  }
+
+  return { terminated: parsed.terminated === true, host: parsed.terminated === true ? host : null }
 }
 
 async function terminateScannedHolder(
@@ -827,6 +886,28 @@ async function terminateScannedHolder(
   resolveOverride?: typeof resolveVenvPython,
   canonicalizeOverride?: (root: string) => string
 ): Promise<boolean> {
+  const outcome = await terminateScannedHolderDetailed(
+    updateRoot,
+    holder,
+    actionFlag,
+    mode,
+    execOverride,
+    resolveOverride,
+    canonicalizeOverride
+  )
+
+  return outcome.terminated
+}
+
+async function terminateScannedHolderDetailed(
+  updateRoot: string,
+  holder: VenvBlockerIdentity & { createdAt: number },
+  actionFlag: '--terminate-mcp-bridge' | '--terminate-desktop-plugin-service' | '--terminate-venv-holder',
+  mode: 'terminate_mcp_bridge' | 'terminate_desktop_plugin_service' | 'terminate_venv_holder',
+  execOverride?: typeof execFileAsync,
+  resolveOverride?: typeof resolveVenvPython,
+  canonicalizeOverride?: (root: string) => string
+): Promise<TerminateOutcome> {
   const execFn = execOverride || execFileAsync
   const resolveFn = resolveOverride || resolveVenvPython
 
@@ -838,18 +919,18 @@ async function terminateScannedHolder(
   try {
     scanRoot = canonicalizeFn(updateRoot)
   } catch {
-    return false
+    return NOT_TERMINATED
   }
 
   const venvPython = resolveFn(scanRoot)
 
-  if (!venvPython) {return false}
+  if (!venvPython) {return NOT_TERMINATED}
   let scanVenv: string
 
   try {
     scanVenv = canonicalizeFn(path.dirname(path.dirname(venvPython)))
   } catch {
-    return false
+    return NOT_TERMINATED
   }
 
   const env = { ...process.env }
@@ -868,14 +949,14 @@ async function terminateScannedHolder(
       { cwd: scanRoot, encoding: 'utf-8', timeout: SCAN_TIMEOUT_MS, windowsHide: true, env } as any
     )
 
-    return parseTerminateOutput(
+    return parseTerminateOutputDetailed(
       String((proc as any).stdout ?? ''),
       { expectedRoot: scanRoot, expectedVenv: scanVenv },
       holder,
       mode
     )
   } catch {
-    return false
+    return NOT_TERMINATED
   }
 }
 
@@ -920,11 +1001,34 @@ export async function terminateDesktopPluginService(
   resolveOverride?: typeof resolveVenvPython,
   canonicalizeOverride?: (root: string) => string
 ): Promise<boolean> {
+  const outcome = await terminateDesktopPluginServiceDetailed(
+    updateRoot,
+    service,
+    execOverride,
+    resolveOverride,
+    canonicalizeOverride
+  )
+
+  return outcome.terminated
+}
+
+/**
+ * Stop one exact Desktop-plugin service UNIT (supervisor, wrapper, workers)
+ * from either of its members and report the supervisor that was stopped so
+ * the caller can relaunch it after the update finishes or aborts.
+ */
+export async function terminateDesktopPluginServiceDetailed(
+  updateRoot: string,
+  service: DesktopPluginServiceProcess,
+  execOverride?: typeof execFileAsync,
+  resolveOverride?: typeof resolveVenvPython,
+  canonicalizeOverride?: (root: string) => string
+): Promise<TerminateOutcome> {
   if (!isExactActionableDesktopPluginService(service)) {
-    return false
+    return NOT_TERMINATED
   }
 
-  return terminateScannedHolder(
+  return terminateScannedHolderDetailed(
     updateRoot,
     service,
     '--terminate-desktop-plugin-service',

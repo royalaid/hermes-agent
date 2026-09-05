@@ -36,6 +36,7 @@ import {
   attachHolderTreeRelationships,
   type ForceReleaseHolder,
   type ForceReleaseTerminateResult,
+  formatHolderLine,
   mergeInstallHolders,
   orderHoldersLeafFirst,
   raceWithBudget,
@@ -367,6 +368,48 @@ describe('mergeInstallHolders', () => {
     assert.match(String(first.resource), /foo\.pyd/)
   })
 
+  it('keeps one Restart Manager path as the ownership proof and lists the rest as evidence', () => {
+    // 2026-09-04: the merged "hermes.exe; python.exe" string was handed to
+    // the exact-terminate script as a path, which could never verify it.
+    const fromScan = holder({ pid: 7, createdAt: 100.25, source: 'scanner', role: 'wrapper' })
+
+    const shim = holder({
+      pid: 7,
+      createdAt: 100,
+      source: 'restart-manager',
+      resource: 'C:\\hermes\\venv\\Scripts\\python.exe'
+    })
+
+    const pyd = holder({
+      pid: 7,
+      createdAt: 100,
+      source: 'restart-manager',
+      resource: 'C:\\hermes\\venv\\Lib\\site-packages\\yaml\\_yaml.pyd'
+    })
+
+    const [merged] = mergeInstallHolders([fromScan, shim, pyd])
+
+    assert.ok(merged)
+    assert.equal(merged.resource, 'C:\\hermes\\venv\\Scripts\\python.exe')
+    assert.deepEqual(merged.resources, [
+      'C:\\hermes\\venv\\Scripts\\python.exe',
+      'C:\\hermes\\venv\\Lib\\site-packages\\yaml\\_yaml.pyd'
+    ])
+    assert.equal(merged.role, 'wrapper')
+    assert.equal(merged.createdAt, 100.25)
+    assert.match(formatHolderLine(merged), /python\.exe; .*_yaml\.pyd/)
+  })
+
+  it('carries the scanner unit routing through a merge', () => {
+    const service = holder({ pid: 9, createdAt: 50, source: 'scanner', terminateVia: 'desktop-plugin-service' })
+    const rm = holder({ pid: 9, createdAt: 50, source: 'restart-manager', resource: 'C:\\hermes\\venv\\Scripts\\python.exe' })
+
+    const [merged] = mergeInstallHolders([rm, service])
+
+    assert.equal(merged?.terminateVia, 'desktop-plugin-service')
+    assert.equal(merged?.resource, 'C:\\hermes\\venv\\Scripts\\python.exe')
+  })
+
   it('drops excluded helper and desktop PIDs', () => {
     const merged = mergeInstallHolders([holder({ pid: 42 }), holder({ pid: 99 })], new Set([42]))
     assert.deepEqual(
@@ -561,6 +604,74 @@ describe('runWindowsUpdateForceRelease', () => {
 
     assert.equal(outcome.kind, 'clear')
     assert.deepEqual(terminated, [606])
+  })
+
+  it('queries Restart Manager once and reuses it while the scanner keeps naming holders', async () => {
+    // Restart Manager costs about 8 s on a loaded host; re-running it every
+    // pass was most of the 20 s budget on 2026-09-04.
+    const scanned = holder({ pid: 700, createdAt: 500, source: 'scanner' })
+    const rm = holder({ pid: 700, createdAt: 500, source: 'restart-manager', resource: 'C:\\hermes\\venv\\Scripts\\python.exe' })
+    let locked = true
+    let rmCalls = 0
+    let attempts = 0
+
+    const { deps } = makeDeps({
+      isResourceLocked: async () => locked,
+      listScannerHolders: async () => [scanned],
+      listRestartManagerHolders: async () => {
+        rmCalls += 1
+
+        return [rm]
+      },
+      terminateHolder: async target => {
+        attempts += 1
+        assert.equal(target.resource, rm.resource, 'RM evidence from the first pass still attributes the holder')
+
+        if (attempts < 2) {
+          return { kind: 'failed', detail: 'first attempt lost the race' }
+        }
+
+        locked = false
+
+        return { kind: 'terminated' }
+      }
+    })
+
+    const outcome = await runWindowsUpdateForceRelease({ ...deps, deadlineMs: 5_000, settleMs: 1 })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.equal(attempts, 2)
+    assert.equal(rmCalls, 1)
+  })
+
+  it('reports each discovery pass and termination outcome for forensics', async () => {
+    const scanned = holder({ pid: 701, createdAt: 501, source: 'scanner' })
+    let locked = true
+    const discoveries: number[] = []
+    const outcomes: string[] = []
+
+    const { deps } = makeDeps({
+      isResourceLocked: async () => locked,
+      listScannerHolders: async () => [scanned],
+      listRestartManagerHolders: async () => [],
+      terminateHolder: async () => {
+        locked = false
+
+        return { kind: 'terminated' }
+      },
+      onDiscovery: info => {
+        discoveries.push(info.scanner)
+      },
+      onHolderOutcome: (target, result) => {
+        outcomes.push(`${target.pid}:${result.kind}`)
+      }
+    })
+
+    const outcome = await runWindowsUpdateForceRelease({ ...deps, deadlineMs: 5_000, settleMs: 1 })
+
+    assert.equal(outcome.kind, 'clear')
+    assert.deepEqual(discoveries, [1])
+    assert.deepEqual(outcomes, ['701:terminated'])
   })
 
   it('never reports clear while any verified holder remains', async () => {
@@ -1141,8 +1252,10 @@ describe('merge create-time tolerance and production leaf-first', () => {
     const merged = mergeInstallHolders([fromScan, fromRm])
     assert.equal(merged.length, 1)
     assert.equal(merged[0]?.pid, 7)
-    assert.match(String(merged[0]?.resource), /python\.exe/)
-    assert.match(String(merged[0]?.resource), /hermes\.exe/)
+    // One exact path for the ownership proof (Restart Manager wins); the
+    // scanner claim stays visible as evidence only.
+    assert.equal(merged[0]?.resource, 'venv\\Scripts\\python.exe')
+    assert.deepEqual(merged[0]?.resources, ['venv\\Scripts\\hermes.exe', 'venv\\Scripts\\python.exe'])
   })
 
   it('orders production generic holders leaf-first when parentPid evidence is present', () => {
