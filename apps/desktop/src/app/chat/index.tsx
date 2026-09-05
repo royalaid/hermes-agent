@@ -292,13 +292,14 @@ function ChatRuntimeBoundary({
   const view = useSessionView()
   const runtimeId = useStore(view.$runtimeId)
   const storeMessages = useMessagesWhileVisible(view.$messages)
-  const transcriptIdentityKey = sessionKey ?? runtimeId
+  const transcriptIdentityKey = sessionKey ?? runtimeId ?? ''
   const incomingMessages = suppressMessages ? NO_MESSAGES : storeMessages
   const deduplicatedIncomingMessages = adoptLatestDuplicatePersistedRows(incomingMessages)
   const windowStateRef = useRef(new Map<string, SessionWindowMemo>())
   const compactionWindowFloorRef = useRef<string | null>(null)
   const transcriptIdentityKeyRef = useRef(transcriptIdentityKey)
   transcriptIdentityKeyRef.current = transcriptIdentityKey
+
   const transcriptMessagesRef = useRef({
     key: transcriptIdentityKey,
     messages: deduplicatedIncomingMessages,
@@ -321,18 +322,21 @@ function ChatRuntimeBoundary({
   }
 
   const messages = transcriptMessagesRef.current.messages
+
   const repairCompactedStore =
     !suppressMessages && transcriptMessagesRef.current.source === storeMessages && messages !== storeMessages
 
   useEffect(() => {
-    if (!repairCompactedStore || !runtimeId) return
+    if (!repairCompactedStore || !runtimeId) {return}
     const delegate = sessionTileDelegate()
-    if (!delegate || view.$runtimeId.get() !== runtimeId || view.$messages.get() !== storeMessages) return
+
+    if (!delegate || view.$runtimeId.get() !== runtimeId || view.$messages.get() !== storeMessages) {return}
     delegate.updateSession(runtimeId, state => (state.messages === storeMessages ? { ...state, messages } : state))
   }, [messages, repairCompactedStore, runtimeId, storeMessages, view])
 
   const [windowPages, setWindowPages] = useState(1)
   const [windowSessionKey, setWindowSessionKey] = useState(transcriptIdentityKey)
+
   if (windowSessionKey !== transcriptIdentityKey) {
     setWindowSessionKey(transcriptIdentityKey)
     setWindowPages(1)
@@ -352,6 +356,7 @@ function ChatRuntimeBoundary({
   }, [messages, transcriptIdentityKey, windowPages])
 
   const compactionWindowFloor = compactionWindowFloorRef.current
+
   const compactionWindowFloorPresent =
     compactionWindowFloor === null ||
     windowedMessages.some(message => transcriptLogicalIdentity(message) === compactionWindowFloor)
@@ -363,6 +368,7 @@ function ChatRuntimeBoundary({
 
     if (!compactionWindowFloorPresent && windowed) {
       setWindowPages(pages => pages + 1)
+
       return
     }
 
@@ -643,6 +649,7 @@ const ChatViewContent = memo(function ChatViewContent({
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
   const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
+
   const threadKey =
     queueSessionKey || selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
