@@ -30,8 +30,6 @@ import { $activeGatewayProfile, $newChatProfile, $newChatRoute, $profiles, ensur
 import {
   $projectScope,
   $projectTree,
-  $removedSessionIds,
-  $sessionMutationsInFlight,
   ALL_PROJECTS
 } from '@/store/projects'
 import { $routeTiles, closeRouteTile } from '@/store/route-tiles'
