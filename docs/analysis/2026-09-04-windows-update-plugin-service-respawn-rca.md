@@ -180,3 +180,29 @@ acceptance test. Expected desktop.log lines on the rebuilt install:
 [updates] force-release PID … -> terminated (…ms)
 [updates] plugin service hosts after update boot: relaunched=1 skipped=0        (on the relaunched app)
 ```
+
+
+## Addendum: the first real run after the fix (2026-09-05 01:11 PT) and what it took to finish the chain
+
+The Update click on the rebuilt Desktop got past every step this document is
+about: the plugin service unit stopped in one call, the remaining holders were
+drained, and the hand-off launched. It then failed further down the chain, and
+the same session fixed each of those in PR #7:
+
+| step | what the run showed | fix |
+|------|---------------------|-----|
+| desktop rebuild | `hermes update` ran the build for ~10 min with nothing on stdout and nothing in `logs/update.log` (the whole build buffered until exit; `_log_only_write` is a no-op in `--gateway` mode); the hand-off's 600 s idle watchdog killed it two minutes after the build had finished | `_run_logged_subprocess` streams into update.log and prints a progress line every 30 s |
+| hand-off window | one `running:` line for the whole update; a viewer holding the log made every `Add-Content` fail silently | live step lines, `still running` heartbeat, retrying log writes that report dropped lines |
+| gateway watchdog | `gateway stop --all` at 08:10:49Z, `Hermes_Gateway_Watchdog.vbs` relaunched it at 08:11:19Z inside the lock gate (it honors `.hermes-update-in-progress`, which the script claims later) | the Desktop holds the marker under its own pid for the drain and hands it to the script |
+| force-release | `PID 58196 -> failed BOUNDARY_FAILED TREE_ASSIGN_FAILED win32=5` (holder already inside a job whose hierarchy refuses ours) | degraded containment: suspend, terminate by handle, report `CONTAINMENT_DEGRADED` |
+| relaunch | the "Hermes update did not finish" dialog was synchronous: no backend, no log flush, no plugin-host relaunch until it was dismissed | async dialog |
+| version state | install-stamp named the merged commit while `app.asar` was still the previous build; git-only skew detection said "in sync" because the stamp commit was unrelated to HEAD after the reset | `hermes desktop --build-needed` and the Desktop consulting it when git cannot place the stamp |
+
+Two things the run also proved right: the plugin-host ledger relaunched the
+tracker on the next boot (`plugin service hosts after update boot:
+relaunched=1`), and the updater's up-to-date path still rebuilds a stale
+bundle through `_rebuild_desktop_after_update`.
+
+Known remaining gap: the Update card compares git HEAD with origin only, so a
+current checkout with a stale bundle reports "You're all set" and never offers
+the rebuild. The version IPC (`bundleOutOfSync`) knows; the card should use it.
