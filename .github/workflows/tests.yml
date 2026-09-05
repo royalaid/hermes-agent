@@ -24,7 +24,9 @@ jobs:
     # Large hosted runners exist only in the NousResearch org; a fork has
     # none and the job queues forever. Fall back to the standard runner there.
     runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # The suite is sized for 96 cores; a fork's standard runner needs about
+    # 40 minutes (measured 2026-09-05: cancelled at 68 % after 30).
+    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 30 || 120 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
