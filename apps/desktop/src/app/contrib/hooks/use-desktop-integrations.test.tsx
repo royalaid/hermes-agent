@@ -485,6 +485,7 @@ describe('useDesktopIntegrations', () => {
           locationPathname: '/kanban',
           profileReady: true,
           resumeExhaustedSessionId: null,
+          resumeLastSession: null,
           routedSessionId: null,
           sessions: []
         })
