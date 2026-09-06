@@ -206,3 +206,43 @@ bundle through `_rebuild_desktop_after_update`.
 Known remaining gap: the Update card compares git HEAD with origin only, so a
 current checkout with a stale bundle reports "You're all set" and never offers
 the rebuild. The version IPC (`bundleOutOfSync`) knows; the card should use it.
+
+
+## Addendum 2: the hand-off handshake itself (2026-09-06 07:05Z)
+
+The first hand-off on the PR #7 Desktop build (install parked one merge
+behind to take PR #9) got through the whole preflight this document is about
+(plugin unit stopped in one call, 25 holders drained, no force-release) and
+then aborted at the handshake: the Desktop logged `repo hand-off script did
+not adopt matching bridge and update markers` one second after the script
+logged `claimed update marker (pid 58508)`. Nothing was changed on disk; the
+script aborted on its own because the Desktop never exited.
+
+Both files were correct. The Desktop's adoption wait proves the marker's owner
+with `probePidIdentity`: the pid's kernel creation time must be no later than
+the marker's `<ts>` (+1 s). The script stamped `<ts>` with
+`HERMES_UPDATE_STARTED_AT`, which the Desktop computes *before* spawning the
+script, so `<ts>` can only predate the script's process:
+
+| event | time |
+|---|---|
+| Desktop releases the drain marker, computes `updateStartedAt` | 07:05:06.977Z → `…306` |
+| cmd wrapper + powershell (pid 58508) created | 07:05:07.x |
+| script adopts the lease, claims the marker `58508\n…306` | 07:05:14–15 |
+| `processCreatedAt (…307.x) < startedAt + 1 (…307)` | false → wait times out at 07:05:17.986 |
+
+The two earlier successful runs landed inside the same second (run #2 released
+at :32.069). The same verdict would let a relaunched Desktop treat a live
+updater's marker as dead.
+
+PR #10 makes the marker's `<ts>` an identity token: the script writes its own
+kernel creation time (the very expression the Desktop's probe evaluates), so
+the check is exact for the life of the process and false for any reuse of the
+pid; the Desktop logs what the adoption wait could see when it gives up. The
+remaining wall-clock comparisons in the lease (skew, grace, expiry) are the
+subject of `docs/plans/2026-09-06-001-refactor-monotonic-update-handoff-plan.md`.
+
+PR #9, merged the same night, closed three leftovers of the successful run:
+the update receipt that was never written (now announced at the command
+boundary and checked by the script), the adopted MCP quiesce lease that nothing
+released, and the "You're all set" card over a stale bundle.
