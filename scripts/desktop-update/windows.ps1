@@ -37,8 +37,9 @@
 #
 # Marker: we claim HERMES_HOME\.hermes-update-in-progress with OUR pid as
 # step 0 (the wrapper cmd.exe pid the Desktop saw is useless -- it exits
-# immediately), stamped with OUR claim time (HERMES_UPDATE_STARTED_AT from
-# the Desktop predates our own process and is kept for the log only).
+# immediately), stamped with OUR kernel creation time as the identity token
+# (HERMES_UPDATE_STARTED_AT from the Desktop predates our own process and
+# is kept for the log only).
 # hermes_cli/update_lock.py's ancestry rule lets our
 # `hermes update` child adopt the claim; electron/update-marker.ts parks a
 # relaunched Desktop on it. Cleanup only removes the marker while WE still
@@ -1912,17 +1913,26 @@ try {
         if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestMarker -and -not (Adopt-McpBridgeLease)) {
             throw "could not adopt the authenticated MCP bridge lease"
         }
-        # The marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n" and
-        # <ts> is the CLAIM time of <pid>: readers prove the claim by checking
-        # that the process was created no later than <ts>
-        # (update-marker.ts probePidIdentity, update_lock.py). The Desktop's
+        # The marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
+        # <ts> is an IDENTITY TOKEN, not a clock to compare: readers prove
+        # <pid> by fetching its kernel creation time and requiring it to be
+        # no later than <ts> (update-marker.ts probePidIdentity evaluates
+        # exactly the expression below for the pid it reads). Writing our own
+        # creation time makes that check exact for the life of this process
+        # and false for any later reuse of our pid. The Desktop's
         # HERMES_UPDATE_STARTED_AT is stamped before it spawns us, so it can
-        # only predate our creation; whenever the spawn crossed a one-second
-        # boundary (2026-09-06 07:05:06.977Z release, process born in :07)
-        # the Desktop judged its own updater's claim stale and aborted with
-        # "did not acknowledge the protected handoff". Claim with our clock.
+        # only predate our creation; on 2026-09-06 a spawn across a
+        # one-second boundary (release :06.977Z, process born in :07) made
+        # the Desktop judge its own updater's claim stale and abort with
+        # "did not acknowledge the protected handoff". Wall clock is only
+        # the fallback when the creation time cannot be read.
         $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $startedAt = $epoch
+        try {
+            $startedAt = [int64][DateTimeOffset]::new((Get-Process -Id $PID -ErrorAction Stop).StartTime.ToUniversalTime()).ToUnixTimeSeconds()
+        } catch {
+            $startedAt = 0L
+        }
+        if ($startedAt -le 0 -or $startedAt -gt ($epoch + 5)) { $startedAt = $epoch }
         $desktopStartedAt = 0L
         if (-not [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$desktopStartedAt) -or $desktopStartedAt -le 0) {
             $desktopStartedAt = 0L
@@ -1933,7 +1943,7 @@ try {
         if (-not (Claim-UpdateMarker $script:MarkerBody)) {
             throw "update marker already exists or could not be claimed"
         }
-        Write-HandoffLog "claimed update marker (pid $PID, claim ts $startedAt; desktop hand-off started at $desktopStartedAt)"
+        Write-HandoffLog "claimed update marker (pid $PID, created $startedAt; desktop hand-off started at $desktopStartedAt)"
     } catch {
         $finalCode = 8
         $finalMsg = "Update aborted: could not claim the authenticated update marker. Nothing was changed."

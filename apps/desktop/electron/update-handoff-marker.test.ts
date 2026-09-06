@@ -79,14 +79,16 @@ function assertScriptHandoff(
   assert.equal(preservedResult.status, 0, String(preservedResult.stderr || preservedResult.stdout))
 
   if (claimTime) {
-    // The marker's <ts> is the claimant's own claim time: every reader proves
-    // <pid> by checking the process was created no later than <ts>, and the
-    // Desktop's acquisition time always predates the script's process
-    // (2026-09-06: a spawn across a second boundary made the Desktop judge
-    // its own updater's claim stale and abort the hand-off).
+    // The marker's <ts> is the claimant's own kernel creation time: every
+    // reader proves <pid> by checking the process was created no later than
+    // <ts>, and the Desktop's acquisition time always predates the script's
+    // process (2026-09-06: a spawn across a second boundary made the Desktop
+    // judge its own updater's claim stale and abort the hand-off). The
+    // script was spawned by this test, so its creation time sits between
+    // the spawn and the claim.
     assert.ok(
-      markerStartedAt(preserved.home) >= preservedBefore && markerStartedAt(preserved.home) <= preservedAfter,
-      'the script must stamp the marker with its own claim time, not the Desktop acquisition time'
+      markerStartedAt(preserved.home) >= preservedBefore - 1 && markerStartedAt(preserved.home) <= preservedAfter,
+      'the script must stamp the marker with its own creation time, not the Desktop acquisition time'
     )
   } else {
     assert.equal(markerStartedAt(preserved.home), acquiredAt, 'the script must preserve the Desktop acquisition time')
@@ -120,6 +122,6 @@ test.skipIf(process.platform === 'win32')('POSIX hand-off preserves the Desktop 
   assertScriptHandoff(runPosix, { claimTime: false })
 })
 
-test.skipIf(process.platform !== 'win32')('PowerShell hand-off stamps the marker with its own claim time', () => {
+test.skipIf(process.platform !== 'win32')('PowerShell hand-off stamps the marker with its own creation time', () => {
   assertScriptHandoff(runWindows, { claimTime: true })
 })
