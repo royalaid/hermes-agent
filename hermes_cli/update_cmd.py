@@ -99,6 +99,14 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        # The update receipt is a module-level singleton (#91277). Purging
+        # its module after the pull re-imports it empty, so every later
+        # record_* call and the command-boundary finalize saw "no receipt
+        # open": no receipt was written for any run that pulled commits
+        # (2026-09-05 20:19Z, 2026-09-06 16:31Z: "No update receipt was
+        # recorded for this run (never started)"), while pre-pull refusals
+        # kept theirs. The module has no dependency that can go stale.
+        "hermes_cli.update_receipt",
     }
 )
 

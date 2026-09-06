@@ -134,3 +134,30 @@ def test_stale_symbol_scenario_end_to_end():
         sys.modules.pop(name, None)
         if real is not None:
             sys.modules[name] = real
+
+
+def test_purge_keeps_the_open_update_receipt():
+    """The receipt singleton lives in hermes_cli.update_receipt (#91277).
+
+    Purging that module after the pull re-imported it empty, so every run
+    that pulled commits ended "No update receipt was recorded for this run
+    (never started)" while pre-pull refusals kept theirs (2026-09-05 20:19Z
+    and 2026-09-06 16:31Z field runs). The module must survive the purge
+    with its open receipt intact.
+    """
+    import hermes_cli.update_receipt as ur
+
+    ur._current = None
+    ur.begin_update_receipt()
+    try:
+        assert ur._current is not None
+        update_cmd._purge_stale_hermes_modules()
+
+        import hermes_cli.update_receipt as ur_after
+
+        assert ur_after is ur, "the receipt module was evicted and re-imported"
+        assert ur_after._current is not None, "the open receipt was lost across the purge"
+        ur_after.record_step("after_purge", True)
+        assert ur._current.data["steps"][-1]["name"] == "after_purge"
+    finally:
+        ur._current = None
