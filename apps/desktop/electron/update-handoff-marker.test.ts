@@ -66,13 +66,33 @@ function runWindows(installRoot: string, startedAt?: string) {
   )
 }
 
-function assertScriptHandoff(run: (installRoot: string, startedAt?: string) => ReturnType<typeof spawnSync>) {
+function assertScriptHandoff(
+  run: (installRoot: string, startedAt?: string) => ReturnType<typeof spawnSync>,
+  { claimTime }: { claimTime: boolean }
+) {
   const preserved = sandbox('preserved')
   const acquiredAt = Math.floor(Date.now() / 1000) - 300
+  const preservedBefore = Math.floor(Date.now() / 1000)
   const preservedResult = run(preserved.installRoot, String(acquiredAt))
+  const preservedAfter = Math.floor(Date.now() / 1000)
 
   assert.equal(preservedResult.status, 0, String(preservedResult.stderr || preservedResult.stdout))
-  assert.equal(markerStartedAt(preserved.home), acquiredAt, 'the script must preserve the Desktop acquisition time')
+
+  if (claimTime) {
+    // The marker's <ts> is the claimant's own kernel creation time: every
+    // reader proves <pid> by checking the process was created no later than
+    // <ts>, and the Desktop's acquisition time always predates the script's
+    // process (2026-09-06: a spawn across a second boundary made the Desktop
+    // judge its own updater's claim stale and abort the hand-off). The
+    // script was spawned by this test, so its creation time sits between
+    // the spawn and the claim.
+    assert.ok(
+      markerStartedAt(preserved.home) >= preservedBefore - 1 && markerStartedAt(preserved.home) <= preservedAfter,
+      'the script must stamp the marker with its own creation time, not the Desktop acquisition time'
+    )
+  } else {
+    assert.equal(markerStartedAt(preserved.home), acquiredAt, 'the script must preserve the Desktop acquisition time')
+  }
 
   const refreshed = sandbox('refreshed')
   fs.writeFileSync(path.join(refreshed.home, '.hermes-update-in-progress'), '999999\n1\n')
@@ -99,9 +119,9 @@ function assertScriptHandoff(run: (installRoot: string, startedAt?: string) => R
 }
 
 test.skipIf(process.platform === 'win32')('POSIX hand-off preserves the Desktop marker acquisition time', () => {
-  assertScriptHandoff(runPosix)
+  assertScriptHandoff(runPosix, { claimTime: false })
 })
 
-test.skipIf(process.platform !== 'win32')('PowerShell hand-off preserves the Desktop marker acquisition time', () => {
-  assertScriptHandoff(runWindows)
+test.skipIf(process.platform !== 'win32')('PowerShell hand-off stamps the marker with its own creation time', () => {
+  assertScriptHandoff(runWindows, { claimTime: true })
 })
