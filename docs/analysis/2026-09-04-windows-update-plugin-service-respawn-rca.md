@@ -246,3 +246,18 @@ PR #9, merged the same night, closed three leftovers of the successful run:
 the update receipt that was never written (now announced at the command
 boundary and checked by the script), the adopted MCP quiesce lease that nothing
 released, and the "You're all set" card over a stale bundle.
+
+
+## Run ledger: 2026-09-06 (three consecutive clean runs requested)
+
+Each row is one Update click on the installed Desktop, read from
+`logs/desktop-update-handoff.log` and `logs/desktop.log`. "Handshake" is the
+time from the Desktop releasing the drain marker to it logging `launched repo
+hand-off script`; the adoption window is 10 s.
+
+| # | click (UTC) | Desktop build | preflight | handshake | build | receipt | lease | result |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 07:05 | 6e49bfd6c3 | clean | gave up at 10 s (marker `<ts>` predated the script's process) | — | — | revoked | aborted, nothing changed → PR #10 |
+| 0 | 16:31 | 6e49bfd6c3 (+ #10 script) | clean | 10.05 s (process born the second after the stamp) | 253 s | never started → PR #12 | released | OK, 7 m 50 s |
+| 0 | 18:06 | 3ce114560b | plugin unit `not stopped` (host relaunched by the Desktop; WmiPrvSE ancestor unreadable) | — | — | — | — | refused (force-release budget) → PR #13 |
+| 1 | 18:16 | 3ce114560b (+ #13 in checkout; unit stopped by hand) | clean | 4.7 s | 185 s (up-to-date path, stale bundle) | written | released | OK |
