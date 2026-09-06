@@ -400,3 +400,53 @@ class TestCodeIdentity:
         # returned dicts are copies, not the shared cache
         second["sha"] = "mutated"
         assert get_code_identity()["sha"] == first["sha"]
+
+
+class TestDescribeLastReceipt:
+    """The one line ``hermes update`` prints at its command boundary.
+
+    2026-09-05: three Windows hand-off runs (success, refusal, watchdog
+    kill) left no receipt and nothing said so. The boundary line must name
+    the path when written and the reason when not.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_last(self):
+        ur._last_finalize.update(path=None, error=None, outcome=None)
+        yield
+        ur._last_finalize.update(path=None, error=None, outcome=None)
+
+    def test_never_started(self):
+        assert "never started" in ur.describe_last_receipt()
+
+    def test_still_open(self, receipt_home):
+        ur.begin_update_receipt()
+        assert "still open" in ur.describe_last_receipt()
+
+    def test_written_names_the_path(self, receipt_home):
+        ur.begin_update_receipt()
+        path = ur.finalize_update_receipt("success")
+        assert path is not None
+        line = ur.describe_last_receipt()
+        assert line.startswith("→ Update receipt: ")
+        assert str(path) in line
+
+    def test_write_failure_names_the_error(self, receipt_home, monkeypatch, caplog):
+        ur.begin_update_receipt()
+        blocker = receipt_home / "logs" / "update_receipts"
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_text("not a directory", encoding="utf-8")
+        with caplog.at_level("WARNING", logger="hermes_cli.update_receipt"):
+            assert ur.finalize_update_receipt("success") is None
+        line = ur.describe_last_receipt()
+        assert line.startswith("⚠ Update receipt NOT written: ")
+        assert "Error" in line
+        assert any("Could not write update receipt" in r.message for r in caplog.records)
+        # Exactly-once still holds: the receipt is gone, not retried.
+        assert ur._current is None
+
+    def test_boundary_net_reports_inner_write(self, receipt_home):
+        ur.begin_update_receipt()
+        inner = ur.finalize_update_receipt("partial")
+        assert ur.finalize_pending_update_receipt(0, "completed") is None
+        assert str(inner) in ur.describe_last_receipt()

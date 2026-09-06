@@ -2780,6 +2780,8 @@ export const ru = defineLocale({
     latestBody: 'У вас последняя версия.',
     latestBodyBackend: 'Бэкенд работает на последней версии.',
     allSetTitle: 'Всё готово',
+    rebuildTitle: 'Приложению нужна пересборка',
+    rebuildBody: 'Код обновлён, но запущенное приложение собрано из более старой версии. Обновите сейчас, чтобы пересобрать его.',
     availableTitle: 'Доступно новое обновление',
     availableBody: 'Новая версия Hermes готова к установке.',
     availableTitleBackend: 'Доступно обновление бэкенда',

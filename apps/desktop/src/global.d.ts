@@ -654,6 +654,9 @@ export interface DesktopUpdateStatus {
   commits?: DesktopUpdateCommit[]
   dirty?: boolean
   fetchedAt?: number
+  /** Client only: git is current but the running renderer bundle is stale
+   *  (`hermes desktop --build-needed`). "Update now" runs the rebuild leg. */
+  bundleOutOfSync?: boolean
 }
 
 export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'

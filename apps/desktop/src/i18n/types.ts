@@ -2329,6 +2329,9 @@ export interface Translations {
     latestBody: string
     latestBodyBackend: string
     allSetTitle: string
+    /** Git-current checkout under a stale renderer bundle: the update is a rebuild. */
+    rebuildTitle: string
+    rebuildBody: string
     availableTitle: string
     availableBody: string
     availableTitleBackend: string
