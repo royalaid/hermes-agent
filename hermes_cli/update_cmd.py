@@ -422,18 +422,68 @@ def _log_only_write(text: str) -> None:
         log_file.flush()
 
 
-def _run_logged_subprocess(cmd, *, cwd=None, env=None):
-    """Run ``cmd`` with combined output captured into update.log only; returns the
-    ``CompletedProcess`` so the caller can surface the output on failure."""
-    # Check if there are updates. On shallow checkouts `rev-list --count` walks the truncated graph and can
-    # report the entire remote ancestry (e.g. "Found 9980 new commit(s)" on a depth-1 install — #53479). The
-    # zero/nonzero gate is still sound (HEAD == origin/<branch> counts 0), so keep it, but treat the shallow
-    # NUMBER as unknown and recover the real one via the GitHub compare API when possible.
-    result = subprocess.run(
-        cmd, cwd=cwd, env=env, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace")
-    _log_only_write(result.stdout or "")
-    return result
+def _update_log_append(text: str) -> None:
+    """Append ``text`` to update.log even when the stdout mirror is disabled."""
+    if not text:
+        return
+    stream = _m().sys.stdout
+    if getattr(stream, "_log", None) is not None:
+        _log_only_write(text)
+        return
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        log_path = get_hermes_home() / "logs" / "update.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+            log_file.write(text if text.endswith("\n") else text + "\n")
+    except Exception:
+        pass
+
+
+_LOGGED_SUBPROCESS_PROGRESS_SECONDS = 30.0
+
+
+def _run_logged_subprocess(
+    cmd,
+    *,
+    cwd=None,
+    env=None,
+    label: str = "desktop build",
+    progress_every: float = _LOGGED_SUBPROCESS_PROGRESS_SECONDS,
+):
+    """Stream combined child output to update.log and return it when complete."""
+    started = _time.monotonic()
+    last_progress = started
+    lines: list[str] = []
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            _update_log_append(line)
+            now = _time.monotonic()
+            if progress_every > 0 and now - last_progress >= progress_every:
+                last_progress = now
+                print(
+                    f"  … {label} running: {int(now - started)}s, "
+                    f"{len(lines)} lines captured (full output: logs/update.log)",
+                    flush=True,
+                )
+    finally:
+        proc.stdout.close()
+        returncode = proc.wait()
+    return subprocess.CompletedProcess(cmd, returncode, stdout="".join(lines), stderr=None)
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
