@@ -268,6 +268,7 @@ import {
   handOffMcpBridgeLeaseToStagedUpdater,
   markMcpBridgeQuiesceLeaseForHandoff,
   type McpBridgeQuiesceLease,
+  readMcpBridgeQuiesceLease,
   revokeMcpBridgeQuiesceLease,
   waitForMcpBridgeQuiesceLeaseAdoption
 } from './mcp-bridge-quiesce'
@@ -478,6 +479,7 @@ import {
   getVenvSitePackagesEntries,
   resolveVenvHermesCommand
 } from './windows-hermes-path'
+import { getCachedWindowsProcessCreatedAt } from './windows-process-identity'
 import { terminateWindowsHolderWithinDeadline } from './windows-process-terminate'
 import {
   connectWindowsRemote,
@@ -2363,6 +2365,55 @@ function relaunchIntoSwappedBundle() {
   void exitAfterBackendShutdown(0)
 
   return true
+}
+
+// One line naming what the hand-off adoption wait could see when it gave up:
+// the lease on disk (owner, claim time), the update marker (owner, claim
+// time, liveness verdict) and each owner's process creation time next to the
+// timestamp it is judged against. 2026-09-06: the wait timed out with both
+// files correctly written by the script, because the marker carried the
+// Desktop's pre-spawn timestamp and the script's process was born in the
+// next second; nothing in the log said which leg failed.
+function describeHandoffAdoptionState(expected: McpBridgeQuiesceLease | null, updateStartedAt: number): string {
+  const parts: string[] = [`desktopStartedAt=${updateStartedAt}`]
+
+  const createdAt = (pid: number) => {
+    try {
+      const value = getCachedWindowsProcessCreatedAt(pid)
+
+      return value === undefined ? 'unknown' : value === null ? 'gone' : String(value)
+    } catch {
+      return 'probe-failed'
+    }
+  }
+
+  try {
+    const lease = readMcpBridgeQuiesceLease(HERMES_HOME)
+
+    parts.push(
+      lease
+        ? `lease owner=${lease.ownerPid} createdAt=${lease.createdAt} id=${lease.leaseId === expected?.leaseId ? 'expected' : 'OTHER'} processCreatedAt=${createdAt(lease.ownerPid)}`
+        : 'lease=absent'
+    )
+  } catch (error: any) {
+    parts.push(`lease=unreadable (${error?.message || error})`)
+  }
+
+  try {
+    const marker = readLiveUpdateMarker(HERMES_HOME)
+
+    parts.push(
+      marker?.kind === 'live'
+        ? `marker owner=${marker.pid} startedAt=${marker.startedAt} processCreatedAt=${createdAt(marker.pid)}`
+        : marker
+          ? `marker=${marker.kind} (${marker.reason})`
+          : 'marker=absent-or-stale'
+    )
+  } catch (error: any) {
+    parts.push(`marker=unreadable (${error?.message || error})`)
+  }
+
+  return parts.join('; ')
 }
 
 function readProvenUpdateOwnerClaim(): { pid: number; startedAt: number } | null {
@@ -4734,6 +4785,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     })
 
     if (!adoptedLease) {
+      rememberLog(`[updates] hand-off adoption wait gave up; ${describeHandoffAdoptionState(bridgeLease, updateStartedAt)}`)
       updateHandoffRevocationPending = true
       const revocation = revokeMcpBridgeQuiesceLease(HERMES_HOME, bridgeLease)
 

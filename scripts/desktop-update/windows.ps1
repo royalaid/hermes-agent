@@ -37,7 +37,8 @@
 #
 # Marker: we claim HERMES_HOME\.hermes-update-in-progress with OUR pid as
 # step 0 (the wrapper cmd.exe pid the Desktop saw is useless -- it exits
-# immediately), retaining HERMES_UPDATE_STARTED_AT from the Desktop hand-off.
+# immediately), stamped with OUR claim time (HERMES_UPDATE_STARTED_AT from
+# the Desktop predates our own process and is kept for the log only).
 # hermes_cli/update_lock.py's ancestry rule lets our
 # `hermes update` child adopt the claim; electron/update-marker.ts parks a
 # relaunched Desktop on it. Cleanup only removes the marker while WE still
@@ -1911,20 +1912,28 @@ try {
         if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestMarker -and -not (Adopt-McpBridgeLease)) {
             throw "could not adopt the authenticated MCP bridge lease"
         }
+        # The marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n" and
+        # <ts> is the CLAIM time of <pid>: readers prove the claim by checking
+        # that the process was created no later than <ts>
+        # (update-marker.ts probePidIdentity, update_lock.py). The Desktop's
+        # HERMES_UPDATE_STARTED_AT is stamped before it spawns us, so it can
+        # only predate our creation; whenever the spawn crossed a one-second
+        # boundary (2026-09-06 07:05:06.977Z release, process born in :07)
+        # the Desktop judged its own updater's claim stale and aborted with
+        # "did not acknowledge the protected handoff". Claim with our clock.
         $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $startedAt = 0L
-        $hasStartedAt = [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$startedAt)
-        if (-not $hasStartedAt -or $startedAt -gt $epoch -or ($epoch - $startedAt) -gt 1200) {
-            $startedAt = $epoch
+        $startedAt = $epoch
+        $desktopStartedAt = 0L
+        if (-not [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$desktopStartedAt) -or $desktopStartedAt -le 0) {
+            $desktopStartedAt = 0L
         }
-        # The marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
         # Claim with an atomic create-only operation; never overwrite a
         # concurrent updater's marker.
         $script:MarkerBody = "$PID`n$startedAt`n"
         if (-not (Claim-UpdateMarker $script:MarkerBody)) {
             throw "update marker already exists or could not be claimed"
         }
-        Write-HandoffLog "claimed update marker (pid $PID)"
+        Write-HandoffLog "claimed update marker (pid $PID, claim ts $startedAt; desktop hand-off started at $desktopStartedAt)"
     } catch {
         $finalCode = 8
         $finalMsg = "Update aborted: could not claim the authenticated update marker. Nothing was changed."
