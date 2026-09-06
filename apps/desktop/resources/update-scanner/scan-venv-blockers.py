@@ -1309,7 +1309,18 @@ def _live_desktop_plugin_service_process(
     root: Path,
     pid: int,
 ) -> tuple[Any, dict[str, Any], Any | None] | None:
-    """Re-prove one exact plugin service and its visible host before killing."""
+    """Re-prove one exact plugin service and its visible host before killing.
+
+    Ancestors are collected nearest-first only to place the wrapper for role
+    classification; the supervisor itself is proven separately by
+    ``_desktop_plugin_service_host``. An ancestor that cannot be opened is
+    skipped, exactly as the scan path does: after an update the Desktop
+    relaunches the plugin host itself, so the chain reads wscript ->
+    Hermes.exe -> WmiPrvSE.exe (session 0, OpenProcess denied). Treating
+    that ancestor as "unit not provable" made every unit stop report
+    ``not stopped`` and the update refuse with the force-release dialog
+    (2026-09-06 18:06Z), on every update that followed a successful one.
+    """
     snapshot = _snapshot_for_pid(pid)
     if snapshot is None:
         return None
@@ -1321,8 +1332,10 @@ def _live_desktop_plugin_service_process(
     for parent_process in parents:
         try:
             parent = _snapshot_for_pid(int(parent_process.pid))
-        except Exception:
+        except _ProcessGenerationChanged:
             return None
+        except Exception:
+            continue
         if parent is not None:
             snapshots[parent.pid] = parent
     wrappers = {
