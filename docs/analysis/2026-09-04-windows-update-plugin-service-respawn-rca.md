@@ -261,3 +261,4 @@ hand-off script`; the adoption window is 10 s.
 | 0 | 16:31 | 6e49bfd6c3 (+ #10 script) | clean | 10.05 s (process born the second after the stamp) | 253 s | never started → PR #12 | released | OK, 7 m 50 s |
 | 0 | 18:06 | 3ce114560b | plugin unit `not stopped` (host relaunched by the Desktop; WmiPrvSE ancestor unreadable) | — | — | — | — | refused (force-release budget) → PR #13 |
 | 1 | 18:16 | 3ce114560b (+ #13 in checkout; unit stopped by hand) | clean | 4.7 s | 185 s (up-to-date path, stale bundle) | written | released | OK |
+| 2 | 18:26 | 755132e7a8 | clean; hand-launched plugin unit stopped in one call | 3.0 s | none needed (docs-only pull) | written (pull path) | released | OK; ledger relaunched the tracker host under the Desktop |
