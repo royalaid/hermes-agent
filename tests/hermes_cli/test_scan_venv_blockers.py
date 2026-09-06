@@ -2730,3 +2730,94 @@ def test_native_scanner_preserves_identity_redacts_and_refuses_stale_identity(
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=5)
+
+
+def test_live_plugin_service_proof_skips_inaccessible_ancestor_above_host(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """2026-09-06 18:06Z: after an update the Desktop relaunches the plugin
+    host itself, so the wrapper's ancestry reads wscript -> Hermes.exe ->
+    WmiPrvSE.exe (session 0, OpenProcess denied). The terminate re-proof
+    aborted on that ancestor, every unit stop reported ``not stopped`` and
+    the update refused with the force-release dialog. Ancestors above the
+    supervisor are irrelevant to the unit's identity: skip what cannot be
+    opened, as the scan path already does, and keep the host proof separate.
+    """
+    root = tmp_path / "hermes-agent"
+    venv = root / "venv"
+    script = tmp_path / "desktop-plugins" / "llm-usage-tracker" / "service.py"
+    host = types.SimpleNamespace(pid=10)  # wscript.exe service-host.vbs
+    desktop = types.SimpleNamespace(pid=9)  # Hermes.exe that relaunched it
+    protected = types.SimpleNamespace(pid=8)  # WmiPrvSE.exe, session 0
+
+    wrapper = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), str(script)),
+        created_at=100.0,
+        process=_FakeProcess(parents=[host, desktop, protected]),
+    )
+    managed_python = root / ".hermes-runtime" / "python" / "generation-1" / "python.exe"
+    worker = _snapshot(
+        pid=30,
+        ppid=20,
+        exe=managed_python,
+        argv=(str(managed_python), str(script)),
+        created_at=101.0,
+        process=_FakeProcess(
+            parents=[types.SimpleNamespace(pid=20), host, desktop, protected]
+        ),
+    )
+
+    class AccessDenied(Exception):
+        pass
+
+    def snapshot_for_pid(pid, **_kwargs):
+        pid = int(pid)
+        if pid == 20:
+            return wrapper
+        if pid == 30:
+            return worker
+        if pid == 8:
+            raise AccessDenied("[WinError 5] Access is denied: '(originated from OpenProcess)'")
+        return None
+
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", snapshot_for_pid)
+    monkeypatch.setattr(scanner, "_desktop_plugin_service_host", lambda _wrapper, _script: host)
+
+    for pid, role in ((20, "desktop_plugin_wrapper"), (30, "desktop_plugin_worker")):
+        live = scanner._live_desktop_plugin_service_process(root, pid)
+        assert live is not None, f"pid {pid}: an unreadable ancestor above the host voided the proof"
+        _process, record, proven_host = live
+        assert record["role"] == role
+        assert record["action"] == "terminate_desktop_plugin_service"
+        assert proven_host is host
+
+
+def test_live_plugin_service_proof_still_refuses_generation_change(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The relaxation above must not swallow a real identity failure."""
+    root = tmp_path / "hermes-agent"
+    venv = root / "venv"
+    script = tmp_path / "desktop-plugins" / "llm-usage-tracker" / "service.py"
+    host = types.SimpleNamespace(pid=10)
+    wrapper = _snapshot(
+        pid=20,
+        ppid=10,
+        exe=venv / "Scripts" / "python.exe",
+        argv=(str(venv / "Scripts" / "python.exe"), str(script)),
+        created_at=100.0,
+        process=_FakeProcess(parents=[host]),
+    )
+
+    def snapshot_for_pid(pid, **_kwargs):
+        if int(pid) == 20:
+            return wrapper
+        raise scanner._ProcessGenerationChanged("pid reused during identity refresh")
+
+    monkeypatch.setattr(scanner, "_snapshot_for_pid", snapshot_for_pid)
+    monkeypatch.setattr(scanner, "_desktop_plugin_service_host", lambda _wrapper, _script: host)
+
+    assert scanner._live_desktop_plugin_service_process(root, 20) is None
