@@ -88,6 +88,9 @@ $TempDir = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $HermesHome = if ($InstallRoot) { Split-Path -Parent $InstallRoot } else { $TempDir }
 $MarkerPath = Join-Path $HermesHome ".hermes-update-in-progress"
 $BridgeLeasePath = Join-Path $HermesHome ".hermes-venv-quiesce"
+# Byte-for-byte body of the lease THIS process adopted; $null until then.
+# Remove-BridgeLeaseIfOwned releases exactly that body and nothing newer.
+$script:BridgeLeaseBody = $null
 $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
 $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
@@ -649,7 +652,11 @@ function Adopt-McpBridgeLease {
         }
 
         $check = [System.IO.File]::ReadAllText($BridgeLeasePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-        return "$($check.lease_id)" -eq $BridgeLeaseId -and [int]$check.owner_pid -eq [int]$PID
+        if ("$($check.lease_id)" -eq $BridgeLeaseId -and [int]$check.owner_pid -eq [int]$PID) {
+            $script:BridgeLeaseBody = $updatedRaw
+            return $true
+        }
+        return $false
     } catch {
         try { if ($temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } } catch {}
         return $false
@@ -714,6 +721,62 @@ function Claim-UpdateMarker([string]$Body) {
     } catch {
         if ($stream) { try { $stream.Dispose() } catch {} }
         return $false
+    }
+}
+
+function Remove-BridgeLeaseIfOwned {
+    # The adopted MCP quiesce lease used to outlive the hand-off: nothing
+    # released it, so every successful update left .hermes-venv-quiesce
+    # naming a dead pid until its 20-minute expiry (2026-09-05 13:19 run).
+    # Release it the way the marker is released: move, compare, delete only
+    # the exact body this process adopted, put anything else back. A crash
+    # between the move and the delete leaves a `.cas-release-*` artifact
+    # the Python gate retires itself once the owner pid is dead.
+    if ($NoMarkerCleanup) { return }
+    $tombstone = $null
+    try {
+        if (-not $script:BridgeLeaseBody -or -not (Test-Path -LiteralPath $BridgeLeasePath -PathType Leaf)) { return }
+        $tombstone = "$BridgeLeasePath.cas-release-$PID-$([Guid]::NewGuid().ToString('N'))"
+        [System.IO.File]::Move($BridgeLeasePath, $tombstone)
+        $raw = [System.IO.File]::ReadAllText($tombstone, [System.Text.Encoding]::UTF8)
+        if ($raw -eq $script:BridgeLeaseBody) {
+            [System.IO.File]::Delete($tombstone)
+            Write-HandoffLog "released MCP bridge lease (exact adopted body)"
+        } elseif (-not (Test-Path -LiteralPath $BridgeLeasePath)) {
+            [System.IO.File]::Move($tombstone, $BridgeLeasePath)
+            Write-HandoffLog "leaving MCP bridge lease: it changed since adoption"
+        } else {
+            Write-HandoffLog "leaving MCP bridge lease: a newer lease won cleanup"
+        }
+    } catch {
+        try {
+            if ($tombstone -and (Test-Path -LiteralPath $tombstone) -and -not (Test-Path -LiteralPath $BridgeLeasePath)) {
+                [System.IO.File]::Move($tombstone, $BridgeLeasePath)
+            }
+        } catch {}
+        Write-HandoffLog "MCP bridge lease release failed: $($_.Exception.Message)"
+    }
+}
+
+function Write-UpdateReceiptState([DateTime]$SinceUtc) {
+    # `hermes update` finalizes logs\update_receipts\latest.json at its
+    # command boundary. A run that leaves no receipt has lost its own
+    # post-mortem (every 2026-09-05 run did), so record which case this was
+    # in the log that survives the console.
+    try {
+        $latest = Join-Path (Join-Path $LogDir "update_receipts") "latest.json"
+        if (-not (Test-Path -LiteralPath $latest -PathType Leaf)) {
+            Write-HandoffLog "update receipt: none on disk ($latest)"
+            return
+        }
+        $fi = Get-Item -LiteralPath $latest
+        if ($fi.LastWriteTimeUtc -ge $SinceUtc.AddSeconds(-2)) {
+            Write-HandoffLog ("update receipt: written {0} ({1} bytes)" -f $latest, $fi.Length)
+        } else {
+            Write-HandoffLog ("update receipt: NOT written by this run; latest.json dates from {0:u}" -f $fi.LastWriteTimeUtc)
+        }
+    } catch {
+        Write-HandoffLog "update receipt: state unavailable ($($_.Exception.Message))"
     }
 }
 
@@ -1985,6 +2048,7 @@ try {
     }
     Write-HandoffLog ("running: python " + ($updateArgs -join " "))
     Publish-UiProgress "Updating code and dependencies"
+    $updateStepStartedUtc = [DateTime]::UtcNow
     $res = Invoke-HermesStep $pythonExe $updateArgs "update"
     Write-HandoffLog "hermes update exit code: $($res.Code)"
 
@@ -2011,6 +2075,7 @@ try {
         $res = Invoke-HermesStep $pythonExe $updateArgs "update"
         Write-HandoffLog "retry exit code: $($res.Code)"
     }
+    Write-UpdateReceiptState $updateStepStartedUtc
 
     # -- 4. Truthful completion: don't trust exit 0 -------------------------
     # `hermes update` treats a Desktop GUI build failure as NON-fatal (prints
@@ -2065,6 +2130,7 @@ try {
     } else {
         Write-Result ($finalCode -eq 0) $finalCode $finalMsg $shortcutRegistrationNeedsManualRepair
         Remove-MarkerIfOwned
+        Remove-BridgeLeaseIfOwned
         if ($finalCode -ne 0) {
             Show-ErrorFinale $finalMsg
             Close-ProgressWindow

@@ -2371,6 +2371,8 @@ export const ja = defineLocale({
     latestBody: '最新バージョンを実行しています。',
     latestBodyBackend: 'バックエンドは最新バージョンを実行しています。',
     allSetTitle: '準備完了',
+    rebuildTitle: 'デスクトップアプリの再ビルドが必要です',
+    rebuildBody: 'コードは最新ですが、実行中のアプリは古いバージョンからビルドされています。今すぐ更新して再ビルドしてください。',
     availableTitle: '新しい更新が利用可能',
     availableBody: '新しいバージョンの Hermes をインストールする準備ができています。',
     availableTitleBackend: 'バックエンドの更新があります',

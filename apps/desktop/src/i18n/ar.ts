@@ -2029,6 +2029,8 @@ export const ar = defineLocale({
     latestBody: 'أنت تستخدم أحدث إصدار.',
     latestBodyBackend: 'الواجهة الخلفية تعمل بأحدث إصدار.',
     allSetTitle: 'كل شيء جاهز',
+    rebuildTitle: 'تطبيق سطح المكتب يحتاج إلى إعادة بناء',
+    rebuildBody: 'الشيفرة محدّثة، لكن التطبيق الذي تشغّله بُني من إصدار أقدم. حدّث الآن لإعادة بنائه.',
     availableTitle: 'يتوفر تحديث جديد',
     availableBody: 'إصدار جديد من Hermes جاهز للتثبيت.',
     availableTitleBackend: 'يتوفر تحديث للواجهة الخلفية',

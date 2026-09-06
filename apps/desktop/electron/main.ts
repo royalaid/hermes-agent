@@ -3198,6 +3198,14 @@ async function checkUpdates() {
   branch = await resolveHealedBranch(updateRoot, branch)
   const originUrl = await getOriginUrl(updateRoot)
 
+  // A checkout that is git-current can still run a stale bundle (2026-09-05:
+  // "You're all set" over an app.asar from the previous build, right after
+  // the update that should have replaced it). That is an update too: the
+  // hand-off's up-to-date path rebuilds through _rebuild_desktop_after_update.
+  const bundleOutOfSync = await detectRendererSkew()
+    .then(skew => skew.outOfSync)
+    .catch(() => false)
+
   if (isOfficialSshRemote(originUrl)) {
     const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
@@ -3241,7 +3249,8 @@ async function checkUpdates() {
       branch,
       currentBranch,
       behind: upToDate ? 0 : sshBehind,
-      updateAvailable: !upToDate,
+      updateAvailable: !upToDate || bundleOutOfSync,
+      bundleOutOfSync,
       currentSha,
       targetSha,
       commits: [],
@@ -3320,7 +3329,8 @@ async function checkUpdates() {
     branch,
     currentBranch,
     behind,
-    updateAvailable: behind === null || behind > 0,
+    updateAvailable: behind === null || behind > 0 || bundleOutOfSync,
+    bundleOutOfSync,
     currentSha,
     targetSha,
     commits,

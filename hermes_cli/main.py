@@ -9603,6 +9603,21 @@ def _windows_running_hermes_launcher_locked() -> bool:
 _UPDATE_REEXEC_ENV = "HERMES_UPDATE_REEXEC"
 
 
+def _announce_update_receipt() -> None:
+    """Print where this run's update receipt went (or why it did not).
+
+    Runs after the command-boundary finalize so the surviving console /
+    hand-off log carries the receipt path, or the reason there is none.
+    Never raises.
+    """
+    try:
+        from hermes_cli.update_receipt import describe_last_receipt
+
+        print(describe_last_receipt())
+    except Exception:
+        pass
+
+
 def _reexec_dependency_sync_off_windows_shim() -> bool:
     """Hand the dependency sync to the venv interpreter, off the console shim.
 
@@ -11159,6 +11174,7 @@ def cmd_update(args):
             finalize_pending_update_receipt(_code, f"sys.exit({_code})")
         except Exception:
             pass
+        _announce_update_receipt()
         _update_handoff_exit_code = (
             _update_exit.code if isinstance(_update_exit.code, int) else 0
         )
@@ -11180,6 +11196,7 @@ def cmd_update(args):
             finalize_pending_update_receipt(0, "completed at command boundary")
         except Exception:
             pass
+        _announce_update_receipt()
         _update_handoff_exit_code = 0
     finally:
         _update_lock.release()

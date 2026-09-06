@@ -2290,6 +2290,8 @@ export const zhHant = defineLocale({
     latestBody: '您正在執行最新版本。',
     latestBodyBackend: '後端正在執行最新版本。',
     allSetTitle: '已是最新版本',
+    rebuildTitle: '桌面應用程式需要重新建置',
+    rebuildBody: '程式碼已是最新，但目前執行的應用程式是由舊版本建置的。立即更新以重新建置。',
     availableTitle: '有可用更新',
     availableBody: '新版 Hermes 已可安裝。',
     availableTitleBackend: '後端有可用更新',

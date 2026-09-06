@@ -2912,6 +2912,8 @@ export const zh: Translations = {
     latestBody: '你正在运行最新版本。',
     latestBodyBackend: '后端正在运行最新版本。',
     allSetTitle: '已是最新',
+    rebuildTitle: '桌面应用需要重新构建',
+    rebuildBody: '代码已是最新，但当前运行的应用是由旧版本构建的。立即更新以重新构建。',
     availableTitle: '有可用更新',
     availableBody: '新版 Hermes 已可安装。',
     availableTitleBackend: '后端有可用更新',

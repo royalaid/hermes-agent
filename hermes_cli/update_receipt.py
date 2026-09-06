@@ -48,6 +48,14 @@ _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
 # any depth without threading a handle through every helper.
 _current: Optional["UpdateReceipt"] = None
 
+# What the most recent finalize in this process did. The receipt is the
+# post-mortem record, so the case where it was NOT written has to be visible
+# somewhere other than a debug log: every Windows hand-off run of 2026-09-05
+# (one success, one refusal, one watchdog kill) ended with no receipt on disk
+# and nothing in any surviving log saying so. ``describe_last_receipt`` turns
+# this into the one line ``cmd_update`` prints at its command boundary.
+_last_finalize: dict[str, Any] = {"path": None, "error": None, "outcome": None}
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -247,10 +255,36 @@ def finalize_update_receipt(
         except OSError:
             pass
         _prune_old_receipts(directory)
+        _last_finalize.update(path=path, error=None, outcome=outcome)
         return path
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Could not write update receipt: %s", exc)
+        logger.warning("Could not write update receipt: %s", exc)
+        _last_finalize.update(
+            path=None, error=f"{type(exc).__name__}: {exc}", outcome=outcome
+        )
         return None
+
+
+def describe_last_receipt() -> str:
+    """One line for the command boundary: where the receipt went, or why not.
+
+    Never raises. Distinguishes the four end states a run can leave behind:
+    written (path), write failed (exception text), still open (no finalize
+    ever ran, which the boundary net should make impossible) and never
+    started (``begin_update_receipt`` was not reached or failed).
+    """
+    try:
+        path = _last_finalize.get("path")
+        error = _last_finalize.get("error")
+        if path is not None:
+            return f"→ Update receipt: {path}"
+        if error:
+            return f"⚠ Update receipt NOT written: {error}"
+        if _current is not None:
+            return "⚠ Update receipt still open at the command boundary (never finalized)"
+        return "⚠ No update receipt was recorded for this run (never started)"
+    except Exception:  # pragma: no cover - defensive
+        return "⚠ Update receipt state unavailable"
 
 
 def finalize_pending_update_receipt(
