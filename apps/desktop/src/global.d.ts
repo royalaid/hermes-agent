@@ -700,8 +700,6 @@ export interface DesktopUpdateCommit {
 export interface DesktopUpdateStatus {
   supported: boolean
   updateAvailable?: boolean
-  /** The running desktop bundle must be rebuilt from the installed checkout. */
-  bundleOutOfSync?: boolean
   branch?: string
   currentBranch?: string
   reason?: string
@@ -718,6 +716,9 @@ export interface DesktopUpdateStatus {
   commits?: DesktopUpdateCommit[]
   dirty?: boolean
   fetchedAt?: number
+  /** Client only: git is current but the running renderer bundle is stale
+   *  (`hermes desktop --build-needed`). "Update now" runs the rebuild leg. */
+  bundleOutOfSync?: boolean
 }
 
 export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'
@@ -733,10 +734,20 @@ export interface DesktopUpdateBlocker {
   createTime?: number
 }
 
+export interface DesktopUpdateElevationHolder {
+  pid: number
+  name: string
+  cmdline?: string
+  createdAt?: number
+  resource?: string
+}
+
 export interface DesktopUpdateApplyOptions {
   dirtyStrategy?: DesktopUpdateDirtyStrategy
   /** User confirmed that Desktop may stop freshly re-scanned safe local preview servers. */
   stopSafeBlockers?: boolean
+  /** User approved the authenticated Administrator force-release retry. */
+  forceUpdateElevated?: boolean
 }
 
 export interface DesktopUpdateApplyResult {
@@ -745,6 +756,8 @@ export interface DesktopUpdateApplyResult {
   error?: string
   message?: string
   blockers?: DesktopUpdateBlocker[]
+  /** Exact install holders that survived the non-elevated release pass. */
+  elevationHolders?: DesktopUpdateElevationHolder[]
   /** True when no staged updater exists (CLI install) and the user should run
    *  `hermes update` themselves. `command` is the exact line to run. */
   manual?: boolean
