@@ -34,7 +34,7 @@ Do not count these attempts, or the historical run ledger for the older updater,
 - Todo hydration and compression tests: 22 passed after stamping trusted snapshots at the extracted database-read boundary.
 - TUI queue, orphan-race, and related server checks: 67 passed after removing a history-to-registry lock inversion and adopting queued prompts from dead transports.
 - All merge and patch assertions match the final working tree. The fork-refresh tests passed within the initial 193-test integration run; failures in that run were isolated to goal-state tests and the subsequently corrected delivery helper.
-- Native scanner and marker source files are unchanged from the tested canonical updater. The fork additionally retains its managed Windows shortcut refresh.
+- Native scanner and marker source files match the canonical updater PR, including its CI follow-up. The fork additionally retains its managed Windows shortcut refresh.
 
 ## Cron handoff
 
@@ -42,4 +42,12 @@ The repository registry now describes the retained modules and canonical updater
 
 ## Status
 
-Rebase completed onto upstream `dec1e87833`. Canonical updater merge: `ea1ae5d8b8`. The [provenance file](2026-09-06-fork-integration-provenance.json) records all 189 captured commits and the four canonical updater commits. Local `fork-integration` and `main` are reconciled to the integration containing this record. Their prior tips remain under the `safety/*-20260906` refs. Findings are copied beside the deployed cron job and linked from its notepad. The deployed executable registry must be synchronized when this integration is published. Remote publication and live updater cutover remain pending.
+Rebase completed onto upstream `dec1e87833`. Canonical updater merge: `ea1ae5d8b8`. The [provenance file](2026-09-06-fork-integration-provenance.json) records all 189 captured commits and the four canonical updater commits. Local `fork-integration` and `main` are reconciled to the integration containing this record. Their prior tips remain under the `safety/*-20260906` refs. Findings are copied beside the deployed cron job and linked from its notepad. The deployed executable registry must be synchronized when this integration is published.
+
+The canonical updater feature branch is published at `034aa2adec8097bff77fbdf6dd8a471b59faf041` as upstream [draft PR #104687](https://github.com/NousResearch/hermes-agent/pull/104687). Publication of fork `main` and `fork-integration`, and live updater cutover, remain pending two complete updater runs in a disposable Windows environment and a pushed known-good rollback reference. The PR remains a draft while that proof is outstanding.
+
+The first upstream CI run exposed seven failing updater tests. Follow-up commit `034aa2adec` restores lazy process reads in both scanner copies, uses the canonical venv-layout helper and gateway lifecycle matcher, and reclaims impossible POSIX PIDs instead of treating them as unknown live owners. The six affected suites passed 227 tests on Windows through `scripts/run_tests.sh`; Ruff passed. The exact follow-up commit is retained in integration merge `453e075fb6`.
+
+Upstream CI completed for `034aa2adec`: **25 checks passed; 12 skipped or neutral; none failed or pending**. Python, Windows, macOS, JS/TypeScript, Nix, both Docker builds, and the aggregate required-check gate passed. [Every check and its job URL](2026-09-06-updater-pr-ci.json) is recorded separately. Desktop E2E was skipped and does not count toward the two-run cutover requirement.
+
+The updated maintenance registry passed its 29 tests and all 41 committed-tree assertions.
