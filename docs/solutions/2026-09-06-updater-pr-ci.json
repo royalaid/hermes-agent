@@ -1,0 +1,231 @@
+{
+  "repository": "NousResearch/hermes-agent",
+  "pull_request": 104687,
+  "url": "https://github.com/NousResearch/hermes-agent/pull/104687",
+  "head": "034aa2adec8097bff77fbdf6dd8a471b59faf041",
+  "observed_at_utc": "2026-09-07T02:15:40.1134902Z",
+  "checks": [
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101601094368",
+      "name": "CI timing report",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101601080115",
+      "name": "All required checks pass",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075355969/job/101600770059",
+      "name": "merge",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075355969/job/101600770064",
+      "name": "publish",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600562160",
+      "name": "Review label gate",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600541707",
+      "name": "Supply-chain scan / Aggregate review statuses",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600384692",
+      "name": "OSV scan / Emit review status",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/runs/101600354724",
+      "name": "osv-scanner",
+      "state": "NEUTRAL"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303997",
+      "name": "OS-specific tests / macOS-only tests",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600304000",
+      "name": "Python tests / Run tests",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303502",
+      "name": "Deny unrelated histories / check-common-ancestor",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600304112",
+      "name": "Python tests / e2e",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075355969/job/101600305609",
+      "name": "build (arm64, ubuntu-latest-32-arm-core, linux/arm64, type=gha,scope=docker-arm64, type=gha,mode=...",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303998",
+      "name": "OS-specific tests / Windows-only tests",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075355969/job/101600305611",
+      "name": "build (amd64, ubuntu-latest-32-core, linux/amd64, type=gha,scope=docker-amd64, type=gha,mode=max,...",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303899",
+      "name": "Python lints / ruff enforcement (blocking)",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303889",
+      "name": "Python lints / Windows footguns (blocking)",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303639",
+      "name": "Supply-chain scan / Scan PR for critical supply chain risks",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303415",
+      "name": "Check no committed infographics / check-no-committed-infographics",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303453",
+      "name": "Check contributors / check-attribution",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303557",
+      "name": "Check no case-colliding filenames / check-case-collisions",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303572",
+      "name": "Profile artifact check / Reject profile archives",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303930",
+      "name": "Python lints / ruff + ty diff",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303479",
+      "name": "JS & TS checks / JS & TS checks",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075355889/job/101600301416",
+      "name": "nix flake check",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600304313",
+      "name": "Installer tests",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600304165",
+      "name": "package-lock.json diff",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600304027",
+      "name": "Rust tests",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600304470",
+      "name": "Supply-chain scan / Check PyPI dependency upper bounds",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600304303",
+      "name": "Docs Site",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303455",
+      "name": "Check uv.lock",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303674",
+      "name": "Lint Docker scripts",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "skipping",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600303638",
+      "name": "Desktop E2E",
+      "state": "SKIPPED"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600270913",
+      "name": "OSV scan / Scan lockfiles / osv-scan",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075356390/job/101600270780",
+      "name": "Detect affected areas",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075355889/job/101600269259",
+      "name": "Detect affected areas",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/NousResearch/hermes-agent/actions/runs/34075355969/job/101600269238",
+      "name": "Detect affected areas",
+      "state": "SUCCESS"
+    }
+  ]
+}
