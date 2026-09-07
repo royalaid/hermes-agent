@@ -28,6 +28,32 @@ import type { ForceReleaseHolder, ForceReleaseTerminateResult } from './windows-
 
 const execFileAsync = promisify(execFile)
 
+// A Job handle does not signal when its last process exits. Query accounting
+// under the same deadline to prove that termination drained every member.
+const JOB_DRAIN_NATIVE = String.raw`
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobAccounting {
+        public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JobAccounting info, uint length, IntPtr returnLength);
+    private static int WaitForJobEmpty(IntPtr job, int waitMs) {
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        while (true) {
+            JobAccounting info;
+            if (!QueryInformationJobObject(job, 1, out info, (uint)Marshal.SizeOf(typeof(JobAccounting)), IntPtr.Zero)) {
+                int error = Marshal.GetLastWin32Error();
+                return error == 0 ? -1 : -error;
+            }
+            if (info.ActiveProcesses == 0) return 0;
+            long remaining = Math.Max(0, waitMs) - timer.ElapsedMilliseconds;
+            if (remaining <= 0) return -258;
+            System.Threading.Thread.Sleep((int)Math.Min(10, remaining));
+        }
+    }
+`
+
 export type StartTargetJobWatcher = (
   ownerPid: number,
   ownerCreatedAt: number,
@@ -200,6 +226,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public static class HermesTerminateJob {
+${JOB_DRAIN_NATIVE}
     [StructLayout(LayoutKind.Sequential)]
     private struct BasicLimits {
         public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
@@ -255,11 +282,7 @@ public static class HermesTerminateJob {
             int error = Marshal.GetLastWin32Error();
             return error == 0 ? -1 : -error;
         }
-        uint result = WaitForSingleObject(job, (uint)Math.Max(0, waitMs));
-        if (result == 0) return 0;
-        if (result == 258) return -258;
-        int waitError = Marshal.GetLastWin32Error();
-        return waitError == 0 ? -1 : -waitError;
+        return WaitForJobEmpty(job, waitMs);
     }
     public static void Close(IntPtr job) {
         if (job != IntPtr.Zero) CloseHandle(job);
@@ -428,6 +451,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public static class HermesTerminateNamedJob {
+${JOB_DRAIN_NATIVE}
     private const uint JOB_OBJECT_TERMINATE = 0x0008;
     private const uint JOB_OBJECT_QUERY = 0x0004;
     private const uint SYNCHRONIZE = 0x00100000;
@@ -452,10 +476,7 @@ public static class HermesTerminateNamedJob {
                 int terminateError = Marshal.GetLastWin32Error();
                 return terminateError == 0 ? -1 : -terminateError;
             }
-            uint result = WaitForSingleObject(job, (uint)Math.Max(0, waitMs));
-            if (result == WAIT_OBJECT_0) return 0;
-            if (result == WAIT_TIMEOUT) return -258;
-            return -(int)result;
+            return WaitForJobEmpty(job, waitMs);
         } finally {
             CloseHandle(job);
         }
@@ -533,6 +554,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 public static class HermesTerminateWatch {
+${JOB_DRAIN_NATIVE}
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     private const uint SYNCHRONIZE = 0x00100000;
     private const uint JOB_OBJECT_TERMINATE = 0x0008;
@@ -644,9 +666,9 @@ public static class HermesTerminateWatch {
             }
             uint jobRemaining = Remaining(deadlineAt);
             if (jobRemaining == 0) return Failure(readyPath, readyNonce, "job-deadline", (int)WAIT_TIMEOUT);
-            uint result = WaitForSingleObject(job, Math.Min(1500U, jobRemaining));
-            if (result == WAIT_OBJECT_0) return 0;
-            return Failure(readyPath, readyNonce, "job-wait", result == WAIT_FAILED ? Marshal.GetLastWin32Error() : (int)result);
+            int result = WaitForJobEmpty(job, (int)Math.Min(1500U, jobRemaining));
+            if (result == 0) return 0;
+            return Failure(readyPath, readyNonce, "job-wait", -result);
         } finally {
             CloseHandle(job);
             CloseHandle(owner);
@@ -2010,6 +2032,26 @@ async function defaultRunPowerShell(
           }
         }
 
+        // Native confirmation can observe the process object gone before Node
+        // delivers its exit event. Drain that event before classifying survivors,
+        // under the same absolute deadline.
+        if (wrapperBoundaryRequired && childProcess && absoluteDeadline > Date.now()) {
+          await waitForChildExit(childProcess, absoluteDeadline - Date.now())
+        }
+
+        // Node's exit status is evidence for the exact child it spawned, even
+        // when a fresh PowerShell liveness probe exhausts the remaining budget.
+        // The target receipt separately proves the external holder job drained.
+        if (
+          killResult && !killResult.confirmed && targetBoundaryConfirmed &&
+          childProcess && childProcess.pid === wrapperProcessIdentity?.pid &&
+          (childProcess.exitCode != null || childProcess.signalCode != null) &&
+          hasSuccessfulWrapperReceipt(wrapperPhasePath, wrapperPhaseNonce)
+        ) {
+          const survivors = killResult.survivors.filter(identity => identity.pid !== childProcess.pid)
+          killResult = { ...killResult, survivors, confirmed: survivors.length === 0 }
+        }
+
         if (killResult && !killResult.confirmed) {
           finalResult = {
             ...finalResult,
@@ -2031,12 +2073,6 @@ async function defaultRunPowerShell(
             code: 1,
             pid: childPid
           }
-        }
-
-        // Native confirmation can observe the process object gone before Node
-        // delivers its exit event. Drain that event under the same deadline.
-        if (wrapperBoundaryRequired && childProcess && absoluteDeadline > Date.now()) {
-          await waitForChildExit(childProcess, absoluteDeadline - Date.now())
         }
 
         // Capture the exact authenticated READY value and the ordered,
@@ -2317,6 +2353,7 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 public static class HermesForceReleaseNative {
+${JOB_DRAIN_NATIVE}
   public const uint PROCESS_TERMINATE = 0x0001;
   public const uint PROCESS_SET_QUOTA = 0x0100;
   public const uint PROCESS_SUSPEND_RESUME = 0x0800;
@@ -2554,11 +2591,7 @@ public static class HermesForceReleaseNative {
       int error = Marshal.GetLastWin32Error();
       return error == 0 ? -1 : -error;
     }
-    uint result = WaitForSingleObject(job, (uint)Math.Max(0, waitMs));
-    if (result == WAIT_OBJECT_0) return 0;
-    if (result == WAIT_TIMEOUT) return -258;
-    int waitError = Marshal.GetLastWin32Error();
-    return waitError == 0 ? -1 : -waitError;
+    return WaitForJobEmpty(job, waitMs);
   }
 }
 "@

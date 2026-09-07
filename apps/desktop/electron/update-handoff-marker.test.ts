@@ -62,7 +62,7 @@ function runWindows(installRoot: string, startedAt?: string) {
       '-NoMarkerCleanup',
       '-SelfTestMarker'
     ],
-    { env, encoding: 'utf8' }
+    { env, encoding: 'utf8', windowsHide: true }
   )
 }
 
@@ -95,7 +95,11 @@ function assertScriptHandoff(
   }
 
   const refreshed = sandbox('refreshed')
-  fs.writeFileSync(path.join(refreshed.home, '.hermes-update-in-progress'), '999999\n1\n')
+
+  if (!claimTime) {
+    fs.writeFileSync(path.join(refreshed.home, '.hermes-update-in-progress'), '999999\n1\n')
+  }
+
   const before = Math.floor(Date.now() / 1000)
   const refreshedResult = run(refreshed.installRoot, 'malformed')
   const after = Math.floor(Date.now() / 1000)
@@ -124,4 +128,16 @@ test.skipIf(process.platform === 'win32')('POSIX hand-off preserves the Desktop 
 
 test.skipIf(process.platform !== 'win32')('PowerShell hand-off stamps the marker with its own creation time', () => {
   assertScriptHandoff(runWindows, { claimTime: true })
+})
+
+test.skipIf(process.platform !== 'win32')('PowerShell hand-off refuses an existing marker without changing its bytes', () => {
+  const existing = sandbox('existing')
+  const marker = path.join(existing.home, '.hermes-update-in-progress')
+  const markerBody = Buffer.from('999999\n1\n', 'utf8')
+  fs.writeFileSync(marker, markerBody)
+
+  const result = runWindows(existing.installRoot, 'malformed')
+
+  assert.ok(Number.isInteger(result.status) && result.status !== 0, String(result.stderr || result.stdout))
+  assert.deepEqual(fs.readFileSync(marker), markerBody)
 })

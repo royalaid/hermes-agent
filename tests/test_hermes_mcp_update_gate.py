@@ -301,6 +301,10 @@ def test_should_quiesce_combines_exact_argv_with_live_lease(tmp_path: Path) -> N
 def test_real_module_launch_quiesces_before_jiter_preload(tmp_path: Path) -> None:
     """Prove the parent-package gate runs before the native preload boundary."""
     root = Path(__file__).resolve().parents[1]
+    # Worktrees can share a venv with another checkout. The child gates its
+    # runtime's owning install, independently of where it imports this code.
+    runtime_root = gate.infer_install_root()
+    assert runtime_root is not None, "this subprocess test requires a Hermes venv"
     hermes_home = tmp_path / "hermes-home"
     marker = hermes_home / gate.MARKER_NAME
     sentinel = tmp_path / "jiter-imported"
@@ -312,7 +316,7 @@ def test_real_module_launch_quiesces_before_jiter_preload(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     gate.write_quiesce_lease(
-        root,
+        runtime_root,
         marker=marker,
         owner_pid=os.getpid(),
         lifetime_seconds=60,
