@@ -1,3 +1,5 @@
+> Historical plan, superseded on 2026-09-06 by the canonical shared-marker implementation. This is not the current implementation contract or proof of live cutover. See [integration record](../solutions/2026-09-06-fork-integration-rebase.md).
+
 # Plan: take wall-clock comparison out of the Windows update hand-off
 
 Status: proposed 2026-09-06, after the first hand-off on the PR #7 Desktop
