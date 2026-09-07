@@ -455,14 +455,26 @@ def _reattach_refusal(rid, sid: str, session: dict) -> dict | None:
 
 
 def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> None:
-    """Point a live session at ``transport`` (caller holds ``history_lock``)."""
+    """Point a live session and its stranded queue at ``transport``.
+
+    The caller holds ``history_lock``. Orphan-reap cancellation is deliberately
+    left to the caller after releasing that lock because cancellation acquires
+    the process-wide sessions lock.
+    """
+    previous_transport = session.get("transport")
     session["transport"] = transport
     # Every transport that showed this session (pop-outs resume the same sid); on disconnect the last
     # viewer becomes the transport instead of the drop sentinel.
     session.setdefault("viewers", {})[transport] = time.time()
-    # See #83716.
-    if transport is not _detached_ws_transport:
-        _cancel_ws_orphan_reap(sid)  # the client is back — a pending ws-orphan reap must not fire
+    # A queued turn may still belong to the viewer that died before this
+    # reattach. Adopt only envelopes whose transport is the prior session
+    # transport or is now dead; live pop-out viewers retain their own queue.
+    for queued in [session.get("queued_prompt"), *(session.get("queued_prompts") or [])]:
+        if not isinstance(queued, dict):
+            continue
+        queued_transport = queued.get("transport")
+        if queued_transport is previous_transport or _transport_is_dead(queued_transport):
+            queued["transport"] = transport
 
 
 def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
@@ -591,38 +603,45 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
         claimed_for_teardown = None
         should_schedule_reap = False
         queue_replacement = None
-        # session.resume fast-path rebinds under _session_resume_lock: take it so a reconnect can't move the transport
-        # between check and claim.
-        with _session_resume_lock:
-            with _sessions_lock:
-                current = _sessions.get(sid)
-                if current is not session:
-                    continue
-                viewers = current.get("viewers") or {}
-                if current.get("transport") is not transport:
-                    viewers.pop(transport, None)
-                    replacement = current.get("transport")
-                    if viewers and replacement in viewers and not _transport_is_dead(replacement):
-                        queue_replacement = replacement
-                elif current.get("close_on_disconnect"):
-                    claimed_for_teardown = _pop_session_by_id(sid)
+        # Claim transport ownership under the registry lock, then release it
+        # before queue rebinding can wait on the session history lock.
+        with _sessions_lock:
+            current = _sessions.get(sid)
+            if current is not session:
+                continue
+            viewers = current.get("viewers") or {}
+            if current.get("transport") is not transport:
+                viewers.pop(transport, None)
+                replacement = current.get("transport")
+                if viewers and replacement in viewers and not _transport_is_dead(replacement):
+                    queue_replacement = replacement
+            elif current.get("close_on_disconnect"):
+                claimed_for_teardown = _pop_session_by_id(sid)
+            else:
+                viewers.pop(transport, None)
+                live = [vt for vt, ts in sorted(viewers.items(), key=lambda kv: kv[1]) if not _transport_is_dead(vt)]
+                if live:
+                    queue_replacement = live[-1]
+                    current["transport"] = queue_replacement
                 else:
-                    viewers.pop(transport, None)
-                    live = [vt for vt, ts in sorted(viewers.items(), key=lambda kv: kv[1]) if not _transport_is_dead(vt)]
-                    if live:
-                        queue_replacement = live[-1]
-                        current["transport"] = queue_replacement
-                    else:
-                        current["transport"] = _detached_ws_transport
-                        current.pop("_client_gone_interrupt_requested", None)
-                        should_schedule_reap = True
-            if queue_replacement is not None:
-                _rebind_queued_prompts_for_transport(current, transport, queue_replacement)
-            elif should_schedule_reap:
-                # Register while the resume claim is still held so an old disconnect
-                # cannot arm its first timer over a reconnect's newer detachment.
-                with contextlib.suppress(Exception):
-                    _schedule_ws_orphan_reap(sid)
+                    current["transport"] = _detached_ws_transport
+                    current.pop("_client_gone_interrupt_requested", None)
+                    should_schedule_reap = True
+        if should_schedule_reap:
+            # Publish the timer under the resume claim, but only after all
+            # history-lock work has finished. Revalidate the detachment because
+            # a reconnect may have won between the registry update above and
+            # this claim; an obsolete disconnect must never arm a timer over it.
+            with _session_resume_lock, _sessions_lock:
+                if _sessions.get(sid) is current and _ws_session_is_detached(current):
+                    with contextlib.suppress(Exception):
+                        _schedule_ws_orphan_reap(sid)
+                else:
+                    should_schedule_reap = False
+        if queue_replacement is not None:
+            # Queue ownership has its own lock. Do not retain either global
+            # lifecycle lock while waiting for an active submit/resume path.
+            _rebind_queued_prompts_for_transport(current, transport, queue_replacement)
         if claimed_for_teardown is not None:
             reaped += _teardown_popped_session(claimed_for_teardown, end_reason=end_reason)
         elif should_schedule_reap:

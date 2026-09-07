@@ -3462,6 +3462,7 @@ class GatewayTurnMixin:
 
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
+        *, claimed_event: Optional[MessageEvent] = None,
     ) -> None:
         """Deliver the first response before a queued follow-up runs, unless streaming already did."""
         session_key = turn_ctx.session_key
@@ -3526,6 +3527,7 @@ class GatewayTurnMixin:
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
         response: Any, result: Any, stream_task: Any,
+        *, claimed_event: Optional[MessageEvent] = None,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
         from gateway.platforms.base import merge_pending_message_event
@@ -3587,7 +3589,9 @@ class GatewayTurnMixin:
         # Interrupted: discard the response ("Operation interrupted." is noise).
         try:
             if not result.get("interrupted"):
-                await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
+                await self._run_agent_deliver_first_response(
+                    turn_ctx, adapter, response, result, stream_task, claimed_event=claimed_event
+                )
         except BaseException:
             _restore_goal_retry_handoff()
             raise
@@ -4063,6 +4067,7 @@ class GatewayTurnMixin:
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                    claimed_event=claimed_event,
                 )
         finally:
             await self._run_agent_cleanup_turn_tasks(

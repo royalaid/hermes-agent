@@ -18,6 +18,7 @@ function context(type: string): GatewayEventContext {
       appendReasoningDelta: vi.fn(),
       compactedTurnRef: { current: new Set() },
       completeAssistantMessage: vi.fn(),
+      completeReasoningSource: vi.fn(),
       failAssistantMessage: vi.fn(),
       finalizeInterimAssistantMessage: vi.fn(),
       flushQueuedDeltas: vi.fn(),

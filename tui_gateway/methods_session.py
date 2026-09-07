@@ -534,6 +534,7 @@ def _resume_live_unpersisted(ctx: _Resume, live_sid: str, live: dict) -> dict:
         if (transport := current_transport()) is not None:
             with live.setdefault("history_lock", threading.Lock()):
                 _rebind_live_transport(live_sid, live, transport)
+            _cancel_ws_orphan_reap(live_sid)
         else:
             _cancel_ws_orphan_reap(live_sid)
     history = live.get("history") or []
@@ -904,6 +905,7 @@ def _(rid, params: dict, session: dict) -> dict:
             return refusal
         with session["history_lock"]:
             _rebind_live_transport(sid, session, current_transport() or _stdio_transport)
+        _cancel_ws_orphan_reap(sid)
     return _ok(rid, _live_session_payload(
         sid, session, touch=True, omit_messages=is_truthy_value(params.get("omit_messages", False))))
 

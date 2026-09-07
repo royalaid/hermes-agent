@@ -1054,8 +1054,12 @@ def prepare_goal_migration(
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a persistent /goal from a parent session to its continuation. Best-effort, never raises
-    (a failure here must not block compression). Returns True when a goal was migrated.
+    """Carry a persistent /goal from a parent session to its continuation.
+
+    The two session locks are acquired in stable order and retained through
+    preparation, atomic publication, and read-back. This preserves the
+    cross-process mutation boundary while the database CAS protects callers
+    such as compression that prepare the same migration independently.
 
     Context compression rotates ``session_id`` to a fresh child session, but ``load_goal`` does a flat
     ``goal:<session_id>`` lookup with no parent-lineage walk — so an active goal silently dies at the
@@ -1063,33 +1067,41 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     so exactly one active goal row exists per logical conversation (avoids the "two active goals" hazard of
     a pure copy).
     """
-    plan = prepare_goal_migration(old_session_id, new_session_id)
-    if plan is None:
-        return False
-    try:
-        committed = plan.db.compare_and_set_meta_many(list(plan.changes))
-    except Exception as exc:
-        raise GoalMutationOutcomeUnknownError(
-            "goal migration publication outcome could not be determined"
-        ) from exc
-    if not committed:
-        raise GoalConflictError("goal changed before migration")
-    try:
-        child_raw = plan.db.get_meta(_meta_key(new_session_id))
-        parent_raw = plan.db.get_meta(_meta_key(old_session_id))
-    except Exception as exc:
-        raise GoalMutationOutcomeUnknownError(
-            "persisted goal migration read-back failed after publication"
-        ) from exc
-    if child_raw != plan.child_replacement or parent_raw != plan.parent_replacement:
-        raise GoalPostconditionError("persisted goal state changed after migration publication")
-    _bump_goal_generation(old_session_id)
-    _bump_goal_generation(new_session_id)
-    logger.debug(
-        "GoalManager: migrated goal %s -> %s (%s)",
-        old_session_id, new_session_id, reason or "rotation",
-    )
-    return True
+    first_session, second_session = sorted((old_session_id, new_session_id))
+    with goal_state_transaction(first_session), goal_state_transaction(second_session):
+        # Preserve the direct helper's established no-clobber contract. The
+        # lower-level preparation API still raises on this condition so an
+        # atomic compression publication cannot silently rotate without its
+        # goal metadata.
+        if load_goal_authoritative(new_session_id) is not None:
+            return False
+        plan = prepare_goal_migration(old_session_id, new_session_id)
+        if plan is None:
+            return False
+        try:
+            committed = plan.db.compare_and_set_meta_many(list(plan.changes))
+        except Exception as exc:
+            raise GoalMutationOutcomeUnknownError(
+                "goal migration publication outcome could not be determined"
+            ) from exc
+        if not committed:
+            raise GoalConflictError("goal changed before migration")
+        try:
+            child_raw = plan.db.get_meta(_meta_key(new_session_id))
+            parent_raw = plan.db.get_meta(_meta_key(old_session_id))
+        except Exception as exc:
+            raise GoalMutationOutcomeUnknownError(
+                "persisted goal migration read-back failed after publication"
+            ) from exc
+        if child_raw != plan.child_replacement or parent_raw != plan.parent_replacement:
+            raise GoalPostconditionError("persisted goal state changed after migration publication")
+        _bump_goal_generation(old_session_id)
+        _bump_goal_generation(new_session_id)
+        logger.debug(
+            "GoalManager: migrated goal %s -> %s (%s)",
+            old_session_id, new_session_id, reason or "rotation",
+        )
+        return True
 
 
 # ── Judge ─────────────────────────────────────────────────────────────

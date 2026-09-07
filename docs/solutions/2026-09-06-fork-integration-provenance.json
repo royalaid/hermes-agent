@@ -1,0 +1,1848 @@
+{
+  "captured_upstream": "dec1e87833d00e6133a89ef94cc352756f95e238",
+  "captured_published_integration": "762862b168d87c059f24eeed305bdbbbb71c3889",
+  "captured_fork_main": "a8c50eb1d841563eff22bd707d80472e7f1e9c9f",
+  "preserved_stale_local_integration": "756f3157942866b24d3f2cebe000cc9b7058e6ca",
+  "canonical_updater_commits": [
+    "9382126ea167129ced71ef5a4161ef81f27383b8",
+    "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+    "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+    "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+  ],
+  "canonical_updater_merge": "ea1ae5d8b8c79f971b3b38f97c94f35295b9e97f",
+  "remote_publication": "pending explicit authorization",
+  "live_updater_cutover": "not proven; two isolated runs and pushed known-good ref required",
+  "captured_commit_count": 189,
+  "commits": [
+    {
+      "original_commit": "988336b730b7745f49bb9c85b360a1847cb3590a",
+      "parents": [
+        "63279301bcbdc185c1b07b98a9312eb0c862f26d"
+      ],
+      "subject": "fix(kanban): stop delegated-child permission-error reconnect storm (U1)",
+      "rebased_commit": "3d1e48d26352b8e64936b205518aa6287f4a0519",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "805b2e3fcc9e9f63ca3448fc94b1ad841178042f",
+      "parents": [
+        "988336b730b7745f49bb9c85b360a1847cb3590a"
+      ],
+      "subject": "fix(agent): never read option values as commands in is_server_role_argv",
+      "rebased_commit": "a48ed974e4255536437211bd17c6bb9ec4e4d73f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6c61753456d29880e4827f5c682611d382c2f6a1",
+      "parents": [
+        "805b2e3fcc9e9f63ca3448fc94b1ad841178042f"
+      ],
+      "subject": "fix(desktop): follow published fork branch for updates",
+      "rebased_commit": "6310ec590fe3d98704e9339358d7a04e06984445",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "a66f641a6527059f4298c5ff008fe8d32635f2f4",
+      "parents": [
+        "6c61753456d29880e4827f5c682611d382c2f6a1"
+      ],
+      "subject": "fix(installer): preserve custom fork remotes",
+      "rebased_commit": "fc76e11b42c0659810f2ce03a805a5ea8498b7fa",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "c0963f307a214d14e672d3cf1d7b9214ee6c4f4a",
+      "parents": [
+        "a66f641a6527059f4298c5ff008fe8d32635f2f4"
+      ],
+      "subject": "feat(desktop): add full-file tool actions",
+      "rebased_commit": "96167e37db194b6d43e71153d8354c70a3b2430c",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "3aa33f0e65919bb8a9e48e52eb5710aea87fa0df",
+      "parents": [
+        "c0963f307a214d14e672d3cf1d7b9214ee6c4f4a"
+      ],
+      "subject": "fix(cron): record no_agent runs as sessions, keep them out of the sidebar",
+      "rebased_commit": "a2f83497c8a82dfcfebb27c21255c2832ecd1c63",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "beebf9a078b58a94a7c01fa3b13c6d02f349ef52",
+      "parents": [
+        "3aa33f0e65919bb8a9e48e52eb5710aea87fa0df"
+      ],
+      "subject": "fix(installer): record the installed checkout commit",
+      "rebased_commit": "e997e87ef16080a69465bfd0fdf2ec149b24a5bb",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "fcd3b95fa76f13f8d6b82dec23f429a38cb2d800",
+      "parents": [
+        "beebf9a078b58a94a7c01fa3b13c6d02f349ef52"
+      ],
+      "subject": "fix(desktop): preserve tile history on resume",
+      "rebased_commit": "8b94b1ad53ca7c3df97bf6e04fe9c1deb0259955",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "05a5e2d8f2622ed795d57da36a8881aeb707f643",
+      "parents": [
+        "fcd3b95fa76f13f8d6b82dec23f429a38cb2d800"
+      ],
+      "subject": "fix(desktop): restore Hermes Windows shell identity",
+      "rebased_commit": "1ab0889bfa9f19ab1338650b4831fc19c0144447",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "e5454fbc8de1de764dcabf5e802e7bc783c66119",
+      "parents": [
+        "05a5e2d8f2622ed795d57da36a8881aeb707f643"
+      ],
+      "subject": "perf(desktop): contain hidden keep-alive pane content (U1)",
+      "rebased_commit": "13503eb41f2bb23f9e6128ad3ca66f061cdad4e6",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "12189e8ed8684a128f20c2f6517f169f9f8c801a",
+      "parents": [
+        "e5454fbc8de1de764dcabf5e802e7bc783c66119"
+      ],
+      "subject": "perf(desktop): apply reveal catch-up as a transition (U2)",
+      "rebased_commit": "3de22144dbc8936fd5d2921a64fbebcd29d515c4",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "5b16a7939efbc1418a20c13be36e46cbaae11d82",
+      "parents": [
+        "12189e8ed8684a128f20c2f6517f169f9f8c801a"
+      ],
+      "subject": "fix(desktop): guard stick-to-bottom and clamp measurement for hidden panes",
+      "rebased_commit": "8ef6669198e8534acce55c055023c4e63a847688",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "0a1d45021cdbed97aa3f9d3f348e375d8a6e7b80",
+      "parents": [
+        "5b16a7939efbc1418a20c13be36e46cbaae11d82"
+      ],
+      "subject": "test(desktop): restore portable journal write coverage",
+      "rebased_commit": "87a2cbb0d6a18325ac7331b00e044b7caab6927f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "c9a6ee48275b1cd773aaced8ee7526f33a90bc32",
+      "parents": [
+        "0a1d45021cdbed97aa3f9d3f348e375d8a6e7b80"
+      ],
+      "subject": "fix(compression): prune stale native replay safely",
+      "rebased_commit": "8fcaf480049c5c0416bdac121e2fe2cb9ea43cf3",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "970b99fdeb4585ae36bdee0d69d6aafc466e1b9b",
+      "parents": [
+        "c9a6ee48275b1cd773aaced8ee7526f33a90bc32"
+      ],
+      "subject": "fix(compression): reject custom relays for Codex compaction",
+      "rebased_commit": "7e397611802f2de1df5a024fc1f955c76a52faa3",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "ed180d86a094a314d937fef5ce58c687f5895665",
+      "parents": [
+        "970b99fdeb4585ae36bdee0d69d6aafc466e1b9b"
+      ],
+      "subject": "fix(bootstrap): preserve fork repository provenance",
+      "rebased_commit": "41ad97cbc9c43889ea43b063129a609b08bd2f66",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6b7016f5ef998d37d3fc985ad8a99c74570a13b0",
+      "parents": [
+        "ed180d86a094a314d937fef5ce58c687f5895665"
+      ],
+      "subject": "feat(gateway): mark release investigators as cron sessions",
+      "rebased_commit": "1feb8a719f9bb8f14a15babed45d391a9f0f97d0",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f56bf3dc27f052e26292456e2d60f20d2e2b5213",
+      "parents": [
+        "6b7016f5ef998d37d3fc985ad8a99c74570a13b0"
+      ],
+      "subject": "fix(desktop): keep composer inside chat viewport",
+      "rebased_commit": "00799d79af38016c3c28c07230edaf92b5cd8b64",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "c6aad2ded2ce12c7ed42db0ff1d1e566433cbd30",
+      "parents": [
+        "f56bf3dc27f052e26292456e2d60f20d2e2b5213"
+      ],
+      "subject": "fix(desktop): keep sidebar root scroll-free",
+      "rebased_commit": "7aa8abe60921a7fe5b891bec3867b11ab01d0196",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "225ba5fde87375b2d0c91cf71375a7b6de8e405b",
+      "parents": [
+        "c6aad2ded2ce12c7ed42db0ff1d1e566433cbd30"
+      ],
+      "subject": "[verified] fix(desktop): restore wheel scrolling in panes",
+      "rebased_commit": "9024b2cabef33358f10108969b09fc3ed674ed55",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "e739e111b405f3b845c09ac2c00746462e2f70a0",
+      "parents": [
+        "225ba5fde87375b2d0c91cf71375a7b6de8e405b"
+      ],
+      "subject": "[verified] fix(discord): allow free-response channels to auto-thread",
+      "rebased_commit": "b90ecc49df3bb758dae90f70780df09039bc0eb2",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "ceb0fd2ce4b86b9323d2ca4910d46ac645f73831",
+      "parents": [
+        "e739e111b405f3b845c09ac2c00746462e2f70a0"
+      ],
+      "subject": "fix(kanban): isolate Windows workers from live runtime",
+      "rebased_commit": "bb5641bc2ae341443d7f3ce27a34f01edfd3e893",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f8e71cf4072f50e103262116568e0f2d34a457c4",
+      "parents": [
+        "ceb0fd2ce4b86b9323d2ca4910d46ac645f73831"
+      ],
+      "subject": "fix(gateway): stamp hermes_home into the runtime status record",
+      "rebased_commit": "dd16d9eb2eeee18f5dae16e4f4fa595228adbde6",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "7437d1b7d31bfd295f01e03d51c2bca51b61f666",
+      "parents": [
+        "f8e71cf4072f50e103262116568e0f2d34a457c4"
+      ],
+      "subject": "docs: canonize the fork-integration line policy",
+      "rebased_commit": "4e6cfe159b34d27ef55f1b356dede2a99fe0ded7",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "5e94cf694fb35356387251d49b317746f7542ff7",
+      "parents": [
+        "7437d1b7d31bfd295f01e03d51c2bca51b61f666"
+      ],
+      "subject": "docs: load agent guidance in Claude Code",
+      "rebased_commit": "9e0e2e9209b73adecb83bbc73c28f1b6a3b185f9",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "268d824312e93dc08f4d5224f423daf808ce2ef4",
+      "parents": [
+        "63279301bcbdc185c1b07b98a9312eb0c862f26d"
+      ],
+      "subject": "fix(desktop): kill all Hermes backends before update",
+      "rebased_commit": "6fea8a9c331a36537fb83901f155da07e7b6ecbf",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "21b519054209592c9b405ef7b6bdd898f70afbf7",
+      "parents": [
+        "5e94cf694fb35356387251d49b317746f7542ff7",
+        "268d824312e93dc08f4d5224f423daf808ce2ef4"
+      ],
+      "subject": "merge: integrate kill-all Windows updater baseline",
+      "rebased_commit": "d2d37e2095d610982663cc63bcf46ca2db4a4775",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "0b6003f00b07899f769bba6677a38720620b7cc5",
+      "parents": [
+        "268d824312e93dc08f4d5224f423daf808ce2ef4"
+      ],
+      "subject": "fix(desktop): use the live Windows update transport",
+      "rebased_commit": "4e067fc29fd6c0c784af108c92668f521394bcff",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "73776f79416ac65a8dc82088fdfe289c2a412af9",
+      "parents": [
+        "21b519054209592c9b405ef7b6bdd898f70afbf7",
+        "0b6003f00b07899f769bba6677a38720620b7cc5"
+      ],
+      "subject": "merge: integrate live Windows update transport",
+      "rebased_commit": "c9c6a85faa7512b858f072bdcc399a415da7aa01",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "ece4ea3b9b98b2c34cbe62ba2365638765d3350b",
+      "parents": [
+        "0b6003f00b07899f769bba6677a38720620b7cc5"
+      ],
+      "subject": "test(desktop): pin the live Windows update transport",
+      "rebased_commit": "d3954ba3107e758221c8db5ddce0f77f73a7c91e",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "1128760701fc21a292dfef4cef3eb539c86d82b1",
+      "parents": [
+        "73776f79416ac65a8dc82088fdfe289c2a412af9",
+        "ece4ea3b9b98b2c34cbe62ba2365638765d3350b"
+      ],
+      "subject": "merge: integrate Windows updater transport regression coverage",
+      "rebased_commit": "bd3b46c0f06b29807269bbb6c9a09f86061fec7c",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "e4d4720e13f0a5b1e817dc937d6c4c37e6b39403",
+      "parents": [
+        "1128760701fc21a292dfef4cef3eb539c86d82b1"
+      ],
+      "subject": "fix(release): compose fork onto debounced upstream",
+      "rebased_commit": "120f055154d4ccc6866833ce0ea652af9ef0cb92",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "c65a9cf75eb9625c7cb6d7342d68374f80ec10cc",
+      "parents": [
+        "e4d4720e13f0a5b1e817dc937d6c4c37e6b39403"
+      ],
+      "subject": "fix(release): wire cron to direct refresh",
+      "rebased_commit": "1bb59accecedca4a79dc083e279f19c08f08e7ea",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "4f9504d98bf67fbea12f76dad18984f79c1f5df8",
+      "parents": [
+        "c65a9cf75eb9625c7cb6d7342d68374f80ec10cc"
+      ],
+      "subject": "fix(release): use runnable cron test python",
+      "rebased_commit": "e46c5fc0abe5e6325800cca5ecea7f2f0c4b0c4b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "0131db17500748e18a8860be0470971e34f29216",
+      "parents": [
+        "4f9504d98bf67fbea12f76dad18984f79c1f5df8"
+      ],
+      "subject": "fix(cron): wake agent only when fork refresh fails",
+      "rebased_commit": "eb2d13190b0ff898e4ce9293620af5435d9506be",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "bff5208fd312ebfb852830a49ae56faf13da663c",
+      "parents": [
+        "0131db17500748e18a8860be0470971e34f29216"
+      ],
+      "subject": "fix(cron): retry GitHub rate limits before triage",
+      "rebased_commit": "d6e3d2ddd562fe6974f49f215736abcf4575b280",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6c8fe03a558c045843b5fc50ea8ccd89b71ee6e7",
+      "parents": [
+        "bff5208fd312ebfb852830a49ae56faf13da663c"
+      ],
+      "subject": "fix(desktop): bridge Windows updater marker handoff",
+      "rebased_commit": "4fd164edcd8e88ee24bf2acc49d062d7209ede85",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "30ddc9ca7ff47097ee665ea2fb831b7a1ee34f40",
+      "parents": [
+        "6c8fe03a558c045843b5fc50ea8ccd89b71ee6e7"
+      ],
+      "subject": "fix(release): continue recorded rerere resolutions",
+      "rebased_commit": "e4a323b100ae66e1e90d2fd1668143e3a225ad80",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "4baae95f76fd696106d503e2bd59f386b7006bff",
+      "parents": [
+        "30ddc9ca7ff47097ee665ea2fb831b7a1ee34f40"
+      ],
+      "subject": "fix(release): verify rerere continuation progress",
+      "rebased_commit": "73d54c34d25266555fac4a6bb8167f8daa07b36f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "0e6245ad7b88fdd14782e111eb208963ed05b3de",
+      "parents": [
+        "4baae95f76fd696106d503e2bd59f386b7006bff"
+      ],
+      "subject": "feat: add model-callable set_goal tool",
+      "rebased_commit": "92fe2371f84aea9526ec4e389954ef72ad25aff3",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "3fa218ed9bf2a6233fb0dffc7e2cd57472f6274e",
+      "parents": [
+        "0e6245ad7b88fdd14782e111eb208963ed05b3de"
+      ],
+      "subject": "[verified] feat: add model-callable goal control",
+      "rebased_commit": "dc32082dd83317d56554ef7d58385755ed756a59",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "1ea3bf877df1a4752e5b730d5d18a69e9b224957",
+      "parents": [
+        "3fa218ed9bf2a6233fb0dffc7e2cd57472f6274e"
+      ],
+      "subject": "[verified] fix: make model goal control atomic",
+      "rebased_commit": "fe951495250aab64b102bfb803a6bc44ea86f7d8",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "83c4b0c1275ad67831f074abdac815abcd942f33",
+      "parents": [
+        "1ea3bf877df1a4752e5b730d5d18a69e9b224957"
+      ],
+      "subject": "Optimize unchanged Kanban notifier polling",
+      "rebased_commit": "66fe158342bd0a554218915f3da7fe3c93185343",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "8cfca667031ba6db3a46ad373fc7e6806b0260c8",
+      "parents": [
+        "83c4b0c1275ad67831f074abdac815abcd942f33"
+      ],
+      "subject": "fix(codex): preserve live reasoning source identity",
+      "rebased_commit": "24f9f3f05784fa25f2f2a5491cc9798503672e2b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "d7a550c757df51ea6d363a8a5e450a17aa7fdea7",
+      "parents": [
+        "8cfca667031ba6db3a46ad373fc7e6806b0260c8"
+      ],
+      "subject": "fix(desktop): hydrate native reasoning summaries",
+      "rebased_commit": "d24f303135bfaa64777f3cca3538c9c888688a30",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "810deb0f4c3619db5cc85ff676bae2fef9be0beb",
+      "parents": [
+        "d7a550c757df51ea6d363a8a5e450a17aa7fdea7"
+      ],
+      "subject": "fix(desktop): hydrate persisted Codex commentary",
+      "rebased_commit": "fd5987e1ac7f2e09ba144ec227e7825abb08adc6",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "c9d72ed7f91f5da285a7ff348aeac0f7b7b9aaf2",
+      "parents": [
+        "810deb0f4c3619db5cc85ff676bae2fef9be0beb"
+      ],
+      "subject": "feat(goals): emit readback receipts",
+      "rebased_commit": "b1308eb9d3b4a9f3735eed59a364414a93250b1a",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "4256fa639eb38bc5e7dde35d3a73380bd9bcac85",
+      "parents": [
+        "c9d72ed7f91f5da285a7ff348aeac0f7b7b9aaf2"
+      ],
+      "subject": "docs(goals): document model goal control",
+      "rebased_commit": "90f3a67f78b9d9a6aa83b4219677d57a8e3f766e",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "b27ac3a9bb523136fe33691536bcfeac4b22c985",
+      "parents": [
+        "4256fa639eb38bc5e7dde35d3a73380bd9bcac85"
+      ],
+      "subject": "fix(goals): persist acceptance evidence in readbacks",
+      "rebased_commit": "bd34fbc95601b139f89f2230c43614dfb16eeaeb",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "c128e1e41be8523e3e4ea2c8db689b92cec59571",
+      "parents": [
+        "b27ac3a9bb523136fe33691536bcfeac4b22c985"
+      ],
+      "subject": "fix(goals): serialize persisted state across processes",
+      "rebased_commit": "6a99892fa6217e6680efd5c23c5b2734631b976b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f8979f17a8ebcbd15bde6e8c00788d40d6301359",
+      "parents": [
+        "c128e1e41be8523e3e4ea2c8db689b92cec59571"
+      ],
+      "subject": "test(goals): bound cross-process pause probe",
+      "rebased_commit": "c932bc3388351449a954f4bb6ba02b83e06980ff",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "71566739cf54adba55c0081a03b329eb031c4d5d",
+      "parents": [
+        "f8979f17a8ebcbd15bde6e8c00788d40d6301359"
+      ],
+      "subject": "fix(goals): serialize clear and migration helpers",
+      "rebased_commit": "1f3bf5f1f9444d0bce1da5d201cb04fab23926ec",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6f33f2309d3e8020e605e04f983831752f00b33e",
+      "parents": [
+        "71566739cf54adba55c0081a03b329eb031c4d5d"
+      ],
+      "subject": "fix(goals): allow controls during slow evaluation",
+      "rebased_commit": "e9fb88e7bc2e09db10a0a4c27db61ea750bd7acf",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "abd023b357952b22696cff1ba1a7f1225b1f79e0",
+      "parents": [
+        "6f33f2309d3e8020e605e04f983831752f00b33e"
+      ],
+      "subject": "feat(desktop): add sidebar sessions open-in-tab preference",
+      "rebased_commit": "5962a88967f032db3c68c9a503aed9bfaeb0d3cd",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "a0a7c0444727c4c9786a35945eaa72f8836e6117",
+      "parents": [
+        "abd023b357952b22696cff1ba1a7f1225b1f79e0"
+      ],
+      "subject": "fix(desktop): sidebar click on an already-tabbed session loads it into main (#92926)",
+      "rebased_commit": "ed79c9301f2a94fa538accd7898e22a51660320f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "b09a25e2c9bc98a55d110164cd5b8ecae1a6d58f",
+      "parents": [
+        "a0a7c0444727c4c9786a35945eaa72f8836e6117"
+      ],
+      "subject": "test(desktop): pin stack-vs-blank-main tile routing; dedupe comment",
+      "rebased_commit": "bfa598631487d6818f9251620d4d7f572efaf82b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "08e344c5a035b36fea86e7efa06dea4e6edb95dd",
+      "parents": [
+        "b09a25e2c9bc98a55d110164cd5b8ecae1a6d58f"
+      ],
+      "subject": "feat(desktop): make sidebar session opens tab-first",
+      "rebased_commit": "758d3cc6a0d9668db0c4b5cc11a6d902960809cc",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "e1e9ae5e05813b2fd5ff463b94519237d6a04210",
+      "parents": [
+        "08e344c5a035b36fea86e7efa06dea4e6edb95dd"
+      ],
+      "subject": "fix(desktop): preserve sidebar session ownership",
+      "rebased_commit": "649584de39ff7fa7e6dbd033157ae39d42108a6b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "84210ef910610c4b6495841b45eb0068d777c8c2",
+      "parents": [
+        "e1e9ae5e05813b2fd5ff463b94519237d6a04210"
+      ],
+      "subject": "fix(desktop): cold-rebind same-id owner retargets",
+      "rebased_commit": "933b022a2675ba3167c5ea5cf3b96f0f706d5e6e",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6c4986ef52932ade0c26f1d375618bb98ecf5d87",
+      "parents": [
+        "84210ef910610c4b6495841b45eb0068d777c8c2"
+      ],
+      "subject": "fix: bind sidebar sessions to exact owners",
+      "rebased_commit": "c7880e26036f776bc3867de17a35b4f18bfe6a07",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "3fcc01ec63f6125cea0f399f5f0331cedb4bb5c4",
+      "parents": [
+        "6c4986ef52932ade0c26f1d375618bb98ecf5d87"
+      ],
+      "subject": "fix(desktop): preserve exact sidebar session ownership",
+      "rebased_commit": "c7901ae69badf0fe742d30f6308513661fba2053",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f3c6582c4323cb9ff4ec44a92f1585145d7bbf45",
+      "parents": [
+        "3fcc01ec63f6125cea0f399f5f0331cedb4bb5c4"
+      ],
+      "subject": "fix(desktop): fence rebuilt runtime pane rebinding",
+      "rebased_commit": "cd6b278b0d7ca4f6d06b329bec3ef08a01f3fc12",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "51248c6c5ea8f182f10adad123b91b36b90b518f",
+      "parents": [
+        "f3c6582c4323cb9ff4ec44a92f1585145d7bbf45"
+      ],
+      "subject": "fix(desktop): preserve untagged runtime rebuilds",
+      "rebased_commit": "4882dc70cd2ec04dda6a27dc902c95dfb27b94e7",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "364714a21e1b17746602c37d9d67419a0e9d9f19",
+      "parents": [
+        "51248c6c5ea8f182f10adad123b91b36b90b518f"
+      ],
+      "subject": "fix(desktop): preserve generic sidebar session opens",
+      "rebased_commit": "0a19339785ae9c62f22896c0abca305a656a7939",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "b1293872156f280bb345c38736221ca5c3c257d7",
+      "parents": [
+        "364714a21e1b17746602c37d9d67419a0e9d9f19"
+      ],
+      "subject": "fix(desktop): isolate session pop-out placement",
+      "rebased_commit": "99aab3ff76400cff951f40ebff154b3211d4e1a3",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f2e7757b36bb6d39322ad1131c238fb042d45175",
+      "parents": [
+        "b1293872156f280bb345c38736221ca5c3c257d7"
+      ],
+      "subject": "fix(desktop): fence tile transcript hydration",
+      "rebased_commit": "d6e5d576a65d220fa4dc978851e15a16607d6081",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "154afff1d2c226342b0dd301763b263843a5a3a9",
+      "parents": [
+        "f2e7757b36bb6d39322ad1131c238fb042d45175"
+      ],
+      "subject": "fix(desktop): qualify session event ownership",
+      "rebased_commit": "517ad077f822d9d1c7b6895fc4aa22945441313c",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "61b890099a425f979aa3115f11bac85ce6d7375a",
+      "parents": [
+        "154afff1d2c226342b0dd301763b263843a5a3a9"
+      ],
+      "subject": "test(desktop): reproduce delegate card ownership regression",
+      "rebased_commit": "2a9adf8fc638424eb6af91300ca4d460ac24df68",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "22df29b667acec7245e4a79e698996ca7cc1d9a7",
+      "parents": [
+        "61b890099a425f979aa3115f11bac85ce6d7375a"
+      ],
+      "subject": "fix(desktop): preserve delegated child ownership",
+      "rebased_commit": "67d458723c986a255bc015c3a688129df4859208",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "d20c5c2ab52aecd6e3709bc1d3ba4ca096d5ee18",
+      "parents": [
+        "22df29b667acec7245e4a79e698996ca7cc1d9a7"
+      ],
+      "subject": "fix(desktop): scope background resume to mounted session",
+      "rebased_commit": "21178ac81e966681c79f43ca06da5954d7479edb",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f6e4563b60776a12a3ccbfe78a1d6df10b2017a4",
+      "parents": [
+        "d20c5c2ab52aecd6e3709bc1d3ba4ca096d5ee18"
+      ],
+      "subject": "fix(desktop): reconcile session hydration ordering",
+      "rebased_commit": "4fb6e130ebb14da879e5a7b649d05da4e872243b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "4f365e5a4f646d5bb075798ed96332c284359afd",
+      "parents": [
+        "f6e4563b60776a12a3ccbfe78a1d6df10b2017a4"
+      ],
+      "subject": "fix(desktop): focus newly opened session tabs",
+      "rebased_commit": "a453b4a77032622669502b2ba9b15513a904265f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "bbe579f0c77eef482daf790394b97b93c936afcb",
+      "parents": [
+        "4f365e5a4f646d5bb075798ed96332c284359afd"
+      ],
+      "subject": "fix(desktop): project model-set goal text",
+      "rebased_commit": "b184481eaf6460ac3fc06df892bc5cae43296dcd",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "994d3e12ae3fc02603f012732673a140928144ad",
+      "parents": [
+        "bbe579f0c77eef482daf790394b97b93c936afcb"
+      ],
+      "subject": "test(desktop): scope integration E2E to active panes",
+      "rebased_commit": "fd109aa379a9d1432d02ae7a7be36f38752b2367",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "4e5efab562b2a4f27416f03b9da670c2119f3499",
+      "parents": [
+        "994d3e12ae3fc02603f012732673a140928144ad"
+      ],
+      "subject": "fix: make model goal mutations snapshot-bound",
+      "rebased_commit": "6e05fc918e77ad2a750bf080969d773e8a927a3a",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "ab6338c5800b533327289507da1f2b5743450108",
+      "parents": [
+        "4e5efab562b2a4f27416f03b9da670c2119f3499"
+      ],
+      "subject": "test: persist goal gate retry budget",
+      "rebased_commit": "60725370f75a1dd16d6c7ed1b686b0ae5062a5db",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "481d25053d8db5d988c845565f9725f6bcdced00",
+      "parents": [
+        "ab6338c5800b533327289507da1f2b5743450108"
+      ],
+      "subject": "fix: surface gateway goal read failures",
+      "rebased_commit": "1895b0162e9f3c2d523e9d2fac9284b1cdc3d1b0",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "72cbee74ba8bda0b661d1a260bb4dfac891d2bd0",
+      "parents": [
+        "481d25053d8db5d988c845565f9725f6bcdced00"
+      ],
+      "subject": "fix: surface late gateway goal read failures",
+      "rebased_commit": "3d259e0b168c4522b0c519d7700a75213cb5eea6",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "11e3b30fdc54584663d776dc070a7f3532b57c09",
+      "parents": [
+        "72cbee74ba8bda0b661d1a260bb4dfac891d2bd0"
+      ],
+      "subject": "fix: surface queued goal read failures",
+      "rebased_commit": "3f32514103be22596b55bfe2a6a3e02003b95e6a",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "ff48ca157fe5ecd16a4d4a926fe899379c12b233",
+      "parents": [
+        "11e3b30fdc54584663d776dc070a7f3532b57c09"
+      ],
+      "subject": "fix: enforce authoritative goal persistence boundaries",
+      "rebased_commit": "09ce6a9f8567b1976b37656c0f0fd350e94d6dd9",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6134ce77033c5bd1ce0973dede53c6dbccef0101",
+      "parents": [
+        "ff48ca157fe5ecd16a4d4a926fe899379c12b233"
+      ],
+      "subject": "fix: preserve queued goal continuations",
+      "rebased_commit": "fda0bf5e98cda0549cc7fcf7543185f22ed97fd6",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "1bf8569f7ad4225473eddf0920ae282b093a1765",
+      "parents": [
+        "6134ce77033c5bd1ce0973dede53c6dbccef0101"
+      ],
+      "subject": "fix: preserve goal continuation ordering and provenance",
+      "rebased_commit": "6cd3f5f0d1e95d63584cd1acc8b79f847811cc24",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "01557788a6c6ab9d0f0b76c3862582d076e48511",
+      "parents": [
+        "1bf8569f7ad4225473eddf0920ae282b093a1765"
+      ],
+      "subject": "fix: make goal continuation recovery crash safe",
+      "rebased_commit": "5b69404be7569f15e2a3722502333164e395f928",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6a7129ed64ef72d71532aacea5426a043dfa346e",
+      "parents": [
+        "01557788a6c6ab9d0f0b76c3862582d076e48511"
+      ],
+      "subject": "fix: claim goal continuations before production dequeue",
+      "rebased_commit": "31b3dea3c6a65f4c56d1ee2509de2bf53b729c04",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "65ea85daba60ce86a34c2635a1f0cc28c08029fc",
+      "parents": [
+        "6a7129ed64ef72d71532aacea5426a043dfa346e"
+      ],
+      "subject": "fix: persist bounded startup continuation successors",
+      "rebased_commit": "0b12ed893e03e34623f2836d25aef65208725e0d",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "314785a3e085b052b3ac84698b4055746551659c",
+      "parents": [
+        "65ea85daba60ce86a34c2635a1f0cc28c08029fc"
+      ],
+      "subject": "fix: reconcile post-replace claim publication",
+      "rebased_commit": "4cb900a5e831962797fd55ee1faa9d85153fd912",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "43b27156e09edf590204d614bd151e47eeedc64e",
+      "parents": [
+        "314785a3e085b052b3ac84698b4055746551659c"
+      ],
+      "subject": "fix: preserve continuation successor queue topology",
+      "rebased_commit": "957b648027da0cf9295312638bffbd9a9cca71b8",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "4607560a07e15b57e94145fb3a8fab8aefff6fb3",
+      "parents": [
+        "43b27156e09edf590204d614bd151e47eeedc64e"
+      ],
+      "subject": "fix: preserve completed continuation publication ownership",
+      "rebased_commit": "43f590f205a5354461516ac4d385c012acd9edcd",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "65945009cae9630c563f163530c9afb64a1f2bc7",
+      "parents": [
+        "4607560a07e15b57e94145fb3a8fab8aefff6fb3"
+      ],
+      "subject": "fix: preserve continuation replay topology after publication",
+      "rebased_commit": "8344d5becb8272589c3fb87c43a5f83f616a0410",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "d2d33c21cd7f22c218e2f92bebfbf2ecc943f114",
+      "parents": [
+        "65945009cae9630c563f163530c9afb64a1f2bc7"
+      ],
+      "subject": "test: assert canonical queued media URI",
+      "rebased_commit": "dbcb17b9a40a691137f459b0b1d3055017b02f0e",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "bfe4b27eb0f16220563c3b6c6ca189c5295931fe",
+      "parents": [
+        "d2d33c21cd7f22c218e2f92bebfbf2ecc943f114"
+      ],
+      "subject": "fix: checkpoint complete claimed response delivery",
+      "rebased_commit": "42889da984b379680d26dbf9c1960446b5753d5a",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6bba0dbcff4b0da38edc6abb2de0324ca1d7efe4",
+      "parents": [
+        "bfe4b27eb0f16220563c3b6c6ca189c5295931fe"
+      ],
+      "subject": "fix: keep incomplete claimed attachments retryable",
+      "rebased_commit": "4cc4e9b77acb86efe49ebd1daf356425c5060d8f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "519d32b678afd63f83a7ffa7f0593f6dd54c01f2",
+      "parents": [
+        "6bba0dbcff4b0da38edc6abb2de0324ca1d7efe4"
+      ],
+      "subject": "fix: snapshot claimed attachment intents",
+      "rebased_commit": "8604cf76fbd112638729ecaf77dbebdb82ffe58f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "c351198a05fc1396c0912f5e8b276b9ed77616a9",
+      "parents": [
+        "519d32b678afd63f83a7ffa7f0593f6dd54c01f2"
+      ],
+      "subject": "fix: sanitize claimed attachment intents before staging",
+      "rebased_commit": "df06a71b17dada89b36f51377e97940ad417a005",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "24c3ea3a69eca8b7a15de8884776e23ae44b95d7",
+      "parents": [
+        "c351198a05fc1396c0912f5e8b276b9ed77616a9"
+      ],
+      "subject": "fix: preserve spaced claimed media intents",
+      "rebased_commit": "f7db7f836315191f74bbde0f5a3311343105c1e4",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "5b952563924cfcecc7c9e7c082fc3a8080290410",
+      "parents": [
+        "24c3ea3a69eca8b7a15de8884776e23ae44b95d7"
+      ],
+      "subject": "feat(goals): emit readback receipts",
+      "rebased_commit": "f7db7f836315191f74bbde0f5a3311343105c1e4",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "e58d98beb690142c2abb410451617d0dd5452a25",
+      "parents": [
+        "5b952563924cfcecc7c9e7c082fc3a8080290410"
+      ],
+      "subject": "fix(goals): persist acceptance evidence in readbacks",
+      "rebased_commit": "f7db7f836315191f74bbde0f5a3311343105c1e4",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "1e3da0c50bdbc88b8a19ee742b06cc4a56b9e1a1",
+      "parents": [
+        "e58d98beb690142c2abb410451617d0dd5452a25"
+      ],
+      "subject": "fix(goals): serialize persisted state across processes",
+      "rebased_commit": "f7db7f836315191f74bbde0f5a3311343105c1e4",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "f671e2a79cc68e2c9178584f99ab9c0cd431fba2",
+      "parents": [
+        "1e3da0c50bdbc88b8a19ee742b06cc4a56b9e1a1"
+      ],
+      "subject": "fix(desktop): project model-set goal text",
+      "rebased_commit": "f7db7f836315191f74bbde0f5a3311343105c1e4",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "d6c4863c107ecd85d886cbd548f2bf90129f4198",
+      "parents": [
+        "f671e2a79cc68e2c9178584f99ab9c0cd431fba2"
+      ],
+      "subject": "fix(integration): reconcile goal concurrency documentation",
+      "rebased_commit": "8218cb1f8b49a26512004c54cfcd10203dbfc5a8",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "d80efa4cd588ba16c4c013b804fdbf1762dcf27e",
+      "parents": [
+        "04fea67963fa36798fe215b9d3c7b5d787a632b4"
+      ],
+      "subject": "[verified] fix(desktop): distinguish paused todo work",
+      "rebased_commit": "d80efa4cd588ba16c4c013b804fdbf1762dcf27e",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "533f669f89d42357db4d8211a0366552a79094b6",
+      "parents": [
+        "d80efa4cd588ba16c4c013b804fdbf1762dcf27e"
+      ],
+      "subject": "style(desktop): format todo clearance e2e",
+      "rebased_commit": "533f669f89d42357db4d8211a0366552a79094b6",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "8095e498147f6c3142237b27b3a9e6f9f07ff4b3",
+      "parents": [
+        "533f669f89d42357db4d8211a0366552a79094b6"
+      ],
+      "subject": "fix(desktop): reconcile stale todo projections",
+      "rebased_commit": "8095e498147f6c3142237b27b3a9e6f9f07ff4b3",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "a6869cac14dfa6e044948f2eb96cdb8604f456da",
+      "parents": [
+        "8095e498147f6c3142237b27b3a9e6f9f07ff4b3"
+      ],
+      "subject": "style(desktop): lint todo clearance e2e",
+      "rebased_commit": "a6869cac14dfa6e044948f2eb96cdb8604f456da",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "e1a5fa9ca1b53082d1c567cb637e411eab9079be",
+      "parents": [
+        "a6869cac14dfa6e044948f2eb96cdb8604f456da"
+      ],
+      "subject": "fix(desktop): preserve Playwright fixture contract",
+      "rebased_commit": "e1a5fa9ca1b53082d1c567cb637e411eab9079be",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "ac956ba0f866772d5120d72ab353575641d611ef",
+      "parents": [
+        "e1a5fa9ca1b53082d1c567cb637e411eab9079be"
+      ],
+      "subject": "feat: persist durable todo state",
+      "rebased_commit": "ac956ba0f866772d5120d72ab353575641d611ef",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "de57907afd9bfb7bea5a2b141cd2ab7181024627",
+      "parents": [
+        "ac956ba0f866772d5120d72ab353575641d611ef"
+      ],
+      "subject": "fix: complete Todo upstream compatibility",
+      "rebased_commit": "de57907afd9bfb7bea5a2b141cd2ab7181024627",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "e5667deab2b18f65291c778dbfc20904ea84e5ee",
+      "parents": [
+        "de57907afd9bfb7bea5a2b141cd2ab7181024627"
+      ],
+      "subject": "test: align Todo CI fixtures",
+      "rebased_commit": "e5667deab2b18f65291c778dbfc20904ea84e5ee",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "e7f2b60250a39efceda932a816c43484a20e7fde",
+      "parents": [
+        "d6c4863c107ecd85d886cbd548f2bf90129f4198",
+        "e5667deab2b18f65291c778dbfc20904ea84e5ee"
+      ],
+      "subject": "Merge draft PR #99644: durable Todo state",
+      "rebased_commit": "c323250caeb331da02b1538c3c30a8176575253d",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f9dc5c787d412dbe3633cfa6a7a06289c74aa547",
+      "parents": [
+        "e7f2b60250a39efceda932a816c43484a20e7fde"
+      ],
+      "subject": "fix(desktop): preserve transcript continuity across reconnects",
+      "rebased_commit": "5deaa3d9af8a2257e8aa8c73a226cb1af5b58a31",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "675e5c3db5733b42bf0f0d4665241dc8218ee8c5",
+      "parents": [
+        "f9dc5c787d412dbe3633cfa6a7a06289c74aa547"
+      ],
+      "subject": "fix(updater): reconstruct Windows holder safety",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "a8e1b1845483f2795b7b7f82af3cb50d5d75e0fb",
+      "parents": [
+        "675e5c3db5733b42bf0f0d4665241dc8218ee8c5"
+      ],
+      "subject": "test(updater): cover Windows safety boundaries",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "7519c90127aeb412f4b01a7331f1a2cd0371779c",
+      "parents": [
+        "a8e1b1845483f2795b7b7f82af3cb50d5d75e0fb"
+      ],
+      "subject": "fix(desktop): authenticate Windows updater handoff",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "1d2dff31732a3798058da08954ea637d9dc31894",
+      "parents": [
+        "7519c90127aeb412f4b01a7331f1a2cd0371779c"
+      ],
+      "subject": "test(desktop): restore updater regression coverage",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "cb1fbfb4fa1e8eab0ab0e9354e506ecb68d33208",
+      "parents": [
+        "1d2dff31732a3798058da08954ea637d9dc31894"
+      ],
+      "subject": "fix(desktop): ship candidate updater scanner carrier",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "15a331ac6a739b29cc5978a04217ed662996fe59",
+      "parents": [
+        "cb1fbfb4fa1e8eab0ab0e9354e506ecb68d33208"
+      ],
+      "subject": "fix(desktop): make Windows updater kill every holder",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "64f7743d8517d00a869f6893a7d290485e63604b",
+      "parents": [
+        "15a331ac6a739b29cc5978a04217ed662996fe59"
+      ],
+      "subject": "fix(desktop): remove stale Electron shortcut",
+      "rebased_commit": "a18edc20e9725a3d0115d2178ad5f0d3aba80996",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "fe4cdf20e21023a4de054f74a8695ea59e276ea1",
+      "parents": [
+        "64f7743d8517d00a869f6893a7d290485e63604b"
+      ],
+      "subject": "fix(release): characterize durable Todo merge",
+      "rebased_commit": "64b2a5f94e287f4f03284fcd0ebdb0af11f804a1",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "fdcaff533c971c9a44120c006132558404afa612",
+      "parents": [
+        "fe4cdf20e21023a4de054f74a8695ea59e276ea1"
+      ],
+      "subject": "fix(desktop): open plugin routes as closeable tabs",
+      "rebased_commit": "14f9847088c4a067a868c8646a57904ded931345",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "9a571cb4a9798bfa53a20a0d3c75ebb6be8e0633",
+      "parents": [
+        "fdcaff533c971c9a44120c006132558404afa612"
+      ],
+      "subject": "fix(desktop): clear stale owner hints for untagged sidebar resumes",
+      "rebased_commit": "2cacbd5e60e6c35788c8608bb89c86fdedeb98d2",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "29555536f8a5598c434303a4d24bad89fc48b53a",
+      "parents": [
+        "9a571cb4a9798bfa53a20a0d3c75ebb6be8e0633"
+      ],
+      "subject": "chore(desktop): format reconstructed PR files",
+      "rebased_commit": "3f451e5af3146d3076d00b3458f2529469e6a45a",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "db80ff2b1ab7da08ac04e88559b325187625b723",
+      "parents": [
+        "29555536f8a5598c434303a4d24bad89fc48b53a"
+      ],
+      "subject": "fix(desktop): canonicalize and reattach route tiles",
+      "rebased_commit": "4fa2b066c8ab168df93529983870bcfcf390bb71",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f0b7069053d5009ba2f20a6e2fd99516de240f7e",
+      "parents": [
+        "db80ff2b1ab7da08ac04e88559b325187625b723"
+      ],
+      "subject": "test(desktop): eager-load sessions settings preference fixture",
+      "rebased_commit": "e5b95524dce7aa2c67ad615fb09644d7b3082abc",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "76a3025eb914edf681b8504346254c0765ec567e",
+      "parents": [
+        "f0b7069053d5009ba2f20a6e2fd99516de240f7e"
+      ],
+      "subject": "fix(kanban): overlay live Windows PATH onto dispatcher-spawned workers",
+      "rebased_commit": "6e69ff4ccd161e617b4e7811b6751cd51f1c9144",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "110bb63f05cd4e6841b9ac5d4cc41f94d95a019f",
+      "parents": [
+        "180291162ff4df0d42b5dc4fecd08005cf7cebf9"
+      ],
+      "subject": "feat(desktop): add sidebar sessions open-in-tab preference",
+      "rebased_commit": "110bb63f05cd4e6841b9ac5d4cc41f94d95a019f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6def68d1fcabc534c1554f1a3f41d2cff3566fdc",
+      "parents": [
+        "110bb63f05cd4e6841b9ac5d4cc41f94d95a019f"
+      ],
+      "subject": "fix(desktop): sidebar click on an already-tabbed session loads it into main (#92926)",
+      "rebased_commit": "6def68d1fcabc534c1554f1a3f41d2cff3566fdc",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "136e60bad4ac140bac380015c037918cebbf7a4c",
+      "parents": [
+        "6def68d1fcabc534c1554f1a3f41d2cff3566fdc"
+      ],
+      "subject": "test(desktop): pin stack-vs-blank-main tile routing; dedupe comment",
+      "rebased_commit": "136e60bad4ac140bac380015c037918cebbf7a4c",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "df9d82a1e81c491d6ba854129f6e39180d31646b",
+      "parents": [
+        "136e60bad4ac140bac380015c037918cebbf7a4c"
+      ],
+      "subject": "feat(desktop): make sidebar session opens tab-first",
+      "rebased_commit": "df9d82a1e81c491d6ba854129f6e39180d31646b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "75fc1cc944de6d08ef4e069a8e7c81037e9292ed",
+      "parents": [
+        "df9d82a1e81c491d6ba854129f6e39180d31646b"
+      ],
+      "subject": "fix(desktop): preserve sidebar session ownership",
+      "rebased_commit": "75fc1cc944de6d08ef4e069a8e7c81037e9292ed",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "355a753d3ac9db5d5db0b2c1f1c8b9499c75e1e7",
+      "parents": [
+        "75fc1cc944de6d08ef4e069a8e7c81037e9292ed"
+      ],
+      "subject": "fix(desktop): cold-rebind same-id owner retargets",
+      "rebased_commit": "355a753d3ac9db5d5db0b2c1f1c8b9499c75e1e7",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "8e9bb05f71dce811feece8a07b506f86a72ee32e",
+      "parents": [
+        "355a753d3ac9db5d5db0b2c1f1c8b9499c75e1e7"
+      ],
+      "subject": "fix: bind sidebar sessions to exact owners",
+      "rebased_commit": "8e9bb05f71dce811feece8a07b506f86a72ee32e",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "60f554824df8f2940ff787e150d98203e7812234",
+      "parents": [
+        "8e9bb05f71dce811feece8a07b506f86a72ee32e"
+      ],
+      "subject": "fix(desktop): preserve exact sidebar session ownership",
+      "rebased_commit": "60f554824df8f2940ff787e150d98203e7812234",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "4fcc56d0352b00e54acba8460256c098ec67ed33",
+      "parents": [
+        "60f554824df8f2940ff787e150d98203e7812234"
+      ],
+      "subject": "fix(desktop): fence rebuilt runtime pane rebinding",
+      "rebased_commit": "4fcc56d0352b00e54acba8460256c098ec67ed33",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "a4569673d55b391df51e26af3cb852d6c165c283",
+      "parents": [
+        "4fcc56d0352b00e54acba8460256c098ec67ed33"
+      ],
+      "subject": "fix(desktop): preserve untagged runtime rebuilds",
+      "rebased_commit": "a4569673d55b391df51e26af3cb852d6c165c283",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "907b7a6d4b469f98361b66e6c6980e0a4aa95112",
+      "parents": [
+        "a4569673d55b391df51e26af3cb852d6c165c283"
+      ],
+      "subject": "fix(desktop): preserve generic sidebar session opens",
+      "rebased_commit": "907b7a6d4b469f98361b66e6c6980e0a4aa95112",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "969508cd3bcaa3f84d1ccf08957c30c74932833b",
+      "parents": [
+        "907b7a6d4b469f98361b66e6c6980e0a4aa95112"
+      ],
+      "subject": "fix(desktop): isolate session pop-out placement",
+      "rebased_commit": "969508cd3bcaa3f84d1ccf08957c30c74932833b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "572dd3fc8863487e36fad3eee81655fc95d1d3c5",
+      "parents": [
+        "969508cd3bcaa3f84d1ccf08957c30c74932833b"
+      ],
+      "subject": "fix(desktop): fence tile transcript hydration",
+      "rebased_commit": "572dd3fc8863487e36fad3eee81655fc95d1d3c5",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "e55231acb5a20227d6790e29e6c6e62d0125327b",
+      "parents": [
+        "572dd3fc8863487e36fad3eee81655fc95d1d3c5"
+      ],
+      "subject": "fix(desktop): qualify session event ownership",
+      "rebased_commit": "e55231acb5a20227d6790e29e6c6e62d0125327b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "ac93d7fd45ba519bd7539ce42f67608fbb9a785d",
+      "parents": [
+        "e55231acb5a20227d6790e29e6c6e62d0125327b"
+      ],
+      "subject": "fix(desktop): open plugin routes as closeable tabs",
+      "rebased_commit": "ac93d7fd45ba519bd7539ce42f67608fbb9a785d",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "80dd24938ea22abfafc7c01276f42d5b38e8cbd3",
+      "parents": [
+        "ac93d7fd45ba519bd7539ce42f67608fbb9a785d"
+      ],
+      "subject": "fix(desktop): clear stale owner hints for untagged sidebar resumes",
+      "rebased_commit": "80dd24938ea22abfafc7c01276f42d5b38e8cbd3",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "bfd30e7f428c28cdfd17b658dd7bf39d69433d23",
+      "parents": [
+        "80dd24938ea22abfafc7c01276f42d5b38e8cbd3"
+      ],
+      "subject": "chore(desktop): format reconstructed PR files",
+      "rebased_commit": "bfd30e7f428c28cdfd17b658dd7bf39d69433d23",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "41fc5e7d596c6a063cb5744e2cb4277e880c47fc",
+      "parents": [
+        "bfd30e7f428c28cdfd17b658dd7bf39d69433d23"
+      ],
+      "subject": "fix(desktop): canonicalize and reattach route tiles",
+      "rebased_commit": "41fc5e7d596c6a063cb5744e2cb4277e880c47fc",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "971a890c90c5d56cba841e76ef7d8b03dd862833",
+      "parents": [
+        "41fc5e7d596c6a063cb5744e2cb4277e880c47fc"
+      ],
+      "subject": "test(desktop): eager-load sessions settings preference fixture",
+      "rebased_commit": "971a890c90c5d56cba841e76ef7d8b03dd862833",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "d9bdead4aab6668727c43cc8a47b794c35d26130",
+      "parents": [
+        "971a890c90c5d56cba841e76ef7d8b03dd862833"
+      ],
+      "subject": "chore(desktop): prettier-format sidebar preference i18n strings",
+      "rebased_commit": "d9bdead4aab6668727c43cc8a47b794c35d26130",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "2717725dc73a4d23355978e826b4aa6cd882fc6f",
+      "parents": [
+        "d9bdead4aab6668727c43cc8a47b794c35d26130"
+      ],
+      "subject": "fix(desktop): open plugin pages as workspace tabs, never full-screen",
+      "rebased_commit": "2717725dc73a4d23355978e826b4aa6cd882fc6f",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "2200b73d4dcf93aa4c9b629bbea70354235d1bbb",
+      "parents": [
+        "76a3025eb914edf681b8504346254c0765ec567e",
+        "2717725dc73a4d23355978e826b4aa6cd882fc6f"
+      ],
+      "subject": "Merge branch 'feat/owner-aware-sidebar-sessions' into rebuild/fork-integration-20260902",
+      "rebased_commit": "612dbd89ed8239353f746dbd756ba85e1b29da7b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "b2dd31a3053a5a5da505107dd7fe6a5e65ff454c",
+      "parents": [
+        "2200b73d4dcf93aa4c9b629bbea70354235d1bbb"
+      ],
+      "subject": "chore(desktop): tidy replay resolutions",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "96d6edb06342ee6b6e64289077476d3f305f9d5f",
+      "parents": [
+        "b2dd31a3053a5a5da505107dd7fe6a5e65ff454c"
+      ],
+      "subject": "fix: resolve duplicate skills and record guardrail blocks",
+      "rebased_commit": "ffcf90c23945b07854e0b8f4ab4fc2954a0fbaf4",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "694788e097612c6057cb118cb22eac1242aa8d56",
+      "parents": [
+        "96d6edb06342ee6b6e64289077476d3f305f9d5f"
+      ],
+      "subject": "feat: add loop risk monitor phase zero scout",
+      "rebased_commit": "740917ccea5ccf43731df9b3cc443ff98863d0af",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f71b0bf0a2a156f526a5de7a5f4364d28b1804ac",
+      "parents": [
+        "694788e097612c6057cb118cb22eac1242aa8d56"
+      ],
+      "subject": "fix(desktop): keep the update scanner carrier and parser on one envelope",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "6395616ab828c1e7dca580aa0e351f210ade33e0",
+      "parents": [
+        "f71b0bf0a2a156f526a5de7a5f4364d28b1804ac"
+      ],
+      "subject": "fix(desktop): replace the update kill-all with kernel-proven holder detection",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "7fd66cc1db6b37d06b8d71aa366cd6e70613a98a",
+      "parents": [
+        "694788e097612c6057cb118cb22eac1242aa8d56",
+        "6395616ab828c1e7dca580aa0e351f210ade33e0"
+      ],
+      "subject": "Merge fix/update-scanner-carrier-envelope: kernel-proven update holder detection replaces the kill-all",
+      "rebased_commit": "740917ccea5ccf43731df9b3cc443ff98863d0af",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "858416436914064899bf27330f37d8da2a917a8f",
+      "parents": [
+        "7fd66cc1db6b37d06b8d71aa366cd6e70613a98a"
+      ],
+      "subject": "fix(desktop): drain operator serve/kernel/MCP before Windows update lock proof",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "a663f3de1e47cbac4f25067a3c6cfc5c8e3416e7",
+      "parents": [
+        "858416436914064899bf27330f37d8da2a917a8f"
+      ],
+      "subject": "fix(release): assert the operator-serve drain instead of retired kill-all",
+      "rebased_commit": "95688951349f9dc3aeec2045e65404c8acf68e5d",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "144728062775079b34f033afc56130dccccd42cc",
+      "parents": [
+        "a663f3de1e47cbac4f25067a3c6cfc5c8e3416e7"
+      ],
+      "subject": "fix(desktop): do not crash boot when rememberLog runs before hermesLog exists",
+      "rebased_commit": "61d626cb31196625a44366ab0140ac8444912ad2",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "dd497f997d500d41847474617d2a8bf8e3c01f38",
+      "parents": [
+        "144728062775079b34f033afc56130dccccd42cc"
+      ],
+      "subject": "fix(desktop): repair the published tip so the desktop builds again",
+      "rebased_commit": "61d626cb31196625a44366ab0140ac8444912ad2",
+      "disposition": "already_represented_owner_routing",
+      "superseded_updater_portion": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "0a21054b8d93304d8cd5898727fb065d4baebb17",
+      "parents": [
+        "dd497f997d500d41847474617d2a8bf8e3c01f38"
+      ],
+      "subject": "fix(desktop): stop Windows plugin service units host-first and make force-release able to kill",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "8f6e32f4358ea249eb3ac460b1beb6ac4262af3f",
+      "parents": [
+        "0a21054b8d93304d8cd5898727fb065d4baebb17"
+      ],
+      "subject": "ci: make the fork's blocking checks pass on their own terms",
+      "rebased_commit": "a50047a229198024242c159799090ee5fc7e8e22",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "facd871cfaf851ce8ae31d3d339fb5f2ba442400",
+      "parents": [
+        "8f6e32f4358ea249eb3ac460b1beb6ac4262af3f"
+      ],
+      "subject": "ci: drop the installer steps for the retired desktop-update.ps1 handoff",
+      "rebased_commit": "fbd5e4d9dade2688abc756c409670a1e51d25f77",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "0a50ba0264a25a35b94b8b317872267da041caa9",
+      "parents": [
+        "facd871cfaf851ce8ae31d3d339fb5f2ba442400"
+      ],
+      "subject": "ci: fall back to standard hosted runners outside the NousResearch org",
+      "rebased_commit": "41e1ef7e22cfcb21aeb580f19cb04d7b7870130d",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "250e941ee49773b1b4a63420c21eb9de94479169",
+      "parents": [
+        "0a50ba0264a25a35b94b8b317872267da041caa9"
+      ],
+      "subject": "build: package the top-level modules the nix venv was missing",
+      "rebased_commit": "41e1ef7e22cfcb21aeb580f19cb04d7b7870130d",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "106d8e3450b28d32545ec07c61c6478b2f72b3f6",
+      "parents": [
+        "250e941ee49773b1b4a63420c21eb9de94479169"
+      ],
+      "subject": "fix(desktop): restore renderer files the published tip rewrite regressed",
+      "rebased_commit": "199e01a334a98d143f78f00b98c6378dc358701b",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "1d36a6f22f52452f6f38f97b17ed334800751594",
+      "parents": [
+        "106d8e3450b28d32545ec07c61c6478b2f72b3f6"
+      ],
+      "subject": "test(desktop): let the fork-only Windows updater tests run on Linux CI",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "180db446b2c2b79e82cbbc42d023fd7c3b16b620",
+      "parents": [
+        "1d36a6f22f52452f6f38f97b17ed334800751594"
+      ],
+      "subject": "style(desktop): apply the lint autofixes the fork's JS job never ran",
+      "rebased_commit": "8d9798e332427929381b0eb67d7cf4e51c9f597d",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "db3fb5ea37f81c7a14196a3ce3cc83bf81fcd0ea",
+      "parents": [
+        "144728062775079b34f033afc56130dccccd42cc",
+        "180db446b2c2b79e82cbbc42d023fd7c3b16b620"
+      ],
+      "subject": "Merge fix/windows-update-plugin-service-unit: stop plugin service units host-first, make force-release able to kill, repair the published tip (#6)",
+      "rebased_commit": "a52c2226111c4c66db846651986c7e103b0dfac0",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "770003e15569b7a590961c0046c9a49764a4eaea",
+      "parents": [
+        "db3fb5ea37f81c7a14196a3ce3cc83bf81fcd0ea"
+      ],
+      "subject": "fix(update): stream the desktop rebuild into update.log and keep stdout alive",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "87cb1bd71495b09825b7ab2a5d27a16ca01f2da4",
+      "parents": [
+        "770003e15569b7a590961c0046c9a49764a4eaea"
+      ],
+      "subject": "fix(desktop-update): stream step output live, heartbeat quiet stretches, keep the log honest",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "864bed4ecd79c12afc639de28c331b146fc5d8d8",
+      "parents": [
+        "87cb1bd71495b09825b7ab2a5d27a16ca01f2da4"
+      ],
+      "subject": "fix(desktop): close the remaining gaps the first real Windows update exposed",
+      "rebased_commit": "dec698f83018b8e2be73cc7ef327bbe80207bd15",
+      "disposition": "retained_ci_timeout_only",
+      "superseded_updater_portion": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "6845da62f59346a54cbed46b18c05f8eac788801",
+      "parents": [
+        "db3fb5ea37f81c7a14196a3ce3cc83bf81fcd0ea",
+        "864bed4ecd79c12afc639de28c331b146fc5d8d8"
+      ],
+      "subject": "Merge fix/windows-update-handoff-live-log: make the Windows update chain finish (#7)",
+      "rebased_commit": "524c95efb7800110d78262322085d44a4954c658",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "6e49bfd6c39b7442937bf6c24fc2f1fb7558b9cf",
+      "parents": [
+        "6845da62f59346a54cbed46b18c05f8eac788801"
+      ],
+      "subject": "docs(analysis): record the first real run after the updater fix and the chain fixes in #7",
+      "rebased_commit": "9d1aff971e7581019410964ae776fbfdf64258dd",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "71ada149c69b51c881dc7f7cc26dbeb4719e1e79",
+      "parents": [
+        "6e49bfd6c39b7442937bf6c24fc2f1fb7558b9cf"
+      ],
+      "subject": "fix(desktop-update): append the hand-off log via a shared FileStream, not Add-Content",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "1f1435ce3518cbcea380f208c9b344c0e5d7313c",
+      "parents": [
+        "6e49bfd6c39b7442937bf6c24fc2f1fb7558b9cf",
+        "71ada149c69b51c881dc7f7cc26dbeb4719e1e79"
+      ],
+      "subject": "Merge fix/handoff-log-sharing: append the hand-off log via a shared FileStream (#8)",
+      "rebased_commit": "9d1aff971e7581019410964ae776fbfdf64258dd",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "fc2c9dafe05256455a2471255042d5a42fa8a2e7",
+      "parents": [
+        "1f1435ce3518cbcea380f208c9b344c0e5d7313c"
+      ],
+      "subject": "fix(update): say where the receipt went, release the bridge lease, offer the rebuild",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "ff171d27262543421a088cc6d04dbecf7bae187a",
+      "parents": [
+        "1f1435ce3518cbcea380f208c9b344c0e5d7313c",
+        "fc2c9dafe05256455a2471255042d5a42fa8a2e7"
+      ],
+      "subject": "Merge pull request #9 from royalaid/fix/update-chain-receipt-lease-card",
+      "rebased_commit": "9d1aff971e7581019410964ae776fbfdf64258dd",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "9df708ccdeeb9afb632eb35764075a3bc951bdad",
+      "parents": [
+        "ff171d27262543421a088cc6d04dbecf7bae187a"
+      ],
+      "subject": "fix(desktop-update): stamp the update marker with the script's own claim time",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "40862401a773e64352ed6ccc6171a7e6a707385e",
+      "parents": [
+        "9df708ccdeeb9afb632eb35764075a3bc951bdad"
+      ],
+      "subject": "fix(desktop-update): use the owner's kernel creation time as the marker identity token",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "70348fcf6dcae511925bf69d82c90a4cb187840f",
+      "parents": [
+        "ff171d27262543421a088cc6d04dbecf7bae187a",
+        "40862401a773e64352ed6ccc6171a7e6a707385e"
+      ],
+      "subject": "Merge pull request #10 from royalaid/fix/handoff-marker-claim-time",
+      "rebased_commit": "9d1aff971e7581019410964ae776fbfdf64258dd",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "9ed0fe4902e0c4c75eb377ae77c3e5b5e9e59bcd",
+      "parents": [
+        "70348fcf6dcae511925bf69d82c90a4cb187840f"
+      ],
+      "subject": "docs(update): hand-off handshake addendum and monotonic-lease plan",
+      "rebased_commit": "5fd6f43cac8b98c1f493dcc2f555c86b4eb22931",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "3ce114560bee4b34358fd07ae5f9925afc654c95",
+      "parents": [
+        "70348fcf6dcae511925bf69d82c90a4cb187840f",
+        "9ed0fe4902e0c4c75eb377ae77c3e5b5e9e59bcd"
+      ],
+      "subject": "Merge pull request #11 from royalaid/docs/handoff-handshake-addendum",
+      "rebased_commit": "66c5be3d8b8ec5f41d1d215834dfa1857f2e66ae",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "02f8cbdb3fe4d436371232920ce5147e4d5b1010",
+      "parents": [
+        "3ce114560bee4b34358fd07ae5f9925afc654c95"
+      ],
+      "subject": "fix(update): keep the update receipt module out of the post-pull purge",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "83535310921a3551465346b9f1ae22fdc5a3ff5e",
+      "parents": [
+        "3ce114560bee4b34358fd07ae5f9925afc654c95",
+        "02f8cbdb3fe4d436371232920ce5147e4d5b1010"
+      ],
+      "subject": "Merge pull request #12 from royalaid/fix/update-receipt-survives-purge",
+      "rebased_commit": "66c5be3d8b8ec5f41d1d215834dfa1857f2e66ae",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "301ee4515c16c0037b68a6ff078053540ff543f8",
+      "parents": [
+        "83535310921a3551465346b9f1ae22fdc5a3ff5e"
+      ],
+      "subject": "fix(update-scanner): prove a plugin service unit past an unreadable ancestor",
+      "disposition": "superseded_by_canonical_updater",
+      "represented_by": [
+        "9382126ea167129ced71ef5a4161ef81f27383b8",
+        "7e1527c5559b8455e48b8c47e59eea607e7226ae",
+        "5dd4d7a114ac631fd25a9417609141b6df63dfb9",
+        "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
+      ]
+    },
+    {
+      "original_commit": "755132e7a894d56819d17052dbcee27457070ea5",
+      "parents": [
+        "83535310921a3551465346b9f1ae22fdc5a3ff5e",
+        "301ee4515c16c0037b68a6ff078053540ff543f8"
+      ],
+      "subject": "Merge pull request #13 from royalaid/fix/plugin-unit-proof-inaccessible-ancestor",
+      "rebased_commit": "66c5be3d8b8ec5f41d1d215834dfa1857f2e66ae",
+      "disposition": "collapsed_into_existing_history"
+    },
+    {
+      "original_commit": "d9f4669b19264b1a14f8d359920ece0b6de580f8",
+      "parents": [
+        "755132e7a894d56819d17052dbcee27457070ea5"
+      ],
+      "subject": "docs(update): run ledger for the 2026-09-06 consecutive-run test",
+      "rebased_commit": "d6a8909fb6cad001bb43add7740a51294b0820ce",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "0de10ee6b2a5e9d63b2ab570f0e6937f2070afe5",
+      "parents": [
+        "755132e7a894d56819d17052dbcee27457070ea5",
+        "d9f4669b19264b1a14f8d359920ece0b6de580f8"
+      ],
+      "subject": "Merge pull request #14 from royalaid/docs/update-run-ledger",
+      "rebased_commit": "144c5764f627dd470af361fac02dc351dfe3dd39",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "1fa8fde40a4ee36870da460abe1c0c707e9b096e",
+      "parents": [
+        "0de10ee6b2a5e9d63b2ab570f0e6937f2070afe5"
+      ],
+      "subject": "docs(update): run ledger, run 2",
+      "rebased_commit": "271fa0ba480293ca694507fbcfbb5bf7d5868f11",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "3cae3e4913dddad67376260e37eef046f45fc7d5",
+      "parents": [
+        "0de10ee6b2a5e9d63b2ab570f0e6937f2070afe5",
+        "1fa8fde40a4ee36870da460abe1c0c707e9b096e"
+      ],
+      "subject": "Merge pull request #15 from royalaid/docs/update-run-ledger-2",
+      "rebased_commit": "a1a4b1e79e713f8f4cabaffb36738cb237fd3def",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "f4281f175d32d442a442894b72b4941999f01c38",
+      "parents": [
+        "3cae3e4913dddad67376260e37eef046f45fc7d5"
+      ],
+      "subject": "docs(update): run ledger, run 3 (three consecutive clean runs)",
+      "rebased_commit": "845e2383c1ad4f6c437beb8598169db6330b2687",
+      "disposition": "rebased_or_conflict_reconciled"
+    },
+    {
+      "original_commit": "762862b168d87c059f24eeed305bdbbbb71c3889",
+      "parents": [
+        "3cae3e4913dddad67376260e37eef046f45fc7d5",
+        "f4281f175d32d442a442894b72b4941999f01c38"
+      ],
+      "subject": "Merge pull request #16 from royalaid/docs/update-run-ledger-3",
+      "rebased_commit": "bf371ccfa5501b6dfbe6ac8d46bbc1bd9ad7b14b",
+      "disposition": "rebased_or_conflict_reconciled"
+    }
+  ]
+}

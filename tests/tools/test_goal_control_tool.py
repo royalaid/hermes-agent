@@ -219,7 +219,7 @@ def test_set_returns_authoritative_persisted_current_session_state(tmp_path, mon
         "condition": "Run the focused checks",
         "turns_used": 0,
         "max_turns": 7,
-        "revision": None,
+        "revision": 1,
         "stop_reason": None,
         "error_reason": None,
     }
@@ -911,7 +911,7 @@ def test_pause_does_not_resurrect_concurrently_cleared_goal(tmp_path, monkeypatc
     result = _call("pause", session_id="session-current")
 
     assert result["success"] is False
-    assert result["error"]["code"] == "concurrent_state_change"
+    assert result["error"]["code"] == "transition_conflict"
     assert goals.load_goal("session-current").to_json() == cleared.to_json()
 
 
@@ -944,7 +944,7 @@ def test_set_does_not_overwrite_concurrently_created_goal(tmp_path, monkeypatch)
     )
 
     assert result["success"] is False
-    assert result["error"]["code"] == "concurrent_state_change"
+    assert result["error"]["code"] == "mutation_conflict"
     assert goals.load_goal("session-current").to_json() == winner.to_json()
 
 
@@ -963,7 +963,7 @@ def test_failed_persistence_never_returns_success(tmp_path, monkeypatch):
     result = _call("set", session_id="session-current", condition="Must persist")
 
     assert result["success"] is False
-    assert result["error"]["code"] == "persistence_verification_failed"
+    assert result["error"]["code"] == "mutation_conflict"
 
 
 def test_dropped_budget_update_is_not_mistaken_for_success(tmp_path, monkeypatch):
@@ -991,7 +991,7 @@ def test_dropped_budget_update_is_not_mistaken_for_success(tmp_path, monkeypatch
     )
 
     assert result["success"] is False
-    assert result["error"]["code"] == "persistence_verification_failed"
+    assert result["error"]["code"] == "mutation_conflict"
 
 
 def test_slow_initialization_fails_closed_instead_of_claiming_success(
