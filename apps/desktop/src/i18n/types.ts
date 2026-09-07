@@ -2444,6 +2444,8 @@ export interface Translations {
   }
 
   updates: {
+    rebuildTitle: string
+    rebuildBody: string
     stages: Record<string, string>
     checking: string
     checkFailedTitle: string

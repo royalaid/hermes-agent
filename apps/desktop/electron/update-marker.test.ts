@@ -7,9 +7,8 @@
  * (Wired into npm test:desktop:platforms in package.json.)
  *
  * Why this matters: the gate must (a) report a live update only when the
- * updater pid is alive AND the marker is fresh, (b) treat absent/malformed/
- * dead-pid/expired markers as "no live update" so a crashed updater can't
- * strand future launches, and (c) self-heal by deleting a stale marker file.
+ * updater pid identity is proven alive, (b) keep malformed/unreadable and
+ * overdue claims blocking, and (c) self-heal only a proven-dead exact claim.
  */
 
 import fs from 'fs'
@@ -17,12 +16,15 @@ import assert from 'node:assert/strict'
 import os from 'os'
 import path from 'path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
+  acquireUpdateMarker,
   isPidAlive,
   markerPath,
+  probePidIdentity,
   readLiveUpdateMarker,
+  releaseUpdateMarkerIfOwnedBy,
   UPDATE_HANDOFF_BRIDGE_GRACE_MS,
   UPDATE_MARKER_MAX_AGE_MS,
   updateHandoffConflict,
@@ -50,6 +52,43 @@ const DEAD: typeof process.kill = () => {
   throw err
 }
 
+test('a concurrent reader leaves an active marker release alone', () => {
+  const home = tmpHome('release-reader')
+  const startedAt = Math.floor(Date.now() / 1000)
+  writeMarker(home, process.pid, startedAt)
+  const rename = fs.renameSync.bind(fs)
+  let observed: ReturnType<typeof readLiveUpdateMarker> | undefined
+
+  const hook = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+    rename(from, to)
+    observed = readLiveUpdateMarker(home, { kill: ALIVE })
+  })
+
+  try {
+    assert.equal(releaseUpdateMarkerIfOwnedBy(home, process.pid, startedAt), true)
+    assert.equal(observed?.kind, 'unreadable')
+    assert.equal(fs.existsSync(markerPath(home)), false)
+    assert.deepEqual(fs.readdirSync(home), [])
+  } finally {
+    hook.mockRestore()
+  }
+})
+
+test('an abandoned release is recovered only after its releaser is proven dead', () => {
+  const home = tmpHome('abandoned-release')
+  const owner = 4242
+  const releaser = 4343
+  const startedAt = Math.floor(Date.now() / 1000)
+  const tombstone = `${markerPath(home)}.cas-release-${releaser}-abandoned`
+  fs.writeFileSync(tombstone, `${owner}\n${startedAt}\n`)
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE })?.kind, 'unreadable')
+  assert.equal(fs.existsSync(tombstone), true)
+  const probe: typeof process.kill = (pid, signal) => pid === releaser ? DEAD(pid, signal) : ALIVE(pid, signal)
+  assert.equal(readLiveUpdateMarker(home, { kill: probe })?.pid, owner)
+  assert.equal(fs.existsSync(tombstone), false)
+  assert.equal(fs.existsSync(markerPath(home)), true)
+})
+
 test('absent marker => no live update', () => {
   const home = tmpHome('absent')
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
@@ -73,20 +112,21 @@ test('dead pid => no live update and marker is pruned', () => {
   assert.ok(!fs.existsSync(markerPath(home)), 'a dead-pid marker self-heals (deleted)')
 })
 
-test('expired marker (past age ceiling) => no live update and pruned', () => {
+test('expired marker remains live but is marked overdue', () => {
   const home = tmpHome('expired')
   const now = 1_000_000_000_000
   writeMarker(home, 4242, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  // Even though the pid is "alive", the marker is too old to trust.
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
-  assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
+  const result = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+  assert.equal(result?.kind, 'live')
+  assert.equal(result?.overdue, true)
+  assert.ok(fs.existsSync(markerPath(home)), 'an overdue live owner remains authoritative')
 })
 
-test('malformed marker => no live update and pruned', () => {
+test('malformed marker is unreadable and remains blocking', () => {
   const home = tmpHome('malformed')
   fs.writeFileSync(markerPath(home), 'not-a-pid\nnonsense')
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
-  assert.ok(!fs.existsSync(markerPath(home)))
+  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE })?.kind, 'unreadable')
+  assert.ok(fs.existsSync(markerPath(home)))
 })
 
 test('isPidAlive: own pid is alive, impossible pid is dead', () => {
@@ -242,11 +282,11 @@ test('a dead-pid marker does not block a hand-off (self-heals)', () => {
   assert.equal(updateHandoffConflict(home, { kill: DEAD }), null)
 })
 
-test('an expired marker does not block a hand-off (self-heals)', () => {
+test('an expired live marker still blocks a hand-off', () => {
   const home = tmpHome('conflict-expired')
   const now = 1_000_000_000_000
   writeMarker(home, 1010, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  assert.equal(updateHandoffConflict(home, { kill: ALIVE, now: () => now }), null)
+  assert.ok(updateHandoffConflict(home, { kill: ALIVE, now: () => now }))
 })
 
 test('minutes-scale elapsed time is formatted as "Nm Ss"', () => {
@@ -256,4 +296,106 @@ test('minutes-scale elapsed time is formatted as "Nm Ss"', () => {
   const conflict = updateHandoffConflict(home, { kill: ALIVE, now: () => now })
   assert.ok(conflict)
   assert.match(conflict.message, /2m 5s/)
+})
+
+// The Desktop holds the marker under its own pid during the holder drain so
+// the gateway/serve watchdogs stay quiet, then hands the slot back before the
+// hand-off script claims it with CreateNew (2026-09-05).
+test('releaseUpdateMarkerIfOwnedBy removes only a marker that names the given pid', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-marker-release-'))
+
+  try {
+    assert.equal(releaseUpdateMarkerIfOwnedBy(home, process.pid), false, 'nothing to release')
+
+    writeUpdateMarker(home, process.pid, { startedAt: Math.floor(Date.now() / 1000) })
+    assert.equal(fs.existsSync(markerPath(home)), true)
+    assert.equal(releaseUpdateMarkerIfOwnedBy(home, process.pid + 1), false, 'another owner keeps its marker')
+    assert.equal(fs.existsSync(markerPath(home)), true)
+    assert.equal(releaseUpdateMarkerIfOwnedBy(home, process.pid), true)
+    assert.equal(fs.existsSync(markerPath(home)), false)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+
+test.each([
+  [99.9, 'matching'], [100.9, 'matching'], [101, 'stale'], [null, 'unknown']
+])('PID creation %s compared with marker timestamp 100 is %s', (created, expected) => {
+  assert.equal(probePidIdentity(123, 100, { kill: ALIVE, getProcessCreatedAt: () => created as number | null }), expected)
+})
+
+test('proven live owner survives the advisory age ceiling', () => {
+  const home = tmpHome('proven-overdue')
+  writeMarker(home, 123, 100)
+  assert.equal(readLiveUpdateMarker(home, { now: () => 10000000, kill: ALIVE, getProcessCreatedAt: () => 99.9 })?.kind, 'live')
+  assert.ok(fs.existsSync(markerPath(home)))
+})
+
+test('recycled PID is reclaimed', () => {
+  const home = tmpHome('recycled')
+  writeMarker(home, 123, 100)
+  assert.equal(readLiveUpdateMarker(home, { now: () => 110000, kill: ALIVE, getProcessCreatedAt: () => 102 }), null)
+})
+
+test('empty marker and unknown cleanup artifacts never age out', () => {
+  const home = tmpHome('incomplete')
+  fs.writeFileSync(markerPath(home), '')
+  assert.equal(readLiveUpdateMarker(home, { now: () => 10000000 })?.kind, 'unreadable')
+  assert.equal(fs.readFileSync(markerPath(home), 'utf8'), '')
+  fs.unlinkSync(markerPath(home))
+  fs.writeFileSync(markerPath(home) + '.cas-unknown', '123\n100\n')
+  assert.equal(readLiveUpdateMarker(home, { now: () => 10000000 })?.kind, 'unreadable')
+  assert.ok(fs.existsSync(markerPath(home) + '.cas-unknown'))
+})
+
+test('release restores a successor installed between read and isolation', () => {
+  const home = tmpHome('release-race')
+  const file = markerPath(home)
+  writeMarker(home, process.pid, 100)
+  const rename = fs.renameSync.bind(fs)
+
+  const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+    fs.writeFileSync(file, '4321\n101\n')
+
+    return rename(from, to)
+  })
+
+  try {
+    assert.equal(releaseUpdateMarkerIfOwnedBy(home, process.pid), false)
+    assert.equal(fs.readFileSync(file, 'utf8'), '4321\n101\n')
+  } finally {
+    spy.mockRestore()
+  }
+})
+
+
+test('exclusive claim refuses a second updater and binds exact release identity', () => {
+  const home = tmpHome('exclusive')
+  const first = acquireUpdateMarker(home)
+  assert.equal(first.acquired, true)
+  assert.equal(acquireUpdateMarker(home).acquired, false)
+  assert.equal(releaseUpdateMarkerIfOwnedBy(home, first.owner.pid, first.owner.startedAt + 1), false)
+  assert.equal(releaseUpdateMarkerIfOwnedBy(home, first.owner.pid, first.owner.startedAt), true)
+})
+
+test('exclusive claim never overwrites a contender arriving after the pre-check', () => {
+  const home = tmpHome('claim-race')
+  const file = markerPath(home)
+  const open = fs.openSync.bind(fs)
+
+  const spy = vi.spyOn(fs, 'openSync').mockImplementation((target, flags, mode) => {
+    if (target === file && flags === 'wx') {
+      fs.writeFileSync(file, '4321\n100\n')
+    }
+
+    return open(target, flags, mode)
+  })
+
+  try {
+    assert.equal(acquireUpdateMarker(home).acquired, false)
+    assert.equal(fs.readFileSync(file, 'utf8'), '4321\n100\n')
+  } finally {
+    spy.mockRestore()
+  }
 })
