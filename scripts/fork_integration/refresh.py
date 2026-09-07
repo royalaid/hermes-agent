@@ -23,40 +23,101 @@ PATCH_ASSERTIONS: dict[str, tuple[TreeAssertion, ...]] = {
     "[verified] fix(desktop): restore wheel scrolling in panes": (TreeAssertion(
         "apps/desktop/src/app/chat/sidebar/index.tsx", contains=("const SCROLL_GUTTER", "GROUP_BODY = 'max-h-none overflow-visible'")),),
     "docs(goals): document model goal control": (TreeAssertion(
-        "toolsets.py", contains=('"goal": {', '"tools": ["goal_control"]')),),
+        "toolsets.py", contains=('"goal": _ts(', '["goal_control"]')),),
 }
+# Historical updater merges are represented by the canonical shared-marker
+# implementation. These assertions deliberately reject the retired kill-all
+# and separate bridge lease rather than requiring their restoration.
+WINDOWS_UPDATE_ASSERTIONS = (
+    TreeAssertion("apps/desktop/electron/update-marker.ts", contains=(
+        "export function acquireUpdateMarker", "export function releaseUpdateMarkerIfOwnedBy")),
+    TreeAssertion("apps/desktop/electron/main.ts", contains=(
+        "function ownsDesktopUpdateClaim", "async function waitForUpdaterClaim"),
+        absent=("function forceKillAllHermesBackendTrees", "function releaseDrainUpdateMarker")),
+    TreeAssertion("apps/desktop/electron/install-mutation-set.ts", contains=(
+        "export function enumerateInstallMutationSet", "export function probeInstallResourceLocks")),
+)
 MERGE_ASSERTIONS: dict[str, tuple[TreeAssertion, ...]] = {
-    DURABLE_TODO_MERGE: (
-        TreeAssertion("agent/message_metadata.py", contains=("def stamp_persisted_todo_snapshot", "def has_persisted_todo_snapshot_provenance")),
-        TreeAssertion("hermes_state.py", contains=("def get_todo_state_messages", "_TODO_STATE_LOOKUP_SQL")),
-        TreeAssertion("apps/desktop/src/lib/todos.ts", contains=("export function latestSessionTodoState", "export function todosFromSnapshotMetadata")),
-        TreeAssertion("tui_gateway/server.py", contains=("def _has_structured_todo_snapshot",)),
-    ),
-    KILL_ALL_MERGE: (
-        TreeAssertion(
-            "apps/desktop/electron/main.ts",
-            contains=(
-                "function killHermesOwnedVenvDaemons",
-                "isHermesOwnedUpdateHolder",
-                "buildVenvHolderListCommand",
-            ),
-            absent=("function forceKillAllHermesBackendTrees",),
-        ),
-        TreeAssertion(
-            "apps/desktop/electron/venv-holder-select.ts",
-            contains=("export function isHermesOwnedUpdateHolder", "isOperatorManagedServeCmdline"),
-        ),
-    ),
+    KILL_ALL_MERGE: WINDOWS_UPDATE_ASSERTIONS,
     "merge: integrate live Windows update transport": (
-        TreeAssertion("apps/desktop/electron/updater-process.ts", contains=("export function resolveWindowsUpdateTransport",)),
-        TreeAssertion("apps/desktop/electron/main.ts", contains=("resolveWindowsUpdateTransport,",
-            "const windowsTransport = resolveWindowsUpdateTransport(updateRoot)",
-            "windowsTransport.kind === 'manual'", "launchWindowsUpdateTransport("))),
-    "merge: integrate Windows updater transport regression coverage": (TreeAssertion(
-        "apps/desktop/electron/updater-process.test.ts", contains=(
+        TreeAssertion("apps/desktop/electron/updater-process.ts", contains=(
+            "export function resolveWindowsUpdateTransport",)),
+        TreeAssertion("apps/desktop/electron/main.ts", contains=(
+            "resolveWindowsUpdateTransport(updateRoot)", "launchWindowsUpdateTransport(")),
+    ),
+    "merge: integrate Windows updater transport regression coverage": (
+        TreeAssertion("apps/desktop/electron/updater-process.test.ts", contains=(
             "test('resolveWindowsUpdateTransport selects the live checkout script'",
-            "test('resolveWindowsUpdateTransport requires a manual update without a live script'")),),
+            "test('resolveWindowsUpdateTransport requires a manual update without a live script'")),
+    ),
+    DURABLE_TODO_MERGE: (
+        TreeAssertion("agent/message_metadata.py", contains=(
+            "def stamp_persisted_todo_snapshot", "def has_persisted_todo_snapshot_provenance")),
+        TreeAssertion("hermes_state.py", contains=("def get_todo_state_messages", "_TODO_STATE_LOOKUP_SQL")),
+        TreeAssertion("apps/desktop/src/lib/todos.ts", contains=(
+            "export function latestSessionTodoState", "export function todosFromSnapshotMetadata")),
+        TreeAssertion("tui_gateway/session_history.py", contains=("def _has_structured_todo_snapshot",)),
+    ),
+    "Merge branch 'feat/owner-aware-sidebar-sessions' into rebuild/fork-integration-20260902": (
+        TreeAssertion("apps/desktop/src/app/contrib/surfaces.tsx", contains=(
+            "function RouteTileRedirect", "openRouteTile(path, 'center')")),
+    ),
+    "Merge fix/update-scanner-carrier-envelope: kernel-proven update holder detection replaces the kill-all":
+        WINDOWS_UPDATE_ASSERTIONS,
+    "Merge fix/windows-update-plugin-service-unit: stop plugin service units host-first, make force-release able to kill, repair the published tip (#6)": (
+        TreeAssertion("apps/desktop/electron/desktop-plugin-host-restore.ts", contains=(
+            "export function recordStoppedDesktopPluginHost", "export async function restoreStoppedDesktopPluginHosts")),
+        TreeAssertion("hermes_cli/_scan_venv_blockers.py", contains=(
+            "def terminate_desktop_plugin_service_unit", "def _kill_proven_member")),
+    ),
+    "Merge fix/windows-update-handoff-live-log: make the Windows update chain finish (#7)": (
+        TreeAssertion("scripts/desktop-update/windows.ps1", contains=(
+            "still running: {1}s elapsed", "no pipe output for {2}s")),
+    ),
+    "Merge fix/handoff-log-sharing: append the hand-off log via a shared FileStream (#8)": (
+        TreeAssertion("scripts/desktop-update/windows.ps1", contains=(
+            "[System.IO.FileStream]::new($LogPath", "[System.IO.FileMode]::Append", "[System.IO.FileShare]::ReadWrite")),
+    ),
+    "Merge pull request #9 from royalaid/fix/update-chain-receipt-lease-card": (
+        TreeAssertion("hermes_cli/update_receipt.py", contains=("def describe_last_receipt()",)),
+        TreeAssertion("apps/desktop/src/lib/update-copy.ts", contains=("rebuildTitle", "rebuildBody")),
+        *WINDOWS_UPDATE_ASSERTIONS,
+    ),
+    "Merge pull request #10 from royalaid/fix/handoff-marker-claim-time": (
+        TreeAssertion("scripts/desktop-update/windows.ps1", contains=(
+            "Get-Process -Id $PID -ErrorAction Stop", "claimed update marker (pid $PID, created $startedAt")),
+    ),
+    "Merge pull request #11 from royalaid/docs/handoff-handshake-addendum": (
+        TreeAssertion("docs/plans/2026-09-06-001-refactor-monotonic-update-handoff-plan.md", contains=(
+            "# Plan: take wall-clock comparison out of the Windows update hand-off", "Identity is a token, not an interval.")),
+    ),
+    "Merge pull request #12 from royalaid/fix/update-receipt-survives-purge": (
+        TreeAssertion("tests/hermes_cli/test_update_stale_module_purge.py", contains=(
+            "test_purge_preserves_active_update_receipt",)),
+    ),
+    "Merge pull request #13 from royalaid/fix/plugin-unit-proof-inaccessible-ancestor": (
+        TreeAssertion("hermes_cli/_scan_venv_blockers.py", contains=(
+            "except _ProcessGenerationChanged:", "An ancestor that cannot be opened is")),
+        TreeAssertion("apps/desktop/resources/update-scanner/scan-venv-blockers.py", contains=(
+            "except _ProcessGenerationChanged:", "An ancestor that cannot be opened is")),
+    ),
+    "Merge pull request #14 from royalaid/docs/update-run-ledger": (
+        TreeAssertion("docs/analysis/2026-09-04-windows-update-plugin-service-respawn-rca.md", contains=(
+            "## Run ledger: 2026-09-06 (three consecutive clean runs requested)",
+            "| 0 | 16:31 | 6e49bfd6c3 (+ #10 script)")),
+    ),
+    "Merge pull request #15 from royalaid/docs/update-run-ledger-2": (
+        TreeAssertion("docs/analysis/2026-09-04-windows-update-plugin-service-respawn-rca.md", contains=(
+            "| 1 | 18:16 |", "| 2 | 18:26 |")),
+    ),
+    "Merge pull request #16 from royalaid/docs/update-run-ledger-3": (
+        TreeAssertion("docs/analysis/2026-09-04-windows-update-plugin-service-respawn-rca.md", contains=(
+            "| 3 | 18:29 |", "OK; three consecutive clean runs")),
+    ),
 }
+
+MERGE_ASSERTIONS["Merge canonical Windows updater PR into rebased fork integration"] = WINDOWS_UPDATE_ASSERTIONS
+
 def _git(repo: Path, *args: str, check: bool = True, timeout: int = 600) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(GIT_ENV)

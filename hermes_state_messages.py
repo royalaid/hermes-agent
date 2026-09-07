@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.context_compressor import _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, split_user_originated_turn
 from agent.memory_manager import sanitize_context
+from agent.message_metadata import stamp_persisted_todo_snapshot
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
@@ -964,6 +965,8 @@ class SessionMessagesMixin:
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded
+                if "todo_snapshot" in decoded:
+                    stamp_persisted_todo_snapshot(msg)
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(

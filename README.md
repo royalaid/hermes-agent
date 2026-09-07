@@ -18,22 +18,30 @@
 
 ## RoyalAid fork integration
 
-This repository is a maintained fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). The published integration branch is [`fork-integration`](https://github.com/royalaid/hermes-agent/tree/fork-integration). It is reconstructed from current upstream `main` plus the reviewable component set documented below; it is not a general-purpose development branch.
+This repository is a maintained fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). [`fork-integration`](https://github.com/royalaid/hermes-agent/tree/fork-integration) carries upstream `main` plus the fork changes described below. Fork `main` follows the validated integration tree. Neither branch is a general-purpose development branch.
 
 ### Included fork changes
 
 | Component | Changes carried by this fork |
 | --- | --- |
-| Windows desktop environment | Preserve the live Windows host `PATH` for desktop-launched backend processes. |
-| Native reasoning display | Preserve reasoning-item boundaries and streamed native reasoning summaries. |
-| Desktop hitch diagnostics | Capture and classify renderer/main-process stalls, expose diagnostics controls and sanitized exports, and provide `hermes debug diagnose`. |
-| Gateway responsiveness | Move gateway configuration I/O off the event loop and serialize config mutations. |
-| Desktop render instrumentation | Attribute multi-thread render cost and bound the in-flight turn journal. |
-| Delegation argv safety | Do not interpret option values as server-role commands. |
+| Fork updates and installation | Follow the published integration branch and preserve custom fork remotes and installed commit provenance. |
+| Windows runtime isolation | Preserve the live Windows `PATH` and isolate dispatcher workers from the installed runtime. |
+| Native reasoning and replay | Preserve reasoning source identity, hydrate persisted reasoning and commentary, and prune stale replay during compression. |
+| Desktop panes and sessions | Preserve exact session ownership, tab placement, transcript continuity, scroll behavior, and plugin route tiles. |
+| File actions | Provide full-file actions from desktop tool results. |
+| Goals and Todo state | Persist model goal controls, acceptance evidence, bounded continuations, and durable Todo projections. |
+| Gateway delivery | Recover claimed continuations and attachment publication without losing delivery ownership. |
+| Kanban and agent safeguards | Reduce unchanged notifier polling, prevent delegated reconnect storms, and record loop-risk and guardrail findings. |
+| Windows updater | Coordinate through the shared update marker, identify file holders, restore stopped plugin hosts, preserve relaunch identity, and retain update receipts and progress logs. |
+| Fork maintenance | Compose upstream changes with characterized fork merges and keep fork CI runnable. |
+
+The [integration record](docs/solutions/2026-09-06-fork-integration-rebase.md) records source commits, dispositions, verification, and remaining limitations. Its companion provenance file identifies the merged branches and the rewritten commits that carry them.
 
 ### Updating this fork
 
-Use the blue **Hermes Setup** bootstrap/updater launcher, not a versioned MSI/NSIS wrapper. The launcher and Desktop update status follow the published integration branch; the status pill reports the exact number of commits available as `(+N)`. The daily integration job rebuilds the branch from the manifest, validates it, and publishes a prerelease launcher with a checksum and provenance record. The prior `local/openai-native-windows` branch remains a compatibility alias for existing installers while clients migrate to `fork-integration`.
+Use the **Hermes Setup** bootstrap/updater launcher. The launcher and Desktop update status follow `fork-integration`. The daily integration job rebases the published fork range onto upstream, validates its recorded assertions, and publishes by lease. The prior `local/openai-native-windows` branch remains a compatibility alias for existing installers.
+
+The September 6 canonical Windows updater has passed focused checks, but its two isolated end-to-end cutover runs remain pending. A separate `HERMES_HOME` on the same Windows host does not isolate the updater's gateway process scan; use a truly isolated Windows environment for that proof.
 
 **The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
 
