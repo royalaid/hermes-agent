@@ -1030,6 +1030,7 @@ describe('active transcript refresh', () => {
     )
 
     const updateSessionState = vi.fn()
+
     const refresh = reconcileTileTranscriptsForTest({
       tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
       requestSequenceRef: { current: 0 },
@@ -1037,7 +1038,7 @@ describe('active transcript refresh', () => {
       updateSessionState
     })
 
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, undefined)
     state.messages = [
       {
         id: `user-queued-${TILE_RUNTIME_ID}`,
@@ -1067,6 +1068,7 @@ describe('active transcript refresh', () => {
     )
 
     const updateSessionState = vi.fn()
+
     const refresh = reconcileTileTranscriptsForTest({
       tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
       requestSequenceRef: { current: 0 },
@@ -1074,7 +1076,7 @@ describe('active transcript refresh', () => {
       updateSessionState
     })
 
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, undefined)
     publishSessionState(TILE_RUNTIME_ID, { ...state, busy: true })
     resolveLatest(transcript('stale persisted tail', TILE_STORED_ID))
     await refresh
