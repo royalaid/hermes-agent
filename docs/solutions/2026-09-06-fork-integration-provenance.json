@@ -10,7 +10,13 @@
     "a28d11daa981d8bff48df0a83eaacb57cae22c0d"
   ],
   "canonical_updater_merge": "ea1ae5d8b8c79f971b3b38f97c94f35295b9e97f",
-  "remote_publication": "pending explicit authorization",
+  "canonical_updater_ci_fix": "034aa2adec8097bff77fbdf6dd8a471b59faf041",
+  "canonical_updater_ci_fix_merge": "453e075fb6e14cdd9986afbeb493a01606190833",
+  "remote_publication": "canonical updater feature branch published; fork-integration and main pending isolated updater proof",
+  "upstream_repository": "NousResearch/hermes-agent",
+  "upstream_pr": "https://github.com/NousResearch/hermes-agent/pull/104687",
+  "upstream_pr_head": "034aa2adec8097bff77fbdf6dd8a471b59faf041",
+  "upstream_merge_sha": null,
   "live_updater_cutover": "not proven; two isolated runs and pushed known-good ref required",
   "captured_commit_count": 189,
   "commits": [

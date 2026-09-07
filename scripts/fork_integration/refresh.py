@@ -117,6 +117,13 @@ MERGE_ASSERTIONS: dict[str, tuple[TreeAssertion, ...]] = {
 }
 
 MERGE_ASSERTIONS["Merge canonical Windows updater PR into rebased fork integration"] = WINDOWS_UPDATE_ASSERTIONS
+MERGE_ASSERTIONS["Merge upstream updater CI fixes from PR #104687"] = (
+    *WINDOWS_UPDATE_ASSERTIONS,
+    TreeAssertion("hermes_cli/_scan_venv_blockers.py", contains=(
+        'psutil.process_iter(["pid", "exe", "name"])', 'raw_argv = info["cmdline"]')),
+    TreeAssertion("hermes_mcp_update_gate.py", contains=(
+        "except (ProcessLookupError, OverflowError):",)),
+)
 
 def _git(repo: Path, *args: str, check: bool = True, timeout: int = 600) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
