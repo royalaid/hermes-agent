@@ -1,0 +1,659 @@
+/**
+ * Elevated (UAC) force-release path for Windows updates.
+ *
+ * Passes only an authenticated, nonce-scoped request file containing the
+ * canonical install identity and exact PID/create-time/resource claims.
+ * Never accepts arbitrary command text.
+ */
+
+import { execFile } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+import { identitiesStillPresent } from './windows-process-terminate'
+import type { ForceReleaseHolder } from './windows-update-force-release'
+
+export const FORCE_RELEASE_REQUEST_SCHEMA = 1 as const
+
+export type ForceReleaseRequest = {
+  schemaVersion: typeof FORCE_RELEASE_REQUEST_SCHEMA
+  nonce: string
+  issuedAt: number
+  expiresAt: number
+  installRoot: string
+  installRootHash: string
+  holders: Array<{
+    pid: number
+    createdAt: number
+    name: string
+    resource?: string
+  }>
+  /** PIDs the elevated helper must never terminate (Desktop main, updater helper). */
+  excludePids?: number[]
+  /** HMAC-like integrity over the body using a one-shot secret written beside the request. */
+  requestMac: string
+}
+
+export type ForceReleaseSurvivor = {
+  pid: number
+  detail: string
+  resource?: string
+  win32Error?: number
+}
+
+export type ForceReleaseResponse = {
+  schemaVersion: typeof FORCE_RELEASE_REQUEST_SCHEMA
+  nonce: string
+  ok: boolean
+  cleared: boolean
+  cancelled?: boolean
+  error?: string
+  terminated?: number[]
+  survivors?: ForceReleaseSurvivor[]
+}
+
+export function hashInstallRoot(installRoot: string): string {
+  return createHash('sha256').update(path.resolve(installRoot)).digest('hex')
+}
+
+/**
+ * Canonical numeric token shared by Electron and the elevated PowerShell helper.
+ * Integers stay decimal integers; non-integers use JS/ECMA round-trip text, which
+ * matches .NET `double.ToString("R", InvariantCulture)`.
+ */
+export function canonicalNumericToken(value: number): string {
+  if (!Number.isFinite(value)) {return '0'}
+
+  if (Object.is(value, -0)) {return '0'}
+
+  if (Number.isInteger(value)) {return String(value)}
+
+  return String(value)
+}
+
+export function canonicalForceReleasePayload(input: {
+  schemaVersion: number
+  nonce: string
+  issuedAt: number
+  expiresAt: number
+  installRoot: string
+  installRootHash: string
+  holders: ReadonlyArray<{ pid: number; createdAt: number; name: string; resource?: string }>
+  excludePids?: readonly number[]
+}): string {
+  const holderLines = input.holders
+    .map(
+      holder =>
+        `${holder.pid}\t${canonicalNumericToken(holder.createdAt)}\t${holder.name}\t${holder.resource ?? ''}`
+    )
+    .join('\n')
+
+  const excludeLine = (input.excludePids ?? [])
+    .filter(pid => Number.isInteger(pid) && pid > 0)
+    .slice()
+    .sort((a, b) => a - b)
+    .join(',')
+
+  return [
+    String(input.schemaVersion),
+    input.nonce,
+    canonicalNumericToken(input.issuedAt),
+    canonicalNumericToken(input.expiresAt),
+    input.installRoot,
+    input.installRootHash,
+    holderLines,
+    excludeLine
+  ].join('\n')
+}
+
+export function buildForceReleaseRequest(input: {
+  installRoot: string
+  holders: readonly ForceReleaseHolder[]
+  now?: number
+  ttlMs?: number
+  nonce?: string
+  secret: string
+  excludePids?: readonly number[]
+}): ForceReleaseRequest {
+  const now = input.now ?? Date.now()
+  const ttlMs = input.ttlMs ?? 120_000
+  const nonce = input.nonce ?? randomBytes(16).toString('hex')
+  const installRoot = path.resolve(input.installRoot)
+
+  const holders = input.holders.map(holder => ({
+    pid: holder.pid,
+    createdAt: holder.createdAt,
+    name: holder.name,
+    ...(holder.resource ? { resource: holder.resource } : {})
+  }))
+
+  const excludePids = Array.from(
+    new Set((input.excludePids ?? []).filter(pid => Number.isInteger(pid) && pid > 0))
+  ).sort((a, b) => a - b)
+
+  const body = {
+    schemaVersion: FORCE_RELEASE_REQUEST_SCHEMA,
+    nonce,
+    issuedAt: now,
+    expiresAt: now + ttlMs,
+    installRoot,
+    installRootHash: hashInstallRoot(installRoot),
+    holders,
+    ...(excludePids.length > 0 ? { excludePids } : {})
+  }
+
+  const requestMac = createHash('sha256')
+    .update(input.secret)
+    .update('\n')
+    .update(canonicalForceReleasePayload(body))
+    .digest('hex')
+
+  return { ...body, requestMac }
+}
+
+export function verifyForceReleaseRequest(
+  request: ForceReleaseRequest,
+  secret: string,
+  expectedInstallRoot: string,
+  now = Date.now()
+): { ok: true } | { ok: false; reason: string } {
+  if (request.schemaVersion !== FORCE_RELEASE_REQUEST_SCHEMA) {
+    return { ok: false, reason: 'schema' }
+  }
+
+  if (!request.nonce || typeof request.nonce !== 'string') {
+    return { ok: false, reason: 'nonce' }
+  }
+
+  if (now > request.expiresAt) {
+    return { ok: false, reason: 'expired' }
+  }
+
+  if (path.resolve(request.installRoot) !== path.resolve(expectedInstallRoot)) {
+    return { ok: false, reason: 'install-root-mismatch' }
+  }
+
+  if (request.installRootHash !== hashInstallRoot(expectedInstallRoot)) {
+    return { ok: false, reason: 'install-root-hash-mismatch' }
+  }
+
+  const { requestMac, ...body } = request
+
+  const expectedMac = createHash('sha256')
+    .update(secret)
+    .update('\n')
+    .update(canonicalForceReleasePayload(body))
+    .digest('hex')
+
+  if (requestMac !== expectedMac) {
+    return { ok: false, reason: 'mac-mismatch' }
+  }
+
+  if (!Array.isArray(request.holders) || request.holders.length === 0) {
+    return { ok: false, reason: 'holders' }
+  }
+
+  for (const holder of request.holders) {
+    if (!Number.isInteger(holder.pid) || holder.pid <= 0) {
+      return { ok: false, reason: 'holder-pid' }
+    }
+
+    if (!Number.isFinite(holder.createdAt) || holder.createdAt <= 0) {
+      return { ok: false, reason: 'holder-created-at' }
+    }
+  }
+
+  return { ok: true }
+}
+
+export function forceReleasePaths(dir: string, nonce: string) {
+  return {
+    requestPath: path.join(dir, `force-release-${nonce}.request.json`),
+    secretPath: path.join(dir, `force-release-${nonce}.secret`),
+    responsePath: path.join(dir, `force-release-${nonce}.response.json`)
+  }
+}
+
+export type ForceReleaseRequestFiles = {
+  directory: string
+  request: ForceReleaseRequest
+  /** Present only until cleanup; never log or return this after launch. */
+  secret: string
+  requestPath: string
+  secretPath: string
+  responsePath: string
+  /** Exact helper response temp path once the elevated helper PID is known. */
+  responseTempPath?: string
+  /** True when writeForceReleaseRequestFiles created the directory via mkdtemp. */
+  ownedDirectory: boolean
+}
+
+export async function writeForceReleaseRequestFiles(input: {
+  installRoot: string
+  holders: readonly ForceReleaseHolder[]
+  directory?: string
+  /** PIDs the elevated helper must never target (Desktop main, updater helper, etc.). */
+  excludePids?: readonly number[]
+}): Promise<ForceReleaseRequestFiles> {
+  const ownedDirectory = input.directory == null
+  const directory = input.directory ?? fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-force-release-'))
+  const secret = randomBytes(32).toString('hex')
+
+  const request = buildForceReleaseRequest({
+    installRoot: input.installRoot,
+    holders: input.holders,
+    secret,
+    excludePids: input.excludePids
+  })
+
+  const paths = forceReleasePaths(directory, request.nonce)
+
+  try {
+    fs.writeFileSync(paths.secretPath, secret, { encoding: 'utf8', mode: 0o600 })
+    fs.writeFileSync(paths.requestPath, JSON.stringify(request, null, 2), { encoding: 'utf8', mode: 0o600 })
+  } catch (error) {
+    // A failed second write can otherwise strand the freshly-created secret or
+    // owned mkdtemp directory before the caller receives a return value.
+    cleanupForceReleaseArtifacts({
+      directory,
+      requestPath: paths.requestPath,
+      secretPath: paths.secretPath,
+      responsePath: paths.responsePath,
+      ownedDirectory
+    })
+    throw error
+  }
+
+  return {
+    directory,
+    request,
+    secret,
+    ownedDirectory,
+    ...paths
+  }
+}
+
+/**
+ * Idempotent cleanup of nonce request/secret/response artifacts.
+ * Removes only the exact owned files. Never recursive-deletes a directory.
+ * If the directory was owned (mkdtemp) and is empty after file removal, remove
+ * the empty directory non-recursively; otherwise leave it (and any unexpected
+ * sentinel/reparse entries) intact.
+ */
+export function cleanupForceReleaseArtifacts(files: {
+  directory?: string
+  requestPath?: string
+  secretPath?: string
+  responsePath?: string
+  responseTempPath?: string
+  ownedDirectory?: boolean
+}): void {
+  for (const filePath of [files.requestPath, files.secretPath, files.responsePath, files.responseTempPath]) {
+    if (!filePath) {continue}
+
+    try {
+      fs.rmSync(filePath, { force: true })
+    } catch {
+      void 0
+    }
+  }
+
+  if (files.ownedDirectory && files.directory) {
+    try {
+      const remaining = fs.readdirSync(files.directory)
+
+      if (remaining.length === 0) {
+        fs.rmdirSync(files.directory)
+      }
+    } catch {
+      void 0
+    }
+  }
+}
+
+export function parseForceReleaseResponse(raw: string, expectedNonce: string): ForceReleaseResponse | null {
+  try {
+    const parsed = JSON.parse(raw)
+
+    if (parsed?.schemaVersion !== FORCE_RELEASE_REQUEST_SCHEMA) {return null}
+
+    if (parsed?.nonce !== expectedNonce) {return null}
+
+    if (typeof parsed.ok !== 'boolean' || typeof parsed.cleared !== 'boolean') {return null}
+
+    return parsed as ForceReleaseResponse
+  } catch {
+    return null
+  }
+}
+
+export function formatElevatedForceReleaseFailure(response: ForceReleaseResponse | null): {
+  message: string
+  protectedHolders: boolean
+} {
+  const survivors = Array.isArray(response?.survivors) ? response!.survivors! : []
+
+  const survivorText = survivors
+    .slice(0, 8)
+    .map(entry => {
+      const resource = entry.resource ? ` resource=${entry.resource}` : ''
+
+      const win32 =
+        typeof entry.win32Error === 'number'
+          ? ` win32=${entry.win32Error}`
+          : /win32=(\d+)/i.test(entry.detail || '')
+            ? ''
+            : ''
+
+      return `PID ${entry.pid}${resource} ${entry.detail || 'survived'}${win32}`.trim()
+    })
+    .join('; ')
+
+  const protectedHolders = survivors.some(entry =>
+    /protected|unkillable|win32=5/i.test(`${entry.detail || ''} ${entry.win32Error ?? ''}`)
+  )
+
+  if (survivorText) {
+    return {
+      message:
+        `Update aborted: elevated force-release could not clear install file locks (${survivorText}). ` +
+        'The virtual environment was not modified.',
+      protectedHolders
+    }
+  }
+
+  return {
+    message:
+      response?.error ||
+      'Update aborted: elevated force-release could not clear install file locks. The virtual environment was not modified.',
+    protectedHolders
+  }
+}
+
+/**
+ * Environment variable names used by the constant elevated launcher.
+ * Dynamic filesystem paths travel ONLY through these env vars — never as
+ * PowerShell source text — so metacharacters cannot be evaluated.
+ */
+export const ELEVATED_FORCE_RELEASE_LAUNCH_ENV = {
+  helper: 'HERMES_FORCE_RELEASE_HELPER',
+  request: 'HERMES_FORCE_RELEASE_REQUEST',
+  response: 'HERMES_FORCE_RELEASE_RESPONSE',
+  job: 'HERMES_FORCE_RELEASE_JOB',
+  bootstrap: 'HERMES_FORCE_RELEASE_BOOTSTRAP'
+} as const
+
+export const ELEVATED_FORCE_RELEASE_JOB_NATIVE_SOURCE = String.raw`
+using System;
+using System.Runtime.InteropServices;
+public static class HermesElevatedBoundaryJob {
+  const int JobObjectExtendedLimitInformation = 9;
+  const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+  const uint JOB_OBJECT_ALL_ACCESS = 0x001F001F;
+  [StructLayout(LayoutKind.Sequential)] struct IO_COUNTERS { public ulong a,b,c,d,e,f; }
+  [StructLayout(LayoutKind.Sequential)] struct BASIC_LIMIT {
+    public long perProcessUserTime, perJobUserTime;
+    public uint limitFlags;
+    public UIntPtr minimumWorkingSet, maximumWorkingSet;
+    public uint activeProcessLimit;
+    public UIntPtr affinity;
+    public uint priorityClass, schedulingClass;
+  }
+  [StructLayout(LayoutKind.Sequential)] struct EXTENDED_LIMIT { public BASIC_LIMIT basic; public IO_COUNTERS io; public UIntPtr processMemory, jobMemory, peakProcess, peakJob; }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr handle);
+  public static IntPtr CreateKillOnClose(string name) {
+    IntPtr job = CreateJobObject(IntPtr.Zero, name);
+    if (job == IntPtr.Zero) return IntPtr.Zero;
+    var info = new EXTENDED_LIMIT(); info.basic.limitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    int size = Marshal.SizeOf(info); IntPtr ptr = Marshal.AllocHGlobal(size);
+    try {
+      Marshal.StructureToPtr(info, ptr, false);
+      if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ptr, (uint)size)) { CloseHandle(job); return IntPtr.Zero; }
+      return job;
+    } finally { Marshal.FreeHGlobal(ptr); }
+  }
+  public static bool JoinCurrent(string name) {
+    IntPtr job = OpenJobObject(JOB_OBJECT_ALL_ACCESS, false, name);
+    if (job == IntPtr.Zero) return false;
+    try { return AssignProcessToJobObject(job, GetCurrentProcess()); }
+    finally { CloseHandle(job); }
+  }
+}`.trim()
+
+/** SHA-256 of UTF-8 helper text after CRLF/CR normalization to LF. */
+export const ELEVATED_FORCE_RELEASE_HELPER_SHA256 =
+  '182d4d0ebdd5ec6dac0f74f7719cff3ecd1001db32530a74f3a14f6a28cee26c'
+
+/**
+ * Trusted elevated source carried inside the compiled Desktop bundle. Dynamic
+ * values replace base64-only placeholders in the non-elevated launcher, then
+ * the whole command is passed via -EncodedCommand. Before joining the Job this
+ * performs memory-only Reflection.Emit P/Invoke construction: no files,
+ * processes, or external state are created. Helper bytes are hash-checked and
+ * converted to a ScriptBlock only after Job assignment.
+ */
+export const ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE = String.raw`
+$ErrorActionPreference = 'Stop'
+function Decode-HermesData([string]$Value) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value)) }
+$jobName = Decode-HermesData '__JOB__'
+$assemblyName = New-Object Reflection.AssemblyName('HermesElevatedBoundary')
+$assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+$module = $assembly.DefineDynamicModule('HermesElevatedBoundary')
+$builder = $module.DefineType('HermesElevatedBoundaryNative', [Reflection.TypeAttributes]'Public,Sealed,Abstract')
+$attributes = [Reflection.MethodAttributes]'Public,Static,PinvokeImpl'
+$calling = [Reflection.CallingConventions]::Standard
+$nativeCalling = [Runtime.InteropServices.CallingConvention]::Winapi
+$open = $builder.DefinePInvokeMethod('OpenJobObjectW','kernel32.dll','OpenJobObjectW',$attributes,$calling,[IntPtr],[Type[]]@([uint32],[bool],[string]),$nativeCalling,[Runtime.InteropServices.CharSet]::Unicode)
+$assign = $builder.DefinePInvokeMethod('AssignProcessToJobObject','kernel32.dll','AssignProcessToJobObject',$attributes,$calling,[bool],[Type[]]@([IntPtr],[IntPtr]),$nativeCalling,[Runtime.InteropServices.CharSet]::Auto)
+$current = $builder.DefinePInvokeMethod('GetCurrentProcess','kernel32.dll','GetCurrentProcess',$attributes,$calling,[IntPtr],[Type[]]@(),$nativeCalling,[Runtime.InteropServices.CharSet]::Auto)
+$close = $builder.DefinePInvokeMethod('CloseHandle','kernel32.dll','CloseHandle',$attributes,$calling,[bool],[Type[]]@([IntPtr]),$nativeCalling,[Runtime.InteropServices.CharSet]::Auto)
+foreach ($method in @($open,$assign,$current,$close)) { $method.SetImplementationFlags($method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig) }
+$native = $builder.CreateType()
+$job = $native::OpenJobObjectW(0x001F001F, $false, $jobName)
+if ($job -eq [IntPtr]::Zero) { exit 5 }
+try {
+  if (-not $native::AssignProcessToJobObject($job, $native::GetCurrentProcess())) { exit 5 }
+} finally {
+  $native::CloseHandle($job) | Out-Null
+}
+`.trim()
+
+export const ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE = String.raw`${ELEVATED_FORCE_RELEASE_JOB_JOIN_TEMPLATE}
+$helper = Decode-HermesData '__HELPER__'
+$request = Decode-HermesData '__REQUEST__'
+$response = Decode-HermesData '__RESPONSE__'
+$helperText = [IO.File]::ReadAllText($helper, [Text.Encoding]::UTF8).Replace(([string][char]13 + [char]10), [string][char]10).Replace([string][char]13, [string][char]10)
+$helperBytes = [Text.UTF8Encoding]::new($false).GetBytes($helperText)
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $actualHash = ([BitConverter]::ToString($sha.ComputeHash($helperBytes))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+if ($actualHash -ne '${ELEVATED_FORCE_RELEASE_HELPER_SHA256}') { exit 13 }
+$verifiedHelper = [ScriptBlock]::Create($helperText)
+& $verifiedHelper -RequestPath $request -ResponsePath $response
+exit $LASTEXITCODE
+`.trim()
+
+/**
+ * Windows PowerShell's Start-Process joins -ArgumentList elements into one
+ * command line. Quote values at that final Windows command-line boundary, not
+ * in the outer PowerShell source. This is the standard CommandLineToArgvW
+ * quoting rule, including doubled trailing backslashes and embedded quotes.
+ */
+export const WINDOWS_ARGUMENT_QUOTER_FUNCTION = [
+  'function ConvertTo-WindowsArgument([string]$Value) {',
+  "  if ($null -eq $Value -or $Value.IndexOf([char]0) -ge 0) { throw 'invalid force-release process argument' }",
+  '  $builder = New-Object System.Text.StringBuilder',
+  '  [void]$builder.Append([char]34)',
+  '  $slashes = 0',
+  '  foreach ($current in $Value.ToCharArray()) {',
+  "    if ($current -eq [char]92) { $slashes++; continue }",
+  "    if ($current -eq [char]34) { [void]$builder.Append((('\\' * ($slashes * 2 + 1)) -join '')); [void]$builder.Append([char]34); $slashes = 0; continue }",
+  "    if ($slashes -gt 0) { [void]$builder.Append((('\\' * $slashes) -join '')); $slashes = 0 }",
+  '    [void]$builder.Append($current)',
+  '  }',
+  "  if ($slashes -gt 0) { [void]$builder.Append((('\\' * ($slashes * 2)) -join '')) }",
+  '  [void]$builder.Append([char]34)',
+  '  return $builder.ToString()',
+  '}'
+].join('; ')
+export const ELEVATED_FORCE_RELEASE_ARGUMENT_QUOTER = WINDOWS_ARGUMENT_QUOTER_FUNCTION
+
+/**
+ * Constant outer launcher. Dynamic values become base64-only tokens in the
+ * trusted bootstrap template, then cross ShellExecute via -EncodedCommand.
+ */
+export const ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND = [
+  "$ErrorActionPreference = 'Stop'",
+  `Add-Type -TypeDefinition @'\n${ELEVATED_FORCE_RELEASE_JOB_NATIVE_SOURCE}\n'@`,
+  `$helper = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper}')`,
+  `$bootstrap = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap}')`,
+  `$request = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request}')`,
+  `$response = [Environment]::GetEnvironmentVariable('${ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response}')`,
+  "if ([string]::IsNullOrWhiteSpace($bootstrap) -or [string]::IsNullOrWhiteSpace($helper) -or [string]::IsNullOrWhiteSpace($request) -or [string]::IsNullOrWhiteSpace($response)) { throw 'missing force-release launch env' }",
+  `$ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'`,
+  WINDOWS_ARGUMENT_QUOTER_FUNCTION,
+  'function ConvertTo-HermesData([string]$Value) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Value)) }',
+  `$jobName = 'Local\\HermesForceRelease-' + [guid]::NewGuid().ToString('N')`,
+  "$bootstrapSource = $bootstrap.Replace('__JOB__',(ConvertTo-HermesData $jobName)).Replace('__HELPER__',(ConvertTo-HermesData $helper)).Replace('__REQUEST__',(ConvertTo-HermesData $request)).Replace('__RESPONSE__',(ConvertTo-HermesData $response))",
+  '$encodedBootstrap = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bootstrapSource))',
+  '$job = [HermesElevatedBoundaryJob]::CreateKillOnClose($jobName)',
+  "if ($job -eq [IntPtr]::Zero) { throw 'elevated boundary job create failed' }",
+  'try {',
+  "  $argList = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',(ConvertTo-WindowsArgument $encodedBootstrap))",
+  '  $p = Start-Process -FilePath $ps -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList $argList',
+  '  if ($null -eq $p) { exit 1223 }',
+  '  Write-Output ("HERMES_ELEVATED_PID=" + $p.Id)',
+  '  Write-Output ("HERMES_ELEVATED_CREATED_AT=" + ([DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() / 1000.0).ToString("R", [Globalization.CultureInfo]::InvariantCulture))',
+  '  [Console]::Out.Flush()',
+  '  $p.WaitForExit()',
+  '  exit $p.ExitCode',
+  '} finally { if ($job -ne [IntPtr]::Zero) { [HermesElevatedBoundaryJob]::CloseHandle($job) | Out-Null } }'
+].join('; ')
+
+export type ElevatedForceReleaseRun = (
+  command: string,
+  args: string[],
+  options?: { env?: NodeJS.ProcessEnv }
+) => Promise<{ code: number; stdout?: string }>
+
+/**
+ * Launch via ShellExecuteEx runas. The helper text is bound to the trusted
+ * digest and executed from the verified bytes only after Job assignment.
+ */
+export async function launchElevatedForceReleaseHelper(input: {
+  helperScriptPath: string
+  requestPath: string
+  responsePath: string
+  platform?: NodeJS.Platform
+  run?: ElevatedForceReleaseRun
+  confirmIdentityAbsent?: (identity: { pid: number; createdAt: number }) => Promise<boolean>
+}): Promise<
+  | { kind: 'launched'; responseTempPath?: string }
+  | { kind: 'cancelled'; responseTempPath?: string }
+  | { kind: 'failed'; detail: string; responseTempPath?: string }
+> {
+  const platform = input.platform ?? process.platform
+
+  if (platform !== 'win32') {
+    return { kind: 'failed', detail: 'windows-only' }
+  }
+
+  const run: ElevatedForceReleaseRun =
+    input.run ??
+    (async (command, args, options) =>
+      await new Promise(resolve => {
+        execFile(
+          command,
+          args,
+          {
+            windowsHide: true,
+            timeout: 180_000,
+            env: options?.env,
+            encoding: 'utf8'
+          },
+          (error: any, stdout: string) => {
+            const code = typeof error?.code === 'number' ? error.code : error ? 1 : 0
+
+            // 1223 = ERROR_CANCELLED (UAC denied)
+            if (code === 1223 || /canceled|cancelled/i.test(String(error?.message ?? ''))) {
+              resolve({ code: 1223, stdout: String(stdout ?? '') })
+
+              return
+            }
+
+            resolve({ code, stdout: String(stdout ?? '') })
+          }
+        )
+      }))
+
+  const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request]: input.requestPath,
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath,
+    [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap]: ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE
+  }
+
+  const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND]
+  const result = await run(ps, args, { env })
+  const helperPidToken = String(result.stdout ?? '').match(/HERMES_ELEVATED_PID=(\d+)/i)?.[1]
+  const helperCreatedToken = String(result.stdout ?? '').match(/HERMES_ELEVATED_CREATED_AT=([0-9]+(?:\.[0-9]+)?)/i)?.[1]
+  const helperPid = Number(helperPidToken)
+  const helperCreatedAt = Number(helperCreatedToken)
+  const responseTempPath = helperPidToken ? `${input.responsePath}.${helperPidToken}.tmp` : undefined
+
+  if (result.code === 1223) {return { kind: 'cancelled', responseTempPath }}
+
+  if (helperPidToken) {
+    if (!Number.isInteger(helperPid) || helperPid <= 0 || !Number.isFinite(helperCreatedAt) || helperCreatedAt <= 0) {
+      return { kind: 'failed', detail: 'elevated helper identity missing', responseTempPath }
+    }
+
+    const confirmIdentityAbsent = input.confirmIdentityAbsent ?? (async identity => {
+      const expiresAt = Date.now() + 5_000
+
+      do {
+        if ((await identitiesStillPresent([identity])).length === 0) {return true}
+        await new Promise(resolve => setTimeout(resolve, 25))
+      } while (Date.now() < expiresAt)
+
+      return false
+    })
+
+    if (!(await confirmIdentityAbsent({ pid: helperPid, createdAt: helperCreatedAt }))) {
+      return { kind: 'failed', detail: 'elevated helper survived terminal boundary', responseTempPath }
+    }
+  } else if (result.code === 0) {
+    return { kind: 'failed', detail: 'elevated helper identity missing', responseTempPath }
+  }
+
+  if (result.code === 0) {return { kind: 'launched', responseTempPath }}
+
+  return { kind: 'failed', detail: `elevated helper exit ${result.code}`, responseTempPath }
+}
+
+/** Pure helper for tests: capture argv + env without launching. */
+export function buildElevatedForceReleaseLaunchInvocation(input: {
+  helperScriptPath: string
+  requestPath: string
+  responsePath: string
+}): { args: string[]; env: Record<string, string>; command: string } {
+  return {
+    command: ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND,
+    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ELEVATED_FORCE_RELEASE_LAUNCHER_COMMAND],
+    env: {
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.helper]: input.helperScriptPath,
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.request]: input.requestPath,
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.response]: input.responsePath,
+      [ELEVATED_FORCE_RELEASE_LAUNCH_ENV.bootstrap]: ELEVATED_FORCE_RELEASE_BOOTSTRAP_TEMPLATE
+    }
+  }
+}

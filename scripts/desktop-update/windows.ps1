@@ -22,7 +22,8 @@
 #     -InstallRoot <path>   repo checkout (HERMES_HOME\hermes-agent)
 #     -Branch <ref>         branch to update against
 #     -DesktopPid <pid>     the Electron main process to wait out
-#     [-RelaunchAppPath <path>] app checkout passed to a dev Electron relaunch
+#     -BridgeLeaseId <id>   opaque MCP-quiesce capability to adopt
+#     [-RelaunchAppPath <path>] optional dev app path retained for relaunch
 #     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
 #     [-NoUi]               headless (tests); default shows a progress window
 #     [-NoMarkerCleanup]    leave .hermes-update-in-progress in place (tests)
@@ -50,18 +51,18 @@ param(
     [int]$DesktopPid = 0,
     [string]$RelaunchExe = "",
     [string]$RelaunchAppPath = "",
+    [string]$BridgeLeaseId = "",
     [switch]$NoUi,
     [switch]$NoMarkerCleanup,
     [switch]$SelfTestUi,
     [switch]$SelfTestPipeDrain,
     [switch]$SelfTestMarker,
     [switch]$SelfTestLog,
-    [switch]$SelfTestRelaunchCommand,
     [switch]$SelfTestRelaunchEnvironment,
     [switch]$SelfTestDirectRelaunch
 )
 
-if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestLog -and -not $SelfTestRelaunchCommand -and -not $SelfTestRelaunchEnvironment -and -not $InstallRoot) {
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestLog -and -not $SelfTestRelaunchEnvironment -and -not $InstallRoot) {
     # Mandatory in spirit; relaxed in the signature only so the self-test
     # switches can drive the UI / the pipe drain / the log without a checkout.
     throw "-InstallRoot is required"
@@ -90,6 +91,10 @@ try {
 $TempDir = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $HermesHome = if ($InstallRoot) { Split-Path -Parent $InstallRoot } else { $TempDir }
 $MarkerPath = Join-Path $HermesHome ".hermes-update-in-progress"
+$BridgeLeasePath = Join-Path $HermesHome ".hermes-venv-quiesce"
+# Byte-for-byte body of the lease THIS process adopted; $null until then.
+# Remove-BridgeLeaseIfOwned releases exactly that body and nothing newer.
+$script:BridgeLeaseBody = $null
 $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
 $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
@@ -267,6 +272,8 @@ function Start-UiServer([string]$HtmlPath) {
                     } elseif ($request -match "^POST /ack/([^ /?]+) HTTP/1\.[01]$") {
                         $receipt = $Matches[1]
                         if ($State.status -in @("done", "manual", "error") -and $State.receipt -and $receipt -ceq $State.receipt) {
+                            # Flush acceptance before waking the owner that will
+                            # close the listener. No request body is needed.
                             Send-Response $stream "204 No Content" "text/plain" ([byte[]]@())
                             $State.acknowledged_receipt = $receipt
                         } else {
@@ -357,7 +364,8 @@ function Stop-UiServer([switch]$LeaveWindow) {
 }
 
 function Publish-UiEvent([string]$Status, [string]$Message) {
-    # Retain a terminal event until the page acknowledges this exact receipt.
+    # A background browser can miss a fixed 900ms delivery window. Retain the
+    # terminal event until the page acknowledges applying this exact receipt.
     # Older/headless clients cannot acknowledge, so teardown remains bounded.
     $receipt = [Guid]::NewGuid().ToString('N')
     $script:UiState.receipt = $receipt
@@ -641,40 +649,103 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
     } catch {}
 }
 
-function Claim-UpdateMarker([string]$Body, [string]$ExpectedBody = "") {
-    # Production adopts the Desktop's exact claim while holding one exclusive
-    # handle, so the marker is never absent and a foreign owner is untouched.
-    # The standalone marker self-test exercises the create-only path.
+function Adopt-McpBridgeLease {
+    # The lease ID is an opaque capability supplied only by the authenticated
+    # Desktop hand-off.  Never create a lease here and never accept a lease
+    # for another checkout.  The JSON rewrite is followed by an exact reread;
+    # failure leaves the original lease in place and aborts before mutation.
+    if ([string]::IsNullOrWhiteSpace($BridgeLeaseId)) { return $false }
+    if (-not (Test-Path -LiteralPath $BridgeLeasePath -PathType Leaf)) { return $false }
+
+    try {
+        $raw = [System.IO.File]::ReadAllText($BridgeLeasePath, [System.Text.Encoding]::UTF8)
+        $lease = $raw | ConvertFrom-Json
+        $properties = @($lease.PSObject.Properties.Name | Sort-Object)
+        $expectedProperties = @('created_at','expires_at','handoff_grace_until','install_root','lease_id','owner_pid','schema_version')
+        if (($properties -join '|') -ne ($expectedProperties -join '|')) { return $false }
+        if ($lease.schema_version -ne 1 -or "$($lease.lease_id)" -ne $BridgeLeaseId) { return $false }
+        $leaseRoot = [System.IO.Path]::GetFullPath("$($lease.install_root)").TrimEnd('\')
+        $expectedRoot = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+        if (-not $leaseRoot.Equals($expectedRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if ([int64]$lease.expires_at -lt $now -or [int64]$lease.created_at -gt ($now + 5)) { return $false }
+
+        $adopted = [ordered]@{
+            schema_version = 1
+            lease_id = "$($lease.lease_id)"
+            owner_pid = [int]$PID
+            created_at = [int64]$now
+            expires_at = [int64]($now + 1200)
+            handoff_grace_until = [int64]($now + 90)
+            install_root = $expectedRoot
+        }
+        $updatedRaw = (($adopted | ConvertTo-Json -Compress) + "`n")
+        if (-not (Replace-FileIfExact $BridgeLeasePath $raw $updatedRaw)) {
+            return $false
+        }
+
+        $check = [System.IO.File]::ReadAllText($BridgeLeasePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ("$($check.lease_id)" -eq $BridgeLeaseId -and [int]$check.owner_pid -eq [int]$PID) {
+            $script:BridgeLeaseBody = $updatedRaw
+            return $true
+        }
+        return $false
+    } catch {
+        try { if ($temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } } catch {}
+        return $false
+    }
+}
+
+function Replace-FileIfExact([string]$Path, [string]$Expected, [string]$Replacement) {
+    $stream = $null
+    $reader = $null
+    try {
+        # Hold an exclusive handle while re-reading and replacing. If the
+        # Desktop revokes or renews the lease first, this call fails closed.
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $reader = New-Object System.IO.StreamReader(
+            $stream,
+            [System.Text.Encoding]::UTF8,
+            $true,
+            4096,
+            $true
+        )
+        $current = $reader.ReadToEnd()
+        $reader.Dispose()
+        $reader = $null
+        if ($current -cne $Expected) { return $false }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Replacement)
+        $stream.SetLength(0)
+        $stream.Position = 0
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($reader) { try { $reader.Dispose() } catch {} }
+        if ($stream) { try { $stream.Dispose() } catch {} }
+    }
+}
+
+function Claim-UpdateMarker([string]$Body) {
+    # CreateNew is the marker's ownership CAS: an existing claim is never
+    # overwritten by this updater. A failed write deliberately leaves any
+    # partial artifact in place so a relaunched Desktop remains fail-closed.
     $stream = $null
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
-        if ($ExpectedBody) {
-            $stream = [System.IO.File]::Open(
-                $MarkerPath,
-                [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::ReadWrite,
-                [System.IO.FileShare]::None
-            )
-            $reader = New-Object System.IO.StreamReader(
-                $stream,
-                [System.Text.Encoding]::UTF8,
-                $true,
-                4096,
-                $true
-            )
-            $current = $reader.ReadToEnd()
-            $reader.Dispose()
-            if ($current -cne $ExpectedBody) { throw "marker owner claim changed" }
-            $stream.SetLength(0)
-            $stream.Position = 0
-        } else {
-            $stream = New-Object System.IO.FileStream(
-                $MarkerPath,
-                [System.IO.FileMode]::CreateNew,
-                [System.IO.FileAccess]::Write,
-                [System.IO.FileShare]::None
-            )
-        }
+        $stream = New-Object System.IO.FileStream(
+            $MarkerPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush($true)
         $stream.Dispose()
@@ -682,8 +753,41 @@ function Claim-UpdateMarker([string]$Body, [string]$ExpectedBody = "") {
         return [System.IO.File]::ReadAllText($MarkerPath, [System.Text.Encoding]::UTF8) -eq $Body
     } catch {
         if ($stream) { try { $stream.Dispose() } catch {} }
-        Write-HandoffLog "update marker claim refused: $($_.Exception.Message)"
         return $false
+    }
+}
+
+function Remove-BridgeLeaseIfOwned {
+    # The adopted MCP quiesce lease used to outlive the hand-off: nothing
+    # released it, so every successful update left .hermes-venv-quiesce
+    # naming a dead pid until its 20-minute expiry (2026-09-05 13:19 run).
+    # Release it the way the marker is released: move, compare, delete only
+    # the exact body this process adopted, put anything else back. A crash
+    # between the move and the delete leaves a `.cas-release-*` artifact
+    # the Python gate retires itself once the owner pid is dead.
+    if ($NoMarkerCleanup) { return }
+    $tombstone = $null
+    try {
+        if (-not $script:BridgeLeaseBody -or -not (Test-Path -LiteralPath $BridgeLeasePath -PathType Leaf)) { return }
+        $tombstone = "$BridgeLeasePath.cas-release-$PID-$([Guid]::NewGuid().ToString('N'))"
+        [System.IO.File]::Move($BridgeLeasePath, $tombstone)
+        $raw = [System.IO.File]::ReadAllText($tombstone, [System.Text.Encoding]::UTF8)
+        if ($raw -eq $script:BridgeLeaseBody) {
+            [System.IO.File]::Delete($tombstone)
+            Write-HandoffLog "released MCP bridge lease (exact adopted body)"
+        } elseif (-not (Test-Path -LiteralPath $BridgeLeasePath)) {
+            [System.IO.File]::Move($tombstone, $BridgeLeasePath)
+            Write-HandoffLog "leaving MCP bridge lease: it changed since adoption"
+        } else {
+            Write-HandoffLog "leaving MCP bridge lease: a newer lease won cleanup"
+        }
+    } catch {
+        try {
+            if ($tombstone -and (Test-Path -LiteralPath $tombstone) -and -not (Test-Path -LiteralPath $BridgeLeasePath)) {
+                [System.IO.File]::Move($tombstone, $BridgeLeasePath)
+            }
+        } catch {}
+        Write-HandoffLog "MCP bridge lease release failed: $($_.Exception.Message)"
     }
 }
 
@@ -779,7 +883,6 @@ function Start-DesktopRelaunch {
     # finally block downgrades the on-screen/on-disk outcome when it didn't
     # — the sibling truth contract to posix.sh's launch acceptance.
     if (-not $RelaunchExe) { return $false }
-    $relaunch = Get-DesktopRelaunchInvocation
     # electron-builder replaces win-unpacked in place. After a successful
     # update it can remove the old Hermes.exe before writing the replacement,
     # so a one-shot existence check races the rebuild and strands the user.
@@ -793,6 +896,7 @@ function Start-DesktopRelaunch {
         if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
     }
     Write-HandoffLog "relaunching desktop: $RelaunchExe"
+    $relaunch = Get-DesktopRelaunchInvocation
     # DO NOT spawn Hermes.exe as our child: Electron/Chromium calls
     # AttachConsole(ATTACH_PARENT_PROCESS) at boot, so a Desktop launched
     # directly from this console PowerShell latches onto OUR console --
@@ -861,7 +965,7 @@ function Start-DesktopRelaunch {
         try {
             $exeName = [System.IO.Path]::GetFileNameWithoutExtension($RelaunchExe)
             $before = @(Get-Process -Name $exeName -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-            Start-Process -FilePath 'explorer.exe' -ArgumentList $relaunch.CommandLine | Out-Null
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $RelaunchExe) | Out-Null
             $explorerDeadline = (Get-Date).AddSeconds(15)
             while ((Get-Date) -lt $explorerDeadline) {
                 $fresh = @(Get-Process -Name $exeName -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id })
@@ -1492,11 +1596,6 @@ $finalMsg = "update did not complete"
 $script:TreeSafeToFinalize = $true
 $shortcutRegistrationNeedsManualRepair = $false
 
-if ($SelfTestRelaunchCommand) {
-    Get-DesktopRelaunchInvocation | ConvertTo-Json -Compress
-    exit 0
-}
-
 if ($SelfTestRelaunchEnvironment) {
     if ($SelfTestDirectRelaunch) {
         $child = Start-DirectDesktopProcess (Get-DesktopRelaunchInvocation)
@@ -1891,6 +1990,9 @@ try {
 
     # -- 0. Claim the update marker with OUR pid ---------------------------
     try {
+        if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestMarker -and -not (Adopt-McpBridgeLease)) {
+            throw "could not adopt the authenticated MCP bridge lease"
+        }
         # The marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
         # <ts> is an IDENTITY TOKEN, not a clock to compare: readers prove
         # <pid> by fetching its kernel creation time and requiring it to be
@@ -1915,22 +2017,18 @@ try {
         if (-not [int64]::TryParse($env:HERMES_UPDATE_STARTED_AT, [ref]$desktopStartedAt) -or $desktopStartedAt -le 0) {
             $desktopStartedAt = 0L
         }
-        $markerBody = "$PID`n$startedAt`n"
-        $createSelfTestMarker = $SelfTestMarker -and $DesktopPid -le 0
-        $expectedMarkerBody = if ($createSelfTestMarker) { "" } else { "$DesktopPid`n$desktopStartedAt`n" }
-        if (-not $createSelfTestMarker -and ($DesktopPid -le 0 -or $desktopStartedAt -le 0)) {
-            throw "desktop marker identity is missing"
+        # Claim with an atomic create-only operation; never overwrite a
+        # concurrent updater's marker.
+        $script:MarkerBody = "$PID`n$startedAt`n"
+        if (-not (Claim-UpdateMarker $script:MarkerBody)) {
+            throw "update marker already exists or could not be claimed"
         }
-        if (-not (Claim-UpdateMarker $markerBody $expectedMarkerBody)) {
-            throw "desktop update marker was absent, changed, or could not be adopted"
-        }
-        $script:MarkerBody = $markerBody
         Write-HandoffLog "claimed update marker (pid $PID, created $startedAt; desktop hand-off started at $desktopStartedAt)"
     } catch {
         $finalCode = 8
         $finalMsg = "Update aborted: could not claim the authenticated update marker. Nothing was changed."
         Write-HandoffLog "$finalMsg $($_.Exception.Message)"
-        exit $finalCode
+        throw
     }
 
     if ($SelfTestMarker) {
@@ -2131,6 +2229,7 @@ try {
     } else {
         Write-Result ($finalCode -eq 0) $finalCode $finalMsg $shortcutRegistrationNeedsManualRepair
         Remove-MarkerIfOwned
+        Remove-BridgeLeaseIfOwned
         if ($finalCode -ne 0) {
             Show-ErrorFinale $finalMsg
             Close-ProgressWindow

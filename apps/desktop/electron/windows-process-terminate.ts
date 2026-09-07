@@ -24,35 +24,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
-import type { ForceReleaseHolder, ForceReleaseTerminateResult, WindowsUpdateForceReleaseDeps } from './windows-update-force-release'
+import type { ForceReleaseHolder, ForceReleaseTerminateResult } from './windows-update-force-release'
 
 const execFileAsync = promisify(execFile)
-
-// A Job handle does not signal when its last process exits. Query accounting
-// under the same deadline to prove that termination drained every member.
-const JOB_DRAIN_NATIVE = String.raw`
-    [StructLayout(LayoutKind.Sequential)]
-    private struct JobAccounting {
-        public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
-        public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
-    }
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JobAccounting info, uint length, IntPtr returnLength);
-    private static int WaitForJobEmpty(IntPtr job, int waitMs) {
-        var timer = System.Diagnostics.Stopwatch.StartNew();
-        while (true) {
-            JobAccounting info;
-            if (!QueryInformationJobObject(job, 1, out info, (uint)Marshal.SizeOf(typeof(JobAccounting)), IntPtr.Zero)) {
-                int error = Marshal.GetLastWin32Error();
-                return error == 0 ? -1 : -error;
-            }
-            if (info.ActiveProcesses == 0) return 0;
-            long remaining = Math.Max(0, waitMs) - timer.ElapsedMilliseconds;
-            if (remaining <= 0) return -258;
-            System.Threading.Thread.Sleep((int)Math.Min(10, remaining));
-        }
-    }
-`
 
 export type StartTargetJobWatcher = (
   ownerPid: number,
@@ -226,7 +200,6 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public static class HermesTerminateJob {
-${JOB_DRAIN_NATIVE}
     [StructLayout(LayoutKind.Sequential)]
     private struct BasicLimits {
         public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
@@ -262,11 +235,11 @@ ${JOB_DRAIN_NATIVE}
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
 
-    public static IntPtr CreateKillOnClose(string name, bool allowDescendantBreakaway) {
+    public static IntPtr CreateKillOnClose(string name) {
         IntPtr job = CreateJobObject(IntPtr.Zero, name);
         if (job == IntPtr.Zero) throw new Win32Exception();
         var limits = new ExtendedLimits();
-        limits.BasicLimitInformation.LimitFlags = 0x00002000U | (allowDescendantBreakaway ? 0x00001000U : 0U);
+        limits.BasicLimitInformation.LimitFlags = 0x00002000;
         if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedLimits)))) {
             int error = Marshal.GetLastWin32Error();
             CloseHandle(job);
@@ -282,7 +255,11 @@ ${JOB_DRAIN_NATIVE}
             int error = Marshal.GetLastWin32Error();
             return error == 0 ? -1 : -error;
         }
-        return WaitForJobEmpty(job, waitMs);
+        uint result = WaitForSingleObject(job, (uint)Math.Max(0, waitMs));
+        if (result == 0) return 0;
+        if (result == 258) return -258;
+        int waitError = Marshal.GetLastWin32Error();
+        return waitError == 0 ? -1 : -waitError;
     }
     public static void Close(IntPtr job) {
         if (job != IntPtr.Zero) CloseHandle(job);
@@ -343,11 +320,8 @@ while (-not (Test-Path -LiteralPath $helperGatePath)) {
     # opens targetJob only to assign the separately authenticated external target
     # tree. Wrapper death therefore contains helper descendants without changing
     # the target tree's job membership contract.
-    # Target descendants must be admitted explicitly after identity and image
-    # authorization. The helper job stays closed so its subprocess cannot
-    # escape the cancellation boundary.
-    $targetJob = [HermesTerminateJob]::CreateKillOnClose($targetJobName, $true)
-    $helperJob = [HermesTerminateJob]::CreateKillOnClose($helperJobName, $false)
+    $targetJob = [HermesTerminateJob]::CreateKillOnClose($targetJobName)
+    $helperJob = [HermesTerminateJob]::CreateKillOnClose($helperJobName)
     Write-WrapperPhase 'target-job-created'
     # The wrapper owns the only persistent target-Job handle. Wrapper death
     # closes it and applies KILL_ON_JOB_CLOSE to every assigned target.
@@ -454,7 +428,6 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public static class HermesTerminateNamedJob {
-${JOB_DRAIN_NATIVE}
     private const uint JOB_OBJECT_TERMINATE = 0x0008;
     private const uint JOB_OBJECT_QUERY = 0x0004;
     private const uint SYNCHRONIZE = 0x00100000;
@@ -479,7 +452,10 @@ ${JOB_DRAIN_NATIVE}
                 int terminateError = Marshal.GetLastWin32Error();
                 return terminateError == 0 ? -1 : -terminateError;
             }
-            return WaitForJobEmpty(job, waitMs);
+            uint result = WaitForSingleObject(job, (uint)Math.Max(0, waitMs));
+            if (result == WAIT_OBJECT_0) return 0;
+            if (result == WAIT_TIMEOUT) return -258;
+            return -(int)result;
         } finally {
             CloseHandle(job);
         }
@@ -557,7 +533,6 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 public static class HermesTerminateWatch {
-${JOB_DRAIN_NATIVE}
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     private const uint SYNCHRONIZE = 0x00100000;
     private const uint JOB_OBJECT_TERMINATE = 0x0008;
@@ -669,9 +644,9 @@ ${JOB_DRAIN_NATIVE}
             }
             uint jobRemaining = Remaining(deadlineAt);
             if (jobRemaining == 0) return Failure(readyPath, readyNonce, "job-deadline", (int)WAIT_TIMEOUT);
-            int result = WaitForJobEmpty(job, (int)Math.Min(1500U, jobRemaining));
-            if (result == 0) return 0;
-            return Failure(readyPath, readyNonce, "job-wait", -result);
+            uint result = WaitForSingleObject(job, Math.Min(1500U, jobRemaining));
+            if (result == WAIT_OBJECT_0) return 0;
+            return Failure(readyPath, readyNonce, "job-wait", result == WAIT_FAILED ? Marshal.GetLastWin32Error() : (int)result);
         } finally {
             CloseHandle(job);
             CloseHandle(owner);
@@ -832,9 +807,7 @@ async function readProcessCreatedAt(
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        `$p = Get-Process -Id ${Math.trunc(pid)} -ErrorAction Stop; ` +
-          'if ($p.HasExited -or $p.WaitForExit(0)) { exit 3 }; ' +
-          '[DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeSeconds()'
+        `$p = Get-Process -Id ${Math.trunc(pid)} -ErrorAction Stop; [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeSeconds()`
       ],
       { encoding: 'utf8', windowsHide: true, timeout: budget }
     )
@@ -980,13 +953,8 @@ async function defaultLivenessProbeRunner(
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        // A terminated process object can remain enumerable while another
-        // process still owns a handle. Its zero-time wait is nevertheless
-        // authoritative terminal-state evidence. Exit 0 = runnable, 3 =
-        // absent/terminated, anything else = unknown.
-        `$p = Get-Process -Id ${Math.trunc(pid)} -ErrorAction SilentlyContinue; ` +
-          'if ($null -eq $p) { exit 3 }; ' +
-          'try { if ($p.HasExited -or $p.WaitForExit(0)) { exit 3 }; exit 0 } catch { exit 4 }'
+        // Exit 0 = live, 3 = explicitly not found, anything else = unknown.
+        `$p = Get-Process -Id ${Math.trunc(pid)} -ErrorAction SilentlyContinue; if ($null -ne $p) { exit 0 } else { exit 3 }`
       ],
       { windowsHide: true, timeout: timeoutMs }
     )
@@ -2017,7 +1985,7 @@ async function defaultRunPowerShell(
             ...finalResult,
             stderr: [watcherStartupFailure, watcherResult.detail, finalResult.stderr]
               .filter(Boolean)
-              .join('\n'),
+              .join('\\n'),
             code: 1,
             pid: childPid
           }
@@ -2028,7 +1996,7 @@ async function defaultRunPowerShell(
             ...finalResult,
             stderr: [formatTargetJobWatcherDiagnostics(watcherDiagnostics), finalResult.stderr]
               .filter(Boolean)
-              .join('\n'),
+              .join('\\n'),
             pid: childPid
           }
         }
@@ -2036,23 +2004,10 @@ async function defaultRunPowerShell(
         if (!targetBoundaryConfirmed) {
           finalResult = {
             ...finalResult,
-            stderr: [finalResult.stderr, 'target-boundary-unconfirmed'].filter(Boolean).join('\n'),
+            stderr: [finalResult.stderr, 'target-boundary-unconfirmed'].filter(Boolean).join('\\n'),
             code: 1,
             pid: childPid
           }
-        }
-
-        // Node's exit status is evidence for the exact child it spawned, even
-        // when a fresh PowerShell liveness probe exhausts the remaining budget.
-        // The target receipt separately proves the external holder job drained.
-        if (
-          killResult && !killResult.confirmed && targetBoundaryConfirmed &&
-          childProcess && childProcess.pid === wrapperProcessIdentity?.pid &&
-          (childProcess.exitCode != null || childProcess.signalCode != null) &&
-          hasSuccessfulWrapperReceipt(wrapperPhasePath, wrapperPhaseNonce)
-        ) {
-          const survivors = killResult.survivors.filter(identity => identity.pid !== childProcess.pid)
-          killResult = { ...killResult, survivors, confirmed: survivors.length === 0 }
         }
 
         if (killResult && !killResult.confirmed) {
@@ -2063,7 +2018,7 @@ async function defaultRunPowerShell(
               `unconfirmed-tree-survivors:${killResult.survivors.map(s => s.pid).join(',')}`
             ]
               .filter(Boolean)
-              .join('\n'),
+              .join('\\n'),
             code: 1,
             pid: childPid
           }
@@ -2072,7 +2027,7 @@ async function defaultRunPowerShell(
         if (!watcherTerminal) {
           finalResult = {
             ...finalResult,
-            stderr: [finalResult.stderr, 'watcher-terminal-state-unconfirmed'].filter(Boolean).join('\n'),
+            stderr: [finalResult.stderr, 'watcher-terminal-state-unconfirmed'].filter(Boolean).join('\\n'),
             code: 1,
             pid: childPid
           }
@@ -2103,7 +2058,7 @@ async function defaultRunPowerShell(
               finalResult.stderr
             ]
               .filter(Boolean)
-              .join('\n'),
+              .join('\\n'),
             pid: childPid
           }
         }
@@ -2362,7 +2317,6 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 public static class HermesForceReleaseNative {
-${JOB_DRAIN_NATIVE}
   public const uint PROCESS_TERMINATE = 0x0001;
   public const uint PROCESS_SET_QUOTA = 0x0100;
   public const uint PROCESS_SUSPEND_RESUME = 0x0800;
@@ -2372,7 +2326,6 @@ ${JOB_DRAIN_NATIVE}
   public const uint JOB_OBJECT_TERMINATE = 0x0008;
   public const uint JOB_OBJECT_QUERY = 0x0004;
   public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
-  public const uint JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000;
   public const int JobObjectExtendedLimitInformation = 9;
   public const uint WAIT_OBJECT_0 = 0;
   public const uint WAIT_TIMEOUT = 258;
@@ -2558,11 +2511,7 @@ ${JOB_DRAIN_NATIVE}
     IntPtr job = CreateJobObject(IntPtr.Zero, name);
     if (job == IntPtr.Zero) return IntPtr.Zero;
     var limits = new ExtendedLimits();
-    // Descendants are excluded until this scanner authenticates and assigns
-    // them explicitly. This prevents an unreviewed executable spawned between
-    // assignment and suspension from inheriting a lethal target boundary.
-    limits.BasicLimitInformation.LimitFlags =
-      JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref limits, (uint)Marshal.SizeOf(typeof(ExtendedLimits)))) {
       CloseHandle(job);
       return IntPtr.Zero;
@@ -2605,7 +2554,11 @@ ${JOB_DRAIN_NATIVE}
       int error = Marshal.GetLastWin32Error();
       return error == 0 ? -1 : -error;
     }
-    return WaitForJobEmpty(job, waitMs);
+    uint result = WaitForSingleObject(job, (uint)Math.Max(0, waitMs));
+    if (result == WAIT_OBJECT_0) return 0;
+    if (result == WAIT_TIMEOUT) return -258;
+    int waitError = Marshal.GetLastWin32Error();
+    return waitError == 0 ? -1 : -waitError;
   }
 }
 "@
@@ -2638,7 +2591,6 @@ $handles = @{}
 $suspended = New-Object 'System.Collections.Generic.List[int]'
 $contained = New-Object 'System.Collections.Generic.HashSet[int]'
 $degraded = New-Object 'System.Collections.Generic.List[int]'
-$foreign = New-Object 'System.Collections.Generic.List[int]'
 $success = $false
 $exitCode = 1
 $fallbackSnapshotUsed = $false
@@ -2750,32 +2702,25 @@ try {
     if ($rootOpenError -eq 0x10001) { throw ("CREATE_TIME_MISMATCH root=" + $pidTarget) }
     throw ('HOLDER_OPEN_FAILED win32=' + $rootOpenError)
   }
-  # PID and creation time prove identity, not authority to terminate. Every
-  # target must also execute from this installation.
-  if ([string]::IsNullOrWhiteSpace($installRootClaim)) {
-    throw 'TERMINATION_AUTHORIZATION_CLAIM_MISSING'
-  }
-  $installRootFinal = [HermesForceReleaseNative]::ReadFinalPath($installRootClaim)
-  if ([string]::IsNullOrWhiteSpace($installRootFinal)) {
-    throw 'TERMINATION_FINAL_PATH_UNAVAILABLE'
-  }
-  $imagePath = [HermesForceReleaseNative]::ReadImagePath($rootHandle)
-  $imageFinal = [HermesForceReleaseNative]::ReadFinalPath($imagePath)
-  if ([string]::IsNullOrWhiteSpace($imageFinal)) {
-    throw 'TERMINATION_EXECUTABLE_IDENTITY_UNAVAILABLE'
-  }
-  if (-not [HermesForceReleaseNative]::IsSameOrUnderRoot($imageFinal, $installRootFinal)) {
-    throw 'TERMINATION_EXECUTABLE_OUTSIDE_INSTALL_ROOT'
-  }
-  # Only the Restart Manager ownership re-proof stays conditional: a
-  # scanner-only holder names no file it holds.
-  if (-not [string]::IsNullOrWhiteSpace($resourceClaim)) {
+  if (-not [string]::IsNullOrWhiteSpace($installRootClaim) -or -not [string]::IsNullOrWhiteSpace($resourceClaim)) {
+    if ([string]::IsNullOrWhiteSpace($installRootClaim) -or [string]::IsNullOrWhiteSpace($resourceClaim)) {
+      throw 'TERMINATION_AUTHORIZATION_CLAIM_INCOMPLETE'
+    }
+    $installRootFinal = [HermesForceReleaseNative]::ReadFinalPath($installRootClaim)
     $resourceFinal = [HermesForceReleaseNative]::ReadFinalPath($resourceClaim)
-    if ([string]::IsNullOrWhiteSpace($resourceFinal)) {
+    if ([string]::IsNullOrWhiteSpace($installRootFinal) -or [string]::IsNullOrWhiteSpace($resourceFinal)) {
       throw 'TERMINATION_FINAL_PATH_UNAVAILABLE'
     }
     if (-not [HermesForceReleaseNative]::IsSameOrUnderRoot($resourceFinal, $installRootFinal)) {
       throw 'TERMINATION_RESOURCE_OUTSIDE_INSTALL_ROOT'
+    }
+    $imagePath = [HermesForceReleaseNative]::ReadImagePath($rootHandle)
+    $imageFinal = [HermesForceReleaseNative]::ReadFinalPath($imagePath)
+    if ([string]::IsNullOrWhiteSpace($imageFinal)) {
+      throw 'TERMINATION_EXECUTABLE_IDENTITY_UNAVAILABLE'
+    }
+    if (-not [HermesForceReleaseNative]::IsSameOrUnderRoot($imageFinal, $installRootFinal)) {
+      throw 'TERMINATION_EXECUTABLE_OUTSIDE_INSTALL_ROOT'
     }
     if (-not [HermesForceReleaseNative]::IsCurrentResourceOwner($resourceFinal, $pidTarget, $expectedUnix)) {
       throw 'TERMINATION_CURRENT_LOCK_OWNERSHIP_MISMATCH'
@@ -2822,16 +2767,6 @@ try {
         if ($childOpenError -eq 0x10001) { throw ("CREATE_TIME_MISMATCH child=" + $childPid) }
         throw ('TREE_OPEN_FAILED win32=' + $childOpenError)
       }
-      # A descendant is authorized by the same executable-under-install-root
-      # proof as the root. A foreign image (the gateway's terminal tool ran an
-      # editor, git, or a user shell) is never assigned to the job: it stays
-      # alive, its subtree is not walked, and it is reported.
-      $childImageFinal = [HermesForceReleaseNative]::ReadFinalPath([HermesForceReleaseNative]::ReadImagePath($childHandle))
-      if ([string]::IsNullOrWhiteSpace($childImageFinal) -or -not [HermesForceReleaseNative]::IsSameOrUnderRoot($childImageFinal, $installRootFinal)) {
-        [HermesForceReleaseNative]::CloseHandle($childHandle) | Out-Null
-        [void]$foreign.Add($childPid)
-        continue
-      }
       $handles[[string]$childPid] = $childHandle
       if (Assign-ContainedProcess $childHandle $childPid) { [void]$contained.Add($childPid) }
       Pause-BoundaryTest 'after-child-assignment' $childPid
@@ -2876,7 +2811,6 @@ try {
   $exitCode = 0
   Write-Output 'TERMINATED'
   if ($degraded.Count -gt 0) { Write-Output ('CONTAINMENT_DEGRADED pids=' + ($degraded -join ',')) }
-  if ($foreign.Count -gt 0) { Write-Output ('FOREIGN_DESCENDANTS_LEFT_ALIVE pids=' + ($foreign -join ',')) }
 } catch {
   $message = [string]$_.Exception.Message
   # Elevation is authorized only when opening the exact authenticated holder
@@ -3083,26 +3017,4 @@ export async function terminateWindowsHolderWithinDeadline(
     deadlineAt: absoluteDeadline,
     installRoot
   })
-}
-
-/** Route plugin units through their owner and authorize every other holder by install root. */
-export function createWindowsHolderTerminator(
-  installRoot: string,
-  stopPluginService: (service: NonNullable<ForceReleaseHolder['service']>) => Promise<boolean>,
-  terminate = terminateWindowsHolderWithinDeadline
-): WindowsUpdateForceReleaseDeps['terminateHolder'] {
-  return async (holder, budgetMs, signal, deadlineAt) => {
-    if (holder.terminateVia === 'desktop-plugin-service' && holder.service) {
-      const stopped = await stopPluginService(holder.service)
-
-      return stopped ? { kind: 'terminated' } : { kind: 'failed', detail: 'plugin service unit not stopped' }
-    }
-
-    return terminate(holder, {
-      budgetMs,
-      deadlineAt: deadlineAt ?? Date.now() + Math.max(0, budgetMs),
-      signal,
-      installRoot
-    })
-  }
 }
