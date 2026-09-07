@@ -1715,6 +1715,50 @@ namespace HermesArgvProbe {
     exit 0
 }
 
+if ($SelfTestArgvQuoting) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace HermesArgvProbe {
+  public static class CommandLine {
+    [DllImport("shell32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CommandLineToArgvW(string commandLine, out int argc);
+    [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr pointer);
+    public static string[] Split(string commandLine) {
+      int argc;
+      IntPtr argv = CommandLineToArgvW(commandLine, out argc);
+      if (argv == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      try {
+        string[] result = new string[argc];
+        for (int index = 0; index < argc; index++) {
+          result[index] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, index * IntPtr.Size));
+        }
+        return result;
+      } finally {
+        LocalFree(argv);
+      }
+    }
+  }
+}
+"@
+    $cases = @(
+        ,([string[]]@('-m', 'hermes_cli.main', 'update', '--yes', '--branch', 'feature\'))
+        ,([string[]]@('--branch', 'C:\path with space\'))
+        ,([string[]]@('--branch', 'a"b'))
+        ,([string[]]@('--branch', 'plain/branch'))
+    )
+    foreach ($case in $cases) {
+        $commandLine = '"C:\exe.exe" ' + (ConvertTo-HermesProcessArguments $case)
+        $parsed = [HermesArgvProbe.CommandLine]::Split($commandLine)
+        $roundTrip = @($parsed[1..($parsed.Length - 1)])
+        if (($roundTrip -join [char]1) -ne ($case -join [char]1)) {
+            throw "argv quoting mismatch: in=[$($case -join '|')] out=[$($roundTrip -join '|')]"
+        }
+    }
+    Write-Output "ARGV-QUOTING SELF-TEST: PASS"
+    exit 0
+}
+
 if ($SelfTestRelaunchCommand) {
     Get-DesktopRelaunchInvocation | ConvertTo-Json -Compress
     exit 0
