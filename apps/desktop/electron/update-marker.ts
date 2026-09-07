@@ -27,8 +27,6 @@ import path from 'path'
 
 import { getCachedWindowsProcessCreatedAt } from './windows-process-identity'
 
-export { transferUpdateMarkerIfOwnedBy } from './windows-update-marker'
-
 // Age is an advisory diagnostic only. A full update (git pull + pip + desktop
 // rebuild) can be slow; an exact live owner remains authoritative beyond this
 // age so a second updater cannot race the first one into the same install.
@@ -39,13 +37,10 @@ export type ProcessCreateTimeProbe = (pid: number) => number | null | undefined
 export type PidIdentityStatus = 'matching' | 'stale' | 'unknown'
 export type UpdateMarkerBlockedReason = 'unreadable' | 'malformed' | 'future' | 'cleanup-race'
 
-export interface UpdateMarkerClaim {
+export interface LiveUpdateMarker {
+  kind: 'live'
   pid: number
   startedAt: number
-}
-
-export interface LiveUpdateMarker extends UpdateMarkerClaim {
-  kind: 'live'
   ageMs: number
   overdue: boolean
   bridge?: boolean
@@ -310,15 +305,6 @@ export function readLiveUpdateMarker(
         const releasePrefix = `${path.basename(file)}.cas-release-`
 
         if (artifacts.length === 1 && path.basename(artifacts[0]).startsWith(releasePrefix)) {
-          const releaserPid = Number(path.basename(artifacts[0]).slice(releasePrefix.length).split('-')[0])
-
-          // A live releaser still owns the rename/read/unlink transaction.
-          // Restoring its temporary file here would resurrect the very claim
-          // it is removing. Only recover an abandoned release.
-          if (!Number.isSafeInteger(releaserPid) || releaserPid <= 0 || isPidAlive(releaserPid, kill)) {
-            return blockedMarker('cleanup-race')
-          }
-
           if (restoreIsolatedMarker(file, artifacts[0]) === 'unresolved') {
             return blockedMarker('cleanup-race')
           }
@@ -373,51 +359,6 @@ export function readLiveUpdateMarker(
   return blockedMarker('cleanup-race')
 }
 
-export type UpdateMarkerClaimResult =
-  | { acquired: true; owner: LiveUpdateMarker }
-  | { acquired: false; message: string }
-
-/** Claim the shared marker before stopping holders or launching an updater. */
-export function acquireUpdateMarker(
-  hermesHome: string,
-  { pid = process.pid, now = Date.now, ...probe }: UpdateMarkerReadOptions & { pid?: number } = {}
-): UpdateMarkerClaimResult {
-  const conflict = updateHandoffConflict(hermesHome, { ...probe, now })
-
-  if (conflict) { return { acquired: false, message: conflict.message } }
-
-  const startedAt = Math.floor(now() / 1000)
-
-  if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(startedAt) || startedAt <= 0) {
-    return { acquired: false, message: 'Cannot establish the update marker owner identity.' }
-  }
-
-  const file = markerPath(hermesHome)
-  const raw = `${pid}\n${startedAt}\n`
-  let descriptor: number | undefined
-
-  try {
-    fs.mkdirSync(hermesHome, { recursive: true })
-    descriptor = fs.openSync(file, 'wx', 0o600)
-    fs.writeFileSync(descriptor, raw)
-    fs.fsyncSync(descriptor)
-  } catch {
-    return { acquired: false, message: 'Could not claim the update marker. Another update may have started; retry when it finishes.' }
-  } finally {
-    if (descriptor !== undefined) { fs.closeSync(descriptor) }
-  }
-
-  const artifacts = recoveryArtifacts(file)
-
-  if (artifacts === null || artifacts.length > 0) {
-    removeMarkerIfExact(file, raw)
-
-    return { acquired: false, message: 'Update marker cleanup is unresolved. Retry after the current update finishes.' }
-  }
-
-  return { acquired: true, owner: { kind: 'live', pid, startedAt, ageMs: 0, overdue: false } }
-}
-
 /**
  * Write the update-in-progress marker *from the desktop* before handing off
  * to the detached updater.
@@ -429,10 +370,8 @@ export function acquireUpdateMarker(
  * Staged updaters receive a marker with their spawned PID. The repo-owned
  * Windows script instead receives a tagged marker with the Desktop PID before
  * `cmd start`; the tag keeps the gate closed for the bounded claim gap, then
- * windows.ps1 replaces it with its own PID and creation time. New ownership
- * claims use acquireUpdateMarker; this compatibility writer is only for an
- * already-coordinated transfer. A transferred timestamp must still bound the
- * new owner's creation time.
+ * windows.ps1 replaces it with its own PID. Transfers preserve the original
+ * timestamp so retries cannot reset the 20-minute stale ceiling.
  */
 export function writeUpdateMarker(
   hermesHome,
@@ -532,7 +471,7 @@ export function updateHandoffConflict(
  * with CreateNew, so the Desktop must hand the slot back first; every refused
  * outcome hands it back as well.
  */
-export function releaseUpdateMarkerIfOwnedBy(hermesHome: string, pid: number, expectedStartedAt?: number): boolean {
+export function releaseUpdateMarkerIfOwnedBy(hermesHome: string, pid: number): boolean {
   const file = markerPath(hermesHome)
   let raw: string
 
@@ -542,9 +481,15 @@ export function releaseUpdateMarkerIfOwnedBy(hermesHome: string, pid: number, ex
     return false
   }
 
-  const owner = parseMarker(raw)
+  const owner = Number.parseInt((raw.split(/\r?\n/)[0] ?? '').trim(), 10)
 
-  if (!owner || owner.pid !== pid || (expectedStartedAt !== undefined && owner.startedAt !== expectedStartedAt)) { return false }
+  if (!Number.isInteger(owner) || owner !== pid) {return false}
 
-  return removeMarkerIfExact(file, raw) === 'retry' && !fs.existsSync(file)
+  try {
+    fs.rmSync(file, { force: true })
+
+    return true
+  } catch {
+    return false
+  }
 }
