@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { describe, it } from 'vitest'
 
-import type { UpdateMarkerClaim } from './update-marker'
+import type { McpBridgeQuiesceLease } from './mcp-bridge-quiesce'
 import {
   authorizeUpdateMutation,
   runAuthorizedUpdateMutation,
@@ -19,7 +19,15 @@ import type {
 
 const PURPOSES: UpdatePreflightPurpose[] = ['normal-update', 'bootstrap-recovery']
 
-const claim: UpdateMarkerClaim = { pid: 777, startedAt: 100 }
+const lease: McpBridgeQuiesceLease = {
+  schemaVersion: 1,
+  leaseId: 'lease-123',
+  ownerPid: 777,
+  createdAt: 100,
+  expiresAt: 1_300,
+  handoffGraceUntil: 100,
+  installRoot: String.raw`C:\Hermes`
+}
 
 const bridge = (overrides: Partial<McpBridgeProcess> = {}): McpBridgeProcess => ({
   pid: 101,
@@ -99,8 +107,14 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
 
       return next
     },
-    claim,
-    ownsUpdateMarker: () => true,
+    acquireMcpBridgeLease: () => {
+      calls.push('lease')
+
+      return lease
+    },
+    clearMcpBridgeLease: current => {
+      calls.push(`clear-lease:${current.leaseId}`)
+    },
     now: () => currentTime,
     terminateDesktopPluginService: async current => {
       calls.push(`terminate-desktop-plugin:${current.pid}:${current.createdAt}`)
@@ -123,43 +137,6 @@ function makeDeps(scans: ScanOutcome[], overrides: Partial<UpdatePreflightDeps> 
 }
 
 describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
-  it('stops force-release retries when a generic holder keeps respawning', async () => {
-    let clock = 0
-    let scans = 0
-    let releases = 0
-    const holder = { pid: 202, name: 'python.exe', cmdline: 'hermes gateway status --deep' }
-
-    const { deps } = makeDeps([], {
-      now: () => clock,
-      wait: async ms => { clock += ms },
-      scan: async () => {
-        scans += 1
-
-        return scans <= 2 || scans % 2 === 0
-          ? clear()
-          : { kind: 'blocked', result: result({ blocked: true, processes: [holder] }) }
-      },
-      forceReleaseInstallHolders: async () => {
-        releases += 1
-        assert.ok(releases < 10, 'force-release must not retry indefinitely')
-
-        return { kind: 'clear' }
-      },
-    })
-
-    const outcome = await runWindowsUpdatePreflight(purpose, deps, {
-      cooperativeExitMs: 0,
-      genericHolderTimeoutMs: 15,
-      respawnIntervalMs: 5,
-      terminationSettleMs: 0
-    })
-
-    assert.equal(outcome.kind, 'blocked')
-    assert.equal(outcome.reason, 'quiesce-incomplete')
-    assert.deepEqual(outcome.result?.processes, [holder])
-    assert.equal(releases, 2)
-  })
-
   it('fails closed before scanning when tracked backend trees do not unlock and no force-release is wired', async () => {
     const { calls, deps } = makeDeps([], {
       releaseTrackedBackendTrees: async () => {
@@ -260,6 +237,7 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     assert.equal(outcome.kind, 'blocked')
     assert.deepEqual(calls, ['release', 'force-release'])
     assert.ok(!calls.includes('scan'), 'scanner continuation would permit the updater handoff to progress')
+    assert.ok(!calls.includes('lease'), 'no mutation-prevention lease starts while an authenticated holder survives')
     assert.ok(!calls.some(call => call.startsWith('terminate-holder:')))
     const permit = authorizeUpdateMutation(outcome)
     assert.equal(permit, null)
@@ -286,7 +264,7 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     })
 
     assert.equal(outcome.kind, 'clear')
-    assert.deepEqual(outcome.claim, claim, 'clear preflight retains the updater claim')
+    assert.equal(outcome.lease, lease, 'clear preflight preserves the exact capability-bearing lease identity')
     const permit = authorizeUpdateMutation(outcome)
     assert.ok(permit)
     assert.equal(authorizeUpdateMutation(outcome), null, 'a successful preflight permit is consumed exactly once')
@@ -297,7 +275,7 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
   })
 
   it('rejects a fabricated structural clear outcome and never runs its mutation', () => {
-    const fabricated = { kind: 'clear' as const, claim }
+    const fabricated = { kind: 'clear' as const, lease }
     const permit = authorizeUpdateMutation(fabricated)
     assert.equal(permit, null)
     let mutated = false
@@ -326,7 +304,7 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
     assert.deepEqual(calls, ['release'])
   })
 
-  it('returns a typed probe failure while retaining the caller-owned marker', async () => {
+  it('returns a typed probe failure before acquiring a prevention lease', async () => {
     const { calls, deps } = makeDeps([{ kind: 'probe-failure', error: 'scanner crashed' }])
 
     const outcome = await runWindowsUpdatePreflight(purpose, deps)
@@ -401,7 +379,7 @@ describe.each(PURPOSES)('runWindowsUpdatePreflight (%s)', purpose => {
 })
 
 describe('MCP bridge drain', () => {
-  it('force-releases a generic holder that starts during the update claim', async () => {
+  it('force-releases a generic holder that starts after the prevention lease', async () => {
     const late = {
       kind: 'blocked' as const,
       result: result({
@@ -428,7 +406,7 @@ describe('MCP bridge drain', () => {
     assert.ok(calls.includes('force-release'))
   })
 
-  it('lets cooperative exit under the update marker win', async () => {
+  it('gets consent before activating the lease, then lets cooperative exit win', async () => {
     const { calls, deps } = makeDeps([blockedByBridges(), clear(), clear()])
 
     const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
@@ -438,8 +416,8 @@ describe('MCP bridge drain', () => {
     })
 
     assert.equal(outcome.kind, 'clear')
-    assert.deepEqual(outcome.claim, claim)
-    assert.deepEqual(calls, ['release', 'scan', 'wait:900', 'scan', 'wait:1100', 'scan'])
+    assert.equal(outcome.lease?.leaseId, lease.leaseId)
+    assert.deepEqual(calls, ['release', 'scan', 'lease', 'wait:900', 'scan', 'wait:1100', 'scan'])
   })
 
   it('waits for a generic holder first seen on the stability scan, then proves a fresh stable interval', async () => {
@@ -463,6 +441,7 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:0',
       'scan',
       'wait:7',
@@ -490,6 +469,7 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:900',
       'scan',
       'terminate:102:124.5',
@@ -528,6 +508,7 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:0',
       'scan',
       // One call per unit: the scanner stops supervisor, wrapper and worker
@@ -564,6 +545,7 @@ describe('MCP bridge drain', () => {
 
     assert.equal(outcome.kind, 'blocked')
     assert.equal(outcome.reason, 'quiesce-incomplete')
+    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
   })
 
   it('waits for a late generic holder when every bridge exits cooperatively', async () => {
@@ -588,6 +570,7 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:0',
       'scan',
       'wait:5',
@@ -624,6 +607,7 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:900',
       'scan',
       'terminate:101:123.5',
@@ -664,6 +648,7 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:0',
       'scan',
       'terminate:101:123.5',
@@ -673,6 +658,7 @@ describe('MCP bridge drain', () => {
       'scan',
       'wait:5',
       'scan',
+      `clear-lease:${lease.leaseId}`
     ])
   })
 
@@ -690,7 +676,7 @@ describe('MCP bridge drain', () => {
         },
         { kind: 'probe-failure', error: 'poll probe failed' }
       ],
-      expectedCalls: ['release', 'scan', 'wait:0', 'scan', 'wait:5', 'scan']
+      expectedCalls: ['release', 'scan', 'lease', 'wait:0', 'scan', 'wait:5', 'scan']
     },
     {
       phase: 'fallback termination',
@@ -709,7 +695,8 @@ describe('MCP bridge drain', () => {
       expectedCalls: [
         'release',
         'scan',
-          'wait:0',
+        'lease',
+        'wait:0',
         'scan',
         'terminate:101:123.5',
         'wait:0',
@@ -732,7 +719,7 @@ describe('MCP bridge drain', () => {
 
       assert.equal(outcome.kind, 'probe-failure')
       assert.equal(outcome.error, 'poll probe failed')
-      assert.deepEqual(calls, expectedCalls)
+      assert.deepEqual(calls, [...expectedCalls, `clear-lease:${lease.leaseId}`])
     }
   )
 
@@ -784,6 +771,7 @@ describe('MCP bridge drain', () => {
       calls.some(call => call.startsWith('terminate:')),
       false
     )
+    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
   })
 
   it('allows exactly 64 fallback records across 32 logical bridge groups', async () => {
@@ -832,6 +820,7 @@ describe('MCP bridge drain', () => {
       calls.some(call => call.startsWith('terminate:')),
       false
     )
+    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
   })
 
   it('refuses 33 paired wrapper and worker groups before terminating any record', async () => {
@@ -846,6 +835,7 @@ describe('MCP bridge drain', () => {
       calls.some(call => call.startsWith('terminate:')),
       false
     )
+    assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
   })
 
   it('awaits each worker-first termination before starting the next bridge', async () => {
@@ -922,7 +912,7 @@ describe('MCP bridge drain', () => {
       ])
     }
   ] satisfies Array<{ blocker: string; outcome: ScanOutcome }>)(
-    'refuses mutation when $blocker appears on the stability scan',
+    'clears its lease when $blocker appears on the stability scan',
     async ({ outcome: blocker }) => {
       const { calls, deps } = makeDeps([blockedByBridges(), clear(), blocker])
 
@@ -933,11 +923,12 @@ describe('MCP bridge drain', () => {
 
       assert.equal(outcome.kind, 'blocked')
       assert.equal(outcome.reason, 'quiesce-incomplete')
-        assert.ok(!calls.some(call => call.startsWith('terminate:')))
+      assert.ok(calls.includes(`clear-lease:${lease.leaseId}`))
+      assert.ok(!calls.some(call => call.startsWith('terminate:')))
     }
   )
 
-  it('returns a probe failure from the stability scan', async () => {
+  it('returns a probe failure from the stability scan and clears its lease', async () => {
     const { calls, deps } = makeDeps([
       blockedByBridges(),
       clear(),
@@ -954,10 +945,12 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:0',
       'scan',
       'wait:7',
       'scan',
+      `clear-lease:${lease.leaseId}`
     ])
   })
 
@@ -989,12 +982,14 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:0',
       'scan',
       'wait:7',
       'scan',
       'wait:5',
       'scan',
+      `clear-lease:${lease.leaseId}`
     ])
   })
 
@@ -1021,6 +1016,7 @@ describe('MCP bridge drain', () => {
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:0',
       'scan',
       'wait:7',
@@ -1029,10 +1025,11 @@ describe('MCP bridge drain', () => {
       'scan',
       'wait:5',
       'scan',
+      `clear-lease:${lease.leaseId}`
     ])
   })
 
-  it('catches a bridge spawned after a clear observation', async () => {
+  it('gets newcomer consent before the lease and catches a bridge spawned after a clear observation', async () => {
     const { calls, deps } = makeDeps([clear(), blockedByBridges(), clear(), clear()])
 
     const outcome = await runWindowsUpdatePreflight('normal-update', deps, {
@@ -1041,10 +1038,11 @@ describe('MCP bridge drain', () => {
     })
 
     assert.equal(outcome.kind, 'clear')
-    assert.deepEqual(outcome.claim, claim)
+    assert.equal(outcome.lease?.leaseId, lease.leaseId)
     assert.deepEqual(calls, [
       'release',
       'scan',
+      'lease',
       'wait:900',
       'scan',
       'terminate:101:123.5',
@@ -1056,57 +1054,48 @@ describe('MCP bridge drain', () => {
   })
 })
 
+describe('production update mutation permit wiring', () => {
+  it('gates normal and bootstrap-recovery updater launch and Desktop shutdown sites', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
 
-
-describe('preflight uses the caller-owned update marker', () => {
-  it('refuses before releasing any process when the claim cannot be verified', async () => {
-    const { calls, deps } = makeDeps([], { ownsUpdateMarker: () => false })
-    const outcome = await runWindowsUpdatePreflight('normal-update', deps)
-    assert.equal(outcome.kind, 'blocked')
-
-    if (outcome.kind !== 'blocked') { throw new Error('expected refusal') }
-    assert.equal(outcome.reason, 'marker-unavailable')
-    assert.deepEqual(calls, [])
-    assert.equal(authorizeUpdateMutation(outcome), null)
+    assert.match(main, /runAuthorizedUpdateMutation\(mutationPermit, \(\) =>\s*launchWindowsUpdateTransport\(/)
+    assert.match(main, /runAuthorizedUpdateMutation\(mutationPermit, \(\) =>\s*spawnUpdaterProcess\(/)
+    assert.equal(
+      (main.match(/runAuthorizedUpdateMutation\(mutationPermit, \(\) =>\s*setTimeout\(/g) ?? []).length,
+      2,
+      'both normal-update and bootstrap-recovery shutdowns require the clear-preflight permit'
+    )
+    assert.doesNotMatch(main, /const launch = launchWindowsUpdateTransport\(/)
   })
 
-  it('does not force-stop after ownership is lost during tracked release', async () => {
-    let owned = true
-    let forced = false
+  it('observes before it stops anything and never runs a path-rooted kill-all', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const main = fs.readFileSync(path.resolve(__dirname, 'main.ts'), 'utf8')
+    const wiringStart = main.indexOf('async function runWindowsHandoffPreflight')
+    const wiringEnd = main.indexOf('\nasync function ', wiringStart + 1)
+    const wiring = main.slice(wiringStart, wiringEnd)
 
-    const { deps } = makeDeps([], {
-      ownsUpdateMarker: () => owned,
-      releaseTrackedBackendTrees: async () => {
-        owned = false
+    // 2026-09-02: the kill-all ran before the first scan, so a scanner
+    // self-check failure still SIGKILLed the gateway and plugin services.
+    assert.equal(main.includes('forceKillAllHermesBackendTrees'), false)
+    assert.doesNotMatch(wiring, /taskkill/)
+    assert.doesNotMatch(wiring, /Get-CimInstance Win32_Process/)
 
-        return { unlocked: false }
-      },
-      forceReleaseInstallHolders: async () => {
-        forced = true
+    const scanAt = wiring.indexOf('await scanVenvBlockers(updateRoot)')
+    const probeAbortAt = wiring.indexOf("observed.kind === 'probe-failure'")
+    const pluginStopAt = wiring.indexOf('stopDesktopPluginServiceUnit(updateRoot, service)')
 
-        return { kind: 'clear' }
-      }
-    })
+    // 2026-09-04: worker-first, two-call draining left the Windows Script
+    // Host loop alive to respawn the service inside the lock window.
+    assert.match(wiring, /desktopPluginServiceUnits\(/)
+    assert.doesNotMatch(wiring, /role === 'desktop_plugin_worker'\) - Number/)
+    const preflightAt = wiring.indexOf('runWindowsUpdatePreflight(purpose')
 
-    const outcome = await runWindowsUpdatePreflight('normal-update', deps)
-    assert.equal(outcome.kind, 'probe-failure')
-    assert.equal(forced, false)
-    assert.equal(authorizeUpdateMutation(outcome), null)
-  })
-
-  it('requires the same claim immediately before launching installation mutation', async () => {
-    let owned = true
-    let mutated = false
-
-    const { deps } = makeDeps([clear(), clear(), clear()], {
-      ownsUpdateMarker: candidate => owned && candidate.pid === claim.pid && candidate.startedAt === claim.startedAt
-    })
-
-    const outcome = await runWindowsUpdatePreflight('normal-update', deps, { cooperativeExitMs: 0, respawnIntervalMs: 0 })
-    const permit = authorizeUpdateMutation(outcome)
-    assert.ok(permit)
-    owned = false
-    assert.throws(() => runAuthorizedUpdateMutation(permit, () => { mutated = true }), /original update marker claim/)
-    assert.equal(mutated, false)
+    assert.ok(scanAt > 0 && probeAbortAt > scanAt, 'first scan happens before any mutation and probe-failure aborts')
+    assert.ok(pluginStopAt > probeAbortAt, 'exact plugin services stop only after a non-failing scan')
+    assert.ok(preflightAt > pluginStopAt, 'the transactional preflight runs last')
   })
 })

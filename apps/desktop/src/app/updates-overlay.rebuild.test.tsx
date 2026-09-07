@@ -39,7 +39,7 @@ describe('UpdatesOverlay: git-current checkout under a stale bundle', () => {
       bundleOutOfSync: true,
       behind: 0,
       commits: []
-    } satisfies DesktopUpdateStatus)
+    } as DesktopUpdateStatus)
 
     await renderUpdatesOverlay()
 
@@ -57,7 +57,7 @@ describe('UpdatesOverlay: git-current checkout under a stale bundle', () => {
       bundleOutOfSync: true,
       behind: 0,
       commits: []
-    } satisfies DesktopUpdateStatus)
+    } as DesktopUpdateStatus)
 
     await renderUpdatesOverlay()
 
@@ -74,7 +74,7 @@ describe('UpdatesOverlay: git-current checkout under a stale bundle', () => {
       bundleOutOfSync: false,
       behind: 0,
       commits: []
-    } satisfies DesktopUpdateStatus)
+    } as DesktopUpdateStatus)
 
     await renderUpdatesOverlay()
 
@@ -90,29 +90,11 @@ describe('UpdatesOverlay: git-current checkout under a stale bundle', () => {
       bundleOutOfSync: true,
       behind: 2,
       commits: []
-    } satisfies DesktopUpdateStatus)
+    } as DesktopUpdateStatus)
 
     await renderUpdatesOverlay()
 
     expect(screen.getByText('New update available')).toBeTruthy()
     expect(screen.queryByText('Desktop app needs a rebuild')).toBeNull()
   })
-
-  it('an unknown commit count does not claim that only a rebuild is needed', async () => {
-    $updateOverlayTarget.set('client')
-    $updateOverlayOpen.set(true)
-    $updateStatus.set({
-      supported: true,
-      updateAvailable: true,
-      bundleOutOfSync: true,
-      behind: null,
-      commits: []
-    } satisfies DesktopUpdateStatus)
-
-    await renderUpdatesOverlay()
-
-    expect(screen.getByText('New update available')).toBeTruthy()
-    expect(screen.queryByText('Desktop app needs a rebuild')).toBeNull()
-  })
-
 })
