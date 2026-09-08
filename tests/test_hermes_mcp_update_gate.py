@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import hermes_mcp_update_gate as gate
 import pytest
@@ -565,6 +566,32 @@ def test_concurrent_new_claim_has_one_winner(tmp_path: Path) -> None:
         thread.join(timeout=5)
 
     assert sorted(results) == ["claimed", "refused"]
+
+
+@pytest.mark.parametrize("error", [ProcessLookupError, OverflowError])
+def test_posix_unrepresentable_or_missing_pid_is_not_alive(monkeypatch, error) -> None:
+    def missing_pid(pid: int, signal: int) -> None:
+        assert (pid, signal) == (0xFFFFFFFE, 0)
+        raise error
+
+    monkeypatch.setattr(gate, "os", SimpleNamespace(name="posix", kill=missing_pid))
+
+    assert not gate._pid_alive(0xFFFFFFFE)
+
+
+def test_windows_out_of_range_pid_never_reaches_process_api(monkeypatch) -> None:
+    calls = []
+
+    def unexpected_api(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("out-of-range PID reached the Windows process API")
+
+    monkeypatch.setattr(gate, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(gate.ctypes, "WinDLL", unexpected_api, raising=False)
+
+    assert gate._pid_alive(0x1_0000_0000)
+    assert gate._pid_create_time(0x1_0000_0000) is None
+    assert calls == []
 
 
 @pytest.mark.windows_only
