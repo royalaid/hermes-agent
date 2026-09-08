@@ -25,8 +25,6 @@
  * waiter could slip through mid-update.
  */
 
-import { UPDATE_MARKER_MAX_AGE_MS } from './update-marker'
-
 export type UpdateGateReason = 'marker' | 'update-in-flight' | null
 
 export interface UpdateGateDeps {
@@ -117,27 +115,13 @@ export async function waitForUpdateClearance(
   return reason ? 'timeout' : 'finished'
 }
 
-/**
- * Keep local backend startup parked across bounded UI wait windows.
- *
- * The park is bounded: after `blockedBudgetMs` (default: the marker's own
- * 20-minute age ceiling) of consecutive closed-gate windows the outcome is
- * 'timeout' and the caller must report a failed startup attempt without spawning
- * a backend. An unbounded loop parked the backend forever
- * behind an unreadable, malformed, future-dated or cleanup-race marker that
- * nothing could self-heal.
- */
+/** Keep local backend startup parked across bounded UI wait windows. */
 export async function waitForLocalBackendClearance(
   deps: UpdateGateDeps,
   options: WaitForUpdateClearanceOptions & {
     onStillBlocked?: (reason: Exclude<UpdateGateReason, null>) => void | Promise<void>
-    /** Total consecutive blocked time before giving up; defaults to UPDATE_MARKER_MAX_AGE_MS. */
-    blockedBudgetMs?: number
   }
-): Promise<UpdateClearanceOutcome> {
-  const now = options.now || Date.now
-  const blockedBudgetMs = Math.max(0, options.blockedBudgetMs ?? UPDATE_MARKER_MAX_AGE_MS)
-  const blockedSince = now()
+): Promise<'clear' | 'finished'> {
   let waited = false
 
   while (true) {
@@ -156,10 +140,6 @@ export async function waitForLocalBackendClearance(
 
     if (reason) {
       await options.onStillBlocked?.(reason)
-    }
-
-    if (now() - blockedSince >= blockedBudgetMs) {
-      return 'timeout'
     }
   }
 }

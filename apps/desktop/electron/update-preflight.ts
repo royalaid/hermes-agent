@@ -1,4 +1,4 @@
-import type { UpdateMarkerClaim } from './update-marker'
+import type { McpBridgeQuiesceLease } from './mcp-bridge-quiesce'
 import {
   type DesktopPluginServiceProcess,
   desktopPluginServiceUnits,
@@ -15,8 +15,8 @@ import type { ForceReleaseHolder, WindowsUpdateForceReleaseOutcome } from './win
 export type UpdatePreflightPurpose = 'normal-update' | 'bootstrap-recovery'
 
 export interface UpdatePreflightDeps {
-  claim: UpdateMarkerClaim
-  ownsUpdateMarker: (claim: UpdateMarkerClaim) => boolean
+  acquireMcpBridgeLease: () => McpBridgeQuiesceLease | null
+  clearMcpBridgeLease: (lease: McpBridgeQuiesceLease) => void
   now?: () => number
   releaseTrackedBackendTrees: () => Promise<{ unlocked: boolean }>
   /**
@@ -40,11 +40,11 @@ export interface UpdatePreflightTiming {
 }
 
 export type UpdatePreflightOutcome =
-  | { kind: 'clear'; claim: UpdateMarkerClaim }
+  | { kind: 'clear'; lease: McpBridgeQuiesceLease }
   | {
       kind: 'blocked'
       message: string
-      reason: 'unlock-failed' | 'holders' | 'marker-unavailable' | 'quiesce-incomplete' | 'needs-elevation'
+      reason: 'unlock-failed' | 'holders' | 'lease-unavailable' | 'quiesce-incomplete' | 'needs-elevation'
       result?: VenvBlockerScanResult
       elevationHolders?: ForceReleaseHolder[]
     }
@@ -55,7 +55,7 @@ export interface UpdateMutationPermit {
 }
 
 const successfulPreflightPermits = new WeakMap<object, UpdateMutationPermit>()
-const updateMutationPermits = new WeakMap<object, () => boolean>()
+const updateMutationPermits = new WeakSet<object>()
 
 export function authorizeUpdateMutation(preflight: UpdatePreflightOutcome): UpdateMutationPermit | null {
   const permit = successfulPreflightPermits.get(preflight) ?? null
@@ -69,10 +69,6 @@ export function authorizeUpdateMutation(preflight: UpdatePreflightOutcome): Upda
 export function runAuthorizedUpdateMutation<T>(permit: UpdateMutationPermit, operation: () => T): T {
   if (!updateMutationPermits.has(permit)) {
     throw new Error('update mutation requires a clear-preflight permit')
-  }
-
-  if (updateMutationPermits.get(permit)?.() !== true) {
-    throw new Error('update mutation requires the original update marker claim')
   }
 
   return operation()
@@ -131,31 +127,6 @@ export async function runWindowsUpdatePreflight(
   const respawnIntervalMs = timing.respawnIntervalMs ?? DEFAULT_RESPAWN_INTERVAL_MS
   const terminationSettleMs = timing.terminationSettleMs ?? DEFAULT_TERMINATION_SETTLE_MS
 
-  // The caller claims the shared updater marker before entering preflight,
-  // and remains responsible for release on every unsuccessful outcome.
-  const claim = Object.freeze({ ...deps.claim })
-
-  const ownsClaim = (): boolean => {
-    try {
-      return Number.isSafeInteger(claim.pid) && claim.pid > 0 &&
-        Number.isSafeInteger(claim.startedAt) && claim.startedAt > 0 &&
-        deps.ownsUpdateMarker(claim) === true
-    } catch {
-      return false
-    }
-  }
-
-  const requireClaim = (): void => {
-    if (!ownsClaim()) { throw new Error('the original update marker claim is no longer owned') }
-  }
-
-  if (!ownsClaim()) {
-    return {
-      kind: 'blocked', reason: 'marker-unavailable',
-      message: 'Update aborted: Hermes no longer owns the update marker. Retry after any other update finishes.'
-    }
-  }
-
   let lock: { unlocked: boolean }
 
   try {
@@ -172,7 +143,6 @@ export async function runWindowsUpdatePreflight(
       let forceOutcome: WindowsUpdateForceReleaseOutcome
 
       try {
-        requireClaim()
         forceOutcome = await deps.forceReleaseInstallHolders()
       } catch (error) {
         return {
@@ -209,11 +179,11 @@ export async function runWindowsUpdatePreflight(
     }
   }
 
-  // Every scan and destructive step remains under the same update claim.
+  // Observe before activating the prevention lease. Existing bridge watchers
+  // exit when they see that lease, while this first scan defines the exact
+  // current holder set authorized by the user's Update action.
   const scanFailClosed = async (): Promise<ScanOutcome> => {
     try {
-      requireClaim()
-
       return await deps.scan()
     } catch (error) {
       return { kind: 'probe-failure', error: `scanner threw: ${errorText(error)}` }
@@ -237,7 +207,6 @@ export async function runWindowsUpdatePreflight(
     let forced: WindowsUpdateForceReleaseOutcome
 
     try {
-      requireClaim()
       forced = await deps.forceReleaseInstallHolders()
     } catch (error) {
       return {
@@ -319,6 +288,26 @@ export async function runWindowsUpdatePreflight(
       }
     }
   }
+
+  let lease: McpBridgeQuiesceLease | null = null
+
+  try {
+    lease = deps.acquireMcpBridgeLease()
+  } catch {
+    lease = null
+  }
+
+  if (!lease) {
+    return {
+      kind: 'blocked',
+      reason: 'lease-unavailable',
+      ...(observed.kind === 'blocked' ? { result: observed.result } : {}),
+      message:
+        'Update aborted: Hermes could not acquire the MCP bridge pause safely. Retry after any other update finishes.'
+    }
+  }
+
+  let returnLease = false
 
   try {
     await sleep(cooperativeExitMs)
@@ -408,8 +397,6 @@ export async function runWindowsUpdatePreflight(
       // the wrapper cannot disappear before the scanner revalidates a worker.
       for (const bridge of terminationOrder) {
         try {
-          requireClaim()
-
           if (!(await deps.terminateMcpBridge(bridge))) {
             return {
               kind: 'blocked',
@@ -435,8 +422,6 @@ export async function runWindowsUpdatePreflight(
       // Script Host loop alive to respawn the service ten seconds later.)
       for (const service of desktopPluginServiceUnits(firstClear.result.desktopPluginServices)) {
         try {
-          requireClaim()
-
           if (!(await deps.terminateDesktopPluginService(service))) {
             return {
               kind: 'blocked',
@@ -502,12 +487,6 @@ export async function runWindowsUpdatePreflight(
       }
     }
 
-    // Bound repeated force-release attempts across stability scans. The
-    // non-force path starts its existing grace period when a holder appears.
-    if (typeof deps.forceReleaseInstallHolders === 'function') {
-      genericHolderDeadline ??= now() + genericHolderTimeoutMs
-    }
-
     while (true) {
       await sleep(respawnIntervalMs)
       let secondClear = await scanFailClosed()
@@ -518,15 +497,6 @@ export async function runWindowsUpdatePreflight(
 
       if (secondClear.kind === 'blocked' && genericHoldersOnly(secondClear.result)) {
         if (typeof deps.forceReleaseInstallHolders === 'function') {
-          if (genericHolderDeadline !== null && now() >= genericHolderDeadline) {
-            return {
-              kind: 'blocked',
-              reason: 'quiesce-incomplete',
-              result: secondClear.result,
-              message: quiesceIncompleteMessage()
-            }
-          }
-
           const forced = await forceReleaseAndRescan(secondClear.result)
 
           if ('outcome' in forced) {
@@ -564,21 +534,32 @@ export async function runWindowsUpdatePreflight(
       break
     }
 
-    requireClaim()
+    returnLease = true
 
     const outcome: Extract<UpdatePreflightOutcome, { kind: 'clear' }> = Object.freeze({
       kind: 'clear',
-      claim
+      // Preserve the exact capability-bearing lease object. The lease module
+      // binds its private nonce to object identity; cloning it here would keep
+      // the public fields while silently destroying handoff authority.
+      lease
     })
 
     const permit: UpdateMutationPermit = Object.freeze({ preflight: outcome })
     successfulPreflightPermits.set(outcome, permit)
-    updateMutationPermits.set(permit, ownsClaim)
+    updateMutationPermits.add(permit)
 
     return outcome
   } catch (error) {
     const detail = `preflight transaction failed: ${errorText(error)}`
 
     return { kind: 'probe-failure', error: detail, message: formatProbeFailedMessage() }
+  } finally {
+    if (!returnLease) {
+      try {
+        deps.clearMcpBridgeLease(lease)
+      } catch {
+        void 0
+      }
+    }
   }
 }
