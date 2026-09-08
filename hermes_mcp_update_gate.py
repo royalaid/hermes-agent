@@ -64,10 +64,12 @@ def _pid_alive(pid: int) -> bool:
     """Return whether *pid* is live, treating access denial as live."""
     if pid <= 0:
         return False
+    if os.name == "nt" and pid > 0xFFFFFFFF:
+        return True  # Not representable by OpenProcess; never wrap to another PID.
     if os.name != "nt":
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, OverflowError):
             return False
         except PermissionError:
             return True
@@ -114,7 +116,7 @@ def _pid_create_time(pid: int) -> float | None:
     without adding a Python-only marker field.  Unknown/API-denied results are
     not proof of reuse and are therefore handled fail-closed by the caller.
     """
-    if pid <= 0 or os.name != "nt":
+    if pid <= 0 or pid > 0xFFFFFFFF or os.name != "nt":
         return None
 
     class _FileTime(ctypes.Structure):
