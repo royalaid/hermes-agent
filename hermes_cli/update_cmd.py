@@ -429,6 +429,25 @@ def _log_only_write(text: str) -> None:
             log_file.flush()
 
 
+def _update_log_append(text: str) -> None:
+    """Append text to update.log even when the stdout mirror is disabled."""
+    if not text:
+        return
+    stream = _m().sys.stdout
+    if getattr(stream, "_log", None) is not None:
+        _log_only_write(text)
+        return
+    try:
+        log_path = get_hermes_home() / "logs" / "update.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
+            log_file.write(text if text.endswith("
+") else text + "
+")
+    except Exception:
+        pass
+
+
 def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     """Stream combined build output to update.log, retaining it for failure reporting."""
     import codecs
