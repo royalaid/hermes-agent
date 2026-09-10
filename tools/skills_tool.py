@@ -829,7 +829,7 @@ SKILL_VIEW_SCHEMA = {
 registry.register(
     name="skills_list", toolset="skills", schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(category=args.get("category"), task_id=kw.get("task_id")),
-    check_fn=check_skills_requirements, emoji="ðŸ“š")
+    check_fn=check_skills_requirements, emoji="\U0001F4DA")
 
 
 def _skill_view_with_bump(args, **kw):
@@ -856,7 +856,7 @@ def _skill_view_with_bump(args, **kw):
 
 registry.register(
     name="skill_view", toolset="skills", schema=SKILL_VIEW_SCHEMA, handler=_skill_view_with_bump,
-    check_fn=check_skills_requirements, emoji="ðŸ“š")
+    check_fn=check_skills_requirements, emoji="\U0001F4DA")
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
