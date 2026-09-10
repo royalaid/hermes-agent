@@ -3833,50 +3833,6 @@ function forceKillProcessTree(pid) {
   }
 }
 
-// Kill every non-Desktop process executing from this Hermes install. Selecting
-// tree roots keeps taskkill /T authoritative across Python/Node trampolines;
-// this is target collection only, never a holder-classification gate.
-function forceKillAllHermesBackendTrees(updateRoot: string) {
-  if (!IS_WINDOWS) {
-    return
-  }
-
-  const root = `${path.resolve(updateRoot).replace(/'/g, "''").replace(/[\\/]+$/, '')}\\`
-  const desktopExecutable = path.resolve(process.execPath).replace(/'/g, "''")
-  const script = `
-$ErrorActionPreference = 'SilentlyContinue'
-$root = '${root}'
-$desktopExecutable = '${desktopExecutable}'
-$processes = @(Get-CimInstance Win32_Process)
-$targets = @($processes | Where-Object {
-  $executable = [string]$_.ExecutablePath
-  $_.ProcessId -ne ${process.pid} -and
-    $executable.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and
-    -not $executable.Equals($desktopExecutable, [StringComparison]::OrdinalIgnoreCase)
-})
-$targetIds = @{}
-foreach ($target in $targets) {
-  $targetIds[[int]$target.ProcessId] = $true
-}
-foreach ($target in $targets) {
-  if (-not $targetIds.ContainsKey([int]$target.ParentProcessId)) {
-    & taskkill.exe /PID ([string]$target.ProcessId) /T /F *> $null
-  }
-}
-`
-
-  try {
-    execFileSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', script],
-      hiddenWindowsChildOptions({ stdio: 'ignore' })
-    )
-  } catch {
-    // Each tree kill is best effort; the existing shim-unlock wait below is
-    // still the fail-closed hand-off gate.
-  }
-}
-
 function writeBackendOwnership(contents) {
   fs.mkdirSync(path.dirname(DESKTOP_BACKEND_OWNERSHIP_PATH), { recursive: true })
   const tempPath = `${DESKTOP_BACKEND_OWNERSHIP_PATH}.${process.pid}.tmp`
@@ -7670,6 +7626,9 @@ async function showPluginCompatNoticeOnce() {
     } catch (err) {
       rememberLog(`[plugins] could not persist compat notice dismissal: ${err.message}`)
     }
+  }
+}
+
 function repairPackagedWindowsShortcutsAfterLaunch() {
   // The updater PowerShell process is already loaded before it pulls this
   // helper. Run the same repair from the newly built/relaunched Hermes process
