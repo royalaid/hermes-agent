@@ -150,5 +150,7 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     );
     await act(async () => click(confirm ?? null));
     expect(apiMocks.deleteSession).toHaveBeenCalledWith("sid-guanli", "guanli");
-  });
+    // Includes cold imports of the dashboard and providers; condition waits
+    // above remain bounded to five seconds each.
+  }, 15_000);
 });

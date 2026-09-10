@@ -1997,7 +1997,7 @@ try {
 
     # -- 0. Claim the update marker with OUR pid ---------------------------
     try {
-        if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestMarker -and -not (Adopt-McpBridgeLease)) {
+        if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestMarker -and -not $SelfTestWorkingDirectory -and -not (Adopt-McpBridgeLease)) {
             throw "could not adopt the authenticated MCP bridge lease"
         }
         # The marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".

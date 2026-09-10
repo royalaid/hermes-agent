@@ -144,7 +144,7 @@ def _cancel_silent_request(
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
     # Thread start-up on a loaded CI runner can exceed 1 s; the bound is only "eventually entered the transport".
-    assert started.wait(timeout=5), "request never entered its silent transport"
+    assert started.wait(timeout=5), f"request never entered its silent transport: {result.get('exc')!r}"
     cancelled_at = time.monotonic()
     cancel_event.set()
     worker.join(timeout=5)

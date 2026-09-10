@@ -25,6 +25,7 @@ Everything here is best-effort: no registry access ever raises out of
 
 from __future__ import annotations
 
+import ntpath
 import os
 import sys
 from collections.abc import Callable, Iterable
@@ -134,7 +135,7 @@ def _managed_roots(env: dict) -> list[str]:
     for candidate in candidates:
         if not candidate:
             continue
-        normalized = os.path.normcase(os.path.normpath(candidate)).rstrip("\\/")
+        normalized = ntpath.normcase(ntpath.normpath(candidate)).rstrip("\\/")
         if normalized and normalized not in roots:
             roots.append(normalized)
     return roots
@@ -143,13 +144,13 @@ def _managed_roots(env: dict) -> list[str]:
 def managed_path_entries(inherited: str | None, roots: Iterable[str]) -> list[str]:
     """Return the inherited entries that live under any of *roots*, in order."""
     normalized_roots = [
-        os.path.normcase(os.path.normpath(root)).rstrip("\\/") for root in roots if root
+        ntpath.normcase(ntpath.normpath(root)).rstrip("\\/") for root in roots if root
     ]
     managed: list[str] = []
     for entry in _split_path(inherited):
-        candidate = os.path.normcase(os.path.normpath(entry))
+        candidate = ntpath.normcase(ntpath.normpath(entry))
         for root in normalized_roots:
-            if candidate == root or candidate.startswith(root + os.sep):
+            if candidate == root or candidate.startswith(root + ntpath.sep):
                 managed.append(entry)
                 break
     return managed

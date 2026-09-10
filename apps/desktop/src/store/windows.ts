@@ -224,7 +224,7 @@ export async function openSessionInNewWindow(
   const profile = normalizeProfileKey(rememberedSessionProfile($sessions.get(), sessionId, $activeGatewayProfile.get()))
 
   await runWindowOpen(
-    () => window.hermesDesktop.openSessionWindow(sessionId, { ...opts, profile }),
+    () => window.hermesDesktop.openSessionWindow(sessionId, opts?.ownerRoute ? opts : { ...opts, profile }),
     'Could not open chat in a new window'
   )
 }

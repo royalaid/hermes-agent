@@ -137,6 +137,7 @@ vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
 const TODO_CARRIER_HEADER = '[Your active task list was preserved across context compression]'
+
 const resumeCarrierTodos = [
   { content: 'parent', id: 'plan', status: 'completed' as const },
   { content: 'child', id: 'child', parent: 'plan', status: 'in_progress' as const },
@@ -152,6 +153,7 @@ const resumeCarrierMessages = [
     timestamp: 1
   }
 ]
+
 const ordinaryFullTailMessages = Array.from({ length: 120 }, (_, index) => ({
   content: `ordinary persisted tail message ${index}`,
   role: 'assistant' as const,
@@ -1202,6 +1204,7 @@ describe('resumeSession failure recovery', () => {
       const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
         current: new Map([['stored-1', 'runtime-warm']])
       }
+
       const warmState = createClientSessionState('stored-1')
 
       warmState.messages = [{ id: 'cached-user', parts: [{ text: 'cached question', type: 'text' }], role: 'user' }]
@@ -1251,6 +1254,7 @@ describe('resumeSession failure recovery', () => {
       const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
         current: warm ? new Map([['stored-1', runtimeSessionId]]) : new Map()
       }
+
       const warmState = createClientSessionState('stored-1')
 
       warmState.messages = [{ id: 'cached-user', parts: [{ text: 'cached question', type: 'text' }], role: 'user' }]
@@ -1305,6 +1309,7 @@ describe('resumeSession failure recovery', () => {
       const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
         current: warm ? new Map([['stored-1', runtimeSessionId]]) : new Map()
       }
+
       const warmState = createClientSessionState('stored-1')
 
       warmState.messages = [{ id: 'cached-user', parts: [{ text: 'cached question', type: 'text' }], role: 'user' }]
@@ -1399,9 +1404,11 @@ describe('resumeSession failure recovery', () => {
   it('keeps a newer live Todo write while warm activation waits for an older post-barrier REST carrier', async () => {
     const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
     const liveTodos = [{ content: 'new warm progress', id: 'live-warm', status: 'in_progress' as const }]
+
     const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
       current: new Map([['stored-1', 'runtime-warm']])
     }
+
     const warmState = createClientSessionState('stored-1')
 
     warmState.messages = [{ id: 'cached-user', parts: [{ text: 'cached question', type: 'text' }], role: 'user' }]

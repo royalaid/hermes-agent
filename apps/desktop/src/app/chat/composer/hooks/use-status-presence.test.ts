@@ -1,9 +1,11 @@
 import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerActionsBySession } from '@/store/composer-actions'
 import { $previewStatusBySession } from '@/store/preview-status'
 import { $sessionControlBySession, type SessionControlEntry } from '@/store/session-control'
+import { $sessionStates } from '@/store/session-states'
 import { $todosBySession } from '@/store/todos'
 
 import { useSessionStatusPresence } from './use-status-presence'
@@ -28,6 +30,7 @@ const mockEntry = (overrides?: Partial<SessionControlEntry>): SessionControlEntr
 describe('useSessionStatusPresence', () => {
   beforeEach(() => {
     $todosBySession.set({})
+    $sessionStates.set({})
     $composerActionsBySession.set({})
     $previewStatusBySession.set({})
     $sessionControlBySession.set({})
@@ -36,6 +39,7 @@ describe('useSessionStatusPresence', () => {
   afterEach(() => {
     cleanup()
     $todosBySession.set({})
+    $sessionStates.set({})
     $composerActionsBySession.set({})
     $previewStatusBySession.set({})
     $sessionControlBySession.set({})
@@ -49,11 +53,12 @@ describe('useSessionStatusPresence', () => {
     expect(emptyResult.current).toBe(false)
   })
 
-  it('returns true when legacy status items exist', () => {
+  it('returns true when live Todo status items exist', () => {
     const { result } = renderHook(() => useSessionStatusPresence(SID))
     expect(result.current).toBe(false)
 
     act(() => {
+      $sessionStates.set({ [SID]: { ...createClientSessionState(SID), busy: true, turnLive: true } })
       $todosBySession.set({
         [SID]: [{ content: 'task 1', id: '1', status: 'in_progress' }]
       })

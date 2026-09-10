@@ -104,7 +104,8 @@ it('keeps equal profile names on separate gateways and routes section creation a
   fireEvent.click(screen.getByText('cloud-1 session'))
   expect(resume).toHaveBeenLastCalledWith(
     'cloud-1',
-    expect.objectContaining({ connection_id: 'cloud-1', profile: 'default' })
+    expect.objectContaining({ connection_id: 'cloud-1', profile: 'default' }),
+    undefined
   )
   const group = within(gateway).getByText('default').closest('[data-gateway-group]')!
   fireEvent.click(within(group as HTMLElement).getByRole('button', { name: 'Hide default sessions' }))
