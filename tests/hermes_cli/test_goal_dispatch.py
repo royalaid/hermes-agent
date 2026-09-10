@@ -63,13 +63,14 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
     'gate clear', 'gate list', 'pause', 'resume', 'clear', 'stop', 'done',
     'build it\nverify: test passes', 'status', '',
 ])
-def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
+def test_surface_goal_state_matches_cli(surface, command, monkeypatch, tmp_path):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(goals, 'draft_contract', lambda objective: goals.GoalContract())
     goals._DB_CACHE.clear()
     command = command.format(pid=os.getpid())
     snapshots = []
-    for name in ('cli', surface):
-        mgr = goals.GoalManager(session_id=name + '-parity-' + surface)
+    for index, name in enumerate(('cli', surface)):
+        mgr = goals.GoalManager(session_id=f'{index}-{name}-parity-{surface}')
         mgr.set('original objective')
         mgr.add_gate('original gate')
         mgr.wait_on(os.getpid(), reason='existing barrier')
@@ -80,7 +81,7 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
         if state:
             from dataclasses import asdict
             state = asdict(state)
-            for key in ('created_at', 'updated_at', 'waiting_since'):
+            for key in ('created_at', 'updated_at', 'waiting_since', 'receipt_token'):
                 state.pop(key, None)
         snapshots.append(state)
     assert snapshots[0] == snapshots[1]

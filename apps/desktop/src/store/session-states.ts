@@ -55,8 +55,8 @@ import {
   setBusy,
   setSessions
 } from './session'
-import { secondaryProfileOwnerForEvent } from './session-event-provenance'
 import { normalizeSessionBinding } from './session-binding'
+import { secondaryProfileOwnerForEvent } from './session-event-provenance'
 import { $focusedTreePaneId } from './session-focus'
 import { assertSessionOwnerResolved } from './session-owner-resolution'
 import {

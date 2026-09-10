@@ -99,6 +99,7 @@ def test_windows_worker_imports_runtime_outside_task_worktree(
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setattr(kb, "_IS_WINDOWS", True)
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
