@@ -2123,6 +2123,10 @@ from gateway.restart import (
 logger = logging.getLogger(__name__)
 
 
+class GoalContinuationPublicationError(RuntimeError):
+    """A completed continuation could not cross its durable publication fence."""
+
+
 def _best_effort(fn: Callable[[], Any], debug_msg: Optional[str] = None) -> Any:
     """Call ``fn``; return None on any Exception (debug-logged via ``debug_msg`` ``%s`` if given)."""
     try:

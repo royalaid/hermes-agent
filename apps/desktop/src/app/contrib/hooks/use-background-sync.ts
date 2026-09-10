@@ -124,7 +124,6 @@ function tileTranscriptSignatureKey(tile: TileTranscriptTarget): string {
  */
 export async function reconcileTileTranscripts({
   requestSequenceRef,
-  busyRef = { current: false },
   isOwnerCurrent = () => true,
   signatureRef,
   updateSessionState,
@@ -181,6 +180,7 @@ export async function reconcileTileTranscripts({
           profile: tile.ownerRoute.targetProfile ?? tile.ownerRoute.profile
         }
       : undefined
+
     const signatureKey = tileTranscriptSignatureKey(tile)
 
     try {
@@ -191,7 +191,6 @@ export async function reconcileTileTranscripts({
         requestId !== requestSequenceRef.current ||
         runtimeOwnsLiveTranscript(runtimeSessionId) ||
         !isOwnerCurrent() ||
-        tileRuntimeOwnsLiveState(runtimeSessionId) ||
         !tileIsCurrent
       ) {
         // Tile closed or superseded mid-read — discard AND prune its
@@ -274,9 +273,11 @@ export async function reconcileActiveTranscript({
   }
 
   const ownerKey = activeTranscriptOwnerKey(stored, storedSessionId)
+
   if (!ownerKey) {
     return
   }
+
   const ownerIsCurrent = () => activeTranscriptOwnerKey(resolveSession(storedSessionId), storedSessionId) === ownerKey
 
   const requestId = requestSequenceRef.current + 1

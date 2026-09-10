@@ -4312,7 +4312,15 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
-            response = await self._message_handler(event)
+            _precomputed_response = getattr(event, "_hermes_precomputed_response", None)
+            if _precomputed_response is not None:
+                response = DeliveryOwnedReply(
+                    str(_precomputed_response),
+                    str(getattr(event, "_hermes_precomputed_obligation_id", "")),
+                )
+            else:
+                response = await self._message_handler(event)
+            _delivery_owned_obligation_id = getattr(response, "obligation_id", None)
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
@@ -4434,6 +4442,10 @@ class BasePlatformAdapter(ABC):
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            if locals().get("_delivery_owned_obligation_id"):
+                if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                    raise
+                return
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):

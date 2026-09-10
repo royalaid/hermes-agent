@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -411,6 +412,47 @@ class GatewayStartupMixin:
             return None
         wake = wakes[key] = asyncio.Event()
 
+        async def _redeliver_after_wait():
+            try:
+                while getattr(self, "_running", False):
+                    wake.clear()
+                    waiting = await asyncio.to_thread(pending_flood_retries)
+                    deadlines = [r["not_before"] for r in waiting
+                                 if (r["platform"], r["profile"]) == key]
+                    if not deadlines:
+                        if wake.is_set():
+                            continue
+                        return
+                    delay = flood_retry_delay(min(deadlines) - time.time())
+                    try:
+                        await asyncio.wait_for(wake.wait(), timeout=delay)
+                        continue  # A shorter sibling may now be due first.
+                    except asyncio.TimeoutError:
+                        pass
+                    if getattr(self, "_running", False):
+                        await self._redeliver_failed_obligations_for_platform(target, profile=profile)
+            finally:
+                pending.pop(key, None)
+                wakes.pop(key, None)
+
+        task = asyncio.create_task(_redeliver_after_wait(), name="flood-redelivery:%s:%s" % key)
+        pending[key] = task
+        # The gateway's ordinary shutdown drain must cancel sleeping timers too.
+        background = getattr(self, "_background_tasks", None)
+        if background is not None:
+            self._track_task_in(background, task)
+
+    async def _arm_flood_timers_for_waiting_rows(self) -> None:
+        """Recover adopted, newly refused and unsent released rows without blocking the loop."""
+        from gateway.delivery_ledger import pending_flood_retries
+        for row in await asyncio.to_thread(pending_flood_retries):
+            self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
+
+    @staticmethod
+    def _claimed_result_replay_event(row: Dict[str, Any]) -> MessageEvent:
+        """Rebuild only the non-authoritative routing needed for output replay."""
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
         source_payload = json.loads(row["source_json"])
         if not isinstance(source_payload, dict):
             raise ValueError("invalid claimed-result replay source")
@@ -451,6 +493,7 @@ class GatewayStartupMixin:
         setattr(event, "_hermes_precomputed_obligation_id", row["obligation_id"])
         return event
 
+
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
@@ -470,6 +513,39 @@ class GatewayStartupMixin:
                 continue
             adapter = await self._obligation_adapter(row)
             if adapter is None:
+                continue
+            if (
+                row.get("claim_id")
+                and row.get("claim_event_id")
+                and row.get("source_json")
+                and row.get("raw_content") is not None
+                and not row.get("runtime_recovery")
+            ):
+                try:
+                    replay_event = self._claimed_result_replay_event(row)
+                    await adapter._process_message_background(
+                        replay_event, row["session_key"])
+                    from gateway.delivery_ledger import get_claimed_result
+
+                    replay_state = await asyncio.to_thread(
+                        get_claimed_result,
+                        row["claim_id"],
+                        row["claim_event_id"],
+                    )
+                    if replay_state and replay_state["state"] == "delivered":
+                        redelivered += 1
+                except Exception:
+                    from gateway.delivery_ledger import mark_claimed_result_failed
+
+                    await asyncio.to_thread(
+                        mark_claimed_result_failed,
+                        row["obligation_id"],
+                        "replay_pipeline_failed",
+                    )
+                    logger.warning(
+                        "Claimed-result replay pipeline failed for obligation %s",
+                        row["obligation_id"],
+                    )
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -735,12 +811,24 @@ class GatewayStartupMixin:
     async def _recover_unclean_sessions(self) -> tuple[int, int]:
         """Recover exact active turns, then run the legacy recency fallback."""
         from gateway.run import _float_env
+        from gateway.delivery_ledger import completed_active_turn_tokens
+
         exact = 0
         fallback = 0
+        try:
+            completed_tokens = await asyncio.to_thread(
+                completed_active_turn_tokens,
+                home=getattr(self, "_goal_continuation_claim_home", None),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "completed-result ownership recovery is unavailable"
+            ) from exc
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
             agent_timeout = max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800))
             exact = await self.async_session_store.recover_interrupted_turns(
-                max_age_seconds=max(60 * 60, int(agent_timeout * 2))
+                max_age_seconds=max(60 * 60, int(agent_timeout * 2)),
+                completed_turn_tokens=completed_tokens,
             )
         with _log_suppressed(logging.WARNING, "Legacy session recovery on startup failed: %s"):
             fallback = await self.async_session_store.suspend_recently_active(max_age_seconds=120)
@@ -1006,6 +1094,8 @@ class GatewayStartupMixin:
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
+        # Completed results own publication before crash markers can reopen execution.
+        await asyncio.to_thread(self._reconcile_completed_goal_continuation_claims)
         # Recover sessions active at last exit (exact turn markers + 120s recency fallback for
         # marker-less older turns). SKIP after a clean exit — the previous process already drained.
         _clean_marker = _hermes_home / ".clean_shutdown"

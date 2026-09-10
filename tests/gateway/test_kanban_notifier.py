@@ -754,10 +754,10 @@ def test_notifier_skips_unchanged_board_after_initial_open(tmp_path, monkeypatch
     """Unchanged poll ticks must not reopen the board database."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "unchanged.db"))
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="unchanged board", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
     finally:
         conn.close()
 

@@ -9,6 +9,7 @@ from gateway import kanban_watchers
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 
 
@@ -31,10 +32,10 @@ def _make_runner(adapter):
 
 def _seed_subscription(db_path, *, title="notify", notifier_profile=None):
     kb.init_db(db_path=db_path)
-    conn = kb.connect(db_path=db_path)
+    conn = kbc.connect(db_path=db_path)
     try:
         task_id = kb.create_task(conn, title=title, assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn,
             task_id=task_id,
             platform="telegram",
@@ -48,7 +49,7 @@ def _seed_subscription(db_path, *, title="notify", notifier_profile=None):
 
 def _seed_completed_subscription(db_path, *, title="completed"):
     task_id = _seed_subscription(db_path, title=title)
-    conn = kb.connect(db_path=db_path)
+    conn = kbc.connect(db_path=db_path)
     try:
         kb.complete_task(conn, task_id, summary="replacement completion")
     finally:
@@ -96,7 +97,7 @@ def test_notifier_reopens_changed_wal_and_checkpointed_board_next_poll(
     db_path = tmp_path / "changed.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     task_id = _seed_subscription(db_path, title="changed board")
-    writer = kb.connect(db_path=db_path)
+    writer = kbc.connect(db_path=db_path)
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
     opens = _count_sqlite_opens(monkeypatch)
@@ -135,9 +136,9 @@ def test_notifier_reopens_changed_wal_and_checkpointed_board_next_poll(
             after_commit[1] != before_commit[1]
             or after_commit[2] != before_commit[2]
         ), "a WAL commit must change a tracked SQLite sidecar"
-    # Two opens for the initial probe/load, two for the changed poll, and one
-    # cursor-advance connection after the event is delivered.
-    assert len(opens) == 5
+    # Two opens for the initial probe/load, two for the changed poll, and separate
+    # ping-checkpoint and cursor-advance connections after the event is delivered.
+    assert len(opens) == 6
 
 
 def test_notifier_invalidates_cache_for_subscription_remove_and_add(
@@ -150,9 +151,9 @@ def test_notifier_invalidates_cache_for_subscription_remove_and_add(
     second_task = _seed_subscription(db_path, title="added subscription")
     # _seed_subscription intentionally adds a sub for the second task; remove
     # it before the watcher starts so the callback can test an actual add.
-    conn = kb.connect(db_path=db_path)
+    conn = kbc.connect(db_path=db_path)
     try:
-        assert kb.remove_notify_sub(
+        assert kbn.remove_notify_sub(
             conn,
             task_id=second_task,
             platform="telegram",
@@ -161,21 +162,21 @@ def test_notifier_invalidates_cache_for_subscription_remove_and_add(
     finally:
         conn.close()
 
-    writer = kb.connect(db_path=db_path)
+    writer = kbc.connect(db_path=db_path)
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
     opens = _count_sqlite_opens(monkeypatch)
 
     def change_subscription_after_poll(poll_sleeps):
         if poll_sleeps == 1:
-            assert kb.remove_notify_sub(
+            assert kbn.remove_notify_sub(
                 writer,
                 task_id=first_task,
                 platform="telegram",
                 chat_id="chat-1",
             )
         elif poll_sleeps == 2:
-            kb.add_notify_sub(
+            kbn.add_notify_sub(
                 writer,
                 task_id=second_task,
                 platform="telegram",
@@ -194,8 +195,8 @@ def test_notifier_invalidates_cache_for_subscription_remove_and_add(
     assert len(adapter.sent) == 1
     assert second_task in adapter.sent[0]["text"]
     # Initial query/load (2), removal leaves a zero-sub read-only probe (1),
-    # and the re-added event needs query/load plus cursor advance (3).
-    assert len(opens) == 6
+    # and the re-added event needs query/load, ping checkpoint, and cursor advance (4).
+    assert len(opens) == 7
 
 
 def test_notifier_reopens_replaced_database_and_delivers_new_event(
@@ -229,8 +230,9 @@ def test_notifier_reopens_replaced_database_and_delivers_new_event(
     assert len(adapter.sent) == 1
     assert replacement_task in adapter.sent[0]["text"]
     # The replacement is detected by device/inode/size/timestamp metadata and
-    # is queried on the immediately following poll.
-    assert len(opens) == 5
+    # is queried on the immediately following poll; delivery writes both the
+    # ping checkpoint and the subscription cursor.
+    assert len(opens) == 6
 
 
 def test_notifier_fails_open_when_file_signature_is_uncertain(tmp_path, monkeypatch):
@@ -279,7 +281,7 @@ def test_notifier_does_not_cache_through_concurrent_writer(tmp_path, monkeypatch
 
         def write_event():
             try:
-                writer = kb.connect(db_path=db_path)
+                writer = kbc.connect(db_path=db_path)
                 try:
                     kb.complete_task(writer, task_id, summary="concurrent commit")
                 finally:
@@ -300,8 +302,8 @@ def test_notifier_does_not_cache_through_concurrent_writer(tmp_path, monkeypatch
     assert len(adapter.sent) == 1
     assert task_id in adapter.sent[0]["text"]
     # Initial probe/load (2), concurrent writer (1), next-poll probe/load and
-    # cursor advance (3). The first query did not incorrectly cache its result.
-    assert len(opens) == 6
+    # ping checkpoint and cursor advance (4). The first query did not cache its result.
+    assert len(opens) == 7
 
 
 def test_notifier_closes_poll_connections_on_shutdown(tmp_path, monkeypatch):
@@ -342,10 +344,10 @@ def test_notifier_polls_each_unchanged_board_once_with_profile_context(
     kb.init_db(board="default")
     kb.create_board("secondary")
     for board, profile in (("default", "main"), ("secondary", "other")):
-        conn = kb.connect(board=board)
+        conn = kbc.connect(board=board)
         try:
             task_id = kb.create_task(conn, title=f"{board} quiet", assignee="worker")
-            kb.add_notify_sub(
+            kbn.add_notify_sub(
                 conn,
                 task_id=task_id,
                 platform="telegram",
