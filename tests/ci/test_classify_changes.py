@@ -149,9 +149,9 @@ CASES = {
     # its tests spawn the real script and poll its loopback server. They run
     # when the script, the Electron side that launches it, or their own test
     # files change — not on every hermes_state.py PR.
-    "windows.ps1 → desktop_updater": (
+    "windows.ps1 → desktop_updater + installer": (
         ["scripts/desktop-update/windows.ps1"],
-        _lanes(python=True, desktop_updater=True),
+        _lanes(python=True, desktop_updater=True, installer=True),
     ),
     # The shipped updater page is exercised by the desktop Electron suite;
     # a page-only change must run that suite as well as the server tests.
