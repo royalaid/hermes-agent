@@ -441,14 +441,12 @@ def _update_log_append(text: str) -> None:
         log_path = get_hermes_home() / "logs" / "update.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
-            log_file.write(text if text.endswith("
-") else text + "
-")
+            log_file.write(text if text.endswith("\n") else text + "\n")
     except Exception:
         pass
 
 
-def _run_logged_subprocess(cmd, *, cwd=None, env=None):
+def _run_logged_subprocess(cmd, *, cwd=None, env=None, label="desktop build", progress_every=30.0):
     """Stream combined build output to update.log, retaining it for failure reporting."""
     import codecs
     import io
@@ -464,14 +462,25 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     # and the universal-newline behavior callers previously got from text=True.
     decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")("replace"), True)
     output = []
+    started = last_progress = _time.monotonic()
+    line_count = 0
     try:
         while True:
             chunk = proc.stdout.read1(8192)
             text = decoder.decode(chunk, final=not chunk)
             output.append(text)
             _log_only_write(text)
+            line_count += text.count("\n")
             if not chunk:
                 break
+            now = _time.monotonic()
+            if text and progress_every > 0 and now - last_progress >= progress_every:
+                last_progress = now
+                print(
+                    f"  … {label} running: {int(now - started)}s, "
+                    f"{line_count} lines captured (full output: logs/update.log)",
+                    flush=True,
+                )
         return subprocess.CompletedProcess(cmd, proc.wait(), stdout="".join(output))
     except BaseException:
         # Unlike Popen.__exit__, do not wait for a cancelled build to finish.

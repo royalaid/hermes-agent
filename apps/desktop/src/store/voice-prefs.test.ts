@@ -15,7 +15,8 @@ it('keeps the desktop toggle local across config refreshes', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const storage = window.localStorage
+      const write = vi.spyOn(Object.hasOwn(storage, 'setItem') ? storage : Object.getPrototypeOf(storage), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -30,6 +31,7 @@ it('keeps the desktop toggle local across config refreshes', async () => {
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: !enabled } })
         expect(prefs.$autoSpeakReplies.get()).toBe(enabled)
         expect(saveHermesConfig).not.toHaveBeenCalled()
+        expect(write).toHaveBeenCalledWith('hermes.desktop.autoSpeakReplies', String(enabled))
         expect(localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe(fails ? null : String(enabled))
       } finally {
         write.mockRestore()
@@ -44,7 +46,8 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const storage = window.localStorage
+      const write = vi.spyOn(Object.hasOwn(storage, 'setItem') ? storage : Object.getPrototypeOf(storage), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -58,6 +61,7 @@ it('migrates the legacy preference once, not on every refresh', async () => {
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: enabled } })
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: !enabled } })
         expect(prefs.$autoSpeakReplies.get()).toBe(enabled)
+        expect(write).toHaveBeenCalledWith('hermes.desktop.autoSpeakReplies', String(enabled))
         expect(localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe(fails ? null : String(enabled))
       } finally {
         write.mockRestore()

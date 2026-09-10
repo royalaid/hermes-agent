@@ -48,7 +48,7 @@ def test_quick_child_prints_no_progress_line(monkeypatch):
 def test_falls_back_to_the_log_file_when_the_mirror_is_off(monkeypatch, tmp_path: Path):
     plain = io.StringIO()
     monkeypatch.setattr(sys, "stdout", plain)
-    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     result = update_cmd._run_logged_subprocess(
         [sys.executable, "-c", "print('gateway-mode build')"]
@@ -61,7 +61,7 @@ def test_falls_back_to_the_log_file_when_the_mirror_is_off(monkeypatch, tmp_path
 
 def test_nonzero_exit_and_output_survive(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(sys, "stdout", io.StringIO())
-    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     result = update_cmd._run_logged_subprocess(
         [sys.executable, "-c", "import sys; print('boom'); sys.exit(3)"]

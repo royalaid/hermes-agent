@@ -621,6 +621,8 @@ describe('useSessionTileDelegate resumeTile', () => {
       ])
       expect(JSON.stringify(refreshed.messages)).toContain('external notice')
     }
+  })
+
   it('continues a displaced warm transcript refresh through the tile current owner', async () => {
     const ownerA = { connectionId: 'source-a', profile: 'profile-a' }
     const ownerB = { connectionId: 'source-b', profile: 'profile-b' }
@@ -756,11 +758,13 @@ describe('useSessionTileDelegate resumeTile', () => {
     const order: string[] = []
     vi.mocked(getLatestSessionMessages).mockImplementation(async () => {
       order.push('history')
+
       return { messages: [{ role: 'user', content: 'hello' }], session_id: 'stored-z' } as never
     })
     const requestGateway = vi.fn(async () => ({}) as never)
     vi.mocked(requestGatewayForProfile).mockImplementationOnce(async () => {
       order.push('resume')
+
       return { session_id: 'runtime-3' } as never
     })
     const updateSessionState = vi.fn()

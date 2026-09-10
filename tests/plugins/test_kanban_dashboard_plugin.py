@@ -602,22 +602,14 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 
 
 def _permissive_ws_auth(monkeypatch):
-    """Stub hermes_cli.web_server so every WS upgrade is authorized."""
-    import hermes_cli
-    import types
-
-    stub = types.SimpleNamespace(
-        _SESSION_TOKEN="",
-        _ws_auth_ok=lambda ws: True,
-    )
-    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
-    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
+    """Stub the canonical gate so every WS upgrade is authorized."""
+    monkeypatch.setattr("hermes_cli.web_server_chat._ws_auth_ok", lambda ws: True)
 
 
-def test_ws_events_delegated_child_closes_terminally_and_logs_once(
+def test_ws_events_permission_error_closes_terminally_and_logs_once(
     tmp_path, monkeypatch, caplog,
 ):
-    """A delegated-child PermissionError is permanent — close terminally, log once.
+    """A connection PermissionError is permanent — close terminally, log once.
 
     The guard is process-level, so every reconnect hits it again. Before the
     fix the catch-all closed with no code, the dashboard's backoff treated that
@@ -637,11 +629,12 @@ def test_ws_events_delegated_child_closes_terminally_and_logs_once(
     app.include_router(mod.router, prefix="/api/plugins/kanban")
     c = TestClient(app)
 
-    # Genuinely delegated-child context: the real guard fires inside
-    # connect()'s first-open migration pass (write_txn), so clear the
-    # per-process init cache to force that pass to run again.
-    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
-    kb._INITIALIZED_PATHS.clear()
+    # Descendants can now read an initialized board. Inject a permanent open
+    # failure directly so this still exercises terminal close and log dedupe.
+    def denied_connect(*args, **kwargs):
+        raise PermissionError("board unavailable to this process")
+
+    monkeypatch.setattr(kbc, "connect", denied_connect)
 
     from starlette.websockets import WebSocketDisconnect
 
@@ -687,8 +680,13 @@ def test_init_db_permission_error_logs_once_per_process(tmp_path, monkeypatch, c
     caplog.clear()
     with caplog.at_level("WARNING"):
         for _ in range(3):
-            with pytest.raises(PermissionError):
-                mod._conn()
+            conn = mod._conn()
+            try:
+                assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+                with pytest.raises(PermissionError):
+                    kb.create_task(conn, title="must remain read-only")
+            finally:
+                conn.close()
 
     init_warnings = [
         r for r in caplog.records if "init_db" in r.getMessage()
@@ -872,7 +870,7 @@ def test_dashboard_done_actions_prompt_for_completion_summary():
     """
 
     repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
 
     import re
 
@@ -967,7 +965,7 @@ def test_dashboard_surfaces_ready_blocked_error_inline():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
         repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
 
     # Helper that strips ``"409: {\"detail\":\"…\"}"`` down to the
     # human-readable message before it lands in any banner.
@@ -995,7 +993,7 @@ def test_dashboard_dependency_selects_use_value_change_handler():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
         repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
 
     parent_select = (
         'value: newParent,\n'
@@ -1365,5 +1363,4 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

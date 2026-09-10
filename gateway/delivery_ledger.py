@@ -20,6 +20,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing, contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -149,8 +150,8 @@ def _db_path():
     return get_hermes_home() / "state.db"
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _connect(home: Optional[Path] = None) -> sqlite3.Connection:
+    path = Path(home) / "state.db" if home is not None else _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
@@ -190,7 +191,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             parts_total INTEGER
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    if "adapter_profile" not in columns:
         try:
             conn.execute("ALTER TABLE delivery_obligations ADD COLUMN adapter_profile TEXT")
         except sqlite3.OperationalError as exc:
@@ -247,7 +249,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(home: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
     """Open a connection, commit/rollback on exit, and ALWAYS close it: ``sqlite3.Connection`` as a
     context manager only commits/rolls back, so ``with _connect()`` alone leaks a connection (and its
     WAL/SHM fds) per call — ``record_obligation`` runs on every final response; exhausts RLIMIT_NOFILE.
@@ -256,7 +258,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     #69567 / PR #69594). ``record_obligation`` runs on every outbound final response, so this ledger is the
     highest-frequency leaker.
     """
-    conn = _connect()
+    conn = _connect(home)
     with closing(conn), conn:
         yield conn
 
@@ -305,6 +307,26 @@ def _owner_alive(pid: Any, started_at: Any) -> bool:
         return started_at is None or int(current_start) == int(started_at)
     except (TypeError, ValueError):
         return True
+
+
+class DeliveryObligationConflict(RuntimeError):
+    """The same durable result identity was presented with different bytes."""
+
+
+class DeliveryObligationCapacityError(RuntimeError):
+    """The bounded ledger cannot safely admit another owed result."""
+
+
+def mark_claimed_result_delivered(obligation_id: str) -> bool:
+    """Mark one claimed result delivered only for its current process owner."""
+    return _update_claimed_result_state(obligation_id, "delivered")
+
+
+def mark_claimed_result_failed(
+    obligation_id: str, error: str = "platform_delivery_failed"
+) -> bool:
+    """Return one claimed result to failed only for its current owner."""
+    return _update_claimed_result_state(obligation_id, "failed", error=error)
 
 
 def compute_obligation_id(session_key: str, message_ref: str, content: str) -> str:
@@ -952,17 +974,52 @@ def record_obligation(
     adapter_profile: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
-    now, (pid, started) = time.time(), _owner_stamp()
+    now = time.time()
+    stored_profile = str(adapter_profile).strip() if adapter_profile else "default"
+    stored_thread = str(thread_id) if thread_id else None
+    expected = (
+        session_key,
+        platform,
+        str(chat_id),
+        stored_thread,
+        content,
+        stored_profile,
+    )
+    pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
+        existing = conn.execute(
+            """SELECT session_key, platform, chat_id, thread_id, content,
+                      adapter_profile, claim_id, claim_event_id
+               FROM delivery_obligations WHERE obligation_id=?""",
+            (obligation_id,),
+        ).fetchone()
+        if existing is not None:
+            if tuple(existing[:6]) == expected and not existing[6] and not existing[7]:
+                return
+            raise DeliveryObligationConflict(
+                "delivery obligation identity conflicts with existing ownership"
+            )
+        _ensure_insert_capacity(conn)
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile)
                VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
-            (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
-    _prune()
+            (
+                obligation_id,
+                session_key,
+                platform,
+                str(chat_id),
+                stored_thread,
+                content,
+                now,
+                now,
+                pid,
+                started,
+                stored_profile,
+            ),
+        )
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -1050,6 +1107,25 @@ def _update_claimed_result_state(
     return bool(cursor.rowcount)
 
 
+def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
+                 needs_marker: bool, runtime: bool = False, flood: bool = False,
+                 last_error: Optional[str] = None, claim_id=None, claim_event_id=None,
+                 raw_content=None, source_json=None, message_ref=None) -> Dict[str, Any]:
+    """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
+    the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
+    ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
+    restart marker default. ``last_error`` is the row's pre-claim error, carried so a runtime claim that is
+    released unsent goes back to ``failed`` with the same error and keeps its retry eligibility."""
+    marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
+    return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
+            "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
+            **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
+            **({"runtime_recovery": True} if runtime else {}),
+            **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1,
+            "claim_id": claim_id, "claim_event_id": claim_event_id,
+            "raw_content": raw_content, "source_json": source_json, "message_ref": message_ref}
+
+
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
                       deliverable_targets: Optional[set] = None) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for redelivery.
@@ -1075,12 +1151,14 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at
+                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
+                      claim_id, claim_event_id, raw_content, source_json, message_ref
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
+             owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
+             claim_id, claim_event_id, raw_content, source_json, message_ref) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -1124,7 +1202,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # the marker.
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
                                             adapter_profile or "default", needs_marker=state != "pending",
-                                            flood=flood_row))
+                                            flood=flood_row, claim_id=claim_id, claim_event_id=claim_event_id,
+                                            raw_content=raw_content, source_json=source_json, message_ref=message_ref))
     return claimed
 
 
@@ -1149,11 +1228,13 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
-                      owner_started_at, last_error, adapter_profile, updated_at
+                      owner_started_at, last_error, adapter_profile, updated_at,
+                      claim_id, claim_event_id, raw_content, source_json, message_ref
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
-             owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
+             owner_pid, owner_started_at, last_error, adapter_profile, updated_at,
+             claim_id, claim_event_id, raw_content, source_json, message_ref) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started
                     or not _runtime_retryable(last_error)):
@@ -1181,7 +1262,9 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 # claim released unsent keeps its flood retry eligibility.
                 claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
                                             attempts, adapter_profile, needs_marker=True, runtime=True,
-                                            flood=is_flood_error(last_error), last_error=last_error))
+                                            flood=is_flood_error(last_error), last_error=last_error,
+                                            claim_id=claim_id, claim_event_id=claim_event_id,
+                                            raw_content=raw_content, source_json=source_json, message_ref=message_ref))
     return claimed
 
 
@@ -1212,22 +1295,27 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
 
 def _prune(now: Optional[float] = None) -> None:
     now = now if now is not None else time.time()
+    cutoff = now - _RETENTION_SECONDS
     try:
         with _transaction() as conn:
             conn.execute(
                 """DELETE FROM delivery_obligations
-                   WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
-            total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
-            if total > _MAX_ROWS:
+                   WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""",
+                (cutoff,),
+            )
+            total = conn.execute(
+                "SELECT COUNT(*) FROM delivery_obligations"
+            ).fetchone()[0]
+            excess = max(0, total - _MAX_ROWS)
+            if excess:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
-                         ORDER BY CASE state
-                                    WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
-                                  END, updated_at ASC
-                         LIMIT ?)""", (total - _MAX_ROWS,))
+                         WHERE state IN ('delivered', 'abandoned')
+                         ORDER BY updated_at ASC
+                         LIMIT ?)""",
+                    (excess,),
+                )
     except Exception:
         logger.debug("delivery ledger prune failed", exc_info=True)
 

@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_common import FTS_TRIGRAM_SQL, SCHEMA_VERSION
+from hermes_state_common import FTS_TRIGRAM_SQL
 
 
 @pytest.fixture
@@ -125,7 +125,9 @@ def test_existing_external_layout_rebuilds_trigram_on_upgrade(tmp_path):
     cli_id = old.append_message("cli", role="user", content="交互迁移内容")
     cron_id = old.append_message("cron", role="user", content="定时迁移内容")
     assert _trigram_rowids(old) == {cli_id, cron_id}
-    old._conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+    # This fixture predates the v29 cron-exclusion migration, independently of
+    # the current schema version.
+    old._conn.execute("UPDATE schema_version SET version = 28")
     old._conn.commit()
     old.close()
 
@@ -233,7 +235,8 @@ def test_partial_upgrade_view_does_not_skip_historical_rebuild(tmp_path):
         old._conn.execute(f"DROP TRIGGER IF EXISTS {name}")
     old._conn.execute("DROP VIEW messages_fts_trigram_src")
     old._conn.executescript(FTS_TRIGRAM_SQL)
-    old._conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
+    # The interrupted v29 migration has not advanced its historical v28 stamp.
+    old._conn.execute("UPDATE schema_version SET version = 28")
     old._conn.commit()
     old.close()
 

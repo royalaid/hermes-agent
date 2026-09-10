@@ -1926,6 +1926,8 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        from gateway.run import GoalContinuationPublicationError
+
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2048,6 +2050,11 @@ class GatewayTurnMixin:
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
             )
 
+        except GoalContinuationPublicationError:
+            # The durable result already owns publication; recovery will replay it.
+            # An error reply here would create a second, contradictory result.
+            await self._hmwa_stop_typing_for_turn(event, source)
+            return None
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
@@ -3686,6 +3693,7 @@ class GatewayTurnMixin:
             source=next_source, session_id=session_id, session_key=next_session_key,
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, channel_prompt=next_channel_prompt,
+            inbound_message_id=str(pending_event.message_id) if pending_event and pending_event.message_id else None,
             message_type=next_message_type,
             claimed_event=pending_event,
         )
@@ -3977,6 +3985,8 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
         claimed_event: Optional[MessageEvent] = None,
+        durable_claimed_event: bool = False,
+        claimed_active_turn_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -3986,10 +3996,15 @@ class GatewayTurnMixin:
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id,
+                defer_result_publication=durable_claimed_event,
             )
-            if claimed_event is not None and session_key:
-                self._complete_goal_continuation_claim_event(
-                    session_key, self._adapter_for_source(source), claimed_event
+            if durable_claimed_event and session_key:
+                await self._commit_goal_continuation_result(
+                    session_key=session_key,
+                    source=source,
+                    event=claimed_event,
+                    result=result,
+                    active_turn_token=claimed_active_turn_token,
                 )
             return result
 

@@ -82,7 +82,8 @@ def _strip_everything(adapter, monkeypatch):
         type(adapter), "extract_images", staticmethod(lambda content: ([], ""))
     )
     monkeypatch.setattr(
-        type(adapter), "extract_local_files", staticmethod(lambda content: ([], ""))
+        type(adapter), "extract_local_files",
+        staticmethod(lambda content, *, include_unavailable=False: ([], ""))
     )
 
 

@@ -16,6 +16,7 @@ import {
 } from '@/store/native-notifications'
 import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { openFolderAsProject } from '@/store/projects'
+import { openRouteTile } from '@/store/route-tiles'
 import {
   $selectedStoredSessionId,
   getRememberedRoute,
@@ -33,7 +34,7 @@ import { isBrowserWindow, isHudWindow, isSecondaryWindow, secondarySessionOwnerR
 import type { SessionInfo } from '@/types/hermes'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
-import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '../../routes'
+import { appViewForPath, isContributedRoute, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '../../routes'
 
 type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>
 
@@ -148,7 +149,14 @@ export function useDesktopIntegrations({
           return
         }
 
-        const route = getRememberedRoute(activeProfile)
+        let route = getRememberedRoute(activeProfile)
+
+        if (route && isContributedRoute(route)) {
+          openRouteTile(route, 'center')
+          setRememberedRoute(null, activeProfile)
+          route = null
+        }
+
         const routeSession = route ? routeSessionId(route) : null
         const last = getRememberedSessionId(activeProfile)
 
@@ -217,7 +225,7 @@ export function useDesktopIntegrations({
     if (routedSessionId && sessionBelongsToProfile(sessions, routedSessionId, activeProfile)) {
       setRememberedSessionId(routedSessionId, activeProfile)
       setRememberedRoute(locationPathname, activeProfile)
-    } else if (!routedSessionId && !isOverlayView(appViewForPath(locationPathname))) {
+    } else if (!routedSessionId && !isOverlayView(appViewForPath(locationPathname)) && !isContributedRoute(locationPathname)) {
       setRememberedRoute(locationPathname, activeProfile)
 
       if (locationPathname === NEW_CHAT_ROUTE) {
