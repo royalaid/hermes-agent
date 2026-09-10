@@ -70,6 +70,22 @@ def test_message_response_projects_only_safe_codex_display_items():
     assert "ANALYSIS_SENTINEL" not in encoded and "ENCRYPTED_SENTINEL" not in encoded
 
 
+@pytest.mark.parametrize("content", ["", "Canonical reply"])
+def test_message_response_preserves_codex_reply_without_raw_sidecars(content):
+    message = {
+        "role": "assistant", "content": content,
+        "codex_message_items": json.dumps([
+            {"type": "message", "role": "assistant", "phase": "analysis", "content": [{"type": "output_text", "text": "ANALYSIS_SENTINEL"}]},
+            {"type": "message", "role": "assistant", "phase": "final_answer", "encrypted_content": "ENCRYPTED_SENTINEL", "content": [{"type": "output_text", "text": "Persisted answer"}]},
+        ]),
+    }
+    response = APIServerAdapter._message_response(message)
+    assert response["content"] == (content or "Persisted answer")
+    assert message["content"] == content
+    for forbidden in ("codex_message_items", "ANALYSIS_SENTINEL", "ENCRYPTED_SENTINEL"):
+        assert forbidden not in json.dumps(response)
+
+
 def test_message_response_drops_malformed_codex_display_sidecars_without_leaking():
     response = APIServerAdapter._message_response({
         "role": "assistant", "content": "", "reasoning": "Fallback whole reasoning",

@@ -2177,6 +2177,32 @@ class TestWebServerEndpoints:
         assert "codex_reasoning_items" not in encoded and "codex_message_items" not in encoded
         assert "ANALYSIS_SENTINEL" not in encoded and "ENCRYPTED_SENTINEL" not in encoded
 
+    @pytest.mark.parametrize("content", ["", "Canonical reply"])
+    def test_get_session_messages_preserves_codex_reply_without_raw_sidecars(self, content):
+        from hermes_state import SessionDB
+
+        message_items = [
+            {"type": "message", "role": "assistant", "phase": "analysis", "content": [{"type": "output_text", "text": "ANALYSIS_SENTINEL"}]},
+            {"type": "message", "role": "assistant", "phase": "final_answer", "encrypted_content": "ENCRYPTED_SENTINEL", "content": [{"type": "output_text", "text": "Persisted answer"}]},
+        ]
+        db = SessionDB()
+        try:
+            db.create_session(session_id="codex-final-reply", source="cli")
+            db.append_message(
+                session_id="codex-final-reply", role="assistant", content=content,
+                codex_message_items=message_items,
+            )
+            response = self.client.get("/api/sessions/codex-final-reply/messages?order=latest")
+            assert response.status_code == 200
+            assert response.json()["messages"][0]["content"] == (content or "Persisted answer")
+            for forbidden in ("codex_message_items", "ANALYSIS_SENTINEL", "ENCRYPTED_SENTINEL"):
+                assert forbidden not in response.text
+            stored = db.get_messages("codex-final-reply")[0]
+            assert stored["content"] == content
+            assert json.loads(stored["codex_message_items"]) == message_items
+        finally:
+            db.close()
+
     def test_get_session_messages_drops_malformed_codex_sidecars_without_leaking(self):
         from hermes_state import SessionDB
         db = SessionDB()

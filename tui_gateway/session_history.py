@@ -220,7 +220,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 messages.append(hidden)
             continue
         content_text = _coerce_message_text(m.get("content"))
-        from agent.codex_display_projection import project_codex_display_items
+        from agent.codex_display_projection import project_codex_display_items, project_codex_reply_text
+        if not content_text:
+            content_text = project_codex_reply_text(m)
         codex_display_items = project_codex_display_items(m) if role == "assistant" else None
         if _is_display_hidden_marker(role, content_text):
             continue
