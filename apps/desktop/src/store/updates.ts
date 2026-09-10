@@ -9,6 +9,7 @@ import type {
   DesktopUpdateApplyOptions,
   DesktopUpdateApplyResult,
   DesktopUpdateBlocker,
+  DesktopUpdateElevationHolder,
   DesktopUpdateProgress,
   DesktopUpdateStage,
   DesktopUpdateStatus,
@@ -34,6 +35,7 @@ export interface UpdateApplyState {
   command: string | null
   /** Structured update blockers used by the safe close-and-update confirmation. */
   blockers?: readonly DesktopUpdateBlocker[] | null
+  elevationHolders?: readonly DesktopUpdateElevationHolder[] | null
   log: readonly { stage: DesktopUpdateStage; message: string; at: number }[]
 }
 
@@ -552,7 +554,8 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
           stage: 'error',
           error: result?.error ?? 'apply-failed',
           message: result?.message ?? translateNow('updates.errorBody'),
-          blockers: result?.blockers ?? null
+          blockers: result?.blockers ?? null,
+          elevationHolders: result?.elevationHolders ?? null
         })
       }
     }

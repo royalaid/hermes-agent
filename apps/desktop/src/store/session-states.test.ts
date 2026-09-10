@@ -419,6 +419,8 @@ describe('SessionTile workspace scope', () => {
       expect.objectContaining({ dir: 'right', storedSessionId: 'bot-chat', workspaceMode: 'sessions' })
     ])
     expect($sessionTiles.get()[0]).not.toHaveProperty('workspaceOwnerKey', scope.workspaceOwnerKey)
+  })
+
   it('keeps an exact Sessions owner when a later same-mode open has no route', () => {
     const ownerRoute = { connectionId: 'source-b', profile: 'profile-b' }
 
