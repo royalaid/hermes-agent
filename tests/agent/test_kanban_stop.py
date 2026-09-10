@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
@@ -87,7 +88,7 @@ def test_guardrail_halt_blocks_worker_task_as_capability(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="guardrail task", assignee="worker")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
@@ -105,7 +106,7 @@ def test_guardrail_halt_blocks_worker_task_as_capability(tmp_path, monkeypatch):
 
     assert record_kanban_guardrail_halt(decision, task_id=task_id) is True
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "blocked"

@@ -121,8 +121,9 @@ def record_kanban_guardrail_halt(decision: Any, task_id: Optional[str] = None) -
 
     try:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             return bool(
                 kb.block_task(
                     conn,

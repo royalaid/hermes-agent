@@ -309,11 +309,13 @@ export function useSessionTileDelegate({
       },
       resumeTile: async (storedSessionId, options) => {
         const ownerRoute = sessionTileOwnerRoute(storedSessionId)
+
         // A retained tile can still own its runtime after the primary view drops
         // its reverse lookup. Reconnect invalidates both bindings.
         const mappedRuntime =
           runtimeIdByStoredSessionIdRef.current.get(storedSessionId) ??
-          .get().find(tile => tile.storedSessionId === storedSessionId)?.runtimeId
+          $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.runtimeId
+
         let owner: SessionOwnerScope = ownerRoute ?? knownSessionOwner(ownerLookupSessionRows(), storedSessionId)
         let binding = bindingForOwner(storedSessionId, owner)
 
@@ -379,6 +381,7 @@ export function useSessionTileDelegate({
 
             return delegate.resumeTile(storedSessionId, options)
           }
+
           // Deltas and completion may land while REST is in flight.
           updateSessionState(
             existing,
@@ -413,7 +416,9 @@ export function useSessionTileDelegate({
             )
           },
           async () => {
-            const stored = (await prefetchPromise) ?? (await fetchStoredTranscriptAcrossBackends(storedSessionId))
+            const stored =
+              (await getLatestSessionMessages(storedSessionId, restScope).catch(() => null)) ??
+              (await fetchStoredTranscriptAcrossBackends(storedSessionId))
 
             if (!stored) {
               throw new Error('stored transcript unavailable on every reachable backend')
@@ -422,8 +427,6 @@ export function useSessionTileDelegate({
             return stored
           }
         )
-
-        const prefetch = await prefetchPromise
 
         if (binding && bindingGeneration !== null && !sessionBindingOwnsGeneration(binding, bindingGeneration)) {
           const delegate = sessionTileDelegate()
