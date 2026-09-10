@@ -29,6 +29,26 @@ def _safe_content(value: Any) -> list[dict[str, str]] | None:
     return result
 
 
+def project_codex_reply_text(message: dict[str, Any]) -> str:
+    """Recover an explicit final reply without exposing its replay-only sidecar."""
+    if message.get("role") != "assistant" or message.get("display_kind") == "hidden":
+        return ""
+    items = _decode_list(message.get("codex_message_items"))
+    if items is None:
+        return ""
+    texts: list[str] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "message" or item.get("role") != "assistant":
+            return ""
+        if item.get("phase") not in ("final", "final_answer"):
+            continue
+        content = _safe_content(item.get("content"))
+        if content is None:
+            return ""
+        texts.extend(part["text"] for part in content)
+    return "".join(texts)
+
+
 def project_codex_display_items(message: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Return only reasoning summaries and explicit commentary, or fail closed."""
     projected: list[dict[str, Any]] = []

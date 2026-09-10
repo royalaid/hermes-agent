@@ -552,8 +552,12 @@ async def get_session_messages(
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     sid, _limit, messages = result
     projected_messages = _project_for_display(messages)
-    from agent.codex_display_projection import project_codex_display_items
+    from agent.codex_display_projection import project_codex_display_items, project_codex_reply_text
     for projected in projected_messages:
+        if not projected.get("content"):
+            reply_text = project_codex_reply_text(projected)
+            if reply_text:
+                projected["content"] = reply_text
         codex_display_items = project_codex_display_items(projected)
         projected.pop("codex_reasoning_items", None)
         projected.pop("codex_message_items", None)
