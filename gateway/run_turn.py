@@ -1926,6 +1926,8 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        from gateway.run import GoalContinuationPublicationError
+
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2048,6 +2050,11 @@ class GatewayTurnMixin:
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
             )
 
+        except GoalContinuationPublicationError:
+            # The durable result already owns publication; recovery will replay it.
+            # An error reply here would create a second, contradictory result.
+            await self._hmwa_stop_typing_for_turn(event, source)
+            return None
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:

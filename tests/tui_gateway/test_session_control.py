@@ -106,9 +106,11 @@ def _forbid_dispatch(server, monkeypatch):
 
 
 def _save_goal(key, **overrides):
-    from hermes_cli.goals import GoalState, save_goal
+    from hermes_cli.goals import GoalState, load_goal, save_goal
 
+    current = load_goal(key)
     fields = {
+        "revision": current.revision if current is not None else 0,
         "goal": "Finish the desktop control card",
         "status": "active",
         "turns_used": 3,
