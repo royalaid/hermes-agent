@@ -15,7 +15,8 @@ it('keeps the desktop toggle local across config refreshes', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(Storage.prototype, 'setItem')
+      const storage = window.localStorage
+      const write = vi.spyOn(Object.hasOwn(storage, 'setItem') ? storage : Object.getPrototypeOf(storage), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -45,7 +46,8 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(Storage.prototype, 'setItem')
+      const storage = window.localStorage
+      const write = vi.spyOn(Object.hasOwn(storage, 'setItem') ? storage : Object.getPrototypeOf(storage), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
