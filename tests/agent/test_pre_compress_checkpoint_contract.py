@@ -413,10 +413,10 @@ def test_native_responses_compaction_is_suppressed_when_checkpoint_required():
         )
 
     assert native_compaction_context_management(
-        agent(False), is_codex_backend=True
+        agent(False), is_codex_backend=False
     )
     assert (
-        native_compaction_context_management(agent(True), is_codex_backend=True)
+        native_compaction_context_management(agent(True), is_codex_backend=False)
         is None
     )
 
