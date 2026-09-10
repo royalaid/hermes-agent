@@ -71,6 +71,7 @@ const { refreshProjectTree } = await import('@/store/projects')
 
 const ACTIVE_RUNTIME_ID = 'runtime-active'
 const ACTIVE_STORED_ID = 'stored-active'
+
 const carrierTodos = [
   { content: 'parent', id: 'plan', status: 'completed' as const },
   { content: 'child', id: 'child', parent: 'plan', status: 'in_progress' as const },
@@ -495,7 +496,7 @@ describe('tile reconciliation lifecycle authority', () => {
       )
 
       act(() => notifySessionsChanged())
-      expect(getLatestSessionMessages).toHaveBeenCalledWith(storedSessionId)
+      expect(getLatestSessionMessages).toHaveBeenCalledWith(storedSessionId, undefined)
 
       if (retirement === 'unmount') {
         hook.unmount()
@@ -532,19 +533,20 @@ describe('tile reconciliation lifecycle authority', () => {
 
   it('rejects a late read when the tile becomes busy', async () => {
     const read = deferred<ReturnType<typeof carrierTranscript>>()
-    const busyRef = { current: false }
+    const busyState = createClientSessionState(storedSessionId)
 
     bindRealTile(storedSessionId, runtimeSessionId)
     vi.mocked(getLatestSessionMessages).mockReturnValueOnce(read.promise as never)
-    const { request, signatureRef, updateSessionState } = reconcileRealTiles({ busyRef })
+    const { request, signatureRef, updateSessionState } = reconcileRealTiles()
 
-    busyRef.current = true
+    busyState.busy = true
+    publishSessionState(runtimeSessionId, busyState)
     read.resolve(carrierTranscript(storedSessionId))
     await request
 
     expect(updateSessionState).not.toHaveBeenCalled()
     expect($todosBySession.get()[runtimeSessionId]).toBeUndefined()
-    expect($sessionStates.get()[runtimeSessionId]).toBeUndefined()
+    expect($sessionStates.get()[runtimeSessionId]).toBe(busyState)
     expect(signatureRef.current.has(`tile:${storedSessionId}`)).toBe(false)
   })
 })
@@ -784,6 +786,7 @@ describe('active transcript refresh', () => {
   it('restores carrier-only todo state during a background tile reconciliation', async () => {
     const runtimeId = 'runtime-carrier-tile'
     const storedId = 'stored-carrier-tile'
+
     const updateSessionState = vi.fn((_sessionId, updater) =>
       updater(createClientSessionState(storedId))
     ) as Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateSessionState']
@@ -804,13 +807,16 @@ describe('active transcript refresh', () => {
   it('restores row 277757 beyond a full 120-message owner-scoped tile tail', async () => {
     const runtimeId = 'runtime-paged-tile'
     const storedId = 'stored-paged-tile'
+
     const ownerRoute = {
       connectionId: 'remote-paged-tile',
       mode: 'remote' as const,
       profile: 'tile-route',
       targetProfile: 'tile-target'
     }
+
     const scope = { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile }
+
     const updateSessionState = vi.fn((_sessionId, updater) =>
       updater(createClientSessionState(storedId))
     ) as Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateSessionState']
@@ -846,6 +852,7 @@ describe('active transcript refresh', () => {
   it('clears tile Todo state after the bounded candidate domain is genuinely exhausted', async () => {
     const runtimeId = 'runtime-absent-tile'
     const storedId = 'stored-absent-tile'
+
     const updateSessionState = vi.fn((_sessionId, updater) =>
       updater(createClientSessionState(storedId))
     ) as Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateSessionState']
@@ -943,6 +950,7 @@ describe('active transcript refresh', () => {
   it('replays legacy evidence row 277757 during a background tile reconciliation', async () => {
     const runtimeId = 'runtime-legacy-carrier-tile'
     const storedId = 'stored-legacy-carrier-tile'
+
     const updateSessionState = vi.fn((_sessionId, updater) =>
       updater(createClientSessionState(storedId))
     ) as Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateSessionState']
@@ -1407,6 +1415,7 @@ describe('reconcileActiveTranscript', () => {
     'rejects an active %s owner response after same-ID/runtime rebind and permits the current-owner retry',
     async (_label, ownerA, ownerB) => {
       const staleRead = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+
       const identicalResponse = {
         ...carrierTranscript(),
         messages: [
@@ -1414,12 +1423,14 @@ describe('reconcileActiveTranscript', () => {
           { content: 'current owner visible transcript', role: 'assistant' as const, timestamp: 4 }
         ]
       } as Awaited<ReturnType<typeof getLatestSessionMessages>>
+
       let currentOwner: ActiveTranscriptRefreshDeps['resolveSession'] extends (...args: never[]) => infer R
         ? R
         : never = {
         ownerRoute: ownerA,
         profile: ownerA.profile
       }
+
       const fixture = makeRefresh(() => currentOwner)
 
       vi.mocked(getLatestSessionMessages)

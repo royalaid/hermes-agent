@@ -327,6 +327,8 @@ class GatewayNotificationsMixin:
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         delivery_obligation_id: Optional[str] = None,
         attachment_snapshot: Optional[Any] = None,
+        session_key: Optional[str] = None,
+        inbound_message_id: Optional[str] = None,
     ) -> None:
         """Deliver a queued response using its existing publication ownership."""
         from gateway.run import (
@@ -391,52 +393,69 @@ class GatewayNotificationsMixin:
             if not text_already_delivered:
                 text_content = _strip_response_attachments_for_direct_send(response, adapter)
                 if text_content:
-                # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
-                # a plain send here would duplicate it.
-                _reconciled = False
-                _sc_msg_id = getattr(stream_consumer, "message_id", None)
-                if (
-                    _sc_msg_id
-                    and _sc_msg_id != "__no_edit__"
-                    and not getattr(stream_consumer, "_turn_split_delivery", False)
-                ):
-                    try:
-                        _edit_res = await adapter.edit_message(
-                            chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
-                        )
-                        if getattr(_edit_res, "success", False):
-                            _reconciled = True
-                            logger.info(
-                                "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
-                                _sc_msg_id,
+                    # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
+                    # a plain send here would duplicate it.
+                    _reconciled = False
+                    _sc_msg_id = getattr(stream_consumer, "message_id", None)
+                    if (
+                        _sc_msg_id
+                        and _sc_msg_id != "__no_edit__"
+                        and not getattr(stream_consumer, "_turn_split_delivery", False)
+                    ):
+                        try:
+                            _edit_res = await adapter.edit_message(
+                                chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                             )
-                        else:
-                            # P5(b): a DECLINE is not "editing unavailable". The
-                            # send below re-delivers the whole response to the
-                            # chat the connector just refused.
-                            from gateway.relay.egress import declined_send
-
-                            if declined_send(_edit_res):
-                                logger.warning(
-                                    "Queued-lane reconcile edit DECLINED by the "
-                                    "connector's egress guard; not falling back "
-                                    "to a send (the destination is not approved)."
+                            if getattr(_edit_res, "success", False):
+                                _reconciled = True
+                                logger.info(
+                                    "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
+                                    _sc_msg_id,
                                 )
-                                return
-                    except Exception as _qe:
-                        logger.debug("Queued-lane reconcile edit failed (%s); falling back to send.", _qe)
-                if not _reconciled:
-                    await self._send_queued_final_text(
-                        adapter, source, text_content, metadata, event_message_id, session_key,
-                        inbound_message_id)
-        # Failed turns deliver their (normalized failure) text but must not upload attachments as if
-        # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
-        if not deliver_media:
-            return
-        await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
-            thread_metadata=metadata,
-        )
+                            else:
+                                # P5(b): a DECLINE is not "editing unavailable". The
+                                # send below re-delivers the whole response to the
+                                # chat the connector just refused.
+                                from gateway.relay.egress import declined_send
+
+                                if declined_send(_edit_res):
+                                    logger.warning(
+                                        "Queued-lane reconcile edit DECLINED by the "
+                                        "connector's egress guard; not falling back "
+                                        "to a send (the destination is not approved)."
+                                    )
+                                    return
+                        except Exception as _qe:
+                            logger.debug("Queued-lane reconcile edit failed (%s); falling back to send.", _qe)
+                    if not _reconciled:
+                        send_result = await self._send_queued_final_text(
+                            adapter, source, text_content, metadata, event_message_id, session_key,
+                            inbound_message_id)
+                        if delivery_obligation_id and not getattr(send_result, "success", True):
+                            raise GoalContinuationPublicationError(
+                                "claimed continuation delivery failed")
+            if deliver_media:
+                await self._deliver_media_from_response(
+                    response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+                    thread_metadata=metadata,
+                )
+        except BaseException as exc:
+            if delivery_obligation_id and isinstance(exc, Exception):
+                from gateway.delivery_ledger import mark_claimed_result_failed
+                try:
+                    await asyncio.to_thread(
+                        mark_claimed_result_failed,
+                        delivery_obligation_id,
+                        "platform_delivery_failed",
+                    )
+                except Exception:
+                    logger.debug("claimed-result ledger failure update failed", exc_info=True)
+            raise
+        else:
+            if delivery_obligation_id:
+                from gateway.delivery_ledger import mark_claimed_result_delivered
+                await asyncio.to_thread(
+                    mark_claimed_result_delivered, delivery_obligation_id)
 
     async def _send_queued_final_text(
         self, adapter, source: SessionSource, text_content: str, metadata: Optional[Dict[str, Any]],

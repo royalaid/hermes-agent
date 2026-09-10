@@ -286,9 +286,11 @@ export async function reconcileActiveTranscript({
   }
 
   const ownerKey = activeTranscriptOwnerKey(stored, storedSessionId)
+
   if (!ownerKey) {
     return
   }
+
   const ownerIsCurrent = () => activeTranscriptOwnerKey(resolveSession(storedSessionId), storedSessionId) === ownerKey
 
   const requestId = requestSequenceRef.current + 1
