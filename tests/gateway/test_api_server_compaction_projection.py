@@ -443,7 +443,7 @@ class TestMessagesEndpointProjection:
         finally:
             reopened.close()
 
-    def test_current_v27_reconciles_new_migration_progress_columns(self, tmp_path):
+    def test_current_schema_reconciles_new_migration_progress_columns(self, tmp_path):
         db_path = tmp_path / "todo-existing-v27-progress-schema.db"
         seeded = SessionDB(db_path)
         try:
@@ -457,6 +457,7 @@ class TestMessagesEndpointProjection:
             seeded.close()
 
         with sqlite3.connect(db_path) as raw:
+            schema_version = raw.execute("SELECT version FROM schema_version").fetchone()[0]
             for trigger in (
                 "trg_todo_migration_reopen_on_authority_activity",
                 "trg_todo_migration_reopen_on_authority_delete",
@@ -476,7 +477,6 @@ class TestMessagesEndpointProjection:
                 "VALUES (?, ?, '[]', 1)",
                 (session_id, message_id + 1),
             )
-            assert raw.execute("SELECT version FROM schema_version").fetchone()[0] == 27
 
         reopened = SessionDB(db_path)
         try:
@@ -500,7 +500,7 @@ class TestMessagesEndpointProjection:
             assert tuple(progress) == ("[]", "scan", None, 1)
             assert reopened._conn.execute(
                 "SELECT version FROM schema_version"
-            ).fetchone()[0] == 27
+            ).fetchone()[0] == schema_version
         finally:
             reopened.close()
 

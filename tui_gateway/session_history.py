@@ -172,8 +172,6 @@ _HISTORY_ASSISTANT_DETAIL_KEYS = (
     "reasoning",
     "reasoning_content",
     "reasoning_details",
-    "codex_reasoning_items",
-    "codex_message_items",
 )
 _HISTORY_ROLES = frozenset({"user", "assistant", "tool", "system"})
 
