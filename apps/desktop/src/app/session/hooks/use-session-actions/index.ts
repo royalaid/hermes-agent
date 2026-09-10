@@ -93,13 +93,13 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
-import { clearSessionControl } from '@/store/session-control'
 import {
   bindRuntimeToSession,
   claimSessionBinding,
   normalizeSessionBinding,
   runtimeForExactSessionBinding
 } from '@/store/session-binding'
+import { clearSessionControl } from '@/store/session-control'
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
   beginSessionMutation,
@@ -1470,12 +1470,14 @@ export function useSessionActions({
               if (todoHydrationMessages) {
                 hydrateSessionTodos(cachedRuntimeId, todoHydrationMessages, todoHydrationFence)
               }
+
               releaseTranscriptView()
 
               const activatedState = updateSessionState(
                 cachedRuntimeId,
                 state => {
                   const messages = preserveEquivalentTranscript(state.messages, visibleActivatedMessages)
+
                   return {
                     ...state,
                     messages,

@@ -626,9 +626,11 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
     reaper. Returns ``(reaped, detached)`` counts."""
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items()
-                 if s.get("transport") is transport or transport in (s.get("viewers") or {})]
+                 if s.get("transport") is transport
+                 or isinstance(s.get("transport"), FanoutTransport) and s["transport"].contains(transport)
+                 or transport in (s.get("viewers") or {})]
     reaped = detached = 0
-    for sid, session in clientless:
+    for sid, session in owned:
         claimed_for_teardown = None
         should_schedule_reap = False
         queue_replacement = None
@@ -639,7 +641,16 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
             if current is not session:
                 continue
             viewers = current.get("viewers") or {}
-            if current.get("transport") is not transport:
+            if isinstance(current.get("transport"), FanoutTransport):
+                if _detach_session_transport(current, transport):
+                    queue_replacement = current["transport"]
+                elif current.get("close_on_disconnect"):
+                    claimed_for_teardown = _pop_session_by_id(sid)
+                else:
+                    current["transport"] = _detached_ws_transport
+                    current.pop("_client_gone_interrupt_requested", None)
+                    should_schedule_reap = True
+            elif current.get("transport") is not transport:
                 viewers.pop(transport, None)
                 replacement = current.get("transport")
                 if viewers and replacement in viewers and not _transport_is_dead(replacement):
