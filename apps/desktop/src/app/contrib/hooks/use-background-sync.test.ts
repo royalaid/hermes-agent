@@ -307,10 +307,14 @@ describe('tile transcript owner routing', () => {
     await request
 
     expect(getLatestSessionMessages).toHaveBeenCalledTimes(1)
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(storedSessionId, {
-      connectionId: ownerRoute.connectionId,
-      profile: ownerRoute.profile
-    })
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(
+      storedSessionId,
+      {
+        connectionId: ownerRoute.connectionId,
+        profile: ownerRoute.profile
+      },
+      { passive: true }
+    )
     expect(updateSessionState).toHaveBeenCalledTimes(1)
   })
 
@@ -329,10 +333,14 @@ describe('tile transcript owner routing', () => {
     await request
 
     expect(getLatestSessionMessages).toHaveBeenCalledTimes(1)
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(storedSessionId, {
-      connectionId: ownerRoute.connectionId,
-      profile: ownerRoute.targetProfile
-    })
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(
+      storedSessionId,
+      {
+        connectionId: ownerRoute.connectionId,
+        profile: ownerRoute.targetProfile
+      },
+      { passive: true }
+    )
     expect(updateSessionState).toHaveBeenCalledTimes(1)
   })
 
@@ -376,9 +384,9 @@ describe('tile transcript owner routing', () => {
     expect(updateSessionState).toHaveBeenCalledTimes(1)
     expect(signatureRef.current.size).toBe(1)
     expect(vi.mocked(getLatestSessionMessages).mock.calls).toEqual([
-      [storedSessionId, { connectionId: ownerA.connectionId, profile: ownerA.targetProfile }],
-      [storedSessionId, { connectionId: ownerB.connectionId, profile: ownerB.targetProfile }],
-      [storedSessionId, { connectionId: ownerB.connectionId, profile: ownerB.targetProfile }]
+      [storedSessionId, { connectionId: ownerA.connectionId, profile: ownerA.targetProfile }, { passive: true }],
+      [storedSessionId, { connectionId: ownerB.connectionId, profile: ownerB.targetProfile }, { passive: true }],
+      [storedSessionId, { connectionId: ownerB.connectionId, profile: ownerB.targetProfile }, { passive: true }]
     ])
   })
 })
@@ -496,7 +504,7 @@ describe('tile reconciliation lifecycle authority', () => {
       )
 
       act(() => notifySessionsChanged())
-      expect(getLatestSessionMessages).toHaveBeenCalledWith(storedSessionId, undefined)
+      expect(getLatestSessionMessages).toHaveBeenCalledWith(storedSessionId, undefined, { passive: true })
 
       if (retirement === 'unmount') {
         hook.unmount()
@@ -638,6 +646,7 @@ describe('active transcript refresh', () => {
 
     await act(async () => {
       await reconcileTileTranscriptsForTest({
+        busyRef: { current: false },
         tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
         requestSequenceRef,
         signatureRef,
@@ -666,6 +675,7 @@ describe('active transcript refresh', () => {
     })
 
     await reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
       tiles: [{ runtimeId, storedSessionId: storedId }],
       requestSequenceRef: { current: 0 },
       signatureRef: { current: new Map() },
@@ -696,6 +706,7 @@ describe('active transcript refresh', () => {
     const updateSessionState = vi.fn()
 
     await reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
       tiles: [{ runtimeId, storedSessionId: storedId }],
       requestSequenceRef: { current: 0 },
       signatureRef: { current: new Map() },
@@ -722,6 +733,7 @@ describe('active transcript refresh', () => {
     const updateSessionState = vi.fn()
 
     const reconcile = reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
       requestSequenceRef: { current: 0 },
       signatureRef: { current: new Map() },
       updateSessionState
@@ -742,6 +754,7 @@ describe('active transcript refresh', () => {
     )
 
     await reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
       tiles: [
         {
           ownerRoute: {
@@ -989,6 +1002,7 @@ describe('active transcript refresh', () => {
     const updateSessionState = vi.fn()
 
     await reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
       tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
       requestSequenceRef: { current: 0 },
       signatureRef: { current: new Map<string, string>() },
@@ -1017,6 +1031,7 @@ describe('active transcript refresh', () => {
     const updateSessionState = vi.fn()
 
     await reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
       tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
       requestSequenceRef: { current: 0 },
       signatureRef: { current: new Map<string, string>() },
@@ -1044,13 +1059,14 @@ describe('active transcript refresh', () => {
     const updateSessionState = vi.fn()
 
     const refresh = reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
       tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
       requestSequenceRef: { current: 0 },
       signatureRef: { current: new Map<string, string>() },
       updateSessionState
     })
 
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, undefined)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, undefined, { passive: true })
     state.messages = [
       {
         id: `user-queued-${TILE_RUNTIME_ID}`,
@@ -1082,13 +1098,14 @@ describe('active transcript refresh', () => {
     const updateSessionState = vi.fn()
 
     const refresh = reconcileTileTranscriptsForTest({
+      busyRef: { current: false },
       tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
       requestSequenceRef: { current: 0 },
       signatureRef: { current: new Map<string, string>() },
       updateSessionState
     })
 
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, undefined)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, undefined, { passive: true })
     publishSessionState(TILE_RUNTIME_ID, { ...state, busy: true })
     resolveLatest(transcript('stale persisted tail', TILE_STORED_ID))
     await refresh
@@ -1125,6 +1142,7 @@ describe('active transcript refresh', () => {
 
     await act(async () => {
       await reconcileTileTranscriptsForTest({
+        busyRef: { current: false },
         tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
         requestSequenceRef,
         signatureRef,
