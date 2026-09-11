@@ -24,6 +24,27 @@ PATCH_ASSERTIONS: dict[str, tuple[TreeAssertion, ...]] = {
         "apps/desktop/src/app/chat/sidebar/index.tsx", contains=("const SCROLL_GUTTER", "GROUP_BODY = 'max-h-none overflow-visible'")),),
     "docs(goals): document model goal control": (TreeAssertion(
         "toolsets.py", contains=('"goal": _ts(', '["goal_control"]')),),
+    "feat(gateway): mark release investigators as cron sessions": (TreeAssertion(
+        "tui_gateway/methods_session.py", contains=(
+            'cron_session = _normalize_cron_session_marker(params.get("cron_session"))',
+            '"cron_session": cron_session',
+        )),),
+    "[verified] feat: add model-callable goal control": (TreeAssertion(
+        "hermes_cli/goals.py", contains=(
+            "def load_goal_authoritative", "def _goal_generation",
+        )),),
+    "fix(desktop): hydrate persisted Codex commentary": (TreeAssertion(
+        "agent/codex_display_projection.py", contains=(
+            "def project_codex_display_items", 'phase not in {"analysis", "commentary", "final", "final_answer"}',
+        )),),
+    "fix: make goal continuation recovery crash safe": (TreeAssertion(
+        "gateway/goal_continuation_claims.py", contains=(
+            "CLAIM_VERSION = 1", '"synthetic_head_pending": True',
+        )),),
+    "fix(desktop): preserve transcript continuity across reconnects": (TreeAssertion(
+        "apps/desktop/src/app/contrib/hooks/use-background-sync.ts", contains=(
+            "graftRefreshedTailOntoBackfill", "export async function reconcileActiveTranscript",
+        )),),
 }
 # Historical updater merges are represented by the canonical shared-marker
 # implementation. These assertions deliberately reject the retired kill-all
