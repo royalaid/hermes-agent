@@ -66,19 +66,32 @@ function chatWindowWebPreferences(preloadPath: string) {
 // lazily so the gateway never builds an agent just to stream into it.
 // profile preserves the local-profile boot fallback; ownerRoute carries
 // the exact connection/profile identity for remote and multiplexed owners.
-function buildSessionWindowUrl(sessionId: string, { devServer, ownerRoute, profile, rendererIndexPath, watch }: any = {}) {
+function buildSessionWindowUrl(
+  sessionId: string,
+  { devServer, ownerRoute, profile, rendererIndexPath, watch }: any = {}
+) {
   const params = new URLSearchParams({ win: 'secondary' })
 
-  if (watch) {params.set('watch', '1')}
+  if (watch) {
+    params.set('watch', '1')
+  }
   const profileKey = typeof profile === 'string' ? profile.trim() : ''
 
-  if (profileKey) {params.set('profile', profileKey)}
+  if (profileKey) {
+    params.set('profile', profileKey)
+  }
 
-  if (ownerRoute?.connectionId) {params.set('ownerConnectionId', ownerRoute.connectionId)}
+  if (ownerRoute?.connectionId) {
+    params.set('ownerConnectionId', ownerRoute.connectionId)
+  }
 
-  if (ownerRoute?.profile) {params.set('ownerProfile', ownerRoute.profile)}
+  if (ownerRoute?.profile) {
+    params.set('ownerProfile', ownerRoute.profile)
+  }
 
-  if (ownerRoute?.targetProfile) {params.set('ownerTargetProfile', ownerRoute.targetProfile)}
+  if (ownerRoute?.targetProfile) {
+    params.set('ownerTargetProfile', ownerRoute.targetProfile)
+  }
 
   const query = `?${params.toString()}`
   const route = `#/${encodeURIComponent(sessionId)}`

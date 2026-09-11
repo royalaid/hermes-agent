@@ -27,6 +27,7 @@ import {
 import { assertSessionOwnerResolved } from '@/store/session-owner-resolution'
 import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
 import {
+  $sessionTiles,
   publishSessionState,
   sessionTileDelegate,
   sessionTileOwnerRoute,

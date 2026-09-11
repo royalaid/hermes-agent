@@ -60,7 +60,12 @@ import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { BackendDialClaims } from './backend-dial-claim'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
-import { isReauthRequiredError, waitForHermesReady } from './backend-health'
+import {
+  isReauthRequiredError,
+  makeNousCloudBackendDownError,
+  makeUnsignedOauthError,
+  waitForHermesReady
+} from './backend-health'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import {
   canImportHermesCli,
@@ -109,6 +114,7 @@ import {
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
   isGatewayAuthRejection,
@@ -241,11 +247,7 @@ import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
-import {
-  getInstallMutationSet,
-  type InstallResourceLocks,
-  probeInstallResourceLocks
-} from './install-mutation-set'
+import { getInstallMutationSet, type InstallResourceLocks, probeInstallResourceLocks } from './install-mutation-set'
 import { createIntroRevealWindowController } from './intro-reveal-window'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { createLocalBackendLifecycle, waitForTeardown } from './local-backend-lifecycle'
@@ -281,7 +283,13 @@ import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import { fetchLocalMedia } from './media-range'
 import { createNativeAccessTokenCoordinator, NativeAuthChangedError } from './native-access-token'
-import { oauthSessionIsLive, resolveJsonBody, resolveReadinessProbeAuth } from './native-auth-decisions'
+import {
+  oauthGuardMayHardFail,
+  oauthSessionIsLive,
+  oauthTicketFailureAuthMessage,
+  resolveJsonBody,
+  resolveReadinessProbeAuth
+} from './native-auth-decisions'
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
@@ -364,7 +372,7 @@ import {
   revalidateRemoteConnection,
   revalidateSuspectPooledRemoteBackends
 } from './remote-liveness'
-import { resolveRemoteOauthTicket, rosterSourceEnumerationTimeoutMs } from './remote-oauth-ticket'
+import { rosterSourceEnumerationTimeoutMs } from './remote-oauth-ticket'
 import {
   applyRemoteRequestHeaders,
   createRegistryGatewayWsUrlHandler,
@@ -416,7 +424,12 @@ import {
 import { branchTipApiUrl, cacheIsFresh, compareApiUrl, githubRepoSlug, parseCompare } from './update-api-check'
 import { resolveDefaultUpdateBranch } from './update-branch'
 import { UpdateInFlightTransaction, waitForLocalBackendClearance, waitForUpdateClearance } from './update-gate'
-import { readLiveUpdateMarker, releaseUpdateMarkerIfOwnedBy, updateHandoffConflict, writeUpdateMarker } from './update-marker'
+import {
+  readLiveUpdateMarker,
+  releaseUpdateMarkerIfOwnedBy,
+  updateHandoffConflict,
+  writeUpdateMarker
+} from './update-marker'
 import {
   authorizeUpdateMutation,
   runAuthorizedUpdateMutation,
@@ -434,6 +447,7 @@ import {
   observeUpdaterHandoff,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
+  resolveWindowsDevRelaunchAppPath,
   resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
@@ -452,11 +466,7 @@ import {
   terminateMcpBridge,
   type VenvBlockerScanResult
 } from './venv-blocker-scan'
-import {
-  buildVenvHolderListCommand,
-  isHermesOwnedUpdateHolder,
-  parseServePidFile
-} from './venv-holder-select'
+import { buildVenvHolderListCommand, isHermesOwnedUpdateHolder, parseServePidFile } from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
@@ -499,10 +509,7 @@ import {
   probeWindowsRemote,
   terminateOwnedWindowsDashboardForUpdate
 } from './windows-remote-lifecycle'
-import {
-  listRestartManagerHoldersForResources,
-  RESTART_MANAGER_DEFAULT_TIMEOUT_MS
-} from './windows-restart-manager'
+import { listRestartManagerHoldersForResources, RESTART_MANAGER_DEFAULT_TIMEOUT_MS } from './windows-restart-manager'
 import {
   alreadyHasNoSandbox,
   buildNoSandboxRelaunchArgs,
@@ -2549,7 +2556,7 @@ async function waitForUpdateToFinish() {
   let announced = false
   let stillBlocked = false
 
-  const outcome = await waitForUpdateClearance(updateGateDeps(), {
+  const outcome = await waitForLocalBackendClearance(updateGateDeps(), {
     signal: localBackendLifecycle.signal,
     onWaitTick: async reason => {
       if (!announced) {
@@ -3343,9 +3350,11 @@ async function resolveDesktopUpdateBranch(updateRoot) {
   const currentBranch = firstLine(current.stdout)
   const originUrl = await getOriginUrl(updateRoot)
   const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
-  const published = currentBranch && currentBranch !== 'HEAD'
-    ? await runGit(['ls-remote', '--exit-code', '--heads', remote, currentBranch], { cwd: updateRoot })
-    : null
+
+  const published =
+    currentBranch && currentBranch !== 'HEAD'
+      ? await runGit(['ls-remote', '--exit-code', '--heads', remote, currentBranch], { cwd: updateRoot })
+      : null
 
   return resolveDefaultUpdateBranch({
     configuredBranch,
@@ -3787,7 +3796,9 @@ function lockedInstallResources(updateRoot, limit?: number) {
 async function attributedInstallHolders(updateRoot, timeoutMs = RESTART_MANAGER_DEFAULT_TIMEOUT_MS) {
   const locks = probeInstallLocks(updateRoot)
 
-  if (locks.definite.length === 0 && locks.shared.length === 0) {return []}
+  if (locks.definite.length === 0 && locks.shared.length === 0) {
+    return []
+  }
 
   return listRestartManagerHoldersForResources(locks.definite, {
     shared: locks.shared,
@@ -3801,9 +3812,13 @@ async function attributedInstallHolders(updateRoot, timeoutMs = RESTART_MANAGER_
 async function isAnyInstallResourceLocked(updateRoot): Promise<boolean> {
   const locks = probeInstallLocks(updateRoot)
 
-  if (locks.definite.length > 0) {return true}
+  if (locks.definite.length > 0) {
+    return true
+  }
 
-  if (locks.shared.length === 0) {return false}
+  if (locks.shared.length === 0) {
+    return false
+  }
 
   return (await attributedInstallHolders(updateRoot)).length > 0
 }
@@ -4281,22 +4296,26 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
   const holders: ForceReleaseHolder[] = []
 
   for (const process of result.processes) {
-      if (!isExactVenvHolder(process)) {continue}
-      holders.push({
-        pid: process.pid,
-        createdAt: process.createdAt,
-        name: process.name,
-        cmdline: process.cmdline,
-        source: 'scanner',
-        ...(typeof process.parentPid === 'number' && process.parentPid > 0
-          ? { parentPid: process.parentPid }
-          : {}),
-        role: 'other'
-      })
+    if (!isExactVenvHolder(process)) {
+      continue
     }
 
+    holders.push({
+      pid: process.pid,
+      createdAt: process.createdAt,
+      name: process.name,
+      cmdline: process.cmdline,
+      source: 'scanner',
+      ...(typeof process.parentPid === 'number' && process.parentPid > 0 ? { parentPid: process.parentPid } : {}),
+      role: 'other'
+    })
+  }
+
   for (const bridge of result.mcpBridges) {
-    if (!isExactVenvHolder(bridge)) {continue}
+    if (!isExactVenvHolder(bridge)) {
+      continue
+    }
+
     holders.push({
       pid: bridge.pid,
       createdAt: bridge.createdAt,
@@ -4309,7 +4328,10 @@ function scanResultToForceReleaseHolders(result: VenvBlockerScanResult): ForceRe
   }
 
   for (const service of result.desktopPluginServices) {
-    if (!isExactVenvHolder(service)) {continue}
+    if (!isExactVenvHolder(service)) {
+      continue
+    }
+
     holders.push({
       pid: service.pid,
       createdAt: service.createdAt,
@@ -4360,14 +4382,18 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
       // mutation window and then race a stale result.
       const outcome = await scanVenvBlockers(updateRoot, undefined, undefined, undefined, budgetMs)
 
-      if (outcome.kind !== 'blocked') {return []}
+      if (outcome.kind !== 'blocked') {
+        return []
+      }
 
       return forceReleaseHoldersFromScan(updateRoot, outcome.result)
     },
     listRestartManagerHolders: async budgetMs => {
       const timeoutMs = Math.max(0, Math.min(RESTART_MANAGER_DEFAULT_TIMEOUT_MS, Math.trunc(budgetMs)))
 
-      if (timeoutMs <= 0) {return []}
+      if (timeoutMs <= 0) {
+        return []
+      }
 
       return attributedInstallHolders(updateRoot, timeoutMs)
     },
@@ -4407,7 +4433,10 @@ async function forceReleaseInstallHoldersForUpdate(updateRoot: string) {
 // Stop one Desktop plugin service unit (Windows Script Host supervisor, venv
 // wrapper, managed-runtime workers) through the scanner and remember the
 // supervisor so it is relaunched when the update finishes or aborts.
-async function stopDesktopPluginServiceUnit(updateRoot: string, service: DesktopPluginServiceProcess): Promise<boolean> {
+async function stopDesktopPluginServiceUnit(
+  updateRoot: string,
+  service: DesktopPluginServiceProcess
+): Promise<boolean> {
   const outcome = await terminateDesktopPluginServiceDetailed(updateRoot, service)
 
   if (outcome.terminated && outcome.host) {
@@ -4418,57 +4447,22 @@ async function stopDesktopPluginServiceUnit(updateRoot: string, service: Desktop
 }
 
 function relaunchStoppedDesktopPluginHosts(reason: string) {
-  if (!IS_WINDOWS) {return}
+  if (!IS_WINDOWS) {
+    return
+  }
 
   try {
     const restored = restoreStoppedDesktopPluginHosts(HERMES_HOME, { log: rememberLog })
 
+    if (restored.relaunched.length > 0 || restored.skipped.length > 0) {
       rememberLog(
         `[updates] plugin service hosts after ${reason}: relaunched=${restored.relaunched.length} skipped=${restored.skipped.length}`
       )
     }
-
-    // Linger on the "updating — don't reopen" overlay long enough for the user
-    // to actually read it (and to bridge the gap until the updater's own window
-    // appears), THEN quit to release the venv shim. The updater rebuilds and
-    // relaunches us when it's done. (#50419 — a 600ms quit looked like a crash
-    // and lured users into the #50238 relaunch loop.)
-    //
-    // The dwell doubles as the hand-off settle window (#66753): watch the
-    // detached child for an async spawn `error` (ENOENT/EACCES) or an early
-    // non-zero/signal exit. On failure, DON'T quit — the user would be left
-    // with no app, no updater, and no evidence. Restart our backend and
-    // surface the error instead. A staged-updater marker self-heals with its
-    // dead child PID; a script bridge expires after its bounded claim grace.
-    const dwellStartedAt = Date.now()
-    const handoffOutcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
-
-    if (!handoffOutcome.ok) {
-      const message = `Update failed to start: ${handoffOutcome.message}. Hermes will keep running — try again, or run \`hermes update\` from a terminal.`
-
-      rememberLog(`[updates] hand-off not viable, aborting quit: ${handoffOutcome.message}`)
-      emitUpdateProgress({ stage: 'error', message, percent: null })
-      startHermes().catch(() => {})
-
-      if (IS_WINDOWS) {
-        // Same drain-semantics restore as the earlier abort paths (#70337).
-        startGatewaysAfterUpdateAbort(venvHermesShimPath(updateRoot))
-      }
-
-      return { ok: false, error: 'updater-spawn-failed', message }
-    }
-
-    isQuittingForHandoff = true
-    setTimeout(
-      () => {
-        app.quit()
-      },
-      Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
+  } catch (error) {
+    rememberLog(
+      `[updates] could not relaunch plugin service hosts after ${reason}: ${error instanceof Error ? error.message : String(error)}`
     )
-
-    return { ok: true, handedOff: true, updater }
-  } finally {
-    updateInFlight = false
   }
 }
 
@@ -4498,17 +4492,11 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
     return {
       ok: false,
       error: 'venv-unlock-failed',
-      message:
-        'Update aborted: the install is still locked but no exact holder identity is available for elevation.'
+      message: 'Update aborted: the install is still locked but no exact holder identity is available for elevation.'
     }
   }
 
-  const helperScriptPath = path.join(
-    updateRoot,
-    'scripts',
-    'desktop-update',
-    'windows-force-release.ps1'
-  )
+  const helperScriptPath = path.join(updateRoot, 'scripts', 'desktop-update', 'windows-force-release.ps1')
 
   if (!fs.existsSync(helperScriptPath)) {
     return {
@@ -4581,16 +4569,17 @@ async function runElevatedForceReleaseForUpdate(updateRoot: string): Promise<{
 
     if (await isAnyInstallResourceLocked(updateRoot)) {
       const survivorDetail = (response.survivors ?? [])
-        .map(entry => `PID ${entry.pid}${entry.resource ? ` resource=${entry.resource}` : ''} ${entry.detail || 'locked'}`.trim())
+        .map(entry =>
+          `PID ${entry.pid}${entry.resource ? ` resource=${entry.resource}` : ''} ${entry.detail || 'locked'}`.trim()
+        )
         .join('; ')
 
       return {
         ok: false,
         error: 'venv-unlock-failed',
-        message:
-          survivorDetail
-            ? `Update aborted: install files remain locked after elevated force-release (${survivorDetail}). The virtual environment was not modified.`
-            : 'Update aborted: install files remain locked after elevated force-release. The virtual environment was not modified.',
+        message: survivorDetail
+          ? `Update aborted: install files remain locked after elevated force-release (${survivorDetail}). The virtual environment was not modified.`
+          : 'Update aborted: install files remain locked after elevated force-release. The virtual environment was not modified.',
         elevationHolders: holders
       }
     }
@@ -4830,9 +4819,7 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
         ok: false,
         error,
         message: preflight.message,
-        ...(preflight.kind === 'blocked' && preflight.result
-          ? { blockers: preflight.result.processes }
-          : {}),
+        ...(preflight.kind === 'blocked' && preflight.result ? { blockers: preflight.result.processes } : {}),
         ...(preflight.kind === 'blocked' && preflight.elevationHolders
           ? {
               elevationHolders: preflight.elevationHolders.map(holder => ({
@@ -4849,7 +4836,10 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
 
     const mutationPermit = authorizeUpdateMutation(preflight)
 
-    if (!mutationPermit) {throw new Error('clear update preflight did not mint a mutation permit')}
+    if (!mutationPermit) {
+      throw new Error('clear update preflight did not mint a mutation permit')
+    }
+
     bridgeLease = mutationPermit.preflight.lease
 
     // Detached so the updater outlives this process — it needs us GONE before
@@ -4946,7 +4936,9 @@ async function applyUpdatesTransaction(opts: { stopSafeBlockers?: boolean; force
     })
 
     if (!adoptedLease) {
-      rememberLog(`[updates] hand-off adoption wait gave up; ${describeHandoffAdoptionState(bridgeLease, updateStartedAt)}`)
+      rememberLog(
+        `[updates] hand-off adoption wait gave up; ${describeHandoffAdoptionState(bridgeLease, updateStartedAt)}`
+      )
       updateHandoffRevocationPending = true
       const revocation = revokeMcpBridgeQuiesceLease(HERMES_HOME, bridgeLease)
 
@@ -5060,6 +5052,7 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
   }
 
   const updateRoot = resolveUpdateRoot()
+
   const branch = directoryExists(path.join(updateRoot, '.git'))
     ? await resolveDesktopUpdateBranch(updateRoot)
     : readDesktopUpdateConfig().branch || DEFAULT_UPDATE_BRANCH
@@ -5095,7 +5088,10 @@ async function handOffWindowsBootstrapRecoveryTransaction(reason, updater) {
 
   const mutationPermit = authorizeUpdateMutation(preflight)
 
-  if (!mutationPermit) {throw new Error('clear recovery preflight did not mint a mutation permit')}
+  if (!mutationPermit) {
+    throw new Error('clear recovery preflight did not mint a mutation permit')
+  }
+
   let bridgeLease = mutationPermit.preflight.lease
   let bridgeLeaseHandedOff = false
 
@@ -6143,6 +6139,7 @@ function fetchJson(url, token, options: any = {}) {
         const client = parsed.protocol === 'https:' ? https : http
         const agent = jsonAgentFor(parsed.protocol)
         const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
           reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
 
@@ -7283,7 +7280,10 @@ async function gatewayAuthProviders(baseUrl, headers = {}) {
 // answers before the SPA catch-all). `probeIsCredentialed` tells
 // waitForHermesReady how to read a 401 — rejected session vs gated route.
 async function buildReadinessHealthProbe(baseUrl, authMode, token) {
-  if (authMode === 'oauth') {
+  const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl).catch(() => null) : null
+  const probeAuth = resolveReadinessProbeAuth(authMode, nativeAt, token)
+
+  if (probeAuth.kind === 'bearer') {
     return {
       // fetchJson takes the bearer via `options.bearer` — a raw `headers`
       // option is ignored, so passing one here would silently probe
@@ -7293,7 +7293,12 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
     }
   }
 
-  const probeAuth = resolveReadinessProbeAuth(authMode, null, token)
+  if (probeAuth.kind === 'cookie') {
+    return {
+      probeHealth: (url, options: any = {}) => fetchJsonViaOauthSession(url, options),
+      probeIsCredentialed: true
+    }
+  }
 
   if (probeAuth.kind === 'token' && probeAuth.token) {
     return {
@@ -7649,7 +7654,17 @@ function repairPackagedWindowsShortcutsAfterLaunch() {
   try {
     const child = spawn(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helper, '-Repair', '-RepairTargetExe', process.execPath],
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        helper,
+        '-Repair',
+        '-RepairTargetExe',
+        process.execPath
+      ],
       hiddenWindowsChildOptions({ stdio: 'ignore' })
     )
 
@@ -8605,6 +8620,7 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
 
     const body = serializeJsonBody(options.body)
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
     const request = electronNet.request({
       method: options.method || 'GET',
       url,
@@ -8766,44 +8782,7 @@ const nativeAccessTokenCoordinator = createNativeAccessTokenCoordinator({
   tokenNeedsRefresh
 })
 
-  if (!tokens) {
-    return null
-  }
-
-  if (!options.forceRefresh && !tokenNeedsRefresh(tokens, Math.floor(Date.now() / 1000))) {
-    return tokens.accessToken
-  }
-
-  if (!tokens.refreshToken) {
-    // Access token expired and no RT to rotate — force re-login.
-    _clearNativeTokens(baseUrl)
-
-    return null
-  }
-
-  try {
-    const body = await postJsonNoAuth(
-      nativeRefreshUrl(baseUrl),
-      { refresh_token: tokens.refreshToken, provider: tokens.provider },
-      { timeoutMs: 10_000 }
-    )
-
-    const rotated = parseTokenResponse(body)
-    _storeNativeTokens(baseUrl, rotated)
-
-    return rotated.accessToken
-  } catch (error: any) {
-    // A 401 means the RT is dead (session_expired) — drop tokens so the UI
-    // prompts a fresh native login. A 503/transient keeps them for a retry.
-    if (error && error.statusCode === 401) {
-      _clearNativeTokens(baseUrl)
-
-      return null
-    }
-
-    throw error
-  }
-}
+const ensureNativeAccessToken = nativeAccessTokenCoordinator.ensure
 
 // OAuth-session download that streams the response body straight to a
 // user-selected destination (via finalizeGatewayDownload). The connect timeout
@@ -14342,7 +14321,11 @@ function spawnSecondaryWindow({
 // Open (or focus) a standalone window for a single chat session.
 function createSessionWindow(
   sessionId,
-  { ownerRoute, profile = null, watch = false }: { ownerRoute?: SessionWindowOwnerRoute; profile?: null | string; watch?: boolean } = {}
+  {
+    ownerRoute,
+    profile = null,
+    watch = false
+  }: { ownerRoute?: SessionWindowOwnerRoute; profile?: null | string; watch?: boolean } = {}
 ) {
   return sessionWindows.openOrFocus(
     sessionId,
@@ -18365,6 +18348,7 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
 
 ipcMain.handle('hermes:updates:branch:get', async () => {
   const updateRoot = resolveUpdateRoot()
+
   const branch = directoryExists(path.join(updateRoot, '.git'))
     ? await resolveDesktopUpdateBranch(updateRoot)
     : readDesktopUpdateConfig().branch || DEFAULT_UPDATE_BRANCH
@@ -18428,7 +18412,9 @@ async function probeDesktopBuildNeeded(): Promise<boolean | null> {
   const root = resolveUpdateRoot()
   const python = resolveVenvPython(root)
 
-  if (!python) {return null}
+  if (!python) {
+    return null
+  }
 
   try {
     const stdout = await new Promise<string>((resolve, reject) => {
