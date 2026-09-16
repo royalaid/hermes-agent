@@ -3791,6 +3791,9 @@ class GatewayTurnMixin:
             if _clear_adapter:
                 with suppress(Exception):
                     await _clear_adapter.send_typing(source.chat_id, metadata=_status_thread_metadata)
+        except BaseException:
+            _restore_goal_retry_handoff()
+            raise
 
         # Re-baseline the cached agent's message_count before recursing, else the coherence guard
         # rebuilds on OUR OWN flushed rows (the outer handler re-baselines only after the chain).
