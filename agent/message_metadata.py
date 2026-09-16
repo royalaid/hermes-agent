@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
+from enum import Enum, auto
 from time import time as wall_time
 from typing import Any, MutableMapping, Optional, TypeVar
+
+
+_TODO_SNAPSHOT_PROVENANCE_KEY = "_todo_snapshot_provenance"
+
+
+class _MessageProvenance(Enum):
+    """Process-local identities that JSON/API callers cannot manufacture."""
+
+    PERSISTED_TODO_SNAPSHOT = auto()
 
 
 # These fields describe Hermes' durable record and timeline display, not
@@ -11,9 +21,28 @@ from typing import Any, MutableMapping, Optional, TypeVar
 # outgoing copy and the token estimator ignores them: one set, so an estimate
 # never prices bytes the provider never receives (an edit's inline_diff in
 # display_metadata is ~9KB and would trigger premature compaction).
-PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp", "display_kind", "display_metadata", "_row_id"})
+PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
+    {"timestamp", "display_kind", "display_metadata", "_row_id", _TODO_SNAPSHOT_PROVENANCE_KEY}
+)
 
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
+
+
+def stamp_persisted_todo_snapshot(message: _Message) -> _Message:
+    """Mark structured Todo state decoded from an authoritative SessionDB row."""
+    message[_TODO_SNAPSHOT_PROVENANCE_KEY] = (
+        _MessageProvenance.PERSISTED_TODO_SNAPSHOT
+    )
+    return message
+
+
+def has_persisted_todo_snapshot_provenance(message: Any) -> bool:
+    """Return whether *message* crossed the trusted persisted-session boundary."""
+    return bool(
+        isinstance(message, MutableMapping)
+        and message.get(_TODO_SNAPSHOT_PROVENANCE_KEY)
+        is _MessageProvenance.PERSISTED_TODO_SNAPSHOT
+    )
 
 
 def stamp_message_timestamp(

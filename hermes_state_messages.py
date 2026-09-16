@@ -14,6 +14,7 @@ from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
     _newest_checkpoint_carrier, split_user_originated_turn)
 from agent.memory_manager import sanitize_context
+from agent.message_metadata import stamp_persisted_todo_snapshot
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
@@ -321,6 +322,19 @@ class SessionMessagesMixin:
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            self._index_todo_message(
+                conn,
+                message_id=msg_id,
+                session_id=session_id,
+                role=role,
+                content=content,
+                tool_calls=tool_calls,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                display_kind=display_kind,
+                display_metadata=display_metadata,
+                timestamp=message_timestamp,
+            )
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
@@ -528,6 +542,20 @@ class SessionMessagesMixin:
             # the generated timestamp exists only in SQLite, every copy receives a new identity and renders
             # as another logical message.
             msg["timestamp"] = message_timestamp
+            self._index_todo_message(
+                conn,
+                message_id=cur.lastrowid,
+                session_id=session_id,
+                role=role,
+                content=msg.get("content"),
+                tool_calls=tool_calls,
+                tool_call_id=msg.get("tool_call_id"),
+                tool_name=msg.get("tool_name"),
+                display_kind=msg.get("display_kind"),
+                display_metadata=self._decode_display_metadata(msg.get("display_metadata")),
+                timestamp=message_timestamp,
+            )
+
             if cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
             inserted += 1
@@ -1233,6 +1261,8 @@ class SessionMessagesMixin:
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded
+                if "todo_snapshot" in decoded:
+                    stamp_persisted_todo_snapshot(msg)
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(

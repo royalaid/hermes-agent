@@ -12,7 +12,7 @@ import { mergeOlderTranscriptPage } from '@/app/chat/transcript-backfill'
 import { useMessageStream } from '@/app/session/hooks/use-message-stream'
 import { useSessionStateCache } from '@/app/session/hooks/use-session-state-cache'
 import { stubThreadEnvironment } from '@/components/assistant-ui/test-utils'
-import { getLatestSessionMessages } from '@/hermes'
+import { getLatestSessionMessages, getSessionMessages } from '@/hermes'
 import { chatMessageText, toChatMessages } from '@/lib/chat-messages'
 import { resetLiveSync } from '@/store/live-sync'
 import {
@@ -36,7 +36,8 @@ import {
 
 vi.mock('@/hermes', async original => ({
   ...(await original<Record<string, unknown>>()),
-  getLatestSessionMessages: vi.fn()
+  getLatestSessionMessages: vi.fn(),
+  getSessionMessages: vi.fn()
 }))
 
 stubThreadEnvironment()
@@ -214,6 +215,13 @@ async function finishTurn() {
 beforeEach(() => {
   vi.useFakeTimers()
   vi.mocked(getLatestSessionMessages).mockReset()
+  // Durable Todo state (fork #99644): a background refresh without todo state
+  // in its tail reads the bounded todo-state projection; answer "none".
+  vi.mocked(getSessionMessages).mockResolvedValue({
+    messages: [],
+    pagination: { exhausted: true, has_more: false, limit: 2, next_before_id: null, returned: 0 },
+    session_id: STORED
+  } as never)
   setActiveSessionId(RUNTIME)
   setSelectedStoredSessionId(STORED)
 })
