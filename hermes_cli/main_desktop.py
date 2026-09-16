@@ -8,6 +8,7 @@ import logging
 import contextlib
 import argparse
 import hashlib
+import json
 import os
 import platform
 import re
@@ -1657,6 +1658,18 @@ def cmd_gui(args: argparse.Namespace):
     if not (desktop_dir / "package.json").exists():
         print(f"Desktop GUI source not found at: {desktop_dir}")
         sys.exit(1)
+
+    if getattr(args, "build_needed", False):
+        source_mode = bool(getattr(args, "source", False))
+        try:
+            needed = _desktop_build_needed(
+                desktop_dir, PROJECT_ROOT, source_mode=source_mode
+            )
+        except Exception as exc:
+            print(json.dumps({"build_needed": None, "error": str(exc)}))
+            return
+        print(json.dumps({"build_needed": bool(needed), "source_mode": source_mode}))
+        return
 
     with contextlib.suppress(Exception):
         from hermes_logging import setup_logging as _setup_logging_gui
