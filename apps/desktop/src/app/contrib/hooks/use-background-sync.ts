@@ -98,10 +98,20 @@ export interface ActiveTranscriptRefreshDeps {
   ) => ClientSessionState
 }
 
-function tileRuntimeOwnsLiveState(runtimeId: string): boolean {
-  const state = $sessionStates.get()[runtimeId]
+function runtimeOwnsLiveTranscript(runtimeSessionId: string): boolean {
+  const state = $sessionStates.get()[runtimeSessionId]
 
-  return Boolean(state && (state.busy || state.awaitingResponse || state.needsInput || state.turnLive))
+  if (state && (state.busy || state.awaitingResponse || state.needsInput || state.turnLive)) {
+    return true
+  }
+
+  const visibleTail = state?.messages.findLast(message => !message.hidden)
+
+  // Between an active turn completing and its accepted queued successor
+  // starting, `busy` can briefly be false. The synthetic queued row is still
+  // authoritative live state; a REST snapshot admitted in this handoff can
+  // predate that row and remove it before the next assistant stream begins.
+  return visibleTail?.role === 'user' && visibleTail.id === `user-queued-${runtimeSessionId}`
 }
 
 /** Backfill/retention may prepend or release a prefix without changing the tail. */
@@ -199,7 +209,7 @@ export async function reconcileTileTranscripts({
       continue
     }
 
-    if (!storedSessionId || !runtimeSessionId || tileRuntimeOwnsLiveState(runtimeSessionId)) {
+    if (!storedSessionId || !runtimeSessionId || runtimeOwnsLiveTranscript(runtimeSessionId)) {
       continue
     }
 
@@ -234,7 +244,7 @@ export async function reconcileTileTranscripts({
       if (
         requestId !== requestSequenceRef.current ||
         !tileStillPresent() ||
-        tileRuntimeOwnsLiveState(runtimeSessionId)
+        runtimeOwnsLiveTranscript(runtimeSessionId)
       ) {
         continue
       }
@@ -253,7 +263,7 @@ export async function reconcileTileTranscripts({
 
       if (
         requestId !== requestSequenceRef.current ||
-        tileRuntimeOwnsLiveState(runtimeSessionId) ||
+        runtimeOwnsLiveTranscript(runtimeSessionId) ||
         transcriptChangedDuringRead(messagesAtRequest, current?.messages) ||
         !tileStillPresent()
       ) {
@@ -324,7 +334,7 @@ export async function hydrateStoredSessionTranscript({
   const messagesAtRequest = $sessionStates.get()[runtimeSessionId]?.messages
 
   const superseded = () =>
-    tileRuntimeOwnsLiveState(runtimeSessionId) ||
+    runtimeOwnsLiveTranscript(runtimeSessionId) ||
     transcriptChangedDuringRead(messagesAtRequest, $sessionStates.get()[runtimeSessionId]?.messages)
 
   for (let index = 0; index < Math.max(1, attempts); index += 1) {
@@ -397,7 +407,7 @@ export async function reconcileActiveTranscript({
   const storedSessionId = selectedStoredSessionIdRef.current
   const runtimeSessionId = activeSessionIdRef.current
 
-  if (!storedSessionId || !runtimeSessionId || busyRef.current || tileRuntimeOwnsLiveState(runtimeSessionId)) {
+  if (!storedSessionId || !runtimeSessionId || busyRef.current || runtimeOwnsLiveTranscript(runtimeSessionId)) {
     return
   }
 
@@ -418,7 +428,7 @@ export async function reconcileActiveTranscript({
   if (
     requestId !== requestSequenceRef.current ||
     busyRef.current ||
-    tileRuntimeOwnsLiveState(runtimeSessionId) ||
+    runtimeOwnsLiveTranscript(runtimeSessionId) ||
     selectedStoredSessionIdRef.current !== storedSessionId ||
     activeSessionIdRef.current !== runtimeSessionId
   ) {
@@ -444,7 +454,7 @@ export async function reconcileActiveTranscript({
     if (
       requestId !== requestSequenceRef.current ||
       busyRef.current ||
-      tileRuntimeOwnsLiveState(runtimeSessionId) ||
+      runtimeOwnsLiveTranscript(runtimeSessionId) ||
       transcriptChangedDuringRead(messagesAtRequest, current?.messages) ||
       selectedStoredSessionIdRef.current !== storedSessionId ||
       activeSessionIdRef.current !== runtimeSessionId
@@ -841,7 +851,7 @@ export function useBackgroundSync({
         activeTranscriptRefreshPendingRef.current = sessionKey
       }
 
-      if ($busy.get() || tileRuntimeOwnsLiveState(runtimeSessionId)) {
+      if ($busy.get() || runtimeOwnsLiveTranscript(runtimeSessionId)) {
         return
       }
 
@@ -874,7 +884,7 @@ export function useBackgroundSync({
     const isCurrent = () =>
       $activeSessionId.get() === activeSessionId && $selectedStoredSessionId.get() === activeStoredSessionId
 
-    const isLive = () => $busy.get() || tileRuntimeOwnsLiveState(activeSessionId)
+    const isLive = () => $busy.get() || runtimeOwnsLiveTranscript(activeSessionId)
 
     const observe = () => {
       if (!isCurrent()) {
