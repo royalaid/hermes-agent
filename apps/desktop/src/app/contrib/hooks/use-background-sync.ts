@@ -136,12 +136,22 @@ function transcriptChangedDuringRead(before: ChatMessage[] | undefined, after: C
   return false
 }
 
+/** A post-turn fallback read is stale once a later turn owns the runtime or
+ *  its transcript moved; snapshots the transcript at call time. */
+export function postTurnHydrationSupersededCheck(runtimeSessionId: string): () => boolean {
+  const messagesAtRequest = $sessionStates.get()[runtimeSessionId]?.messages
+
+  return () =>
+    runtimeOwnsLiveTranscript(runtimeSessionId) ||
+    transcriptChangedDuringRead(messagesAtRequest, $sessionStates.get()[runtimeSessionId]?.messages)
+}
+
 /** Zero persisted rows read over a populated runtime bound to the SAME stored
  *  session. An empty page is not proof the transcript is empty — it is also
  *  what a respawning backend (or a state.db read racing the change event)
  *  returns. A runtime rebound to another stored id while the read was in
  *  flight holds no evidence about the requested transcript. */
-function emptyPageOverPopulatedTranscript(
+export function emptyPageOverPopulatedTranscript(
   page: readonly unknown[],
   current: ClientSessionState | undefined,
   storedSessionId: string
@@ -305,11 +315,7 @@ export async function hydrateStoredSessionTranscript({
   storedProfile: ProfileScope
   updateSessionState: ActiveTranscriptRefreshDeps['updateSessionState']
 }): Promise<void> {
-  const messagesAtRequest = $sessionStates.get()[runtimeSessionId]?.messages
-
-  const superseded = () =>
-    runtimeOwnsLiveTranscript(runtimeSessionId) ||
-    transcriptChangedDuringRead(messagesAtRequest, $sessionStates.get()[runtimeSessionId]?.messages)
+  const superseded = postTurnHydrationSupersededCheck(runtimeSessionId)
 
   for (let index = 0; index < Math.max(1, attempts); index += 1) {
     if (index > 0) {
