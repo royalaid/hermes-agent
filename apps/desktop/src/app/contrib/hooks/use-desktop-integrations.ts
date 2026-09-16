@@ -22,14 +22,18 @@ import {
 import { requestPluginCatalogInstallFromDeepLink } from '@/store/plugin-catalog-install'
 import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { openFolderAsProject } from '@/store/projects'
+import { openRouteTile } from '@/store/route-tiles'
 import {
   $selectedStoredSessionId,
   getRememberedRoute,
   getRememberedSessionId,
   resolveComposerSessionKey,
+  getRememberedSessionOwner,
+  requestSessionResume,
   sessionBelongsToProfile,
   setRememberedRoute,
-  setRememberedSessionId
+  setRememberedSessionId,
+  setRememberedSessionOwner
 } from '@/store/session'
 import { $botChatScopes, $sessionTiles, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { onSessionsChanged } from '@/store/session-sync'
@@ -137,7 +141,12 @@ export function useDesktopIntegrations({
           return
         }
 
-        const route = getRememberedRoute(activeProfile)
+        const remembered = getRememberedRoute(activeProfile)
+        // A remembered plugin page (legacy: it used to be a router
+        // destination) re-opens as its route TILE, and the chat restore below
+        // still runs so main comes back to the session it was on.
+        const rememberedTile = remembered && appViewForPath(remembered) === 'extension' ? remembered : null
+        const route = rememberedTile ? null : remembered
         const routeSession = route ? routeSessionId(route) : null
         const last = getRememberedSessionId(activeProfile)
 
@@ -162,6 +171,10 @@ export function useDesktopIntegrations({
 
         restoredRef.current = true
 
+        if (rememberedTile) {
+          openRouteTile(rememberedTile, 'center')
+        }
+
         if (
           route &&
           route !== NEW_CHAT_ROUTE &&
@@ -172,6 +185,14 @@ export function useDesktopIntegrations({
           // backend was still coming up; the composer moves that draft onto
           // the restored session when its scope swaps (#114122).
           announceNewSessionDraftKey(routeSession && resolveComposerSessionKey(routeSession, sessions))
+          if (routeSession) {
+            const ownerRoute = getRememberedSessionOwner(routeSession, activeProfile)
+
+            if (ownerRoute) {
+              requestSessionResume(routeSession, ownerRoute)
+            }
+          }
+
           navigate(route, { replace: true })
 
           return
@@ -181,10 +202,17 @@ export function useDesktopIntegrations({
         // clear the stale entry so the next cold start won't re-try it.
         if (routeSession) {
           setRememberedRoute(null, activeProfile)
+          setRememberedSessionOwner(null, undefined, activeProfile)
         }
 
         if (last && sessionBelongsToProfile(sessions, last, activeProfile)) {
           announceNewSessionDraftKey(resolveComposerSessionKey(last, sessions))
+          const ownerRoute = getRememberedSessionOwner(last, activeProfile)
+
+          if (ownerRoute) {
+            requestSessionResume(last, ownerRoute)
+          }
+
           navigate(sessionRoute(last), { replace: true })
 
           return
@@ -192,6 +220,7 @@ export function useDesktopIntegrations({
 
         if (last) {
           setRememberedSessionId(null, activeProfile)
+          setRememberedSessionOwner(null, undefined, activeProfile)
         }
       } else {
         restoredRef.current = true
@@ -201,12 +230,17 @@ export function useDesktopIntegrations({
     // Remember the open chat (session id for notifications/resume) AND the last
     // non-overlay route (a page like /skills, or a session route) per profile.
     // Session-shaped routes require an explicit matching owner; unresolved and
-    // wrong-profile rows must not replace known-safe navigation.
+    // wrong-profile rows must not replace known-safe navigation. A contributed
+    // route is transient (the router steps straight back off it into a tile),
+    // so it never replaces the remembered route either.
+    const view = appViewForPath(locationPathname)
+
     if (routedSessionId && sessionBelongsToProfile(sessions, routedSessionId, activeProfile)) {
       setRememberedSessionId(routedSessionId, activeProfile)
       setRememberedRoute(locationPathname, activeProfile)
-    } else if (!routedSessionId && !isOverlayView(appViewForPath(locationPathname))) {
+    } else if (!routedSessionId && !isOverlayView(view) && view !== 'extension') {
       setRememberedRoute(locationPathname, activeProfile)
+      setRememberedSessionOwner(null, undefined, activeProfile)
     }
   }, [
     activeProfile,
@@ -226,10 +260,12 @@ export function useDesktopIntegrations({
 
     if (getRememberedSessionId(activeProfile) === resumeExhaustedSessionId) {
       setRememberedSessionId(null, activeProfile)
+      setRememberedSessionOwner(null, undefined, activeProfile)
     }
 
     if (routeSessionId(getRememberedRoute(activeProfile) ?? '') === resumeExhaustedSessionId) {
       setRememberedRoute(null, activeProfile)
+      setRememberedSessionOwner(null, undefined, activeProfile)
     }
   }, [activeProfile, profileReady, resumeExhaustedSessionId])
 
