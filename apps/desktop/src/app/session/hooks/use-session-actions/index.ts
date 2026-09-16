@@ -17,6 +17,8 @@ import {
 import { useI18n } from '@/i18n'
 import {
   type ChatMessage,
+  discardOpenClarifyToolCalls,
+  discardPendingClarifyToolCall,
   preserveLocalAssistantErrors,
   restorePendingClarifyToolCall,
   settlePendingClarifyToolCall,
@@ -54,7 +56,7 @@ import {
   resolveNewChatOwnerRoute
 } from '@/store/profile'
 import { $projectScope, resolveNewSessionCwd } from '@/store/projects'
-import { receiveApprovalRequest, replayPendingApproval } from '@/store/prompts'
+import { receiveApprovalRequest, replayPendingApproval, sessionApprovalRequest } from '@/store/prompts'
 import { clearStoredTranscriptReadOnly, markStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import { openRouteTile } from '@/store/route-tiles'
 import {
@@ -114,13 +116,16 @@ import {
 } from '@/store/session-request-router'
 import {
   $sessionTiles,
+  clearMainSessionOwner,
   closeSessionTile,
   dropSessionState,
   focusOpenSession,
   holdSessionOwnerUntilForeground,
   isSessionInForeground,
+  mainSessionOwnerRoute,
   openSessionTile,
   patchSessionTile,
+  prepareSessionOwnerRetarget,
   publishSessionState,
   releaseSessionOwnerHold,
   type SessionTileWorkspaceScope,
@@ -149,7 +154,11 @@ import { sessionCreateOverrideParams, type SessionCreateOverrides, type SessionS
 import { captureDisplayHydration } from './display-hydration'
 import { reconcilePersistedLiveTurn } from './persisted-live-turn'
 import { provisionalTranscriptPaint, transcriptRestScope } from './provisional-transcript'
-import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './restore-pending-clarify'
+import {
+  pendingClarifyRequestFromSnapshot,
+  pendingClarifyToolPayload,
+  restorePendingClarifyFromSnapshot
+} from './restore-pending-clarify'
 import { projectPendingConnection, restorePendingConnectionFromSnapshot } from './restore-pending-connection'
 import {
   createPersistedDisplayTranscriptProvenance,
@@ -179,6 +188,7 @@ import {
   resolveSessionProfile,
   resolveStoredSession,
   restoreListedSession,
+  runningProjectionStreamId,
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -336,10 +346,7 @@ async function desktopSessionCreateParams(
   }
 
   const profile =
-    capturedRoute?.profile ||
-    requestedProfile ||
-    $newChatProfile.get() ||
-    normalizeProfileKey($activeGatewayProfile.get())
+    capturedRoute?.profile || requestedProfile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
 
   if (capturedRoute) {
     await ensureGatewayAgent(capturedRoute.connectionId, profile)
@@ -538,6 +545,7 @@ export function useSessionActions({
 
       setActiveSessionId(null)
       activeSessionIdRef.current = null
+      clearMainSessionOwner()
       setSelectedStoredSessionId(null)
       selectedStoredSessionIdRef.current = null
       setMessages([])
@@ -843,17 +851,15 @@ export function useSessionActions({
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
         const explicitTarget =
-          options?.profile !== undefined ||
-          options?.cwd !== undefined ||
-          options?.workspaceScope?.ownerRoute !== undefined
+          options?.profile !== undefined || options?.cwd !== undefined || options?.workspaceScope?.ownerRoute !== undefined
 
         const defaultTarget = options?.route === undefined && !explicitTarget ? defaultNewSessionTarget() : null
 
         const capturedRoute =
           options?.route !== undefined
             ? options.route
-            : (options?.workspaceScope?.ownerRoute ??
-              (defaultTarget ? defaultTarget.route : resolveNewChatOwnerRoute(options?.profile)))
+            : options?.workspaceScope?.ownerRoute ??
+              (defaultTarget ? defaultTarget.route : resolveNewChatOwnerRoute(options?.profile))
 
         // A named local profile uses the legacy profile-only transport (no
         // connectionId). Tab-strip "+" omits `options.profile`; the draft or
@@ -1033,6 +1039,11 @@ export function useSessionActions({
       resumeRequestRef.current = requestId
       const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
+      const ownerRoute = capturedOwner || mainSessionOwnerRoute(storedSessionId) || getSessionOwnerHint(storedSessionId)
+
+      if (ownerRoute) {
+        prepareSessionOwnerRetarget(storedSessionId, ownerRoute, true)
+      }
 
       const isCurrentResume = () =>
         resumeRequestRef.current === requestId &&
@@ -1121,7 +1132,6 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
-      const ownerRoute = capturedOwner || getSessionOwnerHint(storedSessionId)
       // A connection switch clears/reloads the session rows before this path
       // runs, so an untagged row belongs to the connection that supplied the
       // current list. Capture that source before the async metadata lookup. If
@@ -1166,6 +1176,10 @@ export function useSessionActions({
               profile: sessionProfile || 'default'
             }
           : sessionProfile)
+
+      if (sessionOwner && typeof sessionOwner === 'object') {
+        prepareSessionOwnerRetarget(storedSessionId, sessionOwner, true)
+      }
 
       const sessionRestScope = transcriptRestScope(ownerRoute, storedForProfile, ambientConnectionId)
       provisional.paint(sessionRestScope)
@@ -1295,7 +1309,9 @@ export function useSessionActions({
           activeSessionIdRef.current = cachedRuntimeId
           syncSessionStateToView(
             cachedRuntimeId,
-            suppressTranscriptForView(cachedViewState, suppressUnprovenWarmTranscript)
+            suppressUnprovenWarmTranscript
+              ? { ...cachedViewState, messages: [], needsInput: false, streamId: null }
+              : cachedViewState
           )
           setCurrentCwdTransient(cachedViewState.cwd)
           // The warm cache IS this conversation's own workspace truth, so the
@@ -1311,7 +1327,7 @@ export function useSessionActions({
             let activated: SessionResumeResult | null = null
             const activateStartedAt = Date.now() / 1000
             const activateBaselineState = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId) ?? cachedViewState
-            const clarifyRequestIdAtActivateStart = $clarifyRequests.get()[cachedRuntimeId]?.requestId
+            const clarifyRequestIdAtActivateStart = $clarifyRequests.get()[cachedRuntimeId]?.requestId ?? null
             const connectionOpIdAtActivateStart = $connectionRequests.get()[cachedRuntimeId]?.opId
 
             try {
@@ -1354,14 +1370,43 @@ export function useSessionActions({
             } else {
               const pendingApproval = restorePendingApproval(activated, cachedRuntimeId)
 
+              const currentClarifyRequestAfterActivate = $clarifyRequests.get()[cachedRuntimeId]
+
+              const clarifyRequestChangedWhileActivating =
+                (currentClarifyRequestAfterActivate?.requestId ?? null) !== clarifyRequestIdAtActivateStart
+
+              const clarifyClearedWhileActivating =
+                clarifyRequestChangedWhileActivating &&
+                clarifyRequestIdAtActivateStart !== null &&
+                !currentClarifyRequestAfterActivate
+
+              const activationSnapshotRequest = clarifyRequestChangedWhileActivating
+                ? pendingClarifyRequestFromSnapshot(activated, cachedRuntimeId)
+                : null
+
               const pendingClarifyState = restorePendingClarifyFromSnapshot(
                 activated,
                 cachedRuntimeId,
                 activateStartedAt,
-                clarifyRequestIdAtActivateStart
+                clarifyRequestIdAtActivateStart,
+                clarifyRequestChangedWhileActivating
               )
 
-              const pendingClarify = pendingClarifyState.request
+              const alignedActivationClarify =
+                clarifyRequestChangedWhileActivating &&
+                activationSnapshotRequest?.requestId === currentClarifyRequestAfterActivate?.requestId
+                  ? activationSnapshotRequest
+                  : null
+
+              const clarifySupersededWhileActivating = clarifyRequestChangedWhileActivating && !alignedActivationClarify
+
+              const pendingClarify = pendingClarifyState.request ?? alignedActivationClarify
+
+              const supersededClarify =
+                clarifyRequestChangedWhileActivating &&
+                activationSnapshotRequest?.requestId !== currentClarifyRequestAfterActivate?.requestId
+                  ? activationSnapshotRequest
+                  : null
 
               const pendingConnection = restorePendingConnectionFromSnapshot(
                 activated,
@@ -1393,10 +1438,37 @@ export function useSessionActions({
                   ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
                   : cachedViewState.messages
 
+              if (supersededClarify) {
+                activatedMessages = discardPendingClarifyToolCall(
+                  activatedMessages,
+                  pendingClarifyToolPayload(supersededClarify),
+                  false
+                )
+              }
+
               // #70449: never let the activate snapshot's stale running:false
               // rewind a turn that started while the RPC was in flight — read
               // the freshest cache entry, not the pre-await cachedViewState.
               const latestCachedState = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
+              const activationBarrierMessages = latestCachedState?.messages ?? cachedViewState.messages
+
+              activatedMessages = overlayConcurrentMessageChanges(
+                activatedMessages,
+                cachedViewState.messages,
+                activationBarrierMessages
+              )
+
+              if (alignedActivationClarify) {
+                activatedMessages = discardPendingClarifyToolCall(
+                  activatedMessages,
+                  { tool_id: alignedActivationClarify.requestId },
+                  false
+                )
+              }
+
+              if (clarifyClearedWhileActivating) {
+                activatedMessages = discardOpenClarifyToolCalls(activatedMessages)
+              }
 
               const busyChangedWhileActivating = Boolean(
                 latestCachedState?.busy &&
@@ -1418,6 +1490,28 @@ export function useSessionActions({
                   ? activated.turn_started_at * 1000
                   : null
 
+              // A restored approval is the authoritative blocker for this
+              // session. Once the clarify side-store also confirms that no
+              // newer request raced activation, settle the stale cached card
+              // before the pre-REST publication instead of leaving it live
+              // until transcript hydration returns.
+              const preHydrationClearedClarifyProjection =
+                pendingApproval && clarifyAuthoritativelyAbsent && staleClarifyAtActivateStart
+                  ? settlePendingClarifyToolCall(
+                      activatedMessages,
+                      pendingClarifyState.cleared ? pendingClarifyToolPayload(pendingClarifyState.cleared) : {},
+                      running
+                    )
+                  : null
+
+              if (preHydrationClearedClarifyProjection) {
+                activatedMessages = preHydrationClearedClarifyProjection.messages
+              }
+
+              const preHydrationClarifyProjection = pendingClarify
+                ? restorePendingClarifyToolCall(activatedMessages, pendingClarifyToolPayload(pendingClarify))
+                : null
+
               // Settle the activation snapshot before transcript hydration.
               // Once the attached transport reports a later terminal event,
               // that live state is authoritative and must not be overwritten
@@ -1428,27 +1522,53 @@ export function useSessionActions({
                   ...state,
                   ...(runtimeInfo ?? {}),
                   busy: running,
-                  awaitingResponse: running && !pendingClarify,
+                  awaitingResponse: clarifyClearedWhileActivating
+                    ? running && !pendingApproval
+                    : clarifySupersededWhileActivating
+                      ? state.awaitingResponse
+                      : running && !pendingClarify,
+                  ...(preHydrationClarifyProjection
+                    ? { messages: preHydrationClarifyProjection.messages }
+                    : clarifyClearedWhileActivating
+                      ? { messages: activatedMessages }
+                      : preHydrationClearedClarifyProjection?.streamId
+                        ? { messages: preHydrationClearedClarifyProjection.messages }
+                        : {}),
                   // Resumed onto an already-running turn — that IS backend
                   // proof the turn is live (no message.start will replay).
                   turnLive: state.turnLive || running,
-                  needsInput:
-                    pendingApproval ||
-                    Boolean(pendingClarify) ||
-                    Boolean(pendingConnection) ||
-                    (clarifyAuthoritativelyAbsent ? false : state.needsInput),
+                  needsInput: clarifyClearedWhileActivating
+                    ? Boolean(pendingApproval || pendingConnection)
+                    : clarifySupersededWhileActivating
+                      ? state.needsInput
+                      : pendingApproval ||
+                        Boolean(pendingClarify) ||
+                        Boolean(pendingConnection) ||
+                        (clarifyAuthoritativelyAbsent ? false : state.needsInput),
                   // Adopting someone else's turn: we'll stream its reply
                   // without ever having received its prompt, so the settle
                   // path must not take the "I saw it all" shortcut.
                   adoptedRunningTurn: state.adoptedRunningTurn || running,
-                  turnStartedAt: running ? (activatedTurnStartedAt ?? state.turnStartedAt ?? Date.now()) : null
+                  turnStartedAt: running ? (activatedTurnStartedAt ?? state.turnStartedAt ?? Date.now()) : null,
+                  ...(preHydrationClarifyProjection
+                    ? {
+                        sawAssistantPayload: true,
+                        streamId: preHydrationClarifyProjection.streamId
+                      }
+                    : clarifyClearedWhileActivating
+                      ? { streamId: null }
+                      : {})
                 }),
                 storedSessionId
               )
 
+              const preHydrationMessages = activatedLivenessState.messages
+
               busyRef.current = running
               setBusy(running)
-              setAwaitingResponse(running && !pendingClarify)
+              setAwaitingResponse(
+                clarifySupersededWhileActivating ? activatedLivenessState.awaitingResponse : running && !pendingClarify
+              )
               syncSessionStateToView(
                 cachedRuntimeId,
                 suppressTranscriptForView(activatedLivenessState, suppressUnprovenWarmTranscript)
@@ -1543,43 +1663,118 @@ export function useSessionActions({
                   activatedMessages =
                     currentLiveTurn ??
                     reconcileAuthoritativeChatMessages(persistedMessages, previousMessages, liveProjection)
+
+                  if (supersededClarify) {
+                    activatedMessages = discardPendingClarifyToolCall(
+                      activatedMessages,
+                      pendingClarifyToolPayload(supersededClarify),
+                      false
+                    )
+                  }
+
+                  // The occurrence-aware path already read the latest cache; a
+                  // barrier overlay would restore the tools it consumed.
+                  if (!reconciledCurrentLiveTurn) {
+                    activatedMessages = overlayConcurrentMessageChanges(
+                      activatedMessages,
+                      cachedViewState.messages,
+                      activationBarrierMessages
+                    )
+                  }
                 }
               }
 
+              const currentClarifyRequest = $clarifyRequests.get()[cachedRuntimeId]
               const currentMessages = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.messages
+
+              const hasSettledPendingClarifyProjection = Boolean(
+                pendingClarify &&
+                currentMessages?.some(message =>
+                  message.parts.some(
+                    part =>
+                      part.type === 'tool-call' &&
+                      part.toolName === 'clarify' &&
+                      part.toolCallId === pendingClarify.requestId &&
+                      part.result !== undefined
+                  )
+                )
+              )
+
+              const shouldTransferSettledPendingClarify = Boolean(
+                pendingClarify && !currentClarifyRequest && hasSettledPendingClarifyProjection
+              )
+
+              if (
+                pendingClarify &&
+                currentClarifyRequest?.requestId !== pendingClarify.requestId &&
+                !shouldTransferSettledPendingClarify
+              ) {
+                activatedMessages = discardPendingClarifyToolCall(
+                  activatedMessages,
+                  pendingClarifyToolPayload(pendingClarify),
+                  false
+                )
+              }
 
               // The occurrence-aware path already read the latest cache. An
               // additional identity overlay would restore its consumed tools.
               if (currentMessages && !reconciledCurrentLiveTurn) {
                 activatedMessages = overlayConcurrentMessageChanges(
                   activatedMessages,
-                  cachedViewState.messages,
+                  preHydrationMessages,
                   currentMessages
                 )
               }
 
-              const pendingClarifyProjection = pendingClarify
-                ? restorePendingClarifyToolCall(activatedMessages, pendingClarifyToolPayload(pendingClarify))
-                : null
+              if (alignedActivationClarify) {
+                activatedMessages = discardPendingClarifyToolCall(
+                  activatedMessages,
+                  { tool_id: alignedActivationClarify.requestId },
+                  false
+                )
+              }
+
+              const pendingClarifyStillCurrent = Boolean(
+                pendingClarify && currentClarifyRequest?.requestId === pendingClarify.requestId
+              )
+
+              const clarifySettledWhileHydrating =
+                Boolean(pendingClarify) &&
+                !pendingClarifyStillCurrent &&
+                !currentClarifyRequest &&
+                !sessionApprovalRequest(cachedRuntimeId).get()
+
+              const pendingClarifyProjection =
+                pendingClarify && pendingClarifyStillCurrent
+                  ? restorePendingClarifyToolCall(activatedMessages, pendingClarifyToolPayload(pendingClarify))
+                  : null
+
+              const pendingSettledMessages =
+                pendingClarify && shouldTransferSettledPendingClarify
+                  ? discardPendingClarifyToolCall(activatedMessages, pendingClarifyToolPayload(pendingClarify), true)
+                  : activatedMessages
 
               const clearedClarifyProjection = clarifyAuthoritativelyAbsent
                 ? settlePendingClarifyToolCall(
-                    activatedMessages,
+                    pendingSettledMessages,
                     pendingClarifyState.cleared ? pendingClarifyToolPayload(pendingClarifyState.cleared) : {},
                     running
                   )
                 : null
 
+              const settledActivatedMessages = clearedClarifyProjection?.messages ?? pendingSettledMessages
+
+              const visibleClarifyMessages = currentClarifyRequest
+                ? settledActivatedMessages
+                : discardOpenClarifyToolCalls(settledActivatedMessages)
+
               const pendingConnectionProjection = projectPendingConnection(
-                pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? activatedMessages,
+                pendingClarifyProjection?.messages ?? visibleClarifyMessages,
                 pendingConnection
               )
 
               const visibleActivatedMessages =
-                pendingConnectionProjection?.messages ??
-                pendingClarifyProjection?.messages ??
-                clearedClarifyProjection?.messages ??
-                activatedMessages
+                pendingConnectionProjection?.messages ?? pendingClarifyProjection?.messages ?? visibleClarifyMessages
 
               releaseTranscriptView()
 
@@ -1596,11 +1791,15 @@ export function useSessionActions({
                 return {
                   ...state,
                   messages,
+                  streamId: running
+                    ? (runningProjectionStreamId(messages, true) ?? state.streamId)
+                    : null,
                   transcriptProvenance:
                     acceptedPersistedDisplayTranscript || hasValidProvenance
                       ? (expectedProvenance ?? undefined)
                       : undefined,
                   ...livePromptStreamId(pendingConnectionProjection, pendingClarifyProjection),
+                  ...(clarifySettledWhileHydrating ? { needsInput: Boolean(pendingConnection) } : {}),
                   ...(clearedClarifyProjection
                     ? {
                         streamId: state.busy ? (clearedClarifyProjection.streamId ?? state.streamId) : null
@@ -1629,10 +1828,10 @@ export function useSessionActions({
               saveTranscriptTail(
                 storedSessionId,
                 stripPendingClarifyProjectionForCache(
-                  activatedMessages,
-                  pendingClarify?.requestId ??
-                    pendingClarifyState.cleared?.requestId ??
-                    $clarifyRequests.get()[cachedRuntimeId]?.requestId
+                  visibleActivatedMessages,
+                  $clarifyRequests.get()[cachedRuntimeId]?.requestId ??
+                    pendingClarify?.requestId ??
+                    pendingClarifyState.cleared?.requestId
                 ),
                 sessionRestScope
               )
@@ -1750,22 +1949,25 @@ export function useSessionActions({
         let resumeRuntimeBaselineMessages: ChatMessage[] = []
         const resumeStartedAt = Date.now() / 1000
 
-        const resumePromise = singleFlightSessionResume(storedSessionId, () =>
-          requestForSession<SessionResumeResult>('session.resume', {
-            session_id: storedSessionId,
-            cols: 96,
-            source: 'desktop',
-            defer_history: !watchWindow,
-            // REST is the transcript authority for Desktop. Avoid duplicating a
-            // potentially huge compression lineage in the WebSocket response.
-            // Watch windows attach lazily (live mirror). Every other cold resume
-            // gets the gateway's default deferred build: the RPC returns the
-            // transcript immediately instead of blocking the switch on _make_agent
-            // (MCP discovery / prompt build), and the agent pre-warms in the
-            // background while the prefetch above paints the transcript.
-            ...(watchWindow ? { lazy: true } : { omit_messages: true }),
-            ...(sessionProfile ? { profile: sessionProfile } : {})
-          })
+        const resumePromise = singleFlightSessionResume(
+          storedSessionId,
+          () =>
+            requestForSession<SessionResumeResult>('session.resume', {
+              session_id: storedSessionId,
+              cols: 96,
+              source: 'desktop',
+              defer_history: !watchWindow,
+              // REST is the transcript authority for Desktop. Avoid duplicating a
+              // potentially huge compression lineage in the WebSocket response.
+              // Watch windows attach lazily (live mirror). Every other cold resume
+              // gets the gateway's default deferred build: the RPC returns the
+              // transcript immediately instead of blocking the switch on _make_agent
+              // (MCP discovery / prompt build), and the agent pre-warms in the
+              // background while the prefetch above paints the transcript.
+              ...(watchWindow ? { lazy: true } : { omit_messages: true }),
+              ...(sessionProfile ? { profile: sessionProfile } : {})
+            }),
+          sessionOwner
         ).then(resumed => {
           resumeRuntimeBaselineMessages =
             sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.messages ?? resumeRuntimeBaselineMessages
@@ -2032,6 +2234,9 @@ export function useSessionActions({
             messages: visibleMessagesForView,
             transcriptProvenance,
             busy: resumedRunning,
+            streamId: resumedRunning
+              ? (runningProjectionStreamId(visibleMessagesForView, true) ?? state.streamId)
+              : null,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.
             turnLive: state.turnLive || resumedRunning,
@@ -2055,7 +2260,11 @@ export function useSessionActions({
             ...livePromptStreamId(pendingConnectionProjection, pendingClarifyProjection),
             ...(clearedClarifyProjection
               ? {
-                  streamId: resumedRunning ? (clearedClarifyProjection.streamId ?? state.streamId) : null
+                  streamId: resumedRunning
+                    ? (clearedClarifyProjection.streamId ??
+                      runningProjectionStreamId(visibleMessagesForView, true) ??
+                      state.streamId)
+                    : null
                 }
               : {})
           }),
