@@ -33,10 +33,13 @@ import {
 } from '../../session/hooks/use-prompt-actions/single-flight-resume'
 import { markSessionRecentlyInterrupted, withSessionNotFoundResume } from '../../session/hooks/use-prompt-actions/utils'
 import {
+  appendLiveSessionProjection,
   chatMessageArraysEquivalent,
+  overlayConcurrentMessageChanges,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
-  resolveSessionOwner
+  resolveSessionOwner,
+  runningProjectionStreamId
 } from '../../session/hooks/use-session-actions/utils'
 import type { useSessionStateCache } from '../../session/hooks/use-session-state-cache'
 import type { GatewayRequester } from '../types'
