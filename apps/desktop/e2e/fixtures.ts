@@ -394,6 +394,7 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
+  mockServer?: MockServerOptions
 }
 
 /**
@@ -403,10 +404,6 @@ export interface MockBackendOptions {
  *   3. Launch the desktop app
  *   4. Return handles for test interaction
  */
-export interface MockBackendOptions {
-  mockServer?: MockServerOptions
-}
-
 export async function setupMockBackend(options: MockBackendOptions = {}): Promise<MockBackendFixture> {
   // 1. Start mock server
   const mock = await startMockServer(options.mockServer)
@@ -661,6 +658,7 @@ export async function waitForAppReady(fixture: MockBackendFixture | NoProviderFi
       // `position: fixed; inset: 0`. If the hit element or an ancestor
       // is a full-viewport fixed overlay, we're still covered.
       let node: Element | null = el
+
       while (node) {
         const cs = window.getComputedStyle(node)
 
