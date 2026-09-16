@@ -43,6 +43,7 @@ import path from 'node:path'
 import { stripAnsi } from '../../shared/src/ansi'
 
 import { hiddenWindowsChildOptions } from './windows-child-options'
+import { windowsPowerShellExecutable } from './windows-powershell-path'
 
 const IS_WINDOWS = process.platform === 'win32'
 
@@ -416,11 +417,6 @@ async function resolveInstallScript({
 // powershell wrapper
 // ---------------------------------------------------------------------------
 
-// Canonical PowerShell 5.1 location under a Windows root (%SystemRoot%).
-function powershellUnderRoot(root) {
-  return path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-}
-
 // Resolve the PowerShell interpreter to spawn.
 //
 // Spawning bare 'powershell.exe' trusts PATH to contain
@@ -435,7 +431,7 @@ function resolveWindowsPowerShell() {
     const root = process.env[v]
 
     if (root) {
-      const candidate = powershellUnderRoot(root)
+      const candidate = windowsPowerShellExecutable(root)
 
       try {
         if (fs.statSync(candidate).isFile()) {
