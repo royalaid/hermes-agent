@@ -924,7 +924,13 @@ class TurnRunner:
         want_stream_deltas = not ctx.scheduled_heartbeat and (
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )
-        want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
+        want_interim_messages = (
+            bool(ctx.interim_assistant_messages_enabled)
+            and not ctx.scheduled_heartbeat
+            and not ctx.defer_result_publication
+        )
+        if ctx.defer_result_publication:
+            want_stream_deltas = False
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
