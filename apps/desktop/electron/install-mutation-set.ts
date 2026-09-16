@@ -26,7 +26,22 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { resolveVenvDir } from './venv-blocker-scan'
+
 export const INSTALL_MUTATION_EXTENSIONS: ReadonlySet<string> = new Set(['.pyd', '.dll', '.exe'])
+
+/**
+ * The one directory inside an install that the mutation set deliberately
+ * excludes (see the module header): the managed runtime generation, shared
+ * with foreign uv tool venvs. Exported so the termination boundary can apply
+ * the SAME exclusion to kill authorization -- an image under here is not
+ * evidence that the process blocks this update.
+ */
+export const INSTALL_SHARED_RUNTIME_DIRECTORY = '.hermes-runtime'
+
+export function installSharedRuntimeRoot(updateRoot: string): string {
+  return path.join(updateRoot, INSTALL_SHARED_RUNTIME_DIRECTORY)
+}
 
 /** Enumeration is filesystem-bound (~1 s on a full install); cache it briefly. */
 export const INSTALL_MUTATION_SET_TTL_MS = 30_000
@@ -44,15 +59,18 @@ export interface LockProbeFs {
 
 /** Shim files first so a caller that needs one representative resource gets the shim. */
 export function installShimCandidates(updateRoot: string): string[] {
+  const venvDir = resolveVenvDir(updateRoot)
+
   return [
-    path.join(updateRoot, 'venv', 'Scripts', 'hermes.exe'),
-    path.join(updateRoot, 'venv', 'Scripts', 'python.exe'),
-    path.join(updateRoot, 'venv', 'python.exe')
+    path.join(venvDir, 'Scripts', 'hermes.exe'),
+    path.join(venvDir, 'Scripts', 'python.exe'),
+    path.join(venvDir, 'python.exe')
   ]
 }
 
+/** The venv the update rewrites: `venv`, or uv's default `.venv` (resolveVenvDir). */
 export function installMutationRoots(updateRoot: string): string[] {
-  return [path.join(updateRoot, 'venv')]
+  return [resolveVenvDir(updateRoot)]
 }
 
 function walk(dir: string, out: string[], fsImpl: MutationSetFs, depth: number): void {
@@ -224,14 +242,4 @@ export function probeInstallResourceLocks(
   }
 
   return result
-}
-
-/** Every file that refused an exclusive open, definite first. */
-export function findLockedInstallResources(
-  resources: readonly string[],
-  options: { limit?: number; fsImpl?: LockProbeFs; platform?: NodeJS.Platform } = {}
-): string[] {
-  const locks = probeInstallResourceLocks(resources, options)
-
-  return [...locks.definite, ...locks.shared]
 }

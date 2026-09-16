@@ -10,7 +10,6 @@ import { afterEach, describe, it } from 'vitest'
 import {
   clearInstallMutationSetCache,
   enumerateInstallMutationSet,
-  findLockedInstallResources,
   getInstallMutationSet,
   installShimCandidates,
   probeInstallResourceLocks
@@ -82,6 +81,24 @@ describe('install mutation set', () => {
     }
   })
 
+  it("covers uv's default .venv layout, not a venv directory that does not exist", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-mutation-set-dotvenv-'))
+
+    try {
+      fs.mkdirSync(path.join(root, '.venv', 'Scripts'), { recursive: true })
+      fs.writeFileSync(path.join(root, '.venv', 'Scripts', 'hermes.exe'), 'x')
+      fs.mkdirSync(path.join(root, '.venv', 'Lib'), { recursive: true })
+      fs.writeFileSync(path.join(root, '.venv', 'Lib', 'b.pyd'), 'x')
+
+      const files = enumerateInstallMutationSet(root)
+
+      assert.ok(files.includes(path.join(root, '.venv', 'Lib', 'b.pyd')), files.join('\n'))
+      assert.equal(installShimCandidates(root)[0], path.join(root, '.venv', 'Scripts', 'hermes.exe'))
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('caches the enumeration for the TTL and re-reads after it', () => {
     const root = makeInstall()
 
@@ -125,17 +142,21 @@ describe('install mutation set', () => {
 
     const resources = ['C:\\i\\free.dll', 'C:\\i\\mapped.pyd', 'C:\\i\\gone.dll', 'C:\\i\\running.exe']
 
-    assert.deepEqual(findLockedInstallResources(resources, { fsImpl, platform: 'win32' }), [
-      'C:\\i\\mapped.pyd',
-      'C:\\i\\running.exe'
-    ])
+    assert.deepEqual(probeInstallResourceLocks(resources, { fsImpl, platform: 'win32' }), {
+      definite: ['C:\\i\\mapped.pyd', 'C:\\i\\running.exe'],
+      shared: []
+    })
 
     calls.length = 0
-    assert.deepEqual(findLockedInstallResources(resources, { fsImpl, platform: 'win32', limit: 1 }), [
-      'C:\\i\\mapped.pyd'
-    ])
+    // The release gate polls this every 300 ms while the install is locked:
+    // one definite lock is all the answer it needs, so it must stop there
+    // instead of paying an openSync for the whole ~270-file mutation set.
+    assert.deepEqual(probeInstallResourceLocks(resources, { fsImpl, platform: 'win32', limit: 1 }), {
+      definite: ['C:\\i\\mapped.pyd'],
+      shared: []
+    })
     assert.equal(calls.length, 2, 'stops probing once the limit is reached')
-    assert.deepEqual(findLockedInstallResources(resources, { fsImpl, platform: 'linux' }), [])
+    assert.deepEqual(probeInstallResourceLocks(resources, { fsImpl, platform: 'linux' }), { definite: [], shared: [] })
   })
 
   it('separates locked files shared through extra hard links, which a foreign venv can map without blocking our unlink', () => {
@@ -164,7 +185,6 @@ describe('install mutation set', () => {
       shared: [shared]
     })
     assert.deepEqual(stats, [shared, own], 'link counts are read only for files that refused the open')
-    assert.deepEqual(findLockedInstallResources([free, shared, own], { fsImpl, platform: 'win32' }), [own, shared])
     assert.deepEqual(probeInstallResourceLocks([shared, own], { fsImpl, platform: 'linux' }), { definite: [], shared: [] })
   })
 })
