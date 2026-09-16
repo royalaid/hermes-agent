@@ -92,18 +92,46 @@ export function suppressTranscriptForView(
     return state
   }
 
+  // The open clarify correlated to the active input request is the one held
+  // row that must stay actionable: hiding it leaves the session waiting on an
+  // answer the user cannot see. Only its clarify part survives, so unproven
+  // commentary in the same row stays hidden until REST authority lands.
+  const pendingClarifyMessage = state.needsInput
+    ? state.messages.find(message => message.id === state.streamId && message.role === 'assistant' && message.pending)
+    : undefined
+
+  const pendingClarifyPart = pendingClarifyMessage?.parts.findLast(
+    part => part.type === 'tool-call' && part.toolName === 'clarify' && part.result === undefined
+  )
+
+  const pendingClarify =
+    pendingClarifyMessage && pendingClarifyPart ? { ...pendingClarifyMessage, parts: [pendingClarifyPart] } : null
+
   if (cutoff.cutoffIds.size === 0) {
     // Fail-closed: the gate was armed before any cached row existed, so there
     // is no unproven prefix to hide selectively — everything stays off the
     // view until REST authority lands (#73646).
-    return { ...state, messages: [] }
+    return { ...state, messages: pendingClarify ? [pendingClarify] : [] }
   }
 
-  const messages = state.messages.filter(
-    message => !cutoff.cutoffIds.has(message.id) && !(cutoff.cutoffKeys?.has(transcriptRowContentKey(message)) ?? false)
-  )
+  let changed = false
+  const messages: ChatMessage[] = []
 
-  if (messages.length === state.messages.length) {
+  for (const message of state.messages) {
+    if (!cutoff.cutoffIds.has(message.id) && !(cutoff.cutoffKeys?.has(transcriptRowContentKey(message)) ?? false)) {
+      messages.push(message)
+
+      continue
+    }
+
+    changed = true
+
+    if (pendingClarify && message === pendingClarifyMessage) {
+      messages.push(pendingClarify)
+    }
+  }
+
+  if (!changed) {
     return state
   }
 
