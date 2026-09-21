@@ -163,7 +163,8 @@ def _detect_venv_python_processes(
             return []
         root = _m().PROJECT_ROOT
         exclude_pids = set(exclude_pids or set()) | _self_and_non_gateway_ancestor_pids(psutil)
-    kwargs = {} if _parent_by_pid is None else {"_parent_by_pid": _parent_by_pid}    try:
+    kwargs = {} if _parent_by_pid is None else {"_parent_by_pid": _parent_by_pid}
+    try:
         return _detect_target_venv_holders(root, exclude_pids=exclude_pids, strict=strict, **kwargs)
     except Exception:
         if strict:
