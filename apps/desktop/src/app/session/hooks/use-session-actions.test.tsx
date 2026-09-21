@@ -37,7 +37,8 @@ import {
 } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import { $routeTiles, closeRouteTile } from '@/store/route-tiles'
-import { clearAllPrompts, sessionApprovalRequest } from '@/store/prompts'import {
+import { clearAllPrompts, sessionApprovalRequest } from '@/store/prompts'
+import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
   $cronSessions,
