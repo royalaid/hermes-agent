@@ -19,8 +19,7 @@ import {
   CAPABILITIES_ROUTE,
   contributedRoutes,
   MESSAGING_ROUTE,
-  ROUTES_AREA,
-  SKILLS_ROUTE
+  ROUTES_AREA
 } from '../routes'
 
 import { paneMirror } from './pane-mirror'
