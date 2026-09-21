@@ -4441,7 +4441,6 @@ class GatewayTurnMixin:
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
             )
-            )
 
         # Progress sender drains BOTH tool-progress lines and thinking bubbles (needs_progress_queue).
         spawn = asyncio.create_task
