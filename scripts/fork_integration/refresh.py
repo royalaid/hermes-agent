@@ -487,7 +487,7 @@ MERGE_ASSERTIONS.update({
         "gateway/run_turn.py", contains=("claimed_event=claimed_event", "turn_ctx.claimed_event"),
     ),),
     "Merge PR #98456 route-test follow-up": (TreeAssertion(
-        "apps/desktop/src/app/routes.workspace-reveal.test.ts", contains=("import { host } from '@/sdk'", "host.navigate(SKILLS_ROUTE)"),
+        "apps/desktop/src/app/routes.workspace-reveal.test.ts", contains=("import { host } from '@/sdk'", "host.navigate(CAPABILITIES_ROUTE)"),
     ),),
 })
 PATCH_ASSERTIONS["fix(desktop): coordinate Windows updates through one authenticated marker"] = (
