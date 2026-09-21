@@ -240,7 +240,7 @@ export function resolvePosixScriptHandoff(
  * (the script claims the marker itself with its own $PID).
  */
 /* eslint-disable no-redeclare */
-export function wrapHandoffForDetachedConsole(handoff: UpdateScriptHandoff, extraArgs: string[]): { command: string; args: string[] }
+export function wrapHandoffForDetachedConsole(handoff: UpdateScriptHandoff, extraArgs: string[]): { command: string; args: string[]; detached: false }
 export function wrapHandoffForDetachedConsole(handoff: UpdateScriptHandoff, values: WindowsUpdateHandoffValues): DetachedWindowsHandoff
 
 export function wrapHandoffForDetachedConsole(
