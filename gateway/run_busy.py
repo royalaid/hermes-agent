@@ -1287,6 +1287,15 @@ class GatewayBusySessionMixin:
                 for key in self._SECURITY_METADATA_KEYS
             )
         )
+        # Only a photo burst (PHOTO on either side, the other side TEXT or PHOTO) merges into the
+        # head slot. Every other media follow-up — voice, audio, video, document — is an
+        # independent message and takes its own FIFO turn like text does; merging on *any*
+        # ``media_urls`` collapsed three voice notes into one turn (#114363). Telegram albums
+        # (``media_group_id``, photos and videos) are already coalesced by the adapter upstream.
+        merge_types = {
+            getattr(existing, "message_type", None),
+            getattr(event, "message_type", None),
+        }
         if (
             merge_media
             and same_security_context

@@ -956,6 +956,8 @@ function buildDesktopBackendEnvironment(options) {
     // buildDesktopBackendEnv still prepends Hermes-managed paths.
     hostPath: getWindowsHostPath()
   })
+}
+
 // #77311: `desktop.electron_flags` and the renderer heap ceiling
 // (`desktop.renderer_max_old_space_mb`) used to reach Chromium only through
 // the `hermes desktop` launcher's argv, so a packaged app opened from its
@@ -983,27 +985,6 @@ function buildDesktopBackendEnvironment(options) {
     )
   }
 
-}
-
-let windowsHostPath: string | undefined
-
-// Resolve once, only when a local backend needs an environment. Explorer-launched
-// apps can retain a login-time PATH after the registry changes.
-function getWindowsHostPath() {
-  if (windowsHostPath === undefined) {
-    windowsHostPath = IS_WINDOWS ? readWindowsHostPath() || '' : ''
-  }
-
-  return windowsHostPath
-}
-
-function buildDesktopBackendEnvironment(options) {
-  return buildDesktopBackendEnv({
-    ...options,
-    // Keep live host entries ahead of stale process extras, while
-    // buildDesktopBackendEnv still prepends Hermes-managed paths.
-    hostPath: getWindowsHostPath()
-  })
 }
 
 function pathWithHermesManagedNode(...entries) {
@@ -12871,25 +12852,6 @@ async function runPoolBackendStart(
   const outputTail = createBackendOutputTail()
   outputTail.attach(child)
 
-  // Start watching for the READY announcement BEFORE any await (#60323):
-  // stdout is already flowing into the tail, and Node streams never replay
-  // consumed chunks to late listeners — a sentinel printed while
-  // claimBackendChild runs would otherwise be lost forever, timing out a
-  // healthy backend. The tail-buffer accessor covers any residual gap.
-  const portAnnouncement = waitForDashboardPortAnnouncement(child, {
-    bufferedOutput: () => outputTail.text(),
-    describeOutputTail: () => outputTail.describe(),
-    readyFile
-  })
-
-  // Mark handled so an early rejection (child dies during the claim) can't
-  // surface as an unhandled rejection before the Promise.race below attaches.
-  portAnnouncement.catch(() => {})
-  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce, outputTail)
-  assertPoolEntryStillOwned(poolKey, entry, { releaseSlot: false })
-
-  child.stdout.on('data', rememberLog)
-  child.stderr.on('data', rememberLog)
   let ready = false
   let rejectStart = null
 

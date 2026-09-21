@@ -28,6 +28,7 @@ const {
   setSessionPinnedRemote,
   setSessionUnreadRemote
 } = await import('./sessions')
+
 const hermesApi = vi.mocked(client.hermesApi)
 
 beforeEach(() => {
