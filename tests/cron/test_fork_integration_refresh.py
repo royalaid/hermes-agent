@@ -641,9 +641,15 @@ def test_cron_adapter_publishes_debounced_candidate(tmp_path: Path, monkeypatch:
 
     assert stopped.value.code == 0
     assert captured[:6] == ["--repo", str(tmp_path / "hermes-agent"), "--upstream-cutoff-hour", "8", "--publish", "--check"]
-    assert json.loads(captured[6]) == [str(preferred),
-        "-m", "pytest", "tests/cron/test_fork_integration_refresh.py", "-q"]
-    assert captured[7:] == ["--wake-agent-on-failure"]
+    assert json.loads(captured[6]) == [
+        str(preferred),
+        str(tmp_path / "hermes-agent" / "scripts" / "fork_integration" / "syntax_gate.py"),
+        "--esbuild-root",
+        str(tmp_path / "hermes-agent"),
+    ]
+    assert captured[7] == "--check"
+    assert json.loads(captured[8]) == [str(preferred), "-m", "pytest", "tests/cron/test_fork_integration_refresh.py", "-q"]
+    assert captured[9:] == ["--wake-agent-on-failure"]
 
 
 def test_cron_adapter_uses_source_repo_without_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
