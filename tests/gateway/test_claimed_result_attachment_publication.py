@@ -186,6 +186,7 @@ async def test_queued_first_response_uses_current_claimed_attachment_snapshot():
         ),
         event_message_id=None,
         inbound_message_id="claimed-head",
+        mute_notification_reply=False,
         persist_user_display_kind=None,
         run_generation=1,
         session_key="agent:main:slack:channel:claimed-media",
