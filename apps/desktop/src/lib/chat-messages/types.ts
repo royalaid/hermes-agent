@@ -26,7 +26,10 @@ export interface TimelinePartMetadata {
   sourceRowId?: number
 }
 
-export type ChatMessagePart = Exclude<ThreadMessageLike['content'], string>[number] & TimelinePartMetadata
+export type ChatMessagePart = Exclude<ThreadMessageLike['content'], string>[number] &
+  TimelinePartMetadata & {
+    sourceId?: string
+  }
 
 export type ChatMessage = {
   id: string
@@ -117,6 +120,7 @@ export type GatewayEventPayload = {
   provider?: string
   reasoning_effort?: string
   reasoning_effort_wire?: string
+  reasoning_id?: string
   service_tier?: string
   fast?: boolean
   approval_mode?: string
