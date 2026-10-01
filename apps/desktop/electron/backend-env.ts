@@ -35,7 +35,7 @@ function pathEnvKey(env = process.env, platform = process.platform) {
   return Object.keys(env || {}).find(key => key.toUpperCase() === 'PATH') || 'PATH'
 }
 
-function appendUniquePathEntries(entries, { delimiter = path.delimiter } = {}) {
+function appendUniquePathEntries(entries, { delimiter = path.delimiter, caseInsensitive = false }: any = {}) {
   const seen = new Set()
   const ordered = []
 
@@ -47,11 +47,13 @@ function appendUniquePathEntries(entries, { delimiter = path.delimiter } = {}) {
     const parts = Array.isArray(entry) ? entry : String(entry).split(delimiter)
 
     for (const part of parts) {
-      if (!part || seen.has(part)) {
+      const comparisonKey = caseInsensitive ? part.toLowerCase() : part
+
+      if (!part || seen.has(comparisonKey)) {
         continue
       }
 
-      seen.add(part)
+      seen.add(comparisonKey)
       ordered.push(part)
     }
   }
@@ -244,6 +246,24 @@ function buildDesktopBackendEnv({
   }
 }
 
+// Apply the live registry PATH at spawn, after the selected backend's env has
+// been merged. This covers bundled, installed, and source backends without
+// replacing their PYTHONPATH or the managed-tool PATH composed by Python.
+function refreshDesktopBackendHostPath(env: NodeJS.ProcessEnv, hostPath: string | null, platform = process.platform) {
+  if (platform !== 'win32' || !hostPath) {
+    return env
+  }
+
+  const key = pathEnvKey(env, platform)
+
+  const merged = appendUniquePathEntries([hostPath, env[key] || ''], { delimiter: ';', caseInsensitive: true })
+
+  return {
+    ...env,
+    [key]: storeFirstPath(merged, { currentEnv: env, platform })
+  }
+}
+
 export {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
@@ -252,5 +272,6 @@ export {
   pathEnvKey,
   POSIX_SANE_PATH_ENTRIES,
   profileBackendParentEnv,
+  refreshDesktopBackendHostPath,
   storeFirstPath
 }
