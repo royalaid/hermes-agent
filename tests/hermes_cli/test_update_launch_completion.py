@@ -303,6 +303,30 @@ def test_relaunch_keeps_invocation_and_checkout_imports(tmp_path, mode):
     assert json.loads(result.stdout) == ["from checkout", argv[1:]]
 
 
+@pytest.mark.parametrize("module", ["hermes_cli.main", None])
+@pytest.mark.parametrize("action", ["run", "restart"])
+def test_managed_cli_relaunch_retains_gateway_process_identity(tmp_path, module, action):
+    from gateway.status import looks_like_gateway_runtime_command_line
+
+    root = tmp_path / "checkout with spaces"
+    script = root / "hermes_cli/main.py"
+    argv = [str(script), "gateway", action]
+    original = [sys.executable, "-u", "-m", "hermes_cli.main", *argv[1:]]
+    command = venv_sync.relaunch_command(Path(sys.executable), root, argv, original, module)
+
+    # Exercise the updater's real process recognizer, not a copy of launch logic.
+    assert looks_like_gateway_runtime_command_line(subprocess.list2cmdline(command))
+    assert command[1:3] == ["-u", "-I"]
+
+
+def test_inline_program_mentioning_gateway_keeps_its_own_identity(tmp_path):
+    from gateway.status import looks_like_gateway_runtime_command_line
+
+    original = [sys.executable, "-c", "print('gateway launcher')", "gateway", "run"]
+    command = venv_sync.relaunch_command(Path(sys.executable), tmp_path, ["-c", "gateway", "run"], original, None)
+    assert not looks_like_gateway_runtime_command_line(subprocess.list2cmdline(command))
+
+
 @pytest.mark.parametrize("owner,argv", [(None, []), ("external", []), ("electron-updater", []), ("self", ["-p", "coder", "pm", "repair"])])
 def test_non_self_or_pm_launch_cannot_trigger_update(tmp_path, monkeypatch, owner, argv):
     import pm

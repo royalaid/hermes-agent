@@ -8,10 +8,19 @@ Usage:
     hermes <cmd> --help        # Per-command help
 """
 
-# hermes_bootstrap must be the very first import — it sets up UTF-8 stdio on
+# hermes_bootstrap must be the first application import - it sets up UTF-8 stdio on
 # Windows (no-op on POSIX). Guarded: after a ``git pull`` / interrupted
 # ``hermes update`` the editable install's ``.pth`` may not list it yet; crashing
 # here would block ``hermes update``.
+import os
+import sys
+
+# Script-mode launches under -I need the checkout before the first Hermes import.
+# Keep the entrypoint visible in OS argv so gateway discovery can verify it.
+_bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _bootstrap_root not in sys.path:
+    sys.path.insert(0, _bootstrap_root)
+
 try:
     import hermes_bootstrap  # noqa: F401
 except ModuleNotFoundError as exc:
@@ -35,15 +44,8 @@ from hermes_cli._subprocess_compat import suppress_platform_ver_console
 
 suppress_platform_ver_console()
 
-import os
 import re
-import sys
 
-# Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
-# is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
-_bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
-if _bootstrap_root not in sys.path:
-    sys.path.insert(0, _bootstrap_root)
 from hermes_cli import _startup_fast  # noqa: E402
 
 # A literal ``~``/``$VAR`` in HERMES_HOME (fish, or any quoted value) must become absolute

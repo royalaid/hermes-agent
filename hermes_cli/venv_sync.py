@@ -540,6 +540,10 @@ def relaunch_command(
         if option in ("-W", "-X") and index < len(original):
             options.append(original[index])
             index += 1
+    # Gateway identity is validated from OS argv. An inline -c wrapper hides
+    # the real entrypoint and is correctly rejected as a possible launcher.
+    if module == "hermes_cli.main" or Path(argv[0]).absolute() == root / "hermes_cli/main.py":
+        return [str(python), *options, "-I", str(root / "hermes_cli/main.py"), *argv[1:]]
     prefix = f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
