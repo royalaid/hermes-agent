@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { latestSessionTodos } from '@/lib/todos'
 import { toolResultRecord } from '@/lib/tool-result-metadata'
 import type { SessionMessage } from '@/types/hermes'
 
@@ -10,6 +11,8 @@ import {
   chatMessageText,
   collectUnspokenTurnSpeech,
   completeOpenTimelineParts,
+  discardOpenClarifyToolCalls,
+  discardPendingClarifyToolCall,
   mergeFinalAssistantText,
   preserveLocalAssistantErrors,
   reasoningPart,
@@ -573,6 +576,86 @@ describe('toChatMessages', () => {
       expect(chatMessageText(message)).not.toContain('Visible response before the interruption')
       expect(chatMessageText(message)).not.toContain('Context from the interrupted assistant response')
     }
+  })
+
+  it('hides a legacy persisted todo snapshot without losing tool-backed task reconstruction', () => {
+    const snapshotHeader = '[Your active task list was preserved across context compression]'
+    const expectedTodos = [{ content: 'finish the task', id: 'task-1', status: 'in_progress' as const }]
+
+    const messages = toChatMessages([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            function: { arguments: JSON.stringify({ todos: expectedTodos }), name: 'todo' },
+            id: 'todo-1',
+            type: 'function'
+          }
+        ],
+        timestamp: 1
+      },
+      {
+        role: 'tool',
+        content: '[todo] updated task list',
+        timestamp: 2,
+        tool_call_id: 'todo-1',
+        tool_name: 'todo'
+      },
+      {
+        id: 277185,
+        role: 'user',
+        content: `${snapshotHeader}\n- [>] 1. finish the task (in_progress)`,
+        display_kind: null,
+        timestamp: 3
+      }
+    ])
+
+    expect(messages.map(chatMessageText).join('\n')).not.toContain(snapshotHeader)
+    expect(latestSessionTodos(messages)).toEqual(expectedTodos)
+  })
+
+  it('projects a typed composite todo carrier to only the real user turn', () => {
+    const snapshotHeader = '[Your active task list was preserved across context compression]'
+
+    const [message] = toChatMessages([
+      {
+        role: 'user',
+        content: `REAL ASK\n\n${snapshotHeader}\n- [>] 1. finish the task (in_progress)`,
+        display_metadata: {
+          todo_snapshot: {
+            todos: [{ content: 'finish the task', id: '1', status: 'in_progress' as const }]
+          }
+        },
+        timestamp: 1
+      }
+    ])
+
+    expect(chatMessageText(message)).toBe('REAL ASK')
+  })
+
+  it.each([
+    'What does [Your active task list was preserved across context compression] mean?',
+    'REAL ASK\n\n[Your active task list was preserved across context compression]\n- [ ] this is quoted prose'
+  ])('does not reclassify ordinary user prose resembling a todo snapshot', content => {
+    const [message] = toChatMessages([{ role: 'user', content, timestamp: 1 }])
+
+    expect(chatMessageText(message)).toBe(content)
+  })
+
+  it('does not truncate an untyped composite quote with a valid producer-shaped checklist', () => {
+    const content = [
+      'Please explain this:',
+      '',
+      '[Your active task list was preserved across context compression]',
+      '- [x] 1. finished parent (completed)',
+      '  - [>] 1.1. active child (in_progress)',
+      '- [ ] 2. next root (pending)',
+      '- [~] 3. cancelled root (cancelled)'
+    ].join('\n')
+    const [message] = toChatMessages([{ content, display_kind: null, role: 'user', timestamp: 1 }])
+
+    expect(chatMessageText(message)).toBe(content)
   })
 
   it('projects persisted composite compaction carriers to their live user turn', () => {
@@ -1656,6 +1739,195 @@ describe('stripPendingClarifyProjectionForCache', () => {
     const [cached] = stripPendingClarifyProjectionForCache(messages, 'req-1')
     expect(cached.pending).toBe(false)
     expect(cached.parts.map(part => part.type)).toEqual(['text', 'tool-call'])
+  })
+})
+
+describe('discardPendingClarifyToolCall', () => {
+  it('keeps one provider-authored row carrying a concurrent settled answer', () => {
+    const args = { choices: ['safe', 'fast'], question: 'Which path?' }
+
+    const messages: ChatMessage[] = [
+      {
+        id: 'provider',
+        role: 'assistant',
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-provider',
+            toolName: 'clarify',
+            args,
+            argsText: JSON.stringify(args)
+          }
+        ]
+      },
+      {
+        id: 'synthetic',
+        role: 'assistant',
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'req-answer',
+            toolName: 'clarify',
+            args,
+            argsText: JSON.stringify(args),
+            result: { question: 'Which path?', user_response: 'safe' }
+          }
+        ],
+        pending: false
+      }
+    ]
+
+    const reconciled = discardPendingClarifyToolCall(messages, { args, tool_id: 'req-answer' }, true)
+    const clarifyParts = reconciled.flatMap(message => message.parts).filter(part => part.type === 'tool-call')
+
+    expect(clarifyParts).toHaveLength(1)
+    expect(clarifyParts[0]).toMatchObject({
+      result: { question: 'Which path?', user_response: 'safe' },
+      toolCallId: 'call-provider'
+    })
+    expect(clarifyParts[0]).not.toMatchObject({ result: expect.objectContaining({ timed_out: true }) })
+  })
+
+  it('does not transplant an older identical clarification result onto the current open row', () => {
+    const args = { choices: ['safe', 'fast'], question: 'Which path?' }
+    const historicalResult = { question: 'Which path?', user_response: 'fast' }
+
+    const messages: ChatMessage[] = [
+      {
+        id: 'historical',
+        role: 'assistant',
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-historical',
+            toolName: 'clarify',
+            args,
+            argsText: JSON.stringify(args),
+            result: historicalResult
+          }
+        ]
+      },
+      {
+        id: 'current-provider',
+        role: 'assistant',
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-current-provider',
+            toolName: 'clarify',
+            args,
+            argsText: JSON.stringify(args)
+          }
+        ]
+      }
+    ]
+
+    const reconciled = discardPendingClarifyToolCall(messages, { args, tool_id: 'req-current' }, true)
+
+    expect(reconciled).toEqual([messages[0]])
+    expect(reconciled[0].parts[0]).toMatchObject({
+      result: historicalResult,
+      toolCallId: 'call-historical'
+    })
+  })
+
+  it('transfers an exact settled result only to an earlier provider row', () => {
+    const args = { choices: ['same'], question: 'Repeated question?' }
+    const answer = { question: 'Repeated question?', user_response: 'same' }
+
+    const messages: ChatMessage[] = [
+      {
+        id: 'provider-old',
+        role: 'assistant',
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-provider-old',
+            toolName: 'clarify',
+            args,
+            argsText: JSON.stringify(args)
+          }
+        ]
+      },
+      {
+        id: 'settled-exact',
+        role: 'assistant',
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'req-old',
+            toolName: 'clarify',
+            args,
+            argsText: JSON.stringify(args),
+            result: answer
+          }
+        ]
+      },
+      {
+        id: 'newer-open',
+        role: 'assistant',
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'req-newer',
+            toolName: 'clarify',
+            args,
+            argsText: JSON.stringify(args)
+          }
+        ]
+      }
+    ]
+
+    const reconciled = discardPendingClarifyToolCall(messages, { args, tool_id: 'req-old' }, true)
+    const clarifyParts = reconciled.flatMap(message => message.parts).filter(part => part.type === 'tool-call')
+
+    expect(clarifyParts).toHaveLength(2)
+    expect(clarifyParts.find(part => part.toolCallId === 'call-provider-old')).toMatchObject({
+      result: answer,
+      toolCallId: 'call-provider-old'
+    })
+    expect(clarifyParts.find(part => part.toolCallId === 'req-newer')).not.toHaveProperty('result')
+    expect(clarifyParts).not.toEqual(expect.arrayContaining([expect.objectContaining({ toolCallId: 'req-old' })]))
+  })
+
+  it('removes every open clarify while preserving settled history and unrelated parts', () => {
+    const args = { choices: ['same'], question: 'Repeated question?' }
+
+    const settled = {
+      type: 'tool-call' as const,
+      toolCallId: 'call-settled',
+      toolName: 'clarify',
+      args,
+      argsText: JSON.stringify(args),
+      result: { question: 'Repeated question?', user_response: 'same' }
+    }
+
+    const textPart = { type: 'text' as const, text: 'Still running.' }
+
+    const messages: ChatMessage[] = [
+      { id: 'history', role: 'assistant', parts: [settled] },
+      {
+        id: 'mixed',
+        role: 'assistant',
+        parts: [
+          textPart,
+          {
+            type: 'tool-call',
+            toolCallId: 'req-open',
+            toolName: 'clarify',
+            args,
+            argsText: JSON.stringify(args)
+          }
+        ],
+        pending: true
+      }
+    ]
+
+    const filtered = discardOpenClarifyToolCalls(messages)
+
+    expect(filtered).toHaveLength(2)
+    expect(filtered[0].parts).toEqual([settled])
+    expect(filtered[1].parts).toEqual([textPart])
   })
 })
 
