@@ -73,7 +73,7 @@ import { dashboardFallbackArgs, serveBackendArgs } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { BackendDialClaims } from './backend-dial-claim'
 import type { HostBackendRecord } from './backend-discovery'
-import { buildDesktopBackendEnv, profileBackendParentEnv } from './backend-env'
+import { buildDesktopBackendEnv, profileBackendParentEnv, refreshDesktopBackendHostPath } from './backend-env'
 import { createBackendExitRecoveryLatch } from './backend-exit-recovery'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
@@ -280,7 +280,7 @@ import { resolveGatewayVersion } from './gateway-version'
 import { probeGatewayWebSocket, spawnedBackendProbeOptions } from './gateway-ws-probe'
 import { windowsGitCandidates } from './git-binary-candidates'
 import { registerGitIpc } from './git-ipc'
-import { desktopBackendSpawnEnv, guestOnboardingEnabled } from './guest-onboarding'
+import { desktopBackendSpawnEnv as baseDesktopBackendSpawnEnv, guestOnboardingEnabled } from './guest-onboarding'
 import { readAndConsumeHandoffResult } from './handoff-result'
 import {
   assertExistingPathForOpen,
@@ -692,7 +692,7 @@ import {
   shouldSurfaceErrorForRendererStackCookieCrashLoop,
   writeGpuStackCookieMarker
 } from './windows-stack-cookie-fallback'
-import { readWindowsUserEnvVar } from './windows-user-env'
+import { readWindowsHostPath, readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
@@ -1305,6 +1305,24 @@ let desktopSshPathOverride = ''
       `[hermes] desktop launch switch from config.yaml: --${planned.name}${planned.value === undefined ? '' : `=${planned.value}`}`
     )
   }
+}
+
+let windowsHostPath: string | undefined
+
+// Resolve once, only when a local backend is spawned. Explorer-launched apps
+// can retain a login-time PATH after the registry changes.
+function getWindowsHostPath() {
+  if (windowsHostPath === undefined) {
+    windowsHostPath = IS_WINDOWS ? readWindowsHostPath() || '' : ''
+  }
+
+  return windowsHostPath
+}
+
+// Both primary and pooled local backends use this spawn boundary, regardless
+// of whether their runtime is bundled, installed, or sourced from a checkout.
+function desktopBackendSpawnEnv(base: NodeJS.ProcessEnv, guestOnboarding: boolean): NodeJS.ProcessEnv {
+  return refreshDesktopBackendHostPath(baseDesktopBackendSpawnEnv(base, guestOnboarding), getWindowsHostPath())
 }
 
 // ACTIVE_HERMES_ROOT — the canonical mutable Hermes install. Same path
