@@ -26,6 +26,8 @@ export {
 } from './reconciliation'
 export {
   QUESTION_CARD_TOOLS,
+  discardOpenClarifyToolCalls,
+  discardPendingClarifyToolCall,
   restorePendingBlockingToolCall,
   restorePendingClarifyToolCall,
   sealOpenToolParts,
