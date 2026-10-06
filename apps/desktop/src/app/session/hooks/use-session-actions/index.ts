@@ -214,6 +214,7 @@ import {
   resolveSessionProfile,
   resolveStoredSession,
   restoreListedSession,
+  runningProjectionStreamId,
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -2011,6 +2012,7 @@ export function useSessionActions({
                 return {
                   ...state,
                   messages,
+                  streamId: state.busy ? (runningProjectionStreamId(messages, true) ?? state.streamId) : null,
                   transcriptProvenance:
                     acceptedPersistedDisplayTranscript || hasValidProvenance
                       ? (expectedProvenance ?? undefined)
@@ -2493,6 +2495,9 @@ export function useSessionActions({
             messages: visibleMessagesForView,
             transcriptProvenance,
             busy: resumedRunning,
+            streamId: resumedRunning
+              ? (runningProjectionStreamId(visibleMessagesForView, true) ?? state.streamId)
+              : null,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.
             turnLive: state.turnLive || resumedRunning,
@@ -2516,7 +2521,11 @@ export function useSessionActions({
             ...livePromptStreamId(pendingConnectionProjection, pendingClarifyProjection),
             ...(clearedClarifyProjection
               ? {
-                  streamId: resumedRunning ? (clearedClarifyProjection.streamId ?? state.streamId) : null
+                  streamId: resumedRunning
+                    ? (clearedClarifyProjection.streamId ??
+                      runningProjectionStreamId(visibleMessagesForView, true) ??
+                      state.streamId)
+                    : null
                 }
               : {})
           }),

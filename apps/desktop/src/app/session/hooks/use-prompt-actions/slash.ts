@@ -1,8 +1,8 @@
 import { skillInvocationText } from '@hermes/shared'
 import { parseCommandDispatch, parseSlashCommand } from '@hermes/shared'
 import { type MutableRefObject, useCallback, useRef } from 'react'
+import { mergeCompressedTranscript } from './compaction-transcript'
 
-import { mergeOlderTranscriptPage } from '@/app/chat/transcript-backfill'
 import { prepareDefaultNewSession } from '@/app/session/new-session-route'
 import { invalidateContextBreakdown } from '@/app/shell/hooks/use-context-breakdown'
 import { getProfiles } from '@/hermes'
@@ -790,10 +790,13 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             if (Array.isArray(result?.messages)) {
               updateSessionState(
                 sessionId,
-                state => ({
-                  ...state,
-                  messages: mergeOlderTranscriptPage(toChatMessages(result.messages!), state.messages)
-                }),
+                state => {
+                  const active = toChatMessages(result.messages!)
+                  return {
+                    ...state,
+                    messages: mergeCompressedTranscript(active, state.messages)
+                  }
+                },
                 storedSessionId
               )
             }

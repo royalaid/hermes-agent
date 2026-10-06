@@ -91,6 +91,30 @@ function renderTile(
 }
 
 describe('useSessionTileDelegate resumeTile', () => {
+  it('adopts the running assistant and accepted queue on a newly opened tile', async () => {
+    setSessions([row({ id: 'stored-live', profile: 'ai-engineer' })])
+    const response = {
+      session_id: 'runtime-live', session_key: 'stored-live', running: true, info: {},
+      messages: [], inflight: { user: 'Active question', assistant: '', streaming: true },
+      queued: { user: 'Accepted next question' }
+    }
+    vi.mocked(requestGatewayForProfile).mockResolvedValueOnce(response as never)
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce({ messages: [], session_id: 'stored-live' } as never)
+    const requestGateway = vi.fn(async () => response)
+    let resumedState: ClientSessionState | undefined
+    renderTile(requestGateway, {
+      updateSessionState: vi.fn((_sid, update) => {
+        resumedState = update(createClientSessionState('stored-live'))
+        return resumedState
+      })
+    })
+    await sessionTileDelegate()!.resumeTile('stored-live')
+    expect(resumedState?.messages.slice(-2).map(message => message.id)).toEqual([
+      'assistant-stream-runtime-live', 'user-queued-runtime-live'
+    ])
+    expect(resumedState?.streamId).toBe('assistant-stream-runtime-live')
+    expect(resumedState?.busy).toBe(true)
+  })
   beforeEach(() => {
     setSessions([])
     $sessionTiles.set([])
