@@ -20,6 +20,7 @@ import {
   $selectedStoredSessionId,
   $workspaceCwdOwner,
   setCurrentCwd,
+  _resetSessionOwnerHintsForTests,
   setSessionOwnerHint,
   setSessions,
   setUnlistedSessionOwnerRows
@@ -48,6 +49,7 @@ import {
   openSessionTile,
   orderTilesByTree,
   patchSessionTile,
+  prepareSessionOwnerRetarget,
   recordSessionEventScope,
   rekeySessionTile,
   releaseSessionTranscript,
@@ -63,6 +65,47 @@ import {
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
+
+describe('prepareSessionOwnerRetarget', () => {
+  const ownerA = { connectionId: 'source-a', profile: 'profile-a' }
+  const ownerB = { connectionId: 'source-b', profile: 'profile-b' }
+
+  afterEach(() => {
+    _resetSessionOwnerHintsForTests()
+    clearAllSessionStates()
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+    $sessionTiles.set([])
+  })
+
+  it('detaches a same-id main surface before opening a different owner in a tab', () => {
+    const invalidateRuntimeBinding = vi.fn(() => 'runtime-a')
+    setSessionTileDelegate({ invalidateRuntimeBinding } as unknown as SessionTileDelegate)
+    setSessionOwnerHint('shared-id', ownerA)
+    $selectedStoredSessionId.set('shared-id')
+    $activeSessionId.set('runtime-a')
+    prepareSessionOwnerRetarget('shared-id', ownerA, true)
+
+    expect(prepareSessionOwnerRetarget('shared-id', ownerB, false)).toBe(true)
+    expect(invalidateRuntimeBinding).toHaveBeenCalledWith('shared-id')
+    expect($selectedStoredSessionId.get()).toBeNull()
+    expect($activeSessionId.get()).toBeNull()
+  })
+
+  it('retires an exact runtime before reopening the same id on the ambient owner', () => {
+    const invalidateRuntimeBinding = vi.fn(() => 'runtime-a')
+    setSessionTileDelegate({ invalidateRuntimeBinding } as unknown as SessionTileDelegate)
+    setSessionOwnerHint('shared-id', ownerA)
+    $selectedStoredSessionId.set('shared-id')
+    $activeSessionId.set('runtime-a')
+    prepareSessionOwnerRetarget('shared-id', ownerA, true)
+
+    expect(prepareSessionOwnerRetarget('shared-id', undefined, true)).toBe(true)
+    expect(invalidateRuntimeBinding).toHaveBeenCalledWith('shared-id')
+    expect($selectedStoredSessionId.get()).toBe('shared-id')
+    expect($activeSessionId.get()).toBeNull()
+  })
+})
 
 describe('foregroundSessionScopes', () => {
   beforeEach(() => {
@@ -539,6 +582,15 @@ describe('SessionTile workspace scope', () => {
     expect($sessionTiles.get()[0]).not.toHaveProperty('workspaceOwnerKey', scope.workspaceOwnerKey)
   })
 
+  it('keeps an exact Sessions owner when a later same-mode open has no route', () => {
+    const ownerRoute = { connectionId: 'source-b', profile: 'profile-b' }
+
+    openSessionTile('chat', 'center', undefined, undefined, { ownerRoute, workspaceMode: 'sessions' })
+
+    expect(setSessionTileWorkspaceScope('chat', { workspaceMode: 'sessions' })).toBe(false)
+    expect($sessionTiles.get()[0]?.ownerRoute).toEqual(ownerRoute)
+  })
+
   it('preserves workspace scope while dropping a stale runtime binding', () => {
     $sessionTiles.set([
       {
@@ -793,6 +845,29 @@ describe('dropTilesForProfile', () => {
     $selectedStoredSessionId.set(null)
     $sessionTiles.set([])
   })
+  it('normalizes a connectionless legacy persisted route to the safe legacy owner representation', async () => {
+    window.localStorage.setItem(
+      TILES_KEY,
+      JSON.stringify({
+        default: [
+          {
+            storedSessionId: 'legacy-session',
+            ownerRoute: { profile: 'legacy-profile' },
+            workspaceMode: 'sessions'
+          }
+        ]
+      })
+    )
+    vi.resetModules()
+    mod = await import('@/store/session-states')
+    const profile = await import('@/store/profile')
+    profile.$activeGatewayProfile.set('default')
+
+    expect(mod.$sessionTiles.get()).toEqual([
+      expect.objectContaining({ storedSessionId: 'legacy-session', ownerRoute: undefined })
+    ])
+  })
+
   it("drops the deleted profile's persisted session tiles from memory and storage", () => {
     activeGatewayProfile.set('worker')
     mod.openSessionTile('worker-session-1')
