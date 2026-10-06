@@ -73,12 +73,12 @@ describe('clearActiveSessionTodos (turn-end cleanup)', () => {
     vi.useRealTimers()
   })
 
-  it('drops a still-active list when the turn has ended', () => {
+  it('keeps remaining work when the turn has ended', () => {
     setSessionTodos('s1', [todo('a', 'completed'), todo('b', 'in_progress')])
 
     clearActiveSessionTodos('s1')
 
-    expect($todosBySession.get().s1).toBeUndefined()
+    expect($todosBySession.get().s1).toEqual([todo('a', 'completed'), todo('b', 'in_progress')])
   })
 
   it('leaves a finished list to its normal linger instead of clearing immediately', () => {
@@ -103,10 +103,10 @@ describe('clearActiveSessionTodos (turn-end cleanup)', () => {
   })
 })
 
-describe('todosForHydration (stale-active guard on restore)', () => {
-  it('does not restore an active list (stale after a completed turn)', () => {
-    expect(todosForHydration([todo('a', 'completed'), todo('b', 'in_progress')])).toBeNull()
-    expect(todosForHydration([todo('a', 'pending')])).toBeNull()
+describe('todosForHydration (canonical remaining work)', () => {
+  it('restores unfinished rows without claiming their turn is live', () => {
+    expect(todosForHydration([todo('a', 'completed'), todo('b', 'in_progress')])).toEqual([todo('a', 'completed'), todo('b', 'in_progress')])
+    expect(todosForHydration([todo('a', 'pending')])).toEqual([todo('a', 'pending')])
   })
 
   it('restores a finished list so its linger shows the final checkmarks', () => {
@@ -139,11 +139,11 @@ describe('revisioned snapshots', () => {
     expect($todoRevisionsBySession.get().s1).toBe(5)
   })
 
-  it('restores an active snapshot only while the session is running', () => {
+  it('restores an unfinished snapshot whether its turn is running or paused', () => {
     const snapshot = { revision: 7, todos: [todo('active', 'in_progress')] }
 
     restoreSessionTodosFromSnapshot('s1', snapshot, false)
-    expect($todosBySession.get().s1).toBeUndefined()
+    expect($todosBySession.get().s1).toEqual(snapshot.todos)
 
     restoreSessionTodosFromSnapshot('s1', snapshot, true)
     expect($todosBySession.get().s1?.[0]?.id).toBe('active')
@@ -153,7 +153,7 @@ describe('revisioned snapshots', () => {
     const saved = [todo('a', 'completed'), todo('b', 'in_progress')]
     restoreSessionTodosFromSnapshot('s1', { revision: 7, todos: saved }, false)
 
-    expect($todosBySession.get().s1).toBeUndefined()
+    expect($todosBySession.get().s1).toEqual(saved)
     expect($retainedTodosBySession.get().s1).toEqual(saved)
 
     restoreSessionTodosFromSnapshot('s1', { revision: 6, todos: [todo('old', 'pending')] }, false)

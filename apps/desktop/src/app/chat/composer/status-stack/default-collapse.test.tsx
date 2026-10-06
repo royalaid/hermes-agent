@@ -43,7 +43,7 @@ afterEach(() => {
   clearSessionTodos('owner')
 })
 
-it('offers a collapsed read-only checklist from an idle session, without a running spinner', () => {
+it('offers remaining work from an idle session without a running spinner', () => {
   restoreSessionTodosFromSnapshot(
     'owner',
     {
@@ -57,10 +57,8 @@ it('offers a collapsed read-only checklist from an idle session, without a runni
   )
   render(stack())
 
-  const review = screen.getByRole('button', { name: /Previous tasks 1\/2/ })
-  expect(review.getAttribute('aria-expanded')).toBe('false')
-  expect(screen.queryByText('Still open')).toBeNull()
-  fireEvent.click(review)
+  const review = screen.getByRole('button', { name: /Tasks 1\/2/ })
+  expect(review.getAttribute('aria-expanded')).toBe('true')
   expect(screen.getByText('Still open')).toBeTruthy()
   expect(screen.queryByLabelText('Running')).toBeNull()
 })

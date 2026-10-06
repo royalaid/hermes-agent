@@ -156,10 +156,10 @@ const subToItem = (s: SubagentProgress): ComposerStatusItem => ({
   type: 'subagent'
 })
 
-const todoToItem = (t: TodoItem, depth: number): ComposerStatusItem => ({
+const todoToItem = (t: TodoItem, depth: number, turnLive: boolean): ComposerStatusItem => ({
   depth,
   id: `todo:${t.id}`,
-  state: t.status === 'in_progress' ? 'running' : 'done',
+  state: turnLive && t.status === 'in_progress' ? 'running' : 'done',
   title: t.content,
   todoStatus: t.status,
   type: 'todo'
@@ -210,8 +210,8 @@ const stabilizeItems = (prev: ComposerStatusItem[] | undefined, next: ComposerSt
 let prevStatusItems: Record<string, ComposerStatusItem[]> = {}
 
 export const $statusItemsBySession = computed(
-  [$goalsBySession, $subagentsBySession, $backgroundStatusBySession, $todosBySession],
-  (goals, subs, background, todos) => {
+  [$goalsBySession, $subagentsBySession, $backgroundStatusBySession, $todosBySession, $sessionStates],
+  (goals, subs, background, todos, states) => {
     const out: Record<string, ComposerStatusItem[]> = {}
 
     const push = (sid: string, items: ComposerStatusItem[]) => {
@@ -223,7 +223,7 @@ export const $statusItemsBySession = computed(
     for (const [sid, list] of Object.entries(todos)) {
       push(
         sid,
-        todoTree(list).map(([t, depth]) => todoToItem(t, depth))
+        todoTree(list).map(([t, depth]) => todoToItem(t, depth, Boolean(states[sid]?.busy && states[sid]?.turnLive)))
       )
     }
 

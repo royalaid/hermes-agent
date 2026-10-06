@@ -8,13 +8,12 @@ import { $sessions, lineageAliases } from './session'
 import { $sessionStates } from './session-states'
 
 /**
- * Live todo list per runtime session, rendered by the composer status stack
+ * Current plan per runtime session, rendered by the composer status stack
  * (the inline transcript panel is gone). Fed from two places:
  *
  * - live `todo` tool events (use-message-stream)
- * - stored-session hydration (desktop-controller) — but only when the list is
- *   still in flight, so reopening an old chat doesn't pin its finished plan
- *   above the composer forever.
+ * - stored-session hydration from canonical history. Remaining work survives
+ *   turn end; the session's confirmed turn state owns execution indicators.
  */
 export const $todosBySession = atom<Record<string, TodoItem[]>>({})
 export const $todoRevisionsBySession = atom<Record<string, number>>({})
@@ -55,15 +54,10 @@ export const $todoProgressBySession = computed(
   }
 )
 
-// Decide which todo list to restore when rehydrating a session from stored
-// history. Rehydration runs *after* a turn completes, so an active list (last
-// item still pending/in_progress) is stale — the turn ended without a final
-// `todo` update — and must NOT be re-pinned (that would undo the turn-end
-// clear and, because it's read back from history, resurrect on restart). Only
-// a finished list is restored, so its short linger shows the last checkmark.
-// Returns null when there's nothing to restore (caller should clear).
+// A plan's unfinished rows are remaining work, not evidence of a live turn.
+// Restore canonical history without manufacturing execution liveness.
 export function todosForHydration(todos: readonly TodoItem[] | null): TodoItem[] | null {
-  return todos && !todoListActive(todos) ? [...todos] : null
+  return todos ? [...todos] : null
 }
 
 // Once a list finishes (every item completed/cancelled), the final state
@@ -169,11 +163,8 @@ export function clearAllSessionTodos() {
   }
 }
 
-// Drop a still-active todo list (any pending/in_progress item) — used at turn
-// end, when an unfinished list means the turn stopped without a final `todo`
-// update, so the "Tasks N/M" panel would otherwise stay pinned above the
-// composer forever. A finished list is left untouched so its short linger
-// still shows the last checkmark landing.
+// Turn end retires execution, not the remaining plan. Preserve unfinished rows
+// for later review; finished lists retain their normal short linger.
 export function clearActiveSessionTodos(sid: string) {
   const todos = getSessionTodos($todosBySession.get(), sid)
 
@@ -181,12 +172,11 @@ export function clearActiveSessionTodos(sid: string) {
     return
   }
 
-  dropSessionTodos(sid, false)
+  retainSessionTodos(sid, todos)
 }
 
-/** Apply a session.resume/activate or todo.updated full snapshot. Idle
- * sessions keep the existing stale-active guard; running sessions restore the
- * active plan because the backend has proved that turn is still live. */
+/** Apply a session.resume/activate or todo.updated full snapshot. The channel's
+ * revisioned authority outranks an unversioned display-page fallback. */
 export function restoreSessionTodosFromSnapshot(sid: string, snapshot: unknown, running: boolean) {
   const todos = parseTodos(snapshot)
 
@@ -195,6 +185,9 @@ export function restoreSessionTodosFromSnapshot(sid: string, snapshot: unknown, 
   }
 
   const revision = parseTodoRevision(snapshot)
+  if (revision == null && Object.hasOwn($todoRevisionsBySession.get(), sid)) {
+    return
+  }
 
   // An unused store serializes as {todos: [], revision: 0}. That is not a
   // real snapshot. Applying it would stamp watermark 0 and leave an empty
@@ -207,11 +200,5 @@ export function restoreSessionTodosFromSnapshot(sid: string, snapshot: unknown, 
 
   if (visible !== null) {
     setSessionTodos(sid, visible, revision)
-  } else if (acceptRevision(sid, revision)) {
-    if (revision != null) {
-      retainSessionTodos(sid, todos)
-    }
-
-    dropSessionTodos(sid, false)
   }
 }

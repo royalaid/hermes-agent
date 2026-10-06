@@ -36,6 +36,7 @@ import {
   sessionTileOwnerRoute,
   setSessionTileDelegate
 } from '@/store/session-states'
+import { restoreSessionTodosFromSnapshot } from '@/store/todos'
 import type { SessionResumeResult } from '@/types/hermes'
 
 import { refreshCronRunWriteGate } from '../../cron/open-cron-run'
@@ -546,6 +547,7 @@ export function useSessionTileDelegate({
                 // The deferred build reports the session's own effort later (#79807).
                 ...markReasoningEffortPending(state),
                 busy: running,
+                turnLive: state.turnLive || running,
                 adoptedRunningTurn: state.adoptedRunningTurn || running,
                 streamId,
                 // Persist the session's own model/provider from resume so the tile
@@ -565,6 +567,7 @@ export function useSessionTileDelegate({
             storedSessionId
           )
 
+          restoreSessionTodosFromSnapshot(runtimeId, resumed.todo_state, running)
           return runtimeId
         })()
 
