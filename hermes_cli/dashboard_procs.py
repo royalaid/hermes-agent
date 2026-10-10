@@ -641,21 +641,21 @@ def _kill_stale_dashboard_processes(
     def _launchd_owner(pid: int, cmdline: list[str] | None):
         return _dash._launchd_job_owning_backend(pid, cmdline, launchd_jobs, ancestors=_process_ancestors(pid))
 
-    if restart_managed and sys.platform != "win32":
+    if restart_managed:
         for pid in pids:
-            pid_cgroup[pid] = _dash._get_pid_cgroup_path(pid)
-            pid_service[pid] = _dash._get_systemd_service_for_pid(pid)
-            if pid_service[pid]:
+            if sys.platform != "win32":
+                pid_cgroup[pid] = _dash._get_pid_cgroup_path(pid)
+                pid_service[pid] = _dash._get_systemd_service_for_pid(pid)
+            if pid_service.get(pid):
                 continue
             cmdline = _dash._dashboard_cmdline_for_pid(pid)
             if launchd_jobs and (job := _launchd_owner(pid, cmdline)):
                 pid_launchd[pid] = job
             elif cmdline:
-                # Manual process: exact argv + HERMES_HOME for the respawn and its profile cap.
-                # Manually-started process: preserve its exact argv so we can respawn it after the update
-                # (#40449, #68934). Snapshot HERMES_HOME before the kill so per-profile caps still work
-                # after the process is gone (#78821).
-                pid_cmdline[pid] = cmdline
+                # Keep only Hermes arguments: a Windows venv worker names the base Python,
+                # and an update may retire the old interpreter or launcher on any platform.
+                # Snapshot HERMES_HOME before the kill for the existing profile/foreign-home cap.
+                pid_cmdline[pid] = list(_normalize_dashboard_cmdline(cmdline))
                 pid_home[pid] = _hermes_home_for_pid(pid)
         if already_restarted_units:
             pids = [pid for pid in pids if (pid_service.get(pid) or "").removesuffix(".service")

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -253,6 +254,42 @@ class TestKillStaleDashboardWindows:
     """Kill path on Windows: taskkill /F."""
 
     @pytest.mark.platforms("windows")
+    def test_update_captures_fixed_port_backend_before_stopping(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        argv = [sys.executable, "-m", "hermes_cli.main", "serve", "--port", "9119"]
+        captured = []
+
+        def capture(pid):
+            captured.append(pid)
+            return argv
+
+        def stop(pids, killed, failed):
+            assert captured == pids
+            killed.extend(pids)
+
+        with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
+             patch.object(main_dashboard, "_find_stale_dashboard_pids", return_value=[6001]), \
+             patch.object(main_dashboard, "_dashboard_cmdline_for_pid", side_effect=capture), \
+             patch.object(dashboard_procs, "_hermes_home_for_pid", return_value=str(tmp_path)), \
+             patch.object(dashboard_procs, "_kill_pids_windows", side_effect=stop), \
+             patch.object(main_dashboard, "_respawn_dashboard_processes", return_value=[]) as respawn:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        respawn.assert_called_once_with([list(dashboard_procs._normalize_dashboard_cmdline(argv))])
+        assert result["unrecovered"] == []
+
+    @pytest.mark.platforms("windows")
+    def test_windows_cmdline_capture_preserves_argument_boundaries(self):
+        import psutil
+
+        argv = [sys.executable, "C:\\path with spaces\\main.py", "serve", "--port", "9119"]
+        with patch.object(psutil, "Process") as process:
+            process.return_value.cmdline.return_value = argv
+            assert main_dashboard._dashboard_cmdline_for_pid(6001) == argv
+            process.return_value.cmdline.side_effect = psutil.AccessDenied(6001)
+            assert main_dashboard._dashboard_cmdline_for_pid(6001) is None
+
+    @pytest.mark.platforms("windows")
     def test_taskkill_invoked_for_each_pid(self, capsys):
         """``platforms("windows")``: ``taskkill.exe`` only exists on Windows, and the
         faked platform also silently skipped the POSIX-only cgroup/argv
@@ -398,7 +435,7 @@ class TestSupervisedBackendRestart:
             respawn.assert_not_called()
         else:
             assert restarts == [], f"restarted a unit that does not supervise the dashboard: {restarts}"
-            respawn.assert_called_once_with([argv])
+            respawn.assert_called_once_with([list(dashboard_procs._normalize_dashboard_cmdline(argv))])
         assert result["unrecovered"] == []
 
 
@@ -452,7 +489,7 @@ class TestManualBackendRespawn:
              patch("time.sleep"):
             _kill_stale_dashboard_processes(restart_managed=True)
 
-        respawn.assert_called_once_with([argv])
+        respawn.assert_called_once_with([list(dashboard_procs._normalize_dashboard_cmdline(argv))])
         assert "when you're ready" not in capsys.readouterr().out
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX cmdline capture + respawn")
@@ -492,24 +529,31 @@ class TestManualBackendRespawn:
         live = self._live()
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         spawned: list[list[str]] = []
+        launch_kwargs: list[dict] = []
 
         class _FakePopen:
             def __init__(self, cmd, **kwargs):
                 spawned.append(list(cmd))
+                launch_kwargs.append(kwargs)
 
             def poll(self):
                 return None
 
         with patch.object(live.subprocess, "Popen", _FakePopen), \
-             patch.object(live.time, "sleep"):
+             patch.object(live, "_wait_for_dashboard_restore", return_value=None):
             failed = live._respawn_dashboard_processes([
                 ["hermes", "dashboard", "--port", "8300"],
                 ["hermes", "serve", "--host", "0.0.0.0"],
             ])
 
         assert failed == []
-        assert spawned[0] == ["hermes", "dashboard", "--port", "8300", "--no-open"]
-        assert spawned[1] == ["hermes", "serve", "--host", "0.0.0.0"]
+        assert list(dashboard_procs._normalize_dashboard_cmdline(spawned[0])) == ["dashboard", "--port", "8300", "--no-open"]
+        assert list(dashboard_procs._normalize_dashboard_cmdline(spawned[1])) == ["serve", "--host", "0.0.0.0"]
+        if sys.platform == "win32":
+            assert all(kw["creationflags"] & subprocess.CREATE_NO_WINDOW for kw in launch_kwargs)
+            assert all(kw["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP for kw in launch_kwargs)
+        else:
+            assert all(kw["start_new_session"] for kw in launch_kwargs)
 
     def test_respawn_failure_returned(self, tmp_path, monkeypatch, capsys):
         live = self._live()
@@ -544,7 +588,7 @@ class TestManualBackendRespawn:
         from hermes_cli._launchers import runtime_command
 
         with patch.object(live.subprocess, "Popen", _FakePopen), \
-             patch.object(live.time, "sleep"), \
+             patch.object(live, "_wait_for_dashboard_restore", return_value=None), \
              patch.object(_launchers, "resolve_store_python", return_value=None):
             failed = live._respawn_dashboard_processes([captured])
             expected = runtime_command(Path(live.__file__).resolve().parents[1], captured[2:])
@@ -577,6 +621,7 @@ class TestManualBackendRespawn:
         assert failed == [["hermes", "dashboard", "--port", "8300"]]
         assert "✓ restarted" not in out
         assert "✗ failed to restart" in out
+        assert "code 1" in out
 
 
 class TestFilterDashboardRespawnCandidates:
@@ -916,7 +961,7 @@ class TestLaunchdSupervisedBackends:
         other = ("gui/501", "ai.hermes.other", ["hermes", "dashboard", "--port", "8300"], 777)
         result, restart, respawn = self._run(9104, [other])
         restart.assert_not_called()
-        respawn.assert_called_once_with([list(self.ARGV)])
+        respawn.assert_called_once_with([list(dashboard_procs._normalize_dashboard_cmdline(self.ARGV))])
         assert result["unrecovered"] == []
 
     def test_launchd_job_attribution_is_by_live_pid_ancestor_or_exact_argv(self):

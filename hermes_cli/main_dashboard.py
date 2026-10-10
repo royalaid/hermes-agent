@@ -352,9 +352,16 @@ def _restart_launchd_job(domain: str, label: str, old_pid: int | None, *, timeou
 
 def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
     """Exact argv of a running process: ``/proc/<pid>/cmdline`` (Linux), ``ps -o command=`` + shlex
-    (macOS), None on Windows (no graceful taskkill window; Desktop manages its backend)."""
+    (macOS), or psutil's parsed argument vector (Windows)."""
     if sys.platform == "win32":
-        return None
+        try:
+            import psutil
+        except ImportError:
+            return None
+        try:
+            return psutil.Process(pid).cmdline() or None
+        except (psutil.Error, OSError):
+            return None
     try:
         cmdline_path = f"/proc/{pid}/cmdline"
         if os.path.exists(cmdline_path):
@@ -377,24 +384,57 @@ def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
         return None
 
 
-_RESPAWN_LIVENESS_GRACE_SECONDS = 1.0
+_RESPAWN_READY_TIMEOUT_SECONDS = 30.0
+_RESPAWN_READY_POLL_SECONDS = 0.5
+
+
+def _wait_for_dashboard_restore(proc: "subprocess.Popen", host: str, port: int) -> str | None:
+    """Require the new process tree to own the reachable listener; return a failure reason."""
+    import socket
+    import psutil
+    from hermes_cli._subprocess_compat import kill_process_tree
+
+    deadline = time.monotonic() + _RESPAWN_READY_TIMEOUT_SECONDS
+    owner_pid = None
+    while True:
+        code = proc.poll()
+        if code is not None:
+            return f"child exited (code {code}) on {host}:{port}"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            kill_process_tree(proc)
+            return f"restore not ready on {host}:{port} (owner PID {owner_pid})"
+        try:
+            with socket.create_connection((_dashboard_probe_host(host), port),
+                                          timeout=min(_RESPAWN_READY_POLL_SECONDS, remaining)) as sock:
+                peer_host = sock.getpeername()[0]
+            listeners = [conn for conn in psutil.net_connections(kind="tcp")
+                         if conn.status == psutil.CONN_LISTEN and conn.laddr.port == port
+                         and conn.laddr.ip in (peer_host, "0.0.0.0", "::")]
+            owner_pid = next((conn.pid for conn in listeners), None)
+            tree = psutil.Process(proc.pid)
+            owned_pids = {tree.pid, *(child.pid for child in tree.children(recursive=True))}
+            if (listeners and all(conn.pid in owned_pids for conn in listeners)
+                    and time.monotonic() < deadline):
+                code = proc.poll()
+                return None if code is None else f"child exited (code {code}) on {host}:{port}"
+        except (OSError, psutil.Error):
+            # An unreadable listener or process tree cannot establish ownership.
+            pass
+        time.sleep(min(_RESPAWN_READY_POLL_SECONDS, max(0, deadline - time.monotonic())))
 
 
 def _respawnable_command_for_current_install(argv: list[str]) -> list[str]:
-    """Rebuild a captured ``[<interpreter>, <hermes launcher>, ...]`` argv on this install's launcher.
+    """Launch the captured Hermes argument tail through this install's current runtime.
 
-    A pre-PM-takeover install left ``~/.local/bin/hermes`` as a symlink to a Python console
-    script, so the kernel recorded a manual backend as ``[<old venv python>, <launcher>, dashboard,
-    ...]``. The takeover then rewrote that launcher into a POSIX shell shim, and replaying the
-    captured argv verbatim asks the old interpreter to parse a shell script (#124778). This
-    checkout's own ``hermes`` entry script stays Python, so it and every other shape replay unchanged.
+    Never replay a stopped worker's interpreter: Windows venv workers name the base
+    Python, and updates can replace both Python and the dependency generation.
     """
+    from hermes_cli._launchers import runtime_command
+    from hermes_cli.dashboard_procs import _normalize_dashboard_cmdline
+
     root = Path(__file__).resolve().parents[1]
-    if (len(argv) > 2 and os.path.basename(argv[0]).startswith("python")
-            and os.path.basename(argv[1]) == "hermes" and Path(argv[1]) != root / "hermes"):
-        from hermes_cli._launchers import runtime_command
-        return runtime_command(root, argv[2:])
-    return list(argv)
+    return runtime_command(root, _normalize_dashboard_cmdline(argv))
 
 
 def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
@@ -405,8 +445,9 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
     See #78821.
     """
     from hermes_constants import get_hermes_home
+    from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+    from hermes_cli.dashboard_procs import _normalize_dashboard_cmdline
     respawned: list[list[str]] = []
-    spawned: list[tuple[list[str], list[str], subprocess.Popen]] = []
     failed: list[tuple[list[str], list[str], str]] = []
     log_path = get_hermes_home() / "logs" / "dashboard-restart.log"
     with contextlib.suppress(OSError):
@@ -414,6 +455,10 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
 
     for original in commands:
         command = _respawnable_command_for_current_install(original)
+        runtime = _parse_dashboard_runtime(shlex.join(["hermes", *_normalize_dashboard_cmdline(original)]))
+        if runtime is None or runtime[2] <= 0:
+            failed.append((original, command, "restore not ready: missing fixed host:port"))
+            continue
         # Keep restarted dashboards headless; reopening a browser after a
         # background update is noisy and fails in SSH/headless sessions.
         if "dashboard" in command and "--no-open" not in command:
@@ -422,22 +467,15 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
             with open(log_path, "ab") as log_f:
                 proc = subprocess.Popen(
                     command, stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT,
-                    start_new_session=True, close_fds=True)
-            spawned.append((original, command, proc))
+                    close_fds=True, **windows_detach_popen_kwargs())
         except (OSError, ValueError) as exc:
             failed.append((original, command, str(exc)))
-
-    # A respawned backend is a resident server: one that exits within the grace
-    # window died at startup (SyntaxError on a stale argv, port already bound,
-    # ...) and must surface as a failure, not as ``✓ restarted`` (#124778).
-    if spawned:
-        time.sleep(_RESPAWN_LIVENESS_GRACE_SECONDS)
-    for original, command, proc in spawned:
-        if proc.poll() is None:
+            continue
+        error = _wait_for_dashboard_restore(proc, runtime[1], runtime[2])
+        if error is None:
             respawned.append(command)
         else:
-            failed.append((original, command, f"child exited during the first "
-                                              f"{_RESPAWN_LIVENESS_GRACE_SECONDS:.0f}s (code {proc.returncode})"))
+            failed.append((original, command, error))
 
     for command in respawned:
         print(f"    ✓ restarted: {shlex.join(command)}")
