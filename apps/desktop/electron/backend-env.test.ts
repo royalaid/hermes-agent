@@ -12,7 +12,8 @@ import {
   pathEnvKey,
   pooledProfileBackendEnv,
   POSIX_SANE_PATH_ENTRIES,
-  profileBackendParentEnv
+  profileBackendParentEnv,
+  refreshDesktopBackendHostPath
 } from './backend-env'
 import { applyLoginShellPath } from './shell-path'
 
@@ -157,6 +158,48 @@ test('pathEnvKey finds the platform-cased PATH key', () => {
 
 test('appendUniquePathEntries flattens, dedupes, and preserves first occurrence', () => {
   assert.equal(appendUniquePathEntries(['/a:/b', ['/b', '/c'], '', null], { delimiter: ':' }), '/a:/b:/c')
+})
+
+test('Windows local backend PATH puts live host entries before stale process extras', () => {
+  const backendEnv = {
+    Path: 'C:\\Stale\\Desktop\\bin;C:\\WINDOWS\\System32',
+    PYTHONPATH: 'C:\\source'
+  }
+
+  const env = refreshDesktopBackendHostPath(
+    backendEnv,
+    'C:\\Windows\\System32;C:\\Host\\GitHubCLI;C:\\Host\\Git\\bin',
+    'win32'
+  )
+
+  const entries = env.Path.split(';')
+
+  assert.deepEqual(entries.slice(0, 3), ['C:\\Windows\\System32', 'C:\\Host\\GitHubCLI', 'C:\\Host\\Git\\bin'])
+  assert.equal(entries[3], 'C:\\Stale\\Desktop\\bin')
+  assert.equal(entries.length, 4, 'Windows PATH de-duplicates case-insensitively')
+  assert.equal(env.PYTHONPATH, 'C:\\source', 'source backend imports are preserved')
+  assert.equal(backendEnv.Path, 'C:\\Stale\\Desktop\\bin;C:\\WINDOWS\\System32', 'input stays unchanged')
+
+  assert.equal(refreshDesktopBackendHostPath(backendEnv, null, 'win32'), backendEnv)
+  assert.equal(refreshDesktopBackendHostPath(backendEnv, '/bin', 'linux'), backendEnv)
+})
+
+test('live Windows PATH keeps inherited Hermes store tools before registry entries', () => {
+  const env = refreshDesktopBackendHostPath(
+    {
+      HERMES_RUNTIME_DIR: 'C:\\Hermes\\tools',
+      Path: 'C:\\Old\\bin;C:\\Hermes\\tools\\node\\bin;C:\\WINDOWS\\System32'
+    },
+    'C:\\Windows\\System32;C:\\New\\bin',
+    'win32'
+  )
+
+  assert.deepEqual(env.Path?.split(';'), [
+    'C:\\Hermes\\tools\\node\\bin',
+    'C:\\Windows\\System32',
+    'C:\\New\\bin',
+    'C:\\Old\\bin'
+  ])
 })
 
 // `hermes desktop` loads its launch profile's .env/.op.env into os.environ and
