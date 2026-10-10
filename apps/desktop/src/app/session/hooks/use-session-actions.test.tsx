@@ -11,6 +11,7 @@ import { resolveSessionRpcOwner } from '@/app/contrib/wiring-routing'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { group } from '@/components/pane-shell/tree/model'
 import { $activeTreeGroup, $layoutTree, noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
+import { registry } from '@/contrib/registry'
 import {
   deleteSession,
   getAllSessionMessages,
@@ -22,6 +23,7 @@ import {
   setSessionArchived
 } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { type ChatMessagePart, settlePendingClarifyToolCall, toChatMessages } from '@/lib/chat-messages'
 import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $backgroundStatusBySession, type ComposerStatusItem } from '@/store/composer-status'
@@ -45,6 +47,7 @@ import {
 } from '@/store/profile'
 import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
 import { $projectTree } from '@/store/projects'
+import { $routeTiles, closeRouteTile } from '@/store/route-tiles'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
@@ -98,6 +101,7 @@ import { requestForSessionProfile, type SessionProfileRoute } from '@/store/sess
 import {
   $sessionTiles,
   clearAllSessionStates,
+  clearMainSessionOwner,
   dropSessionState,
   knownOwnerForSession,
   publishSessionState,
@@ -111,7 +115,7 @@ import { loadTranscriptTail, saveTranscriptTail } from '@/store/transcript-tail-
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { deferred } from '../../../test/deferred'
-import { NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
+import { NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { pinnedOwnerCount, pinnedStoredSessionIdsForOwner, releaseStoredSessionPins } from './session-context-drift'
@@ -713,13 +717,14 @@ describe('active stored-session id rotation routing', () => {
   afterEach(() => {
     cleanup()
     setActiveSessionId(null)
-    setActiveSessionStoredIdRotation(null)
+    clearMainSessionOwner()
     setSelectedStoredSessionId(null)
     setSessions([])
     $sessionTiles.set([])
     $layoutTree.set(null)
     $activeTreeGroup.set(null)
     window.history.pushState({}, '', '/')
+    setActiveSessionStoredIdRotation(null)
     vi.restoreAllMocks()
   })
 
@@ -1727,6 +1732,9 @@ describe('resumeSession failure recovery', () => {
   afterEach(() => {
     cleanup()
     setActiveSessionId(null)
+    clearMainSessionOwner()
+    setSelectedStoredSessionId(null)
+    _resetSessionOwnerHintsForTests()
     setResumeFailedSessionId(null)
     setSessionStartedAt(null)
     setMessages([])
@@ -3853,6 +3861,9 @@ describe('resumeSession warm-cache mapping integrity', () => {
   afterEach(() => {
     cleanup()
     setActiveSessionId(null)
+    clearMainSessionOwner()
+    setSelectedStoredSessionId(null)
+    _resetSessionOwnerHintsForTests()
     setResumeFailedSessionId(null)
     setSessionStartedAt(null)
     setMessages([])
@@ -5983,6 +5994,277 @@ describe('resumeSession warm-cache mapping integrity', () => {
 
     expect($sessionStartedAt.get()).toBe(runtimeStartedAt)
   })
+
+  it('does not resurrect a clarify completed while persisted transcript hydration is pending', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const state = clientState('stored-A')
+    state.messages = [{ id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] }]
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', state]])
+    }
+
+    const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+
+    setSessions([storedSession({ id: 'stored-A', message_count: 1 })])
+    vi.mocked(getLatestSessionMessages).mockReturnValue(persisted.promise as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        setClarifyRequest({
+          requestId: 'req-warm-answer',
+          sessionId: 'rt-A',
+          questions: [{ qid: 'q0', question: 'Which path?', choices: ['safe', 'fast'], multiSelect: false }]
+        })
+
+        return {
+          info: {},
+          message_count: 1,
+          messages: [],
+          messages_omitted: true,
+          open_requests: [
+            {
+              id: 'req-warm-answer',
+              method: 'clarify',
+              params: { choices: ['safe', 'fast'], question: 'Which path?' }
+            }
+          ],
+          resumed: 'stored-A',
+          running: true,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    const resumePromise = resume!('stored-A', true)
+    await waitFor(() => expect($clarifyRequests.get()['rt-A']).toMatchObject({ requestId: 'req-warm-answer' }))
+
+    const pendingState = sessionStateByRuntimeIdRef.current.get('rt-A')!
+
+    const settledProjection = settlePendingClarifyToolCall(
+      pendingState.messages,
+      {
+        args: { questions: [{ choices: ['safe', 'fast'], question: 'Which path?' }] },
+        tool_id: 'req-warm-answer'
+      },
+      false
+    )
+
+    const answeredMessages = settledProjection.messages.map(message => ({
+      ...message,
+      parts: message.parts.map(part =>
+        part.type === 'tool-call' && part.toolName === 'clarify'
+          ? { ...part, result: { question: 'Which path?', user_response: 'safe' } }
+          : part
+      )
+    }))
+
+    clearClarifyRequest('req-warm-answer', 'rt-A')
+    sessionStateByRuntimeIdRef.current.set('rt-A', {
+      ...pendingState,
+      messages: answeredMessages,
+      needsInput: false,
+      streamId: null
+    })
+
+    persisted.resolve({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        {
+          content: 'I found two paths.',
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [
+            {
+              function: {
+                arguments: '{"question":"Which path?","choices":["safe","fast"]}',
+                name: 'clarify'
+              },
+              id: 'call-provider'
+            }
+          ]
+        }
+      ],
+      session_id: 'stored-A'
+    } as never)
+    await resumePromise
+
+    const finalState = sessionStateByRuntimeIdRef.current.get('rt-A')
+
+    const clarifyParts =
+      finalState?.messages
+        .flatMap(message => message.parts)
+        .filter(
+          (part): part is Extract<ChatMessagePart, { type: 'tool-call' }> =>
+            part.type === 'tool-call' && part.toolName === 'clarify'
+        ) ?? []
+
+    const openClarifyCount = clarifyParts.filter(part => part.result === undefined).length
+    const clarifyResults = clarifyParts.filter(part => part.result !== undefined).map(part => part.result)
+
+    const cachedClarifyParts =
+      loadTranscriptTail('stored-A')
+        ?.flatMap(message => message.parts)
+        .filter(
+          (part): part is Extract<ChatMessagePart, { type: 'tool-call' }> =>
+            part.type === 'tool-call' && part.toolName === 'clarify'
+        ) ?? []
+
+    expect($clarifyRequests.get()['rt-A']).toBeUndefined()
+    expect(finalState?.needsInput).toBe(false)
+    expect(clarifyParts).toHaveLength(1)
+    expect(openClarifyCount).toBe(0)
+    expect(clarifyResults).toContainEqual({ question: 'Which path?', user_response: 'safe' })
+    expect(clarifyResults).not.toContainEqual(expect.objectContaining({ timed_out: true }))
+    expect(cachedClarifyParts).toHaveLength(1)
+    expect(cachedClarifyParts[0]).toMatchObject({
+      result: { question: 'Which path?', user_response: 'safe' },
+      toolCallId: 'call-provider'
+    })
+  })
+
+  it.each(['settled', 'replacement'] as const)('reconciles %s request lifetime after delayed hydration', async mode => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const state = clientState('stored-A')
+    state.messages = [{ id: 'cached-user', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] }]
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', state]])
+    }
+
+    const persisted = deferred<Awaited<ReturnType<typeof getLatestSessionMessages>>>()
+
+    setSessions([storedSession({ id: 'stored-A', message_count: 1 })])
+    vi.mocked(getLatestSessionMessages).mockReturnValue(persisted.promise as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        setClarifyRequest({
+          requestId: 'req-warm-response-gap',
+          sessionId: 'rt-A',
+          questions: [{ qid: 'q0', question: 'Which path?', choices: ['safe', 'fast'], multiSelect: false }]
+        })
+
+        return {
+          info: {},
+          message_count: 1,
+          messages: [],
+          messages_omitted: true,
+          open_requests: [
+            {
+              id: 'req-warm-response-gap',
+              method: 'clarify',
+              params: { choices: ['safe', 'fast'], question: 'Which path?' }
+            }
+          ],
+          resumed: 'stored-A',
+          running: true,
+          session_id: 'rt-A',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    const resumePromise = resume!('stored-A', true)
+    await waitFor(() => expect($clarifyRequests.get()['rt-A']).toMatchObject({ requestId: 'req-warm-response-gap' }))
+
+    const pendingState = sessionStateByRuntimeIdRef.current.get('rt-A')!
+
+    expect(pendingState.needsInput).toBe(true)
+
+    // Successful clarify.respond clears the request immediately. The
+    // tool.complete event that settles the transcript can arrive later.
+    clearClarifyRequest('req-warm-response-gap', 'rt-A')
+
+    if (mode === 'replacement') {
+      setClarifyRequest({
+        requestId: 'req-new-during-rest', sessionId: 'rt-A',
+        questions: [{ qid: 'new', question: 'New question?', choices: ['yes', 'no'], multiSelect: false }]
+      })
+    }
+
+    persisted.resolve({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        {
+          content: 'I found two paths.',
+          role: 'assistant',
+          timestamp: 2,
+          tool_calls: [
+            {
+              function: {
+                arguments: '{"question":"Which path?","choices":["safe","fast"]}',
+                name: 'clarify'
+              },
+              id: 'call-provider'
+            }
+          ]
+        }
+      ],
+      session_id: 'stored-A'
+    } as never)
+    await resumePromise
+
+    const finalState = sessionStateByRuntimeIdRef.current.get('rt-A')
+
+    const finalClarifyParts =
+      finalState?.messages
+        .flatMap(message => message.parts)
+        .filter(part => part.type === 'tool-call' && part.toolName === 'clarify') ?? []
+
+    const cachedClarifyParts =
+      loadTranscriptTail('stored-A')
+        ?.flatMap(message => message.parts)
+        .filter(part => part.type === 'tool-call' && part.toolName === 'clarify') ?? []
+
+    if (mode === 'replacement') {
+      expect($clarifyRequests.get()['rt-A']?.requestId).toBe('req-new-during-rest')
+      expect(finalState?.needsInput).toBe(true)
+      expect(finalClarifyParts).toHaveLength(1)
+      expect(finalClarifyParts[0]).toMatchObject({ toolCallId: 'req-new-during-rest' })
+      expect((finalClarifyParts[0] as Extract<ChatMessagePart, { type: 'tool-call' }>).result).toBeUndefined()
+    } else {
+      expect($clarifyRequests.get()['rt-A']).toBeUndefined()
+      expect(finalState?.needsInput).toBe(false)
+      expect(finalClarifyParts).toHaveLength(0)
+    }
+    expect(cachedClarifyParts).toHaveLength(0)
+  })
+
+
 })
 
 describe('createBackendSessionForSend workspace target', () => {
@@ -6503,6 +6785,78 @@ describe('selectSidebarItem', () => {
     expect(navigate).toHaveBeenCalledWith('/capabilities', undefined)
     expect(noteActiveTreeGroup).toHaveBeenCalledWith(null)
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
+  })
+
+  it('opens route-backed plugin sidebar items as stable closeable route tiles', async () => {
+    const navigate = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    const disposeRoutes = registry.registerMany([
+      {
+        area: ROUTES_AREA,
+        data: { path: '/kanban' },
+        id: 'kanban-page',
+        render: () => null,
+        source: 'plugin:kanban',
+        title: 'Kanban'
+      },
+      {
+        area: ROUTES_AREA,
+        data: { path: '/llm-usage' },
+        id: 'llm-usage-page',
+        render: () => null,
+        source: 'plugin:llm-usage',
+        title: 'LLM Usage'
+      }
+    ])
+
+    let handle: HarnessHandle | null = null
+
+    $routeTiles.set([])
+
+    try {
+      render(<Harness navigate={navigate} onReady={value => (handle = value)} requestGateway={requestGateway} />)
+      await waitFor(() => expect(handle).not.toBeNull())
+
+      act(() => {
+        handle!.selectSidebarItem({ icon: (() => null) as never, id: 'kanban', label: 'Kanban', route: '/kanban' })
+        handle!.selectSidebarItem({ icon: (() => null) as never, id: 'kanban', label: 'Kanban', route: '/kanban' })
+        handle!.selectSidebarItem({
+          icon: (() => null) as never,
+          id: 'llm-usage',
+          label: 'LLM Usage',
+          route: '/llm-usage'
+        })
+      })
+
+      expect(navigate).not.toHaveBeenCalled()
+      expect($routeTiles.get()).toEqual([
+        { dir: 'center', path: '/kanban' },
+        { dir: 'center', path: '/llm-usage' }
+      ])
+      expect(revealTreePane).toHaveBeenCalledWith('route-tile:/kanban')
+      expect(revealTreePane).toHaveBeenCalledWith('route-tile:/llm-usage')
+    } finally {
+      disposeRoutes()
+      closeRouteTile('/kanban')
+      closeRouteTile('/llm-usage')
+    }
+  })
+
+  it('falls back to router navigation when a previously contributed route is unloaded', async () => {
+    const navigate = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(<Harness navigate={navigate} onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    act(() => {
+      handle!.selectSidebarItem({ icon: (() => null) as never, id: 'kanban', label: 'Kanban', route: '/kanban' })
+    })
+
+    expect(navigate).toHaveBeenCalledWith('/kanban', undefined)
+    expect($routeTiles.get()).toEqual([])
   })
 })
 
@@ -7294,3 +7648,53 @@ describe('branchStoredSession failure retry', () => {
     })
   })
 })
+
+it('keeps the running projection stream target when an accepted queued user follows it', async () => {
+    const storedMessages = [
+      { content: 'earlier question', role: 'user', timestamp: 1 },
+      { content: 'earlier answer', role: 'assistant', timestamp: 2 }
+    ]
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-1' } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          session_id: 'runtime-queued',
+          session_key: 'stored-1',
+          resumed: 'stored-1',
+          message_count: storedMessages.length,
+          messages: storedMessages,
+          running: true,
+          inflight: {
+            user: 'running prompt',
+            assistant: 'partial answer',
+            streaming: true
+          },
+          queued: { user: 'accepted queued prompt' },
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resumedState: ClientSessionState | undefined
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        onStateUpdate={(_sessionId, state) => (resumedState = state)}
+        requestGateway={requestGateway}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-1', true)
+
+    expect(resumedState?.messages.slice(-2).map(message => message.id)).toEqual([
+      'assistant-stream-runtime-queued',
+      'user-queued-runtime-queued'
+    ])
+    expect(resumedState?.streamId).toBe('assistant-stream-runtime-queued')
+  })

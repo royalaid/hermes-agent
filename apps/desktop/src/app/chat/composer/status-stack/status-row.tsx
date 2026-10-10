@@ -42,7 +42,7 @@ function leadingGlyph(item: ComposerStatusItem, s: Translations['statusStack'], 
     )
   }
 
-  if (item.todoStatus === 'pending' || (historical && item.todoStatus === 'in_progress')) {
+  if (item.todoStatus === 'pending' || ((historical || item.state !== 'running') && item.todoStatus === 'in_progress')) {
     return <StatusPendingIcon />
   }
 

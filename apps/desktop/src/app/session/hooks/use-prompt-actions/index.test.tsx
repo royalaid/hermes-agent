@@ -719,6 +719,32 @@ describe('usePromptActions /wake', () => {
 })
 
 describe('usePromptActions /compress', () => {
+  it('preserves mounted renderer identity when compression returns unversioned copied rows', async () => {
+    const seeds: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async (method: string) => method === 'session.compress' ? {
+      removed: 2, summary: { headline: 'Compressed history' },
+      messages: [{ role: 'user', content: 'Protected user turn', timestamp: 20 }]
+    } : {})
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => seeds.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway as never}
+        seedMessages={[
+          { id: 'mounted-old', role: 'user', parts: [textPart('Older history')], timestamp: 10, rowId: 1 },
+          { id: 'mounted-protected', role: 'user', parts: [textPart('Protected user turn')], timestamp: 20, rowId: 2 }
+        ]}
+      />
+    )
+    await handle!.submitText('/compress')
+    const messages = (seeds.at(-1)?.messages as Array<{ id: string; role: string; rowId?: number }>).filter(
+      message => message.role === 'user'
+    )
+    expect(messages.map(message => message.id)).toEqual(['mounted-old', 'mounted-protected'])
+    expect(messages[1].rowId).toBeUndefined()
+  })
   beforeEach(() => {
     setSessions(() => [sessionInfo()])
   })

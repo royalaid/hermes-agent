@@ -764,9 +764,51 @@ export const focusComposerInput = (el: HTMLElement | null) => {
     el.focus({ preventScroll: true })
   }
 
+  // Only the original external control may reclaim focus during recovery.
+  // A later focus gesture wins even if that control blurs before a retry.
+  const restoreFrom = document.activeElement
+  const isRecoverySource = (active: EventTarget | null) =>
+    active instanceof Node && restoreFrom !== document.body && Boolean(restoreFrom?.contains(active))
+  let cancelled = false
+  let remaining = 2
+  let frame = 0
+  let timer = 0
+  const cancel = () => {
+    cancelled = true
+    window.cancelAnimationFrame(frame)
+    window.clearTimeout(timer)
+    document.removeEventListener('focusin', onFocus)
+  }
+  const onFocus = (event: FocusEvent) => {
+    if (event.target !== el && !isRecoverySource(event.target)) {
+      cancel()
+    }
+  }
+  const retry = () => {
+    if (cancelled) {
+      return
+    }
+
+    const active = document.activeElement
+
+    if (active !== el && active !== null && active !== document.body && !isRecoverySource(active)) {
+      cancel()
+
+      return
+    }
+
+    focus()
+    remaining -= 1
+
+    if (remaining === 0) {
+      document.removeEventListener('focusin', onFocus)
+    }
+  }
+
+  document.addEventListener('focusin', onFocus)
   focus()
-  window.requestAnimationFrame(focus)
-  window.setTimeout(focus, 0)
+  frame = window.requestAnimationFrame(retry)
+  timer = window.setTimeout(retry, 0)
 }
 
 /** Drop focus from the main composer input (status-stack chrome, sidebar, etc.).

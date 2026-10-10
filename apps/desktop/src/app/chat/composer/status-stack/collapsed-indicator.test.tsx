@@ -3,6 +3,8 @@ import { MemoryRouter } from 'react-router'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { $todosBySession } from '@/store/todos'
+import { createClientSessionState } from '@/lib/chat-runtime'
+import { dropSessionState, publishSessionState } from '@/store/session-states'
 
 import { ComposerStatusStack } from './index'
 
@@ -20,9 +22,11 @@ describe('ComposerStatusStack collapsed todo indicator', () => {
   afterEach(() => {
     cleanup()
     $todosBySession.set({})
+    dropSessionState('session-1')
   })
 
   it('shows a running indicator next to the collapsed todo label', () => {
+    publishSessionState('session-1', { ...createClientSessionState(), busy: true, turnLive: true })
     $todosBySession.set({
       'session-1': [{ content: 'Wire the status stack', id: '1', status: 'in_progress' }]
     })

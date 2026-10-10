@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $hoveredTreeGroup } from '@/components/pane-shell/tree/store'
 
@@ -82,6 +82,46 @@ describe('focusComposerInput', () => {
     focusComposerInput(input)
 
     expect(document.activeElement).toBe(input)
+  })
+
+  it.each([false, true])('yields recovery to a newer transcript control even after blur=%s', blur => {
+    vi.useFakeTimers()
+    try {
+      const input = mountInput()
+      const paging = document.createElement('button')
+      document.body.append(paging)
+      focusComposerInput(input)
+      paging.focus({ preventScroll: true })
+      expect(document.activeElement).toBe(paging)
+      if (blur) paging.blur()
+      vi.runAllTimers()
+      expect(document.activeElement).toBe(blur ? document.body : paging)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('recovers from the original external control but yields to a different control', () => {
+    vi.useFakeTimers()
+    try {
+      const input = mountInput()
+      const panel = document.createElement('div')
+      const insert = document.createElement('button')
+      const other = document.createElement('button')
+      panel.append(insert, other)
+      document.body.append(panel)
+      insert.focus()
+      focusComposerInput(input)
+      insert.focus()
+      vi.advanceTimersByTime(0)
+      expect(document.activeElement).toBe(input)
+      other.focus()
+      other.blur()
+      vi.runAllTimers()
+      expect(document.activeElement).toBe(document.body)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('takes the caret from a hidden keep-alive composer on tab switch', () => {

@@ -69,6 +69,44 @@ describe('appendReasoningPart', () => {
 })
 
 describe('toChatMessages', () => {
+  it('hydrates accepted queue markers only from strict user metadata without losing attachments or identity', () => {
+    const metadata = [
+      { _queued_prompt: true },
+      JSON.stringify({ _queued_prompt: true }),
+      { _queued_prompt: false },
+      { _queued_prompt: 'true' },
+      { _queued_prompt: 1 },
+      '{bad json',
+      null
+    ]
+    for (const [index, display_metadata] of metadata.entries()) {
+      const rows = toChatMessages([
+        {
+          id: 10,
+          role: 'user',
+          timestamp: 1,
+          content: '@file:/tmp/input.txt\n@image:/tmp/image.png\n\nnext prompt',
+          display_metadata: display_metadata as never
+        },
+        {
+          id: 11,
+          role: 'assistant',
+          timestamp: 2,
+          content: 'History stays visible.',
+          display_metadata: { _queued_prompt: true } as never
+        }
+      ])
+      expect(rows.map(chatMessageText)).toEqual(['next prompt', 'History stays visible.'])
+      expect(rows[0]).toMatchObject({
+        id: '1-0-user',
+        rowId: 10,
+        attachmentRefs: ['@file:/tmp/input.txt', '@image:/tmp/image.png']
+      })
+      expect(rows[0].queuedPrompt).toBe(index < 2 ? true : undefined)
+      expect(rows[1].queuedPrompt).toBeUndefined()
+    }
+  })
+
   it('does not render an opaque native_assistant reasoning_details carrier as Thought (#126588)', () => {
     const carrier = JSON.stringify([
       {
@@ -1824,4 +1862,48 @@ describe('toChatMessages backend-row accounting', () => {
     expect(messages).toHaveLength(1)
     expect(messages[0].serverRowSpan).toBe(3)
   })
+})
+
+it('hydrates a marked accepted queue after the active reply without reordering ordinary or answered history', () => {
+  const active = { id: 6, role: 'user' as const, content: 'Active', timestamp: 6 }
+  const queued = {
+    id: 7,
+    role: 'user' as const,
+    content: 'Next',
+    timestamp: 7,
+    display_metadata: JSON.stringify({ _queued_prompt: true }),
+    display_kind: null
+  }
+  const final = { id: 8, role: 'assistant' as const, content: 'Finished active', timestamp: 8 }
+  const input = [active, queued, final]
+  const hydrated = toChatMessages(input)
+  expect(hydrated.map(row => [row.role, chatMessageText(row), row.rowId])).toEqual([
+    ['user', 'Active', 6],
+    ['assistant', 'Finished active', 8],
+    ['user', 'Next', 7]
+  ])
+  expect(hydrated.at(-1)?.queuedPrompt).toBe(true)
+  expect(input.map(row => row.id)).toEqual([6, 7, 8])
+  expect(toChatMessages([active, { ...queued, display_metadata: null }, final]).map(row => row.rowId)).toEqual([
+    6, 7, 8
+  ])
+  expect(toChatMessages([queued, final, active]).map(row => row.rowId)).toEqual([7, 8, 6])
+  const structured = toChatMessages([
+    active,
+    {
+      id: 10,
+      role: 'assistant',
+      content: 'Working',
+      tool_calls: [{ id: 'call-active', function: { name: 'read_file', arguments: '{}' } }]
+    },
+    queued,
+    { id: 11, role: 'tool', tool_call_id: 'call-active', content: 'read result' },
+    final
+  ])
+  expect(structured.at(-1)).toMatchObject({ role: 'user', rowId: 7, queuedPrompt: true })
+  expect(structured.flatMap(row => row.parts)).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ type: 'tool-call', toolCallId: 'call-active', result: 'read result' })
+    ])
+  )
 })
